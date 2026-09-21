@@ -48,6 +48,12 @@ import {
 const recoverableAttentionQueryHookSymbol = Symbol.for(
   "torsor.kernel.recoverable-attention-query",
 );
+const recoverableAttentionHydrationQueryHookSymbol = Symbol.for(
+  "torsor.kernel.recoverable-attention-hydration-query",
+);
+const recoverySnapshotPromotionHookSymbol = Symbol.for(
+  "torsor.kernel.recovery-snapshot-promotion",
+);
 const publicEventQueryHookSymbol = Symbol.for(
   "torsor.kernel.authorized-public-event-query",
 );
@@ -851,17 +857,28 @@ export function getAttentionRecoverySnapshot(
   kernel: db.KernelContext,
 ): AttentionRecoverySnapshot {
   const observedAt = db.now(kernel);
-  const promoted = db.allRows(
-    kernel,
-    `UPDATE attention_recovery_executions
+  const promotionSql = `UPDATE attention_recovery_executions
         SET expired_recoverable = 1
       WHERE unfinished = 1
         AND expired_recoverable = 0
-        AND expires_at <= ?
-      RETURNING activation_id`,
+        AND expires_at <= ?`;
+  const promotedCount = db.run(
+    kernel,
+    promotionSql,
     observedAt,
   );
-  if (promoted.length > 0) {
+  const promotionHook = Reflect.get(
+    globalThis,
+    recoverySnapshotPromotionHookSymbol,
+  );
+  if (typeof promotionHook === "function") {
+    promotionHook({
+      sql: promotionSql,
+      parameters: [observedAt],
+      changes: promotedCount,
+    });
+  }
+  if (promotedCount > 0) {
     db.run(
       kernel,
       `UPDATE kernel_runtime_state
@@ -907,12 +924,12 @@ function readAttentionRecoverySnapshot(
 export function listRecoverableAttentionExecutions(
   kernel: db.KernelContext,
   afterCursor: RecoverableAttentionExecutionCursor | undefined,
-  requestedSnapshot: AttentionRecoverySnapshot | undefined,
+  requestedRevision: number | undefined,
   limit: number,
 ): RecoverableAttentionExecutionPage {
   const recoverySnapshot = resolveAttentionRecoverySnapshot(
     kernel,
-    requestedSnapshot,
+    requestedRevision,
   );
   const expiredClauses = [
     "recovery.expired_recoverable = 1",
@@ -1006,12 +1023,18 @@ export function listRecoverableAttentionExecutions(
     attentions.map((attention) => [text(attention.id), attention]),
   );
   const attemptsByActivation = new Map<string, Row[]>();
-  for (const attempt of db.allRows(
-    kernel,
-    `SELECT *
+  const hydrationSql = `SELECT *
        FROM provider_attempts
       WHERE activation_id IN (${placeholders})
-      ORDER BY activation_id, started_at, id`,
+      ORDER BY activation_id, started_at, id`;
+  recordQuery(
+    recoverableAttentionHydrationQueryHookSymbol,
+    hydrationSql,
+    activationIds,
+  );
+  for (const attempt of db.allRows(
+    kernel,
+    hydrationSql,
     ...activationIds,
   )) {
     const activationId = text(attempt.activation_id);
@@ -1054,55 +1077,49 @@ export function listRecoverableAttentionExecutions(
 
 function resolveAttentionRecoverySnapshot(
   kernel: db.KernelContext,
-  requested: AttentionRecoverySnapshot | undefined,
+  requestedRevision: number | undefined,
 ): AttentionRecoverySnapshot {
-  if (!requested) {
+  if (requestedRevision === undefined) {
     return getAttentionRecoverySnapshot(kernel);
   }
   if (
-    !Number.isInteger(requested.revision) ||
-    requested.revision < 0 ||
-    Number.isNaN(Date.parse(requested.observedAt)) ||
-    (requested.nextExpiryAt !== null &&
-      Number.isNaN(Date.parse(requested.nextExpiryAt)))
+    !Number.isInteger(requestedRevision) ||
+    requestedRevision < 0
   ) {
     throw new KernelError(
       "InvalidCommand",
-      "The Attention recovery snapshot is invalid.",
+      "The Attention recovery revision is invalid.",
     );
   }
-  const current = readAttentionRecoverySnapshot(kernel, db.now(kernel));
-  const authoritativeHorizon = db.getRow(
+  const observedAt = db.now(kernel);
+  const current = readAttentionRecoverySnapshot(kernel, observedAt);
+  const due = db.getRow(
     kernel,
-    `SELECT MIN(expires_at) AS next_expiry_at
+    `SELECT activation_id
        FROM attention_recovery_executions
       WHERE unfinished = 1
          AND expired_recoverable = 0
-         AND expires_at > ?`,
-    requested.observedAt,
+         AND expires_at <= ?
+      ORDER BY expires_at
+      LIMIT 1`,
+    observedAt,
   );
-  const nextExpiryAt = authoritativeHorizon
-    ? optionalText(authoritativeHorizon.next_expiry_at)
-    : null;
   if (
-    current.revision !== requested.revision ||
-    nextExpiryAt !== requested.nextExpiryAt ||
-    new Date(requested.observedAt) > new Date(current.observedAt) ||
-    (requested.nextExpiryAt !== null &&
-      new Date(current.observedAt) >= new Date(requested.nextExpiryAt))
+    current.revision !== requestedRevision ||
+    due !== undefined
   ) {
     throw new KernelError(
       "StaleRevision",
-      "The Attention recovery snapshot changed or crossed its expiry horizon.",
+      "The Attention recovery revision changed or has unmaterialized expired work.",
       {
-        expectedRevision: requested.revision,
+        expectedRevision: requestedRevision,
         actualRevision: current.revision,
         observedAt: current.observedAt,
-        nextExpiryAt: requested.nextExpiryAt,
+        nextExpiryAt: current.nextExpiryAt,
       },
     );
   }
-  return requested;
+  return current;
 }
 
 function mergeRecoveryRows(

@@ -252,7 +252,7 @@ export class TorsorKernel {
       query.type === "GetAttentionRecoverySnapshot" ||
       (
         query.type === "ListRecoverableAttentionExecutions" &&
-        query.recoverySnapshot === undefined
+        query.recoveryRevision === undefined
       );
     this.#context.database.exec(
       advancesRecoveryClock ? "BEGIN IMMEDIATE" : "BEGIN",
@@ -410,7 +410,7 @@ export class TorsorKernel {
           result = listRecoverableAttentionExecutions(
             this.#context,
             query.afterCursor,
-            query.recoverySnapshot,
+            query.recoveryRevision,
             boundedLimit(query.limit),
           );
           break;

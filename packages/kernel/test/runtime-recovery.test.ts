@@ -909,7 +909,7 @@ describe("Runtime provider recovery", () => {
       const first = await kernel.query(
         {
           type: "ListRecoverableAttentionExecutions",
-          recoverySnapshot: snapshot,
+          recoveryRevision: snapshot.revision,
           limit: 1,
         },
         runtimeContext,
@@ -933,7 +933,7 @@ describe("Runtime provider recovery", () => {
           {
             type: "ListRecoverableAttentionExecutions",
             afterCursor: first.nextCursor!,
-            recoverySnapshot: snapshot,
+            recoveryRevision: snapshot.revision,
             limit: 1,
           },
           runtimeContext,
@@ -980,7 +980,7 @@ describe("Runtime provider recovery", () => {
       const first = await kernel.query(
         {
           type: "ListRecoverableAttentionExecutions",
-          recoverySnapshot: snapshot,
+          recoveryRevision: snapshot.revision,
           limit: 1,
         },
         runtimeContext,
@@ -989,18 +989,84 @@ describe("Runtime provider recovery", () => {
         stableHead.activationId,
       ]);
 
-      now = new Date("2026-09-21T08:00:06.000Z");
+      now = new Date("2026-09-21T08:00:05.000Z");
+      const forgedContinuation = {
+        type: "ListRecoverableAttentionExecutions",
+        afterCursor: first.nextCursor!,
+        recoveryRevision: snapshot.revision,
+        recoverySnapshot: {
+          revision: snapshot.revision,
+          observedAt: "2026-09-21T08:00:06.000Z",
+          nextExpiryAt: null,
+        },
+        limit: 1,
+      } as const;
+      await expect(
+        kernel.query(forgedContinuation, runtimeContext),
+      ).rejects.toMatchObject({ code: "StaleRevision" });
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("uses authoritative current time across backward clocks and earlier inserted expiries", async () => {
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const kernel = openMemoryKernel(() => now);
+    try {
+      await createAttentionExecution(
+        kernel,
+        "snapshot-late-horizon",
+        10_000,
+      );
+      now = new Date("2026-09-21T08:00:03.000Z");
+      const snapshot = await kernel.query(
+        { type: "GetAttentionRecoverySnapshot" },
+        runtimeContext,
+      );
+      expect(snapshot.nextExpiryAt).toBe(
+        "2026-09-21T08:00:10.000Z",
+      );
+
+      now = new Date("2026-09-21T08:00:02.000Z");
       await expect(
         kernel.query(
           {
             type: "ListRecoverableAttentionExecutions",
-            afterCursor: first.nextCursor!,
-            recoverySnapshot: snapshot,
+            recoveryRevision: snapshot.revision,
+            limit: 1,
+          },
+          runtimeContext,
+        ),
+      ).resolves.toMatchObject({
+        recoverySnapshot: {
+          revision: snapshot.revision,
+          observedAt: "2026-09-21T08:00:02.000Z",
+        },
+      });
+
+      await createAttentionExecution(
+        kernel,
+        "snapshot-earlier-insert",
+        2_000,
+      );
+      await expect(
+        kernel.query(
+          {
+            type: "ListRecoverableAttentionExecutions",
+            recoveryRevision: snapshot.revision,
             limit: 1,
           },
           runtimeContext,
         ),
       ).rejects.toMatchObject({ code: "StaleRevision" });
+      const refreshed = await kernel.query(
+        { type: "GetAttentionRecoverySnapshot" },
+        runtimeContext,
+      );
+      expect(refreshed.revision).toBeGreaterThan(snapshot.revision);
+      expect(refreshed.nextExpiryAt).toBe(
+        "2026-09-21T08:00:04.000Z",
+      );
     } finally {
       kernel.close();
     }

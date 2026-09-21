@@ -224,60 +224,6 @@ export function releaseAttentionDomainLease(
   );
 }
 
-export function synchronizeAttentionDomainProviderAttempts(
-  kernel: db.KernelContext,
-  activation: Row,
-): void {
-  const attentionId = optionalText(activation.attention_id);
-  if (!attentionId) {
-    return;
-  }
-  const unsettled = db.getRow(
-    kernel,
-    `SELECT COUNT(*) AS count
-       FROM provider_attempts
-      WHERE activation_id IN (
-        SELECT id
-          FROM activation_attempts
-         WHERE attention_id = ?
-      )
-        AND status IN ('Started', 'Acknowledged')`,
-    attentionId,
-  );
-  const unsettledCount = unsettled ? integer(unsettled.count) : 0;
-  const fence = db.getRow(
-    kernel,
-    `SELECT attention_id
-       FROM attention_domain_fences
-      WHERE attention_id = ?`,
-    attentionId,
-  );
-  if (!fence) {
-    if (unsettledCount === 0) {
-      return;
-    }
-    throw new Error(
-      `Attention ${attentionId} has unsettled provider work without a domain fence.`,
-    );
-  }
-  db.run(
-    kernel,
-    `UPDATE attention_domain_fences
-        SET unsettled_provider_attempt_count = ?
-      WHERE attention_id = ?`,
-    unsettledCount,
-    attentionId,
-  );
-  db.run(
-    kernel,
-    `DELETE FROM attention_domain_fences
-      WHERE attention_id = ?
-        AND lease_token IS NULL
-        AND unsettled_provider_attempt_count = 0`,
-    attentionId,
-  );
-}
-
 export function checkThreadCursor(kernel: db.KernelContext, thread: Row, expected?: number): void {
   if (expected !== undefined && integer(thread.cursor) !== expected) {
     const events = db.allRows(kernel, `SELECT * FROM public_events

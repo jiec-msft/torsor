@@ -377,7 +377,7 @@ export interface GetAttentionRecoverySnapshotQuery {
 export interface ListRecoverableAttentionExecutionsQuery {
   readonly type: "ListRecoverableAttentionExecutions";
   readonly afterCursor?: RecoverableAttentionExecutionCursor;
-  readonly recoverySnapshot?: AttentionRecoverySnapshot;
+  readonly recoveryRevision?: number;
   readonly limit?: number;
 }
 

@@ -914,6 +914,17 @@ describe("independent review regressions", () => {
         },
         runtimeContext,
       );
+      await expect(
+        kernel.execute(
+          {
+            type: "ClaimOutboxEvents",
+            idempotencyKey: "outbox-batch-claim",
+            limit: 2,
+            leaseDurationMs: 30_000,
+          },
+          runtimeContext,
+        ),
+      ).rejects.toMatchObject({ code: "Conflict" });
     } finally {
       kernel.close();
     }

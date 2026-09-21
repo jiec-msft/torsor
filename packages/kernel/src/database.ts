@@ -72,8 +72,8 @@ export function run(
   context: KernelContext,
   sql: string,
   ...parameters: SQLInputValue[]
-): void {
-  context.database.prepare(sql).run(...parameters);
+): number {
+  return Number(context.database.prepare(sql).run(...parameters).changes);
 }
 
 export function now(context: KernelContext): string {

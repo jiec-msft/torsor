@@ -138,7 +138,7 @@ export function resolveCachedOutboxClaim(kernel: db.KernelContext, command: Extr
   const rows = originalIds.map((id) => db.getRow(kernel, "SELECT * FROM outbox_events WHERE id = ?", id));
   if (rows.some((row) => row === undefined ||
     row.acknowledged_at !== null)) {
-    return result;
+    throw staleCachedOutboxClaim();
   }
   const typedRows = rows as Row[];
   const originalLeaseIsLive = typedRows.every((row) => optionalText(row.lease_holder_principal_id) === text(principal.id) &&
@@ -160,12 +160,20 @@ export function resolveCachedOutboxClaim(kernel: db.KernelContext, command: Extr
       outboxEvents: typedRows.map(mapOutboxEvent),
     };
   }
+  const originalLeaseStillPersisted = typedRows.every(
+    (row) =>
+      optionalText(row.lease_holder_principal_id) === text(principal.id) &&
+      optionalText(row.lease_token) === result.leaseToken,
+  );
+  if (!originalLeaseStillPersisted) {
+    throw staleCachedOutboxClaim();
+  }
   const anotherLiveLease = typedRows.some((row) => {
     const expiry = optionalText(row.lease_expires_at);
     return expiry !== null && new Date(expiry) > now;
   });
   if (anotherLiveLease) {
-    return result;
+    throw staleCachedOutboxClaim();
   }
   const frontier = db.allRows(kernel, `SELECT id
          FROM outbox_events
@@ -174,7 +182,7 @@ export function resolveCachedOutboxClaim(kernel: db.KernelContext, command: Extr
         LIMIT ?`, originalIds.length).map((row) => text(row.id));
   if (frontier.length !== originalIds.length ||
     frontier.some((id, index) => id !== originalIds[index])) {
-    return result;
+    throw staleCachedOutboxClaim();
   }
   const leaseDurationMs = boundedDuration(command.leaseDurationMs, "leaseDurationMs");
   const leaseToken = kernel.idFactory("outbox_lease");
@@ -194,4 +202,11 @@ export function resolveCachedOutboxClaim(kernel: db.KernelContext, command: Extr
     leaseExpiresAt,
     outboxEvents: originalIds.map((id) => mapOutboxEvent(invariants.requireOutboxEvent(kernel, id))),
   };
+}
+
+function staleCachedOutboxClaim(): KernelError {
+  return new KernelError(
+    "Conflict",
+    "The cached Outbox claim is no longer the current authoritative pending batch.",
+  );
 }

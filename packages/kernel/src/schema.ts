@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 9;
+export const CURRENT_SCHEMA_VERSION = 10;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -250,6 +250,9 @@ CREATE TABLE IF NOT EXISTS provider_attempts (
 
 CREATE INDEX IF NOT EXISTS provider_attempts_activation_status_idx
   ON provider_attempts(activation_id, status);
+
+CREATE INDEX IF NOT EXISTS provider_attempts_activation_order_idx
+  ON provider_attempts(activation_id, started_at, id);
 
 CREATE INDEX IF NOT EXISTS provider_attempts_run_snapshot_idx
   ON provider_attempts(run_id, created_event_sequence, started_at, id);
@@ -566,21 +569,20 @@ WHEN EXISTS (
 )
 BEGIN
   UPDATE attention_recovery_executions
-     SET unsettled_provider_attempt_count = (
-           SELECT COUNT(*)
-             FROM provider_attempts
-            WHERE activation_id = NEW.activation_id
-              AND status IN ('Started', 'Acknowledged')
-         ),
+     SET unsettled_provider_attempt_count =
+           unsettled_provider_attempt_count +
+           CASE
+             WHEN NEW.status IN ('Started', 'Acknowledged') THEN 1
+             ELSE 0
+           END,
          finished_with_unsettled_provider =
            CASE
              WHEN unfinished = 0
-              AND EXISTS (
-                SELECT 1
-                  FROM provider_attempts
-                 WHERE activation_id = NEW.activation_id
-                   AND status IN ('Started', 'Acknowledged')
-              )
+              AND unsettled_provider_attempt_count +
+                  CASE
+                    WHEN NEW.status IN ('Started', 'Acknowledged') THEN 1
+                    ELSE 0
+                  END > 0
              THEN 1
              ELSE 0
            END
@@ -603,21 +605,28 @@ WHEN EXISTS (
 )
 BEGIN
   UPDATE attention_recovery_executions
-     SET unsettled_provider_attempt_count = (
-           SELECT COUNT(*)
-             FROM provider_attempts
-            WHERE activation_id = NEW.activation_id
-              AND status IN ('Started', 'Acknowledged')
-         ),
+     SET unsettled_provider_attempt_count =
+           unsettled_provider_attempt_count +
+           CASE
+             WHEN NEW.status IN ('Started', 'Acknowledged') THEN 1
+             ELSE 0
+           END -
+           CASE
+             WHEN OLD.status IN ('Started', 'Acknowledged') THEN 1
+             ELSE 0
+           END,
          finished_with_unsettled_provider =
            CASE
              WHEN unfinished = 0
-              AND EXISTS (
-                SELECT 1
-                  FROM provider_attempts
-                 WHERE activation_id = NEW.activation_id
-                   AND status IN ('Started', 'Acknowledged')
-              )
+              AND unsettled_provider_attempt_count +
+                  CASE
+                    WHEN NEW.status IN ('Started', 'Acknowledged') THEN 1
+                    ELSE 0
+                  END -
+                  CASE
+                    WHEN OLD.status IN ('Started', 'Acknowledged') THEN 1
+                    ELSE 0
+                  END > 0
              THEN 1
              ELSE 0
            END
@@ -625,6 +634,143 @@ BEGIN
   UPDATE kernel_runtime_state
      SET attention_recovery_revision = attention_recovery_revision + 1
    WHERE singleton = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS attention_recovery_provider_delete
+AFTER DELETE ON provider_attempts
+WHEN EXISTS (
+  SELECT 1
+    FROM attention_recovery_executions
+   WHERE activation_id = OLD.activation_id
+)
+BEGIN
+  UPDATE attention_recovery_executions
+     SET unsettled_provider_attempt_count =
+           unsettled_provider_attempt_count -
+           CASE
+             WHEN OLD.status IN ('Started', 'Acknowledged') THEN 1
+             ELSE 0
+           END,
+         finished_with_unsettled_provider =
+           CASE
+             WHEN unfinished = 0
+              AND unsettled_provider_attempt_count -
+                  CASE
+                    WHEN OLD.status IN ('Started', 'Acknowledged') THEN 1
+                    ELSE 0
+                  END > 0
+             THEN 1
+             ELSE 0
+           END
+   WHERE activation_id = OLD.activation_id
+     AND unsettled_provider_attempt_count -
+         CASE
+           WHEN OLD.status IN ('Started', 'Acknowledged') THEN 1
+           ELSE 0
+         END >= 0;
+  SELECT CASE
+    WHEN changes() != 1
+    THEN RAISE(ABORT, 'Attention recovery ProviderAttempt count underflow')
+  END;
+  UPDATE kernel_runtime_state
+     SET attention_recovery_revision = attention_recovery_revision + 1
+   WHERE singleton = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS attention_domain_provider_insert
+AFTER INSERT ON provider_attempts
+WHEN NEW.status IN ('Started', 'Acknowledged') AND EXISTS (
+  SELECT 1
+    FROM attention_recovery_executions
+   WHERE activation_id = NEW.activation_id
+)
+BEGIN
+  UPDATE attention_domain_fences
+     SET unsettled_provider_attempt_count =
+           unsettled_provider_attempt_count + 1
+   WHERE attention_id = (
+     SELECT attention_id
+       FROM activation_attempts
+      WHERE id = NEW.activation_id
+   );
+  SELECT CASE
+    WHEN changes() != 1
+    THEN RAISE(ABORT, 'Attention ProviderAttempt has no domain fence')
+  END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS attention_domain_provider_update
+AFTER UPDATE OF status ON provider_attempts
+WHEN (
+  CASE WHEN OLD.status IN ('Started', 'Acknowledged') THEN 1 ELSE 0 END
+) != (
+  CASE WHEN NEW.status IN ('Started', 'Acknowledged') THEN 1 ELSE 0 END
+) AND EXISTS (
+  SELECT 1
+    FROM attention_recovery_executions
+   WHERE activation_id = NEW.activation_id
+)
+BEGIN
+  UPDATE attention_domain_fences
+     SET unsettled_provider_attempt_count =
+           unsettled_provider_attempt_count +
+           CASE
+             WHEN NEW.status IN ('Started', 'Acknowledged') THEN 1
+             ELSE -1
+           END
+   WHERE attention_id = (
+     SELECT attention_id
+       FROM activation_attempts
+      WHERE id = NEW.activation_id
+   )
+     AND unsettled_provider_attempt_count +
+         CASE
+           WHEN NEW.status IN ('Started', 'Acknowledged') THEN 1
+           ELSE -1
+         END >= 0;
+  SELECT CASE
+    WHEN changes() != 1
+    THEN RAISE(ABORT, 'Attention domain ProviderAttempt count underflow')
+  END;
+  DELETE FROM attention_domain_fences
+   WHERE attention_id = (
+     SELECT attention_id
+       FROM activation_attempts
+      WHERE id = NEW.activation_id
+   )
+     AND lease_token IS NULL
+     AND unsettled_provider_attempt_count = 0;
+END;
+
+CREATE TRIGGER IF NOT EXISTS attention_domain_provider_delete
+AFTER DELETE ON provider_attempts
+WHEN OLD.status IN ('Started', 'Acknowledged') AND EXISTS (
+  SELECT 1
+    FROM attention_recovery_executions
+   WHERE activation_id = OLD.activation_id
+)
+BEGIN
+  UPDATE attention_domain_fences
+     SET unsettled_provider_attempt_count =
+           unsettled_provider_attempt_count - 1
+   WHERE attention_id = (
+     SELECT attention_id
+       FROM activation_attempts
+      WHERE id = OLD.activation_id
+   )
+     AND unsettled_provider_attempt_count > 0;
+  SELECT CASE
+    WHEN changes() != 1
+    THEN RAISE(ABORT, 'Attention domain ProviderAttempt count underflow')
+  END;
+  DELETE FROM attention_domain_fences
+   WHERE attention_id = (
+     SELECT attention_id
+       FROM activation_attempts
+      WHERE id = OLD.activation_id
+   )
+     AND lease_token IS NULL
+     AND unsettled_provider_attempt_count = 0;
 END;
 
 CREATE TRIGGER IF NOT EXISTS attention_recovery_attention_update
