@@ -3,17 +3,19 @@
   "private": true,
   "version": "0.1.0",
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "apps/*"
   ],
   "engines": {
     "node": ">=22.13"
   },
   "scripts": {
-    "test": "npm run test:kernel && npm run test:prototype",
+    "test": "npm run test:kernel && npm run test:server && npm run test:prototype",
     "test:kernel": "npm run test --workspace @torsor/kernel",
+    "test:server": "npm run test --workspace @torsor/server",
     "test:prototype": "npm --prefix prototype test",
-    "typecheck": "npm run typecheck --workspace @torsor/kernel && npm exec --prefix prototype -- tsc --noEmit -p prototype/tsconfig.app.json",
-    "build": "npm run build --workspace @torsor/kernel && npm --prefix prototype run build",
+    "typecheck": "npm run typecheck --workspace @torsor/kernel && npm run typecheck --workspace @torsor/server && npm exec --prefix prototype -- tsc --noEmit -p prototype/tsconfig.app.json",
+    "build": "npm run build --workspace @torsor/kernel && npm run build --workspace @torsor/server && npm --prefix prototype run build",
     "ci": "npm run typecheck && npm test && npm run build"
   }
 }
