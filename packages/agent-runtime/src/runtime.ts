@@ -87,6 +87,10 @@ interface RuntimePassExecution extends RuntimePassResult {
 }
 
 type AttentionDispatchResult = "dispatched" | "blocked" | "retry";
+type AttentionAdmissionResult =
+  | "admitted"
+  | "deferred"
+  | "global-full";
 
 const ATTENTION_PAGE_SIZE = 100;
 const ATTENTION_PROJECT_QUEUE_RESERVE = 1;
@@ -217,6 +221,14 @@ export class AgentRuntime {
   }> {
     let dispatched = 0;
     let deferred = 0;
+    const bufferLimit = this.#attentionConcurrency * ATTENTION_PAGE_SIZE;
+    const projectLimit = Math.max(
+      1,
+      Math.min(
+        this.#attentionConcurrency + ATTENTION_PROJECT_QUEUE_RESERVE,
+        Math.floor(bufferLimit / this.#projectIds.size),
+      ),
+    );
     for (
       let round = 0;
       round < this.#attentionConcurrency * ATTENTION_PAGE_SIZE;
@@ -224,9 +236,8 @@ export class AgentRuntime {
     ) {
       const scheduler = new AttentionScheduler({
         concurrency: this.#attentionConcurrency,
-        bufferLimit: this.#attentionConcurrency * ATTENTION_PAGE_SIZE,
-        projectLimit:
-          this.#attentionConcurrency + ATTENTION_PROJECT_QUEUE_RESERVE,
+        bufferLimit,
+        projectLimit,
         ...(this.#hooks.attentionBufferChanged
           ? { onBufferChanged: this.#hooks.attentionBufferChanged }
           : {}),
@@ -270,19 +281,15 @@ export class AgentRuntime {
       ...projectIds.slice(offset),
       ...projectIds.slice(0, offset),
     ];
-    if (projectIds.length > 0) {
-      this.#attentionProjectOffset =
-        (offset +
-          Math.min(projectIds.length, this.#attentionConcurrency)) %
-        projectIds.length;
-    }
-    let states = orderedProjectIds.map((projectId) => ({
+    let states = orderedProjectIds.map((projectId, orderedIndex) => ({
       projectId,
+      projectIndex: (offset + orderedIndex) % projectIds.length,
       afterCursor: undefined as number | undefined,
       snapshotEventId: undefined as string | null | undefined,
     }));
     const leasedDomains = new Set<string>();
     let firstError: unknown;
+    let globallyDeferredProjectIndex: number | undefined;
     while (states.length > 0 && firstError === undefined) {
       const batch = states.splice(0, this.#attentionConcurrency);
       const results = await Promise.all(
@@ -316,7 +323,7 @@ export class AgentRuntime {
           result !== undefined,
       );
       for (let index = 0; index < ATTENTION_PAGE_SIZE; index += 1) {
-        for (const { page } of pages) {
+        for (const { state, page } of pages) {
           const attention = page.items[index];
           if (attention === undefined) {
             continue;
@@ -340,18 +347,32 @@ export class AgentRuntime {
           ) {
             continue;
           }
-          scheduler.enqueue(attention);
+          const admission = scheduler.enqueue(attention);
+          if (admission === "global-full") {
+            globallyDeferredProjectIndex = state.projectIndex;
+            break;
+          }
         }
+        if (globallyDeferredProjectIndex !== undefined) {
+          break;
+        }
+      }
+      if (globallyDeferredProjectIndex !== undefined) {
+        break;
       }
       for (const { state, page } of pages) {
         if (page.hasMore && page.nextCursor !== null) {
           states.push({
             projectId: state.projectId,
+            projectIndex: state.projectIndex,
             afterCursor: page.nextCursor,
             snapshotEventId: page.snapshotEventId,
           });
         }
       }
+    }
+    if (globallyDeferredProjectIndex !== undefined) {
+      this.#attentionProjectOffset = globallyDeferredProjectIndex;
     }
     return firstError;
   }
@@ -1271,7 +1292,7 @@ class AttentionScheduler {
 
   constructor(private readonly options: AttentionSchedulerOptions) {}
 
-  enqueue(attention: AttentionView): boolean {
+  enqueue(attention: AttentionView): AttentionAdmissionResult {
     const key = attentionConflictDomain(attention);
     if (this.#queues.has(key) || this.#activeDomains.has(key)) {
       this.#deferred += 1;
@@ -1279,7 +1300,7 @@ class AttentionScheduler {
         key,
         (this.#domainDeferred.get(key) ?? 0) + 1,
       );
-      return false;
+      return "deferred";
     }
     const projectId = attention.projectId;
     if (
@@ -1288,7 +1309,7 @@ class AttentionScheduler {
     ) {
       if (!this.#evictQueuedCandidate(projectId)) {
         this.#deferred += 1;
-        return false;
+        return "deferred";
       }
     } else if (this.#buffered >= this.options.bufferLimit) {
       const projectRetained =
@@ -1299,7 +1320,7 @@ class AttentionScheduler {
           : this.#evictQueuedCandidate(projectId);
       if (!madeRoom) {
         this.#deferred += 1;
-        return false;
+        return "global-full";
       }
     }
     this.#queues.set(key, { attention, projectId });
@@ -1308,7 +1329,7 @@ class AttentionScheduler {
     this.#markReady(projectId, key);
     this.#pump();
     this.#notifyRetainedChanged();
-    return true;
+    return "admitted";
   }
 
   async drain(): Promise<{

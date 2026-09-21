@@ -12,11 +12,14 @@ The runtime provides:
 - Configurably bounded Attention concurrency across independent Agent/Thread
   domains and Projects, with page-round-robin discovery, hierarchical
   Project/domain dispatch, in-pass reconsideration, and same-domain ordering
-  preserved across pages and claim races. Each Project retains at most one
-  queued candidate beyond the global concurrency width; a newly ready Project
-  receives a turn after at most one candidate from each Project already in the
-  scheduler rotation. Later-page candidates replace queued candidates within
-  that same bounded Project reservoir rather than joining an unbounded FIFO.
+  preserved locally across pages and claim races. The configured Project
+  rotation persists at the first globally unadmitted Project. Each Project
+  retains at most the smaller of `attentionConcurrency + 1` and its equal
+  share of the global candidate buffer, with a minimum of one candidate. Thus,
+  when ready Projects outnumber the candidate buffer, a concurrency-one
+  runtime gives every Project its first provider start within one ready-Project
+  rotation. Later-page candidates replace queued candidates within the same
+  bounded Project reservoir rather than joining an unbounded FIFO.
 - Ordered, leased outbox consumption with idempotent command keys.
 - A provider-neutral adapter contract and deterministic fake adapter.
 - A GitHub Copilot CLI ACP stdio adapter using `copilot --acp --stdio`.
@@ -33,6 +36,11 @@ becomes eligible behind an advanced cursor during a productive sweep is still
 reconciled in the same drain. Proving that an otherwise clean complete sweep
 was mutation-free still requires a Kernel recovery-set revision or snapshot
 token.
+
+Cross-runtime same-Agent/Thread serialization still requires a Kernel claim
+domain fence. Runtime-local domain queues cannot prevent a second runtime from
+claiming the next Attention after the first decision commits but before its
+ProviderAttempt finishes.
 
 The current Kernel contract does not expose lease renewal. The runtime
 therefore claims one outbox event at a time and requires Attention and outbox

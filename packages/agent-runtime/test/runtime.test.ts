@@ -559,6 +559,135 @@ describe("AgentRuntime", () => {
   );
 
   it(
+    "rotates through more ready Projects than the candidate buffer",
+    async () => {
+      const projectCount = 102;
+      const fairnessBootstrap =
+        createProjectFairnessBootstrap(projectCount);
+      const kernel = openKernel(
+        ":memory:",
+        () => new Date("2026-09-21T08:00:00.000Z"),
+        fairnessBootstrap,
+      );
+      const projectIds = Array.from(
+        { length: projectCount },
+        (_, index) => `project-fair-${index}`,
+      );
+      let releaseFirst!: () => void;
+      let signalFirstStarted!: () => void;
+      const release = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      const firstStarted = new Promise<void>((resolve) => {
+        signalFirstStarted = resolve;
+      });
+      let phase = 1;
+      let phaseOrdinal = 0;
+      let blocked = false;
+      const firstStartOrdinal = new Map<string, number>();
+      const refillStartOrdinal = new Map<string, number>();
+      let maximumActive = 0;
+      let active = 0;
+      try {
+        for (let index = 0; index < projectCount; index += 1) {
+          const project = {
+            projectId: `project-fair-${index}`,
+            channelId: `channel-fair-${index}`,
+            agentId: `agent-fair-${index}`,
+          };
+          for (let item = 0; item < 2; item += 1) {
+            await startProjectMention(
+              kernel,
+              project,
+              `project-rotation:${index}:${item}`,
+              `Fair Agent ${index}, handle rotation item ${item}.`,
+            );
+          }
+        }
+        const adapter = new DeterministicFakeAdapter(async (context) => {
+          if (context.cause.type !== "attention") {
+            throw new Error(
+              "The Project rotation test must not create Run work.",
+            );
+          }
+          const projectId = context.cause.attention.projectId;
+          active += 1;
+          maximumActive = Math.max(maximumActive, active);
+          phaseOrdinal += 1;
+          try {
+            const ordinals =
+              phase === 1 ? firstStartOrdinal : refillStartOrdinal;
+            if (!ordinals.has(projectId)) {
+              ordinals.set(projectId, phaseOrdinal);
+            }
+            if (!blocked) {
+              blocked = true;
+              signalFirstStarted();
+              await release;
+            }
+            await context.capabilities.ignoreAttention(
+              "Persistently rotated synthetic Attention.",
+            );
+          } finally {
+            active -= 1;
+          }
+        });
+        const runtime = createRuntime(kernel, adapter, {
+          projectIds,
+          attentionConcurrency: 1,
+        });
+
+        const firstPass = runtime.runOnce();
+        await firstStarted;
+        releaseFirst();
+        const firstResult = await firstPass;
+
+        expect(firstResult.attentionsDispatched).toBe(projectCount * 2);
+        expect(firstStartOrdinal.size).toBe(projectCount);
+        expect(
+          Math.max(...firstStartOrdinal.values()),
+        ).toBeLessThanOrEqual(projectCount);
+        expect(maximumActive).toBe(1);
+
+        phase = 2;
+        phaseOrdinal = 0;
+        await startProjectMention(
+          kernel,
+          {
+            projectId: "project-fair-0",
+            channelId: "channel-fair-0",
+            agentId: "agent-fair-0",
+          },
+          "project-rotation:refill:0",
+          "Fair Agent 0, handle refilled work.",
+        );
+        await startProjectMention(
+          kernel,
+          {
+            projectId: "project-fair-101",
+            channelId: "channel-fair-101",
+            agentId: "agent-fair-101",
+          },
+          "project-rotation:refill:101",
+          "Fair Agent 101, handle refilled work.",
+        );
+
+        const refillResult = await runtime.runOnce();
+
+        expect(refillResult.attentionsDispatched).toBe(2);
+        expect(refillStartOrdinal.size).toBe(2);
+        expect(
+          Math.max(...refillStartOrdinal.values()),
+        ).toBeLessThanOrEqual(2);
+      } finally {
+        releaseFirst();
+        kernel.close();
+      }
+    },
+    60_000,
+  );
+
+  it(
     "admits a fifth later domain before four early domains drain",
     async () => {
       const kernel = openKernel(":memory:");
@@ -3307,16 +3436,52 @@ function createRuntime(
 function openKernel(
   databasePath: string,
   clock: () => Date = () => new Date("2026-09-21T08:00:00.000Z"),
+  kernelBootstrap: KernelBootstrap = bootstrap,
 ): TorsorKernel {
   const instance = kernelInstance;
   kernelInstance += 1;
   let nextId = 0;
   return TorsorKernel.open({
     databasePath,
-    bootstrap,
+    bootstrap: kernelBootstrap,
     clock,
     idFactory: (prefix) => `${prefix}-${instance}-${++nextId}`,
   });
+}
+
+function createProjectFairnessBootstrap(projectCount: number): KernelBootstrap {
+  return {
+    principals: [
+      { id: "principal-human", kind: "human", displayName: "Avery Stone" },
+      {
+        id: "principal-runtime",
+        kind: "runtime",
+        displayName: "Local Runtime",
+      },
+      ...Array.from({ length: projectCount }, (_, index) => ({
+        id: `principal-fair-${index}`,
+        kind: "agent" as const,
+        displayName: `Fair Agent ${index}`,
+      })),
+    ],
+    projects: Array.from({ length: projectCount }, (_, index) => ({
+      id: `project-fair-${index}`,
+      name: `Fair Project ${index}`,
+    })),
+    channels: Array.from({ length: projectCount }, (_, index) => ({
+      id: `channel-fair-${index}`,
+      projectId: `project-fair-${index}`,
+      name: "general",
+    })),
+    agents: Array.from({ length: projectCount }, (_, index) => ({
+      id: `agent-fair-${index}`,
+      principalId: `principal-fair-${index}`,
+      projectId: `project-fair-${index}`,
+      name: `Fair Agent ${index}`,
+      configRevision: 1,
+      config: { provider: "deterministic-fake" },
+    })),
+  };
 }
 
 async function mentionAgent(kernel: TorsorKernel, key: string) {
