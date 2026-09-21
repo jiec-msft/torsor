@@ -21,10 +21,21 @@ import {
 } from "./types.js";
 
 export interface AgentRuntimeHooks {
+  readonly beforeAttentionClaim?: (attention: AttentionView) => Promise<void>;
   readonly afterProviderAttemptStarted?: (input: {
     readonly activationId: string;
     readonly providerAttemptId: string;
     readonly causeType: ProviderCause["type"];
+  }) => Promise<void>;
+  readonly beforeFailureParking?: (input: {
+    readonly runId: string;
+    readonly providerAttemptId: string;
+    readonly outboxEventId: string;
+  }) => Promise<void>;
+  readonly afterFailureParking?: (input: {
+    readonly runId: string;
+    readonly providerAttemptId: string;
+    readonly outboxEventId: string;
   }) => Promise<void>;
   readonly beforeOutboxAcknowledge?: (
     events: readonly OutboxEventView[],
@@ -37,6 +48,7 @@ export interface AgentRuntimeOptions {
   readonly projectIds: readonly string[];
   readonly adapter: ProviderAdapter;
   readonly attentionLeaseMs?: number;
+  readonly attentionConcurrency?: number;
   readonly activationDurationMs?: number;
   readonly outboxLeaseMs?: number;
   readonly outboxBatchSize?: number;
@@ -58,6 +70,7 @@ export class AgentRuntime {
   readonly #projectIds: Set<string>;
   readonly #adapter: ProviderAdapter;
   readonly #attentionLeaseMs: number;
+  readonly #attentionConcurrency: number;
   readonly #activationDurationMs: number | undefined;
   readonly #outboxLeaseMs: number;
   readonly #outboxBatchSize: number;
@@ -77,6 +90,7 @@ export class AgentRuntime {
     this.#projectIds = new Set(options.projectIds);
     this.#adapter = options.adapter;
     this.#attentionLeaseMs = options.attentionLeaseMs ?? 30_000;
+    this.#attentionConcurrency = options.attentionConcurrency ?? 4;
     this.#activationDurationMs = options.activationDurationMs;
     this.#outboxLeaseMs = options.outboxLeaseMs ?? 30_000;
     this.#outboxBatchSize = options.outboxBatchSize ?? 1;
@@ -88,6 +102,15 @@ export class AgentRuntime {
     if (this.#outboxBatchSize !== 1) {
       throw new Error(
         "AgentRuntime currently requires outboxBatchSize=1 because the Kernel does not expose outbox lease renewal.",
+      );
+    }
+    if (
+      !Number.isInteger(this.#attentionConcurrency) ||
+      this.#attentionConcurrency < 1 ||
+      this.#attentionConcurrency > 32
+    ) {
+      throw new Error(
+        "attentionConcurrency must be an integer between 1 and 32.",
       );
     }
     const minimumLeaseMs = this.#providerTimeoutMs + this.#leaseSafetyMs;
@@ -156,6 +179,7 @@ export class AgentRuntime {
     let dispatched = 0;
     let afterCursor: number | undefined;
     let snapshotEventId: string | null | undefined;
+    const blockedConflictDomains = new Set<string>();
     do {
       const page = await this.#kernel.query(
         {
@@ -168,17 +192,33 @@ export class AgentRuntime {
         this.#runtimeContext,
       );
       snapshotEventId = page.snapshotEventId;
-      for (const attention of page.items) {
-        const agent = this.#agents.get(attention.targetAgentId);
-        if (!agent) {
-          throw new Error(
-            `Attention ${attention.id} targets unknown Agent ${attention.targetAgentId}.`,
-          );
-        }
-        if (await this.#dispatchAttention(attention, agent)) {
-          dispatched += 1;
-        }
-      }
+      const pageResults = await mapWithConcurrency(
+        groupAttentionsByConflictDomain(page.items).filter(
+          (group) => !blockedConflictDomains.has(group.key),
+        ),
+        this.#attentionConcurrency,
+        async (group) => {
+          let groupDispatched = 0;
+          for (const attention of group.attentions) {
+            const agent = this.#agents.get(attention.targetAgentId);
+            if (!agent) {
+              throw new Error(
+                `Attention ${attention.id} targets unknown Agent ${attention.targetAgentId}.`,
+              );
+            }
+            if (!(await this.#dispatchAttention(attention, agent))) {
+              blockedConflictDomains.add(group.key);
+              break;
+            }
+            groupDispatched += 1;
+          }
+          return groupDispatched;
+        },
+      );
+      dispatched += pageResults.reduce(
+        (total, count) => total + count,
+        0,
+      );
       afterCursor = page.nextCursor ?? undefined;
       if (!page.hasMore) {
         break;
@@ -202,12 +242,13 @@ export class AgentRuntime {
     attention: AttentionView,
     agent: BootstrapAgent,
   ): Promise<boolean> {
+    await this.#hooks.beforeAttentionClaim?.(attention);
     let claim;
     try {
       claim = await this.#kernel.execute(
         {
           type: "ClaimAttention",
-          idempotencyKey: `attention:${attention.id}:claim:${attention.revision}`,
+          idempotencyKey: `attention:${attention.id}:claim:${attention.revision}:${randomUUID()}`,
           attentionId: attention.id,
           expectedAttentionRevision: attention.revision,
           leaseDurationMs: this.#attentionLeaseMs,
@@ -215,7 +256,10 @@ export class AgentRuntime {
         this.#runtimeContext,
       );
     } catch (error) {
-      if (error instanceof KernelError && error.code === "Conflict") {
+      if (
+        error instanceof KernelError &&
+        (error.code === "Conflict" || error.code === "StaleRevision")
+      ) {
         return false;
       }
       throw error;
@@ -511,7 +555,6 @@ export class AgentRuntime {
       causeType: input.cause.type,
     });
     const existingStatus = await this.#findProviderAttemptStatus(
-      input.cause,
       attempt.entityId,
     );
     if (existingStatus && isTerminalProviderStatus(existingStatus)) {
@@ -753,43 +796,16 @@ export class AgentRuntime {
   }
 
   async #findProviderAttemptStatus(
-    cause: ProviderCause,
     providerAttemptId: string,
-  ): Promise<ProviderAttemptStatus | null> {
-    if (cause.type === "run") {
-      const projection = await this.#kernel.query(
-        { type: "GetRunProjection", runId: cause.run.run.id },
-        this.#runtimeContext,
-      );
-      return (
-        projection.providerAttempts.find(
-          (attempt) => attempt.id === providerAttemptId,
-        )?.status ?? null
-      );
-    }
-    let afterEventId: string | null = null;
-    let status: ProviderAttemptStatus | null = null;
-    for (;;) {
-      const events = await this.#kernel.readEvents(afterEventId, 500);
-      for (const event of events) {
-        if (
-          event.entityType === "ProviderAttempt" &&
-          event.entityId === providerAttemptId
-        ) {
-          if (event.type === "ProviderAttemptStarted") {
-            status = "Started";
-          } else if (event.type === "ProviderAttemptAcknowledged") {
-            status = "Acknowledged";
-          } else if (event.type === "ProviderAttemptFinished") {
-            status = requireProviderStatus(event.payload);
-          }
-        }
-      }
-      if (events.length < 500) {
-        return status;
-      }
-      afterEventId = events.at(-1)!.eventId;
-    }
+  ): Promise<ProviderAttemptStatus> {
+    const attempt = await this.#kernel.query(
+      {
+        type: "GetProviderAttempt",
+        providerAttemptId,
+      },
+      this.#runtimeContext,
+    );
+    return attempt.status;
   }
 
   async #settleUncertainAttempt(
@@ -833,54 +849,40 @@ export class AgentRuntime {
     event: OutboxEventView,
     status: "Failed" | "Unknown",
   ): Promise<void> {
-    let agent = this.#agents.get(projection.run.ownerAgentId);
-    if (!agent) {
-      await this.#loadProject(projection.run.projectId);
-      agent = this.#agents.get(projection.run.ownerAgentId);
-    }
-    if (!agent) {
+    const attempt = projection.providerAttempts
+      .filter(
+        (candidate) =>
+          candidate.requestIdempotencyKey ===
+          `outbox:${event.id}:provider`,
+      )
+      .at(-1);
+    if (!attempt) {
       throw new Error(
-        `Run ${projection.run.id} belongs to unknown Agent ${projection.run.ownerAgentId}.`,
+        `Outbox delivery ${event.id} has no ProviderAttempt to park.`,
       );
     }
-    const activation = await this.#kernel.execute(
-      {
-        type: "StartActivation",
-        idempotencyKey: `outbox:${event.id}:delivery-${status.toLowerCase()}-recovery`,
-        runId: projection.run.id,
-        expectedRunRevision: projection.run.revision,
-        ...(this.#activationDurationMs === undefined
-          ? {}
-          : { durationMs: this.#activationDurationMs }),
-      },
-      this.#runtimeContext,
-    );
+    const hookInput = {
+      runId: projection.run.id,
+      providerAttemptId: attempt.id,
+      outboxEventId: event.id,
+    };
+    await this.#hooks.beforeFailureParking?.(hookInput);
     await this.#kernel.execute(
       {
-        type: "WaitRun",
-        idempotencyKey: `${activation.entityId}:delivery-${status.toLowerCase()}-waiting`,
+        type: "ParkRunAfterProviderAttemptFailure",
+        idempotencyKey: `outbox:${event.id}:delivery-${status.toLowerCase()}-park`,
         runId: projection.run.id,
-        expectedRunRevision: activation.revision ?? projection.run.revision,
+        providerAttemptId: attempt.id,
+        expectedRunRevision: projection.run.revision,
+        expectedActivationGeneration: projection.run.activationGeneration,
         reason:
           status === "Unknown"
             ? "Provider delivery outcome is unknown and requires explicit resumption."
             : "Provider delivery failed and requires explicit resumption.",
       },
-      {
-        principalId: agent.principalId,
-        activationId: activation.entityId,
-      },
-    );
-    await this.#kernel.execute(
-      {
-        type: "FinishActivation",
-        idempotencyKey: `${activation.entityId}:delivery-recovery-completed`,
-        activationId: activation.entityId,
-        outcome: "Completed",
-        detail: `Run entered Waiting after a ${status} ProviderAttempt.`,
-      },
       this.#runtimeContext,
     );
+    await this.#hooks.afterFailureParking?.(hookInput);
   }
 
   async #reconcileRunProjection(projection: RunProjection): Promise<void> {
@@ -930,85 +932,41 @@ export class AgentRuntime {
   }
 
   async #reconcileOrphanedAttentionExecutions(): Promise<void> {
-    let afterEventId: string | null = null;
-    const attempts = new Map<
-      string,
-      {
-        readonly activationId: string;
-        status: ProviderAttemptStatus;
-      }
-    >();
-    const attentionActivationExpirations = new Map<string, Date>();
-    const finishedActivations = new Set<string>();
-    for (;;) {
-      const events = await this.#kernel.readEvents(afterEventId, 500);
-      for (const event of events) {
-        if (
-          event.type === "ActivationStarted" &&
-          event.activationId &&
-          isAttentionActivationPayload(event.payload)
-        ) {
-          attentionActivationExpirations.set(
-            event.activationId,
-            new Date(requirePayloadString(event.payload, "expiresAt")),
-          );
-        } else if (
-          event.type === "ProviderAttemptStarted" &&
-          event.activationId &&
-          event.threadRootId
-        ) {
-          attempts.set(event.entityId, {
-            activationId: event.activationId,
-            status: "Started",
-          });
-        } else if (
-          (event.type === "ProviderAttemptAcknowledged" ||
-            event.type === "ProviderAttemptFinished") &&
-          attempts.has(event.entityId)
-        ) {
-          attempts.get(event.entityId)!.status =
-            event.type === "ProviderAttemptAcknowledged"
-              ? "Acknowledged"
-              : requireProviderStatus(event.payload);
-        } else if (
-          event.type === "ActivationFinished" ||
-          ((event.type === "AttentionResolved" ||
-            event.type === "AttentionIgnored") &&
-            event.activationId)
-        ) {
-          finishedActivations.add(
-            event.type === "ActivationFinished"
-              ? event.entityId
-              : event.activationId!,
-          );
+    let afterCursor:
+      | {
+          readonly startedAt: string;
+          readonly activationId: string;
         }
-      }
-      if (events.length < 500) {
-        break;
-      }
-      afterEventId = events.at(-1)!.eventId;
-    }
-    for (const [activationId, expiresAt] of attentionActivationExpirations) {
-      const activationFinished = finishedActivations.has(activationId);
-      if (expiresAt > this.#clock()) {
-        continue;
-      }
-      const attemptEntry = [...attempts.entries()].find(
-        ([, attempt]) => attempt.activationId === activationId,
+      | undefined;
+    for (;;) {
+      const page = await this.#kernel.query(
+        {
+          type: "ListRecoverableAttentionExecutions",
+          ...(afterCursor ? { afterCursor } : {}),
+          limit: 100,
+        },
+        this.#runtimeContext,
       );
-      let outcome: "Completed" | "Failed" | "Expired" = "Expired";
-      let detail = "The Attention Activation expired before it was reconciled.";
-      if (attemptEntry) {
-        const [providerAttemptId, attempt] = attemptEntry;
-        if (
-          attempt.status === "Started" ||
-          attempt.status === "Acknowledged"
-        ) {
+      for (const execution of page.items) {
+        if (new Date(execution.activation.expiresAt) > this.#clock()) {
+          continue;
+        }
+        let outcome: "Completed" | "Failed" | "Expired" = "Expired";
+        let detail =
+          "The Attention Activation expired before it was reconciled.";
+        const latestAttempt = execution.providerAttempts.at(-1);
+        for (const attempt of execution.providerAttempts) {
+          if (
+            attempt.status !== "Started" &&
+            attempt.status !== "Acknowledged"
+          ) {
+            continue;
+          }
           await this.#kernel.execute(
             {
               type: "FinishProviderAttempt",
-              idempotencyKey: `${providerAttemptId}:attention-reconciled-unknown`,
-              providerAttemptId,
+              idempotencyKey: `${attempt.id}:attention-reconciled-unknown`,
+              providerAttemptId: attempt.id,
               status: "Unknown",
               detail:
                 "Runtime recovered an unfinished expired Attention ProviderAttempt.",
@@ -1016,29 +974,87 @@ export class AgentRuntime {
             this.#runtimeContext,
           );
           detail = "Recovered an uncertain expired Attention ProviderAttempt.";
-        } else if (attempt.status === "Completed") {
+        }
+        if (latestAttempt?.status === "Completed") {
           outcome = "Completed";
           detail = "Recovered a completed Attention ProviderAttempt.";
-        } else if (attempt.status === "Failed") {
+        } else if (latestAttempt?.status === "Failed") {
           outcome = "Failed";
           detail = "Recovered a failed Attention ProviderAttempt.";
         }
+        if (execution.activation.finishedAt === null) {
+          await this.#kernel.execute(
+            {
+              type: "FinishActivation",
+              idempotencyKey: `${execution.activation.id}:attention-reconciled-${outcome.toLowerCase()}`,
+              activationId: execution.activation.id,
+              outcome,
+              detail,
+            },
+            this.#runtimeContext,
+          );
+        }
       }
-      if (activationFinished) {
-        continue;
+      if (!page.hasMore || !page.nextCursor) {
+        break;
       }
-      await this.#kernel.execute(
-        {
-          type: "FinishActivation",
-          idempotencyKey: `${activationId}:attention-reconciled-${outcome.toLowerCase()}`,
-          activationId,
-          outcome,
-          detail,
-        },
-        this.#runtimeContext,
-      );
+      afterCursor = page.nextCursor;
     }
   }
+}
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  operation: (item: T) => Promise<R>,
+): Promise<readonly R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  let firstError: unknown;
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    async () => {
+      for (;;) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= items.length) {
+          return;
+        }
+        try {
+          results[index] = await operation(items[index]!);
+        } catch (error) {
+          firstError ??= error;
+        }
+      }
+    },
+  );
+  await Promise.all(workers);
+  if (firstError !== undefined) {
+    throw firstError;
+  }
+  return results;
+}
+
+function groupAttentionsByConflictDomain(
+  attentions: readonly AttentionView[],
+): readonly {
+  readonly key: string;
+  readonly attentions: readonly AttentionView[];
+}[] {
+  const groups = new Map<string, AttentionView[]>();
+  for (const attention of attentions) {
+    const key = `${attention.targetAgentId}\u0000${attention.threadRootId}`;
+    const group = groups.get(key);
+    if (group) {
+      group.push(attention);
+    } else {
+      groups.set(key, [attention]);
+    }
+  }
+  return [...groups.entries()].map(([key, group]) => ({
+    key,
+    attentions: group,
+  }));
 }
 
 function requirePayloadString(payload: JsonValue, key: string): string {
@@ -1050,15 +1066,6 @@ function requirePayloadString(payload: JsonValue, key: string): string {
     throw new Error(`Event payload ${key} must be a non-empty string.`);
   }
   return value;
-}
-
-function isAttentionActivationPayload(payload: JsonValue): boolean {
-  return (
-    payload !== null &&
-    !Array.isArray(payload) &&
-    typeof payload === "object" &&
-    typeof payload.attentionId === "string"
-  );
 }
 
 function requireActivation(

@@ -335,7 +335,11 @@ export class CopilotAcpAdapter implements ProviderAdapter {
         "session/prompt result",
       );
       connection.allowProcessExit();
-      await stopProcess(processHandle, this.#shutdownGraceMs);
+      await stopProcess(
+        processHandle,
+        this.#shutdownGraceMs,
+        () => connection.endInput(),
+      );
       acceptUpdates = false;
       await persistence.drain();
       connection.seal();
@@ -367,8 +371,16 @@ export class CopilotAcpAdapter implements ProviderAdapter {
         primaryError ??= error;
       }
       context.signal.removeEventListener("abort", abort);
+      try {
+        await stopProcess(
+          processHandle,
+          this.#shutdownGraceMs,
+          () => connection.endInput(),
+        );
+      } catch (error) {
+        primaryError ??= error;
+      }
       connection.close();
-      await stopProcess(processHandle, this.#shutdownGraceMs);
     }
 
     if (primaryError !== undefined) {
@@ -457,6 +469,7 @@ class NdjsonRpcConnection {
   #closed = false;
   #sealed = false;
   #failed: Error | null = null;
+  #inputEnd: Promise<void> | null = null;
   #buffer = Buffer.alloc(0);
   readonly #pending = new Map<
     number,
@@ -483,6 +496,9 @@ class NdjsonRpcConnection {
     });
     processHandle.once("error", (error) => {
       this.fail(error);
+    });
+    processHandle.stdin.on("error", (error) => {
+      this.fail(stdinFailure(error));
     });
     processHandle.once("exit", (code, signal) => {
       if (
@@ -537,13 +553,59 @@ class NdjsonRpcConnection {
   close(): void {
     this.#closed = true;
     this.processHandle.stdout.removeAllListeners("data");
-    this.fail(new Error("ACP connection closed."));
-    this.processHandle.stdin.end();
+    if (this.#pending.size > 0) {
+      this.fail(new Error("ACP connection closed."));
+    }
   }
 
   allowProcessExit(): void {
     this.#allowProcessExit = true;
     this.#shuttingDown = true;
+  }
+
+  endInput(): Promise<void> {
+    this.#shuttingDown = true;
+    if (this.#inputEnd) {
+      return this.#inputEnd;
+    }
+    if (
+      this.processHandle.stdin.destroyed ||
+      this.processHandle.stdin.writableEnded
+    ) {
+      this.#inputEnd = Promise.resolve();
+      return this.#inputEnd;
+    }
+    this.#inputEnd = new Promise((resolve) => {
+      let settled = false;
+      const settle = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        this.processHandle.stdin.removeListener("finish", settle);
+        this.processHandle.stdin.removeListener("close", settle);
+        this.processHandle.stdin.removeListener("error", onError);
+        resolve();
+      };
+      const onError = (error: Error) => {
+        this.fail(stdinFailure(error));
+        settle();
+      };
+      this.processHandle.stdin.once("finish", settle);
+      this.processHandle.stdin.once("close", settle);
+      this.processHandle.stdin.once("error", onError);
+      try {
+        this.processHandle.stdin.end(settle);
+      } catch (error) {
+        this.fail(
+          stdinFailure(
+            error instanceof Error ? error : new Error(String(error)),
+          ),
+        );
+        settle();
+      }
+    });
+    return this.#inputEnd;
   }
 
   seal(): void {
@@ -667,7 +729,22 @@ class NdjsonRpcConnection {
     ) {
       throw this.#failed ?? new Error("ACP connection is not writable.");
     }
-    this.processHandle.stdin.write(`${JSON.stringify(message)}\n`);
+    try {
+      this.processHandle.stdin.write(
+        `${JSON.stringify(message)}\n`,
+        (error?: Error | null) => {
+          if (error) {
+            this.fail(stdinFailure(error));
+          }
+        },
+      );
+    } catch (error) {
+      const failure = stdinFailure(
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      this.fail(failure);
+      throw failure;
+    }
   }
 }
 
@@ -1208,15 +1285,17 @@ function abortReason(signal: AbortSignal): Error {
 async function stopProcess(
   processHandle: ChildProcessWithoutNullStreams,
   graceMs: number,
+  endInput: () => Promise<void>,
 ): Promise<void> {
   if (isProcessClosed(processHandle)) {
     return;
   }
   const gracefulClose = waitForClose(processHandle, graceMs);
-  processHandle.stdin.end();
+  await endInput();
   if (await gracefulClose) {
     return;
   }
+
   if (processHandle.exitCode === null && processHandle.signalCode === null) {
     const terminatedClose = waitForClose(processHandle, graceMs);
     processHandle.kill();
@@ -1236,6 +1315,13 @@ async function stopProcess(
       "Copilot ACP process did not terminate after forced shutdown.",
     );
   }
+}
+
+function stdinFailure(error: Error): ProviderExecutionError {
+  return new ProviderExecutionError(
+    `Copilot ACP stdin failed: ${error.message}`,
+    "Unknown",
+  );
 }
 
 function waitForClose(

@@ -1,4 +1,5 @@
 import { createInterface } from "node:readline";
+import { closeSync } from "node:fs";
 
 const mode = process.argv[2] ?? "valid";
 const parameter = Number(process.argv[3] ?? "0");
@@ -18,6 +19,9 @@ lines.on("line", (line) => {
         authMethods: [],
       },
     });
+    if (mode === "close-after-initialize") {
+      setImmediate(() => process.exit(0));
+    }
     return;
   }
   if (message.method === "session/new") {
@@ -71,6 +75,32 @@ function handlePrompt() {
           },
         },
       });
+      return;
+    case "permission-close-stdin":
+      send({
+        jsonrpc: "2.0",
+        id: 900,
+        method: "session/request_permission",
+        params: {
+          sessionId: "diagnostic-session",
+          options: [{ optionId: "allow_once", name: "Allow once", kind: "allow_once" }],
+          toolCall: {
+            toolCallId: "closed-permission",
+            title: "Closed permission pipe",
+            kind: "execute",
+            rawInput: { command: "echo forbidden" },
+          },
+        },
+      });
+      setImmediate(() => process.exit(0));
+      return;
+    case "cancel-close-stdin":
+      sendUpdate({
+        sessionUpdate: "agent_message_chunk",
+        messageId: "cancellation-ready",
+        content: { type: "text", text: "{" },
+      });
+      closeInputAndHold();
       return;
     case "tool-activity":
       sendUpdate({
@@ -340,6 +370,17 @@ function nested(depth) {
     value = { value };
   }
   return value;
+}
+
+function closeInputAndHold() {
+  lines.close();
+  process.stdin.destroy();
+  try {
+    closeSync(0);
+  } catch {
+    // The descriptor may already be closed by destroy().
+  }
+  setInterval(() => {}, 1_000);
 }
 
 function send(message) {

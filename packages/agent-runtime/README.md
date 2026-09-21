@@ -9,6 +9,8 @@ The runtime provides:
 - Runtime-owned Attention claims and Activation creation.
 - Explicit Agent decisions to ignore an Attention, continue one eligible
   same-thread Run, or create a new Run.
+- Configurably bounded Attention concurrency across independent Agent/Thread
+  domains, with same-domain ordering preserved across pages and claim races.
 - Ordered, leased outbox consumption with idempotent command keys.
 - A provider-neutral adapter contract and deterministic fake adapter.
 - A GitHub Copilot CLI ACP stdio adapter using `copilot --acp --stdio`.
@@ -17,16 +19,18 @@ The runtime provides:
 
 Provider session IDs are diagnostic only. Recovery always rebuilds provider
 input from Kernel projections and never treats a provider session as
-authoritative state.
+authoritative state. Provider delivery failures park Runs through one atomic
+Kernel command, and expired Attention executions are discovered through
+bounded targeted projections rather than public-event history scans.
 
 The current Kernel contract does not expose lease renewal. The runtime
 therefore claims one outbox event at a time and requires Attention and outbox
 leases to exceed the configured provider timeout by a safety margin.
 
-Because the Kernel outbox is globally ordered, one runtime instance consumes
-the global stream. `projectIds` supplies the Projects whose existing open
-Attentions are scanned at startup; Projects encountered in outbox events are
-loaded dynamically.
+Because the Kernel outbox is globally ordered, runtime instances coordinate
+through the same leased stream. `projectIds` supplies the Projects whose
+existing open Attentions are scanned at startup; Projects encountered in
+outbox events are loaded dynamically.
 
 The Copilot adapter starts with a deny-by-default provider policy. It filters
 the model-visible tool list to a nonexistent Runtime sentinel, explicitly
@@ -34,7 +38,8 @@ denies shell, write, and URL permissions, disables built-in MCP servers and
 custom instructions, supplies no session MCP servers, and launches with a
 minimal environment allowlist. Custom command arguments are rejected unless
 the caller explicitly enables the unsafe development option used by test
-fixtures.
+fixtures. Child stdin write, end, EOF, and pipe failures are folded into the
+same provider failure and cleanup path.
 
 Copilot returns a bounded JSON action envelope rather than invoking Kernel
 commands directly. Frame, stream, persisted activity, pending write, JSON
