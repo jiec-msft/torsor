@@ -62,13 +62,16 @@ const terminalRunStates: readonly RunState[] = [
   "Cancelled",
 ];
 const schemaInitializationHookSymbol = Symbol.for(
-  "torsor.kernel.schema-initialization-before-lock",
+  "torsor.kernel.schema-initialization-operation",
 );
 
-function runSchemaInitializationInterleavingHook(): void {
+// Internal test seam for asserting lock/read order without exposing SQLite publicly.
+function recordSchemaInitializationOperation(
+  operation: Readonly<{ kind: "exec" | "read"; sql: string }>,
+): void {
   const hook = Reflect.get(globalThis, schemaInitializationHookSymbol);
   if (typeof hook === "function") {
-    hook();
+    hook(operation);
   }
 }
 
@@ -1210,9 +1213,10 @@ export class TorsorKernel {
     this.#authorizeActivationActor(principal, context, activation);
     this.#assertActivationScopeCurrent(activation);
     const runId = optionalText(activation.run_id);
-    for (const inputId of unique(command.runInputIds)) {
+    const runInputIds = unique(command.runInputIds);
+    for (const inputId of runInputIds) {
       const input = this.#getRow(
-        "SELECT run_id FROM run_inputs WHERE id = ?",
+        "SELECT run_id, disposition FROM run_inputs WHERE id = ?",
         inputId,
       );
       if (!input) {
@@ -1220,6 +1224,12 @@ export class TorsorKernel {
       }
       if (!runId || text(input.run_id) !== runId) {
         throw new KernelError("Forbidden", "Provider input must belong to the Activation Run.");
+      }
+      if (text(input.disposition) !== "Pending") {
+        throw new KernelError(
+          "Conflict",
+          "Provider input must still be Pending when delivery starts.",
+        );
       }
       const supplied = this.#getRow(
         `SELECT 1 AS present
@@ -1248,7 +1258,7 @@ export class TorsorKernel {
       command.adapter,
       command.adapterVersion,
       JSON.stringify(command.capabilitySnapshot),
-      JSON.stringify(unique(command.runInputIds)),
+      JSON.stringify(runInputIds),
       command.requestIdempotencyKey,
       command.diagnosticSessionId ?? null,
       this.#now(),
@@ -2870,12 +2880,9 @@ export class TorsorKernel {
   }
 
   #initializeSchema(): void {
-    runSchemaInitializationInterleavingHook();
-    this.#database.exec("BEGIN IMMEDIATE");
+    this.#initializeSchemaExec("BEGIN IMMEDIATE");
     try {
-      const versionRow = this.#database.prepare("PRAGMA user_version").get() as
-        | Row
-        | undefined;
+      const versionRow = this.#initializeSchemaGet("PRAGMA user_version");
       const version = versionRow ? integer(versionRow.user_version) : 0;
       if (version === CURRENT_SCHEMA_VERSION) {
         this.#database.exec(schemaSql);
@@ -2883,6 +2890,15 @@ export class TorsorKernel {
         return;
       }
       if (version === 1) {
+        // v1 acknowledgements re-read the lease token under BEGIN IMMEDIATE, so
+        // clearing it under this migration lock fences already-open v1 workers.
+        this.#database.exec(
+          `UPDATE outbox_events
+              SET lease_holder_principal_id = NULL,
+                  lease_token = NULL,
+                  lease_expires_at = NULL
+            WHERE acknowledged_at IS NULL`,
+        );
         this.#database.exec(
           `ALTER TABLE attentions
              ADD COLUMN created_event_sequence INTEGER
@@ -2966,14 +2982,12 @@ export class TorsorKernel {
           `Unsupported kernel schema version ${version}; expected ${CURRENT_SCHEMA_VERSION}.`,
         );
       }
-      const existing = this.#database
-        .prepare(
-          `SELECT name
-             FROM sqlite_master
-            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-            LIMIT 1`,
-        )
-        .get() as Row | undefined;
+      const existing = this.#initializeSchemaGet(
+        `SELECT name
+           FROM sqlite_master
+          WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+          LIMIT 1`,
+      );
       if (existing) {
         throw new KernelError(
           "Conflict",
@@ -2987,6 +3001,16 @@ export class TorsorKernel {
       this.#database.exec("ROLLBACK");
       throw this.#translateError(error);
     }
+  }
+
+  #initializeSchemaExec(sql: string): void {
+    recordSchemaInitializationOperation({ kind: "exec", sql });
+    this.#database.exec(sql);
+  }
+
+  #initializeSchemaGet(sql: string): Row | undefined {
+    recordSchemaInitializationOperation({ kind: "read", sql });
+    return this.#database.prepare(sql).get() as Row | undefined;
   }
 
   #applyBootstrap(bootstrap?: KernelBootstrap): void {

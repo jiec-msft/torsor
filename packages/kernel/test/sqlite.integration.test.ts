@@ -13,6 +13,76 @@ import {
   runtimeContext,
 } from "./helpers.js";
 
+interface SchemaInitializationOperation {
+  readonly kind: "exec" | "read";
+  readonly sql: string;
+}
+
+function legacyAcknowledgeOutboxEvents(
+  database: DatabaseSync,
+  eventIds: readonly string[],
+  leaseToken: string,
+  now: Date,
+): boolean {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const leasedRows = database
+      .prepare(
+        `SELECT id
+           FROM outbox_events
+          WHERE acknowledged_at IS NULL
+            AND lease_holder_principal_id = ?
+            AND lease_token = ?
+          ORDER BY sequence`,
+      )
+      .all("principal-runtime", leaseToken) as ReadonlyArray<
+      Record<string, unknown>
+    >;
+    const leasedIds = leasedRows.map((row) => String(row.id));
+    if (
+      leasedIds.length !== eventIds.length ||
+      leasedIds.some((id) => !eventIds.includes(id))
+    ) {
+      database.exec("ROLLBACK");
+      return false;
+    }
+    const selectEvent = database.prepare(
+      `SELECT lease_holder_principal_id, lease_token, lease_expires_at
+         FROM outbox_events
+        WHERE id = ?`,
+    );
+    const acknowledge = database.prepare(
+      `UPDATE outbox_events
+          SET acknowledged_at = ?,
+              acknowledged_by_principal_id = 'principal-runtime',
+              lease_token = NULL,
+              lease_expires_at = NULL
+        WHERE id = ?`,
+    );
+    for (const eventId of eventIds) {
+      const event = selectEvent.get(eventId) as
+        | Record<string, unknown>
+        | undefined;
+      if (
+        !event ||
+        event.lease_holder_principal_id !== "principal-runtime" ||
+        event.lease_token !== leaseToken ||
+        typeof event.lease_expires_at !== "string" ||
+        new Date(event.lease_expires_at) <= now
+      ) {
+        database.exec("ROLLBACK");
+        return false;
+      }
+      acknowledge.run(now.toISOString(), eventId);
+    }
+    database.exec("COMMIT");
+    return true;
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 describe("SQLite persistence", () => {
   it("recovers durable state after close and reopen", async () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-kernel-"));
@@ -321,13 +391,13 @@ describe("SQLite persistence", () => {
       );
       first.close();
 
-      const versionOne = new DatabaseSync(databasePath);
-      versionOne.exec(`
+      const legacyWorker = new DatabaseSync(databasePath);
+      legacyWorker.exec(`
         DROP TABLE attention_history;
         ALTER TABLE attentions DROP COLUMN created_event_sequence;
         PRAGMA user_version = 1;
       `);
-      const setLease = versionOne.prepare(
+      const setLease = legacyWorker.prepare(
         `UPDATE outbox_events
             SET lease_holder_principal_id = 'principal-runtime',
                 lease_token = ?,
@@ -338,49 +408,102 @@ describe("SQLite persistence", () => {
       setLease.run("lease-c", beforeMigration.items[0]!.id);
       setLease.run("lease-b", beforeMigration.items[1]!.id);
       setLease.run("lease-c", beforeMigration.items[2]!.id);
-      versionOne.close();
 
-      const migrated = TorsorKernel.open(options);
       try {
-        await expect(
-          migrated.execute(
-            {
-              type: "AcknowledgeOutboxEvents",
-              idempotencyKey: "legacy-noncontiguous-ack",
-              outboxEventIds: [
+        const migrated = TorsorKernel.open(options);
+        try {
+          expect(
+            legacyAcknowledgeOutboxEvents(
+              legacyWorker,
+              [
                 beforeMigration.items[0]!.id,
                 beforeMigration.items[2]!.id,
               ],
-              leaseToken: "lease-c",
+              "lease-c",
+              options.clock(),
+            ),
+          ).toBe(false);
+
+          const afterRejection = await migrated.query(
+            {
+              type: "ListOutboxEvents",
+              includeAcknowledged: true,
+              limit: 10,
             },
             runtimeContext,
-          ),
-        ).rejects.toMatchObject({
-          code: "Conflict",
-          message:
-            "Outbox acknowledgement must exactly advance the oldest pending prefix.",
-        });
+          );
+          expect(
+            afterRejection.items.map((event) => event.acknowledgedAt),
+          ).toEqual([null, null, null]);
+          expect(
+            afterRejection.items.map(
+              (event) => event.leaseHolderPrincipalId,
+            ),
+          ).toEqual([null, null, null]);
+          expect(
+            afterRejection.items.map((event) => event.deliveryAttempts),
+          ).toEqual([1, 1, 1]);
 
-        const afterRejection = await migrated.query(
-          {
-            type: "ListOutboxEvents",
-            includeAcknowledged: true,
-            limit: 10,
-          },
-          runtimeContext,
-        );
-        expect(afterRejection.items.map((event) => event.acknowledgedAt)).toEqual(
-          [null, null, null],
-        );
-        expect(
-          afterRejection.items.map((event) => event.leaseHolderPrincipalId),
-        ).toEqual([
-          "principal-runtime",
-          "principal-runtime",
-          "principal-runtime",
-        ]);
+          setLease.run("lease-v2-c", beforeMigration.items[0]!.id);
+          setLease.run("lease-v2-b", beforeMigration.items[1]!.id);
+          setLease.run("lease-v2-c", beforeMigration.items[2]!.id);
+          await expect(
+            migrated.execute(
+              {
+                type: "AcknowledgeOutboxEvents",
+                idempotencyKey: "v2-noncontiguous-ack",
+                outboxEventIds: [
+                  beforeMigration.items[0]!.id,
+                  beforeMigration.items[2]!.id,
+                ],
+                leaseToken: "lease-v2-c",
+              },
+              runtimeContext,
+            ),
+          ).rejects.toMatchObject({
+            code: "Conflict",
+            message:
+              "Outbox acknowledgement must exactly advance the oldest pending prefix.",
+          });
+          const afterV2Rejection = await migrated.query(
+            {
+              type: "ListOutboxEvents",
+              includeAcknowledged: true,
+              limit: 10,
+            },
+            runtimeContext,
+          );
+          expect(
+            afterV2Rejection.items.map((event) => event.acknowledgedAt),
+          ).toEqual([null, null, null]);
+
+          legacyWorker.exec(
+            `UPDATE outbox_events
+                SET lease_holder_principal_id = NULL,
+                    lease_token = NULL,
+                    lease_expires_at = NULL
+              WHERE acknowledged_at IS NULL`,
+          );
+          const recovered = await migrated.execute(
+            {
+              type: "ClaimOutboxEvents",
+              idempotencyKey: "claim-after-v1-lease-revocation",
+              limit: 3,
+              leaseDurationMs: 30_000,
+            },
+            runtimeContext,
+          );
+          expect(recovered.outboxEvents?.map((event) => event.id)).toEqual(
+            beforeMigration.items.map((event) => event.id),
+          );
+          expect(
+            recovered.outboxEvents?.map((event) => event.deliveryAttempts),
+          ).toEqual([2, 2, 2]);
+        } finally {
+          migrated.close();
+        }
       } finally {
-        migrated.close();
+        legacyWorker.close();
       }
     } finally {
       await rm(directory, { recursive: true, force: true });
@@ -632,20 +755,60 @@ describe("SQLite persistence", () => {
     }
   });
 
+  it("acquires the schema write lock before reading schema state", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-schema-order-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    const hookSymbol = Symbol.for(
+      "torsor.kernel.schema-initialization-operation",
+    );
+    const operations: SchemaInitializationOperation[] = [];
+    try {
+      Reflect.set(
+        globalThis,
+        hookSymbol,
+        (operation: SchemaInitializationOperation) => {
+          operations.push(operation);
+        },
+      );
+      const kernel = TorsorKernel.open({ databasePath, bootstrap });
+      kernel.close();
+
+      expect(operations[0]).toEqual({
+        kind: "exec",
+        sql: "BEGIN IMMEDIATE",
+      });
+      expect(operations[1]).toEqual({
+        kind: "read",
+        sql: "PRAGMA user_version",
+      });
+      expect(operations[2]).toMatchObject({ kind: "read" });
+      expect(operations[2]!.sql).toContain("sqlite_master");
+    } finally {
+      Reflect.deleteProperty(globalThis, hookSymbol);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("re-reads schema state after another opener wins initialization", async () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-init-race-"));
     const databasePath = join(directory, "kernel.sqlite");
     const hookSymbol = Symbol.for(
-      "torsor.kernel.schema-initialization-before-lock",
+      "torsor.kernel.schema-initialization-operation",
     );
     let competingOpenCompleted = false;
     try {
-      Reflect.set(globalThis, hookSymbol, () => {
-        Reflect.deleteProperty(globalThis, hookSymbol);
-        const competing = TorsorKernel.open({ databasePath, bootstrap });
-        competingOpenCompleted = true;
-        competing.close();
-      });
+      Reflect.set(
+        globalThis,
+        hookSymbol,
+        (operation: SchemaInitializationOperation) => {
+          if (operation.kind === "exec" && operation.sql === "BEGIN IMMEDIATE") {
+            Reflect.deleteProperty(globalThis, hookSymbol);
+            const competing = TorsorKernel.open({ databasePath, bootstrap });
+            competingOpenCompleted = true;
+            competing.close();
+          }
+        },
+      );
 
       const follower = TorsorKernel.open({ databasePath, bootstrap });
       try {
@@ -668,7 +831,7 @@ describe("SQLite persistence", () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-migration-race-"));
     const databasePath = join(directory, "kernel.sqlite");
     const hookSymbol = Symbol.for(
-      "torsor.kernel.schema-initialization-before-lock",
+      "torsor.kernel.schema-initialization-operation",
     );
     let competingOpenCompleted = false;
     try {
@@ -682,12 +845,18 @@ describe("SQLite persistence", () => {
       `);
       versionOne.close();
 
-      Reflect.set(globalThis, hookSymbol, () => {
-        Reflect.deleteProperty(globalThis, hookSymbol);
-        const competing = TorsorKernel.open({ databasePath, bootstrap });
-        competingOpenCompleted = true;
-        competing.close();
-      });
+      Reflect.set(
+        globalThis,
+        hookSymbol,
+        (operation: SchemaInitializationOperation) => {
+          if (operation.kind === "exec" && operation.sql === "BEGIN IMMEDIATE") {
+            Reflect.deleteProperty(globalThis, hookSymbol);
+            const competing = TorsorKernel.open({ databasePath, bootstrap });
+            competingOpenCompleted = true;
+            competing.close();
+          }
+        },
+      );
 
       const follower = TorsorKernel.open({ databasePath, bootstrap });
       try {

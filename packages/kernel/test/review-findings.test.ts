@@ -277,6 +277,88 @@ describe("independent review regressions", () => {
     }
   });
 
+  it("prevents new Provider delivery after RunInput withdrawal", async () => {
+    const kernel = openMemoryKernel();
+    try {
+      const setup = await createRun(kernel);
+      const sent = await kernel.execute(
+        {
+          type: "SendToRun",
+          idempotencyKey: "provider-withdrawal-input",
+          runId: setup.runId,
+          expectedRunRevision: 1,
+          body: "Do not deliver this input after it is withdrawn.",
+        },
+        humanContext,
+      );
+      const runInputId = sent.relatedIds!.runInputId!;
+      const activation = await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "provider-withdrawal-activation",
+          runId: setup.runId,
+          expectedRunRevision: 2,
+        },
+        runtimeContext,
+      );
+      const alreadyStarted = await kernel.execute(
+        {
+          type: "StartProviderAttempt",
+          idempotencyKey: "provider-before-withdrawal",
+          activationId: activation.entityId,
+          adapter: "deterministic-fake",
+          adapterVersion: "1",
+          capabilitySnapshot: {},
+          runInputIds: [runInputId],
+          requestIdempotencyKey: "provider-before-withdrawal",
+        },
+        runtimeContext,
+      );
+
+      await kernel.execute(
+        {
+          type: "WithdrawRunInput",
+          idempotencyKey: "withdraw-before-new-provider",
+          runInputId,
+          expectedRunRevision: 2,
+          expectedDispositionRevision: 1,
+          reason: "The assigning Human withdrew the input.",
+        },
+        humanContext,
+      );
+
+      await expect(
+        kernel.execute(
+          {
+            type: "StartProviderAttempt",
+            idempotencyKey: "provider-after-withdrawal",
+            activationId: activation.entityId,
+            adapter: "deterministic-fake",
+            adapterVersion: "1",
+            capabilitySnapshot: {},
+            runInputIds: [runInputId],
+            requestIdempotencyKey: "provider-after-withdrawal",
+          },
+          runtimeContext,
+        ),
+      ).rejects.toMatchObject({
+        code: "Conflict",
+        message: "Provider input must still be Pending when delivery starts.",
+      });
+      const projection = await kernel.query(
+        { type: "GetRunProjection", runId: setup.runId },
+        humanContext,
+      );
+      expect(
+        projection.providerAttempts.find(
+          (attempt) => attempt.id === alreadyStarted.entityId,
+        ),
+      ).toMatchObject({ status: "Started", runInputIds: [runInputId] });
+    } finally {
+      kernel.close();
+    }
+  });
+
   it("paginates every open Attention with a stable cursor", async () => {
     const kernel = openMemoryKernel();
     try {
