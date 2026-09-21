@@ -19,6 +19,7 @@ Torsor is at an early design and implementation stage. The first working slice w
 ## Documentation
 
 - [Product definition](docs/product.md)
+- [MVP 0.1 core and interactive prototype (Simplified Chinese)](docs/prototype/001-overview.zh-cn.md)
 - [Public content policy](docs/public-content.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
