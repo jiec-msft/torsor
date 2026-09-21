@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 
 import { describe, expect, it } from "vitest";
@@ -19,6 +19,11 @@ import {
   humanContext,
   runtimeContext,
 } from "./helpers.js";
+
+interface RecordedQuery {
+  readonly sql: string;
+  readonly parameters: readonly SQLInputValue[];
+}
 
 function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object") {
@@ -497,7 +502,37 @@ describe("Runtime recovery with SQLite", () => {
     try {
       const first = TorsorKernel.open({ databasePath, bootstrap });
       const execution = await createFinishedAttentionAttempt(first);
+      const initialPage = await first.query(
+        { type: "ListRecoverableAttentionExecutions", limit: 1 },
+        runtimeContext,
+      );
+      let recordedQuery: RecordedQuery | undefined;
+      const queryHookSymbol = Symbol.for(
+        "torsor.kernel.recoverable-attention-query",
+      );
+      Reflect.set(
+        globalThis,
+        queryHookSymbol,
+        (query: RecordedQuery) => {
+          recordedQuery = query;
+        },
+      );
+      try {
+        await first.query(
+          {
+            type: "ListRecoverableAttentionExecutions",
+            afterCursor: initialPage.items[0]!.cursor,
+            limit: 1,
+          },
+          runtimeContext,
+        );
+      } finally {
+        Reflect.deleteProperty(globalThis, queryHookSymbol);
+      }
       first.close();
+      if (!recordedQuery) {
+        throw new Error("Expected the noninitial recovery query to be recorded.");
+      }
 
       const database = new DatabaseSync(databasePath);
       try {
@@ -515,6 +550,23 @@ describe("Runtime recovery with SQLite", () => {
           "activation_attention_recovery_idx",
           "provider_attempts_activation_status_idx",
         ]);
+        const queryPlan = database.prepare(
+          `EXPLAIN QUERY PLAN ${recordedQuery.sql}`,
+        ).all(...recordedQuery.parameters) as Array<{
+          readonly detail: string;
+        }>;
+        const planDetails = queryPlan.map((row) => row.detail);
+        expect(
+          planDetails.some(
+            (detail) =>
+              /\bSEARCH\b/i.test(detail) &&
+              detail.includes("activation_attention_recovery_idx") &&
+              detail.includes(">"),
+          ),
+        ).toBe(true);
+        expect(
+          planDetails.some((detail) => /\bSCAN\s+activation\b/i.test(detail)),
+        ).toBe(false);
         database.prepare(
           `DELETE FROM public_events
             WHERE entity_type IN ('ActivationAttempt', 'ProviderAttempt')`,

@@ -38,6 +38,10 @@ import {
   type Row
 } from "./values.js";
 
+const recoverableAttentionQueryHookSymbol = Symbol.for(
+  "torsor.kernel.recoverable-attention-query",
+);
+
 export function getBootstrap(kernel: db.KernelContext, projectId: string, attentionTargetAgentId?: string): BootstrapProjection {
   const project = db.getRow(kernel, "SELECT * FROM projects WHERE id = ?", projectId);
   if (!project) {
@@ -254,22 +258,29 @@ export function listRecoverableAttentionExecutions(
     requireNonEmpty(afterCursor.startedAt, "afterCursor.startedAt");
     requireNonEmpty(afterCursor.activationId, "afterCursor.activationId");
     clauses.push(
-      "(activation.started_at > ? OR (activation.started_at = ? AND activation.id > ?))",
+      "(activation.started_at, activation.id) > (?, ?)",
     );
     parameters.push(
-      afterCursor.startedAt,
       afterCursor.startedAt,
       afterCursor.activationId,
     );
   }
   parameters.push(limit + 1);
-  const rows = db.allRows(
-    kernel,
-    `SELECT activation.*
+  const sql = `SELECT activation.*
        FROM activation_attempts AS activation
       WHERE ${clauses.join(" AND ")}
       ORDER BY activation.started_at, activation.id
-      LIMIT ?`,
+      LIMIT ?`;
+  const queryHook = Reflect.get(
+    globalThis,
+    recoverableAttentionQueryHookSymbol,
+  );
+  if (typeof queryHook === "function") {
+    queryHook({ sql, parameters: [...parameters] });
+  }
+  const rows = db.allRows(
+    kernel,
+    sql,
     ...parameters,
   );
   const hasMore = rows.length > limit;
