@@ -38,6 +38,13 @@ carry durable Activation or ProviderAttempt provenance. Provider session IDs
 are diagnostic only; provider delivery never changes RunInput disposition or
 other semantic state.
 
+An Attention wakes its target Agent but does not choose a Run. A claimed
+Attention Activation can use `IgnoreAttention`, attach the triggering Message
+revision to an eligible same-Project, same-Channel, same-Thread Run with
+`ResolveAttentionWithExistingRun`, or create a new Run with
+`ResolveAttentionWithRun`. All three decisions consume the Attention exactly
+once and end its handler Activation.
+
 Outbox consumers use `ClaimOutboxEvents`, `AcknowledgeOutboxEvents`, and
 `ListOutboxEvents`. Claims are ordered, leased, and recoverable after process
 restart or lease expiry.
