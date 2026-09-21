@@ -32,20 +32,20 @@ interface HeldActivationCommand {
   readonly worker: Worker;
 }
 
-interface PreparedActivationCommand {
-  readonly allowLockAttempt: () => void;
-  readonly attempting: Promise<void>;
-  readonly proceeding: Promise<void>;
-  readonly result: Promise<{ readonly entityId: string }>;
+interface SqliteBusyEvidence {
+  readonly elapsedMs: number;
+  readonly errcode: number;
+  readonly message: string;
+}
+
+interface PreparedBusyOperation {
+  readonly busy: Promise<SqliteBusyEvidence>;
   readonly start: () => void;
   readonly worker: Worker;
 }
 
-interface PendingKernelOpen {
-  readonly allowLockAttempt: () => void;
-  readonly attempting: Promise<void>;
-  readonly opened: Promise<void>;
-  readonly proceeding: Promise<void>;
+interface PendingBusyOperation {
+  readonly busy: Promise<SqliteBusyEvidence>;
   readonly worker: Worker;
 }
 
@@ -65,30 +65,6 @@ function canonicalJson(value: unknown): string {
 
 function commandHash(command: unknown): string {
   return createHash("sha256").update(canonicalJson(command)).digest("hex");
-}
-
-async function expectUnsettled<T>(
-  operation: Promise<T>,
-  durationMs = 100,
-): Promise<void> {
-  const outcome: {
-    failure?: unknown;
-    state: "pending" | "fulfilled" | "rejected";
-  } = { state: "pending" };
-  void operation.then(
-    () => {
-      outcome.state = "fulfilled";
-    },
-    (error: unknown) => {
-      outcome.state = "rejected";
-      outcome.failure = error;
-    },
-  );
-  await new Promise((resolve) => setTimeout(resolve, durationMs));
-  if (outcome.state === "rejected") {
-    throw outcome.failure;
-  }
-  expect(outcome.state).toBe("pending");
 }
 
 async function holdWriteLock(
@@ -285,45 +261,51 @@ async function startActivationHoldingBeforeCommit(
   };
 }
 
-async function prepareActivationCommand(
+async function prepareBusyActivationCommand(
   databasePath: string,
   command: Readonly<Record<string, unknown>>,
-): Promise<PreparedActivationCommand> {
-  const signal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
-  const control = new Int32Array(signal);
+): Promise<PreparedBusyOperation> {
+  const signal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const startSignal = new Int32Array(signal);
   const worker = new Worker(
     `
       const { parentPort, workerData } = require("node:worker_threads");
-      const control = new Int32Array(workerData.signal);
+      const startSignal = new Int32Array(workerData.signal);
+      globalThis[Symbol.for("torsor.kernel.test-sqlite-busy-timeout-ms")] =
+        workerData.busyTimeoutMs;
       import(workerData.moduleUrl)
         .then(async ({ TorsorKernel }) => {
           const kernel = TorsorKernel.open({
             databasePath: workerData.databasePath,
             bootstrap: workerData.bootstrap,
           });
-          globalThis[Symbol.for("torsor.kernel.command-transaction-operation")] = (
-            operation,
-          ) => {
-            if (operation.kind === "exec" && operation.sql === "BEGIN IMMEDIATE") {
-              parentPort.postMessage({ type: "attempting" });
-              if (Atomics.wait(control, 1, 0, 5000) === "timed-out") {
-                throw new Error("Timed out waiting to attempt the Activation lock.");
-              }
-              parentPort.postMessage({ type: "proceeding" });
-            }
-          };
           parentPort.postMessage({ type: "ready" });
-          if (Atomics.wait(control, 0, 0, 5000) === "timed-out") {
+          if (Atomics.wait(startSignal, 0, 0, 5000) === "timed-out") {
             throw new Error("Timed out waiting to start the Activation contender.");
           }
+          const startedAt = performance.now();
           try {
-            const result = await kernel.execute(
+            await kernel.execute(
               workerData.command,
               workerData.principalContext,
             );
+            throw new Error("Activation contender unexpectedly acquired the write lock.");
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            const errcode =
+              typeof error === "object" && error !== null && "errcode" in error
+                ? error.errcode
+                : undefined;
+            if (errcode !== 5 || !/database is locked/i.test(message)) {
+              throw error;
+            }
             parentPort.postMessage({
-              type: "result",
-              result: { entityId: result.entityId },
+              type: "busy",
+              evidence: {
+                elapsedMs: performance.now() - startedAt,
+                errcode,
+                message,
+              },
             });
           } finally {
             kernel.close();
@@ -340,6 +322,7 @@ async function prepareActivationCommand(
       eval: true,
       workerData: {
         bootstrap,
+        busyTimeoutMs: 150,
         command,
         databasePath,
         moduleUrl: new URL("../dist/index.js", import.meta.url).href,
@@ -350,61 +333,41 @@ async function prepareActivationCommand(
   );
   let resolveReady!: () => void;
   let rejectReady!: (error: Error) => void;
-  let resolveAttempting!: () => void;
-  let rejectAttempting!: (error: Error) => void;
-  let resolveProceeding!: () => void;
-  let rejectProceeding!: (error: Error) => void;
-  let resolveResult!: (result: { readonly entityId: string }) => void;
-  let rejectResult!: (error: Error) => void;
+  let resolveBusy!: (evidence: SqliteBusyEvidence) => void;
+  let rejectBusy!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => {
     resolveReady = resolve;
     rejectReady = reject;
   });
-  const attempting = new Promise<void>((resolve, reject) => {
-    resolveAttempting = resolve;
-    rejectAttempting = reject;
-  });
-  const proceeding = new Promise<void>((resolve, reject) => {
-    resolveProceeding = resolve;
-    rejectProceeding = reject;
-  });
-  const result = new Promise<{ readonly entityId: string }>(
+  const busy = new Promise<SqliteBusyEvidence>(
     (resolve, reject) => {
-      resolveResult = resolve;
-      rejectResult = reject;
+      resolveBusy = resolve;
+      rejectBusy = reject;
     },
   );
   worker.on(
     "message",
     (message: {
+      evidence?: SqliteBusyEvidence;
       type: string;
       message?: string;
-      result?: { readonly entityId: string };
     }) => {
       if (message.type === "ready") {
         resolveReady();
-      } else if (message.type === "attempting") {
-        resolveAttempting();
-      } else if (message.type === "proceeding") {
-        resolveProceeding();
-      } else if (message.type === "result" && message.result) {
-        resolveResult(message.result);
+      } else if (message.type === "busy" && message.evidence) {
+        resolveBusy(message.evidence);
       } else if (message.type === "error") {
         const error = new Error(
           message.message ?? "Activation contender worker failed.",
         );
         rejectReady(error);
-        rejectAttempting(error);
-        rejectProceeding(error);
-        rejectResult(error);
+        rejectBusy(error);
       }
     },
   );
   worker.on("error", (error) => {
     rejectReady(error);
-    rejectAttempting(error);
-    rejectProceeding(error);
-    rejectResult(error);
+    rejectBusy(error);
   });
   worker.on("exit", (code) => {
     if (code !== 0) {
@@ -412,54 +375,56 @@ async function prepareActivationCommand(
         `Activation contender worker exited with code ${code}.`,
       );
       rejectReady(error);
-      rejectAttempting(error);
-      rejectProceeding(error);
-      rejectResult(error);
+      rejectBusy(error);
     }
   });
   await ready;
   return {
-    allowLockAttempt: () => {
-      Atomics.store(control, 1, 1);
-      Atomics.notify(control, 1);
-    },
-    attempting,
-    proceeding,
-    result,
+    busy,
     start: () => {
-      Atomics.store(control, 0, 1);
-      Atomics.notify(control, 0);
+      Atomics.store(startSignal, 0, 1);
+      Atomics.notify(startSignal, 0);
     },
     worker,
   };
 }
 
-function openKernelInWorker(databasePath: string): PendingKernelOpen {
-  const signal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
-  const attemptSignal = new Int32Array(signal);
+function openKernelWithShortBusyTimeout(
+  databasePath: string,
+): PendingBusyOperation {
   const worker = new Worker(
     `
       const { parentPort, workerData } = require("node:worker_threads");
-      const attemptSignal = new Int32Array(workerData.signal);
-      globalThis[Symbol.for("torsor.kernel.schema-initialization-operation")] = (
-        operation,
-      ) => {
-        if (operation.kind === "exec" && operation.sql === "BEGIN IMMEDIATE") {
-          parentPort.postMessage({ type: "attempting" });
-          if (Atomics.wait(attemptSignal, 0, 0, 5000) === "timed-out") {
-            throw new Error("Timed out waiting to attempt the schema lock.");
-          }
-          parentPort.postMessage({ type: "proceeding" });
-        }
-      };
+      globalThis[Symbol.for("torsor.kernel.test-sqlite-busy-timeout-ms")] =
+        workerData.busyTimeoutMs;
       import(workerData.moduleUrl)
         .then(({ TorsorKernel }) => {
-          const kernel = TorsorKernel.open({
-            databasePath: workerData.databasePath,
-            bootstrap: workerData.bootstrap,
-          });
-          kernel.close();
-          parentPort.postMessage({ type: "opened" });
+          const startedAt = performance.now();
+          try {
+            const kernel = TorsorKernel.open({
+              databasePath: workerData.databasePath,
+              bootstrap: workerData.bootstrap,
+            });
+            kernel.close();
+            throw new Error("Kernel opener unexpectedly acquired the write lock.");
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            const errcode =
+              typeof error === "object" && error !== null && "errcode" in error
+                ? error.errcode
+                : undefined;
+            if (errcode !== 5 || !/database is locked/i.test(message)) {
+              throw error;
+            }
+            parentPort.postMessage({
+              type: "busy",
+              evidence: {
+                elapsedMs: performance.now() - startedAt,
+                errcode,
+                message,
+              },
+            });
+          }
         })
         .catch((error) => {
           parentPort.postMessage({
@@ -472,67 +437,45 @@ function openKernelInWorker(databasePath: string): PendingKernelOpen {
       eval: true,
       workerData: {
         bootstrap,
+        busyTimeoutMs: 150,
         databasePath,
         moduleUrl: new URL("../dist/index.js", import.meta.url).href,
-        signal,
       },
     },
   );
-  let resolveAttempting!: () => void;
-  let rejectAttempting!: (error: Error) => void;
-  let resolveProceeding!: () => void;
-  let rejectProceeding!: (error: Error) => void;
-  let resolveOpened!: () => void;
-  let rejectOpened!: (error: Error) => void;
-  const attempting = new Promise<void>((resolve, reject) => {
-    resolveAttempting = resolve;
-    rejectAttempting = reject;
+  let resolveBusy!: (evidence: SqliteBusyEvidence) => void;
+  let rejectBusy!: (error: Error) => void;
+  const busy = new Promise<SqliteBusyEvidence>((resolve, reject) => {
+    resolveBusy = resolve;
+    rejectBusy = reject;
   });
-  const proceeding = new Promise<void>((resolve, reject) => {
-    resolveProceeding = resolve;
-    rejectProceeding = reject;
-  });
-  const opened = new Promise<void>((resolve, reject) => {
-    resolveOpened = resolve;
-    rejectOpened = reject;
-  });
-  worker.on("message", (message: { type: string; message?: string }) => {
-    if (message.type === "attempting") {
-      resolveAttempting();
-    } else if (message.type === "proceeding") {
-      resolveProceeding();
-    } else if (message.type === "opened") {
-      resolveOpened();
-    } else if (message.type === "error") {
-      const error = new Error(message.message ?? "Kernel open worker failed.");
-      rejectAttempting(error);
-      rejectProceeding(error);
-      rejectOpened(error);
-    }
-  });
+  worker.on(
+    "message",
+    (message: {
+      evidence?: SqliteBusyEvidence;
+      type: string;
+      message?: string;
+    }) => {
+      if (message.type === "busy" && message.evidence) {
+        resolveBusy(message.evidence);
+      } else if (message.type === "error") {
+        const error = new Error(
+          message.message ?? "Kernel open worker failed.",
+        );
+        rejectBusy(error);
+      }
+    },
+  );
   worker.on("error", (error) => {
-    rejectAttempting(error);
-    rejectProceeding(error);
-    rejectOpened(error);
+    rejectBusy(error);
   });
   worker.on("exit", (code) => {
     if (code !== 0) {
       const error = new Error(`Kernel open worker exited with code ${code}.`);
-      rejectAttempting(error);
-      rejectProceeding(error);
-      rejectOpened(error);
+      rejectBusy(error);
     }
   });
-  return {
-    allowLockAttempt: () => {
-      Atomics.store(attemptSignal, 0, 1);
-      Atomics.notify(attemptSignal, 0);
-    },
-    attempting,
-    opened,
-    proceeding,
-    worker,
-  };
+  return { busy, worker };
 }
 
 describe("SQLite persistence", () => {
@@ -1019,7 +962,7 @@ describe("SQLite persistence", () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-attention-"));
     const databasePath = join(directory, "kernel.sqlite");
     let winner: HeldActivationCommand | undefined;
-    let contender: PreparedActivationCommand | undefined;
+    let contender: PreparedBusyOperation | undefined;
     try {
       const kernel = TorsorKernel.open({ databasePath, bootstrap });
       await kernel.execute(
@@ -1055,7 +998,7 @@ describe("SQLite persistence", () => {
           attentionId: attention.id,
           handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
         } as const;
-        contender = await prepareActivationCommand(
+        contender = await prepareBusyActivationCommand(
           databasePath,
           contenderCommand,
         );
@@ -1064,15 +1007,18 @@ describe("SQLite persistence", () => {
           idempotencyKey: "cross-connection-winner",
         });
         contender.start();
-        await contender.attempting;
-        contender.allowLockAttempt();
-        await contender.proceeding;
-        await expectUnsettled(contender.result);
+        const busy = await contender.busy;
+        expect(busy).toMatchObject({
+          errcode: 5,
+          message: expect.stringMatching(/database is locked/i),
+        });
+        expect(busy.elapsedMs).toBeGreaterThanOrEqual(100);
         winner.release();
-        const [winnerResult, contenderResult] = await Promise.all([
-          winner.result,
-          contender.result,
-        ]);
+        const winnerResult = await winner.result;
+        const contenderResult = await kernel.execute(
+          contenderCommand,
+          runtimeContext,
+        );
 
         expect(contenderResult.entityId).toBe(winnerResult.entityId);
         const database = new DatabaseSync(databasePath, { readOnly: true });
@@ -1216,7 +1162,7 @@ describe("SQLite persistence", () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-init-race-"));
     const databasePath = join(directory, "kernel.sqlite");
     let holder: HeldWriteLock | undefined;
-    let pendingOpen: PendingKernelOpen | undefined;
+    let pendingOpen: PendingBusyOperation | undefined;
     try {
       const initialized = TorsorKernel.open({ databasePath, bootstrap });
       await initialized.execute(
@@ -1232,13 +1178,15 @@ describe("SQLite persistence", () => {
       initialized.close();
 
       holder = await holdWriteLock(databasePath);
-      pendingOpen = openKernelInWorker(databasePath);
-      await pendingOpen.attempting;
-      pendingOpen.allowLockAttempt();
-      await pendingOpen.proceeding;
-      await expectUnsettled(pendingOpen.opened);
+      pendingOpen = openKernelWithShortBusyTimeout(databasePath);
+      const busy = await pendingOpen.busy;
+      expect(busy).toMatchObject({
+        errcode: 5,
+        message: expect.stringMatching(/database is locked/i),
+      });
+      expect(busy.elapsedMs).toBeGreaterThanOrEqual(100);
       holder.release();
-      await Promise.all([holder.committed, pendingOpen.opened]);
+      await holder.committed;
       const follower = TorsorKernel.open({ databasePath, bootstrap });
       try {
         const projection = await follower.query(

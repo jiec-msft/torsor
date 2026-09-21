@@ -64,8 +64,8 @@ const terminalRunStates: readonly RunState[] = [
 const schemaInitializationHookSymbol = Symbol.for(
   "torsor.kernel.schema-initialization-operation",
 );
-const commandTransactionHookSymbol = Symbol.for(
-  "torsor.kernel.command-transaction-operation",
+const sqliteBusyTimeoutOverrideSymbol = Symbol.for(
+  "torsor.kernel.test-sqlite-busy-timeout-ms",
 );
 const commandBeforeCommitHookSymbol = Symbol.for(
   "torsor.kernel.command-before-commit",
@@ -81,20 +81,23 @@ function recordSchemaInitializationOperation(
   }
 }
 
-function recordCommandTransactionOperation(
-  operation: Readonly<{ kind: "exec"; sql: "BEGIN IMMEDIATE" }>,
-): void {
-  const hook = Reflect.get(globalThis, commandTransactionHookSymbol);
-  if (typeof hook === "function") {
-    hook(operation);
-  }
-}
-
 function recordCommandBeforeCommit(commandType: KernelCommand["type"]): void {
   const hook = Reflect.get(globalThis, commandBeforeCommitHookSymbol);
   if (typeof hook === "function") {
     hook({ commandType });
   }
+}
+
+function sqliteBusyTimeoutMs(): number {
+  if (process.env.NODE_ENV !== "test") {
+    return 5_000;
+  }
+  const override = Reflect.get(globalThis, sqliteBusyTimeoutOverrideSymbol);
+  return typeof override === "number" &&
+    Number.isInteger(override) &&
+    override >= 0
+    ? override
+    : 5_000;
 }
 
 export class KernelError extends Error {
@@ -134,7 +137,9 @@ export class TorsorKernel {
     );
     this.#database = new DatabaseSync(options.databasePath);
     try {
-      this.#database.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+      this.#database.exec(
+        `PRAGMA foreign_keys = ON; PRAGMA busy_timeout = ${sqliteBusyTimeoutMs()};`,
+      );
       this.#initializeSchema();
       if (options.databasePath !== ":memory:") {
         this.#database.exec("PRAGMA journal_mode = WAL;");
@@ -174,10 +179,6 @@ export class TorsorKernel {
       this.#requireKind(principal, "runtime");
     }
     const payloadHash = hashPayload(command);
-    recordCommandTransactionOperation({
-      kind: "exec",
-      sql: "BEGIN IMMEDIATE",
-    });
     this.#database.exec("BEGIN IMMEDIATE");
     try {
       const cached = this.#getRow(
