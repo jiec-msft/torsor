@@ -10,7 +10,8 @@ The runtime provides:
 - Explicit Agent decisions to ignore an Attention, continue one eligible
   same-thread Run, or create a new Run.
 - Configurably bounded Attention concurrency across independent Agent/Thread
-  domains, with same-domain ordering preserved across pages and claim races.
+  domains and Projects, with page-round-robin discovery, pass-local fair
+  admission, and same-domain ordering preserved across pages and claim races.
 - Ordered, leased outbox consumption with idempotent command keys.
 - A provider-neutral adapter contract and deterministic fake adapter.
 - A GitHub Copilot CLI ACP stdio adapter using `copilot --acp --stdio`.

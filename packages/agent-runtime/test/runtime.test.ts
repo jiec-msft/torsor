@@ -201,6 +201,186 @@ describe("AgentRuntime", () => {
     }
   });
 
+  it(
+    "starts an independent next-page domain without waiting for a busy first page",
+    async () => {
+      const kernel = openKernel(":memory:");
+      let releaseBusy!: () => void;
+      let signalBusyStarted!: () => void;
+      let signalIndependentStarted!: () => void;
+      const release = new Promise<void>((resolve) => {
+        releaseBusy = resolve;
+      });
+      const busyStarted = new Promise<void>((resolve) => {
+        signalBusyStarted = resolve;
+      });
+      const independentStarted = new Promise<void>((resolve) => {
+        signalIndependentStarted = resolve;
+      });
+      let busyReleased = false;
+      let independentOverlapped = false;
+      let maximumBuffered = 0;
+      let observedBufferLimit = 0;
+      try {
+        const busyThread = await startMention(
+          kernel,
+          "paged-overlap-busy-root",
+          "Orbit, handle busy paged item 0.",
+        );
+        for (let index = 1; index < 100; index += 1) {
+          await kernel.execute(
+            {
+              type: "ReplyToThread",
+              idempotencyKey: `paged-overlap-busy:${index}`,
+              threadRootId: busyThread.entityId,
+              body: `Orbit, handle busy paged item ${index}.`,
+              targetAgentIds: ["agent-orbit"],
+            },
+            humanContext,
+          );
+        }
+        const independentThread = await startMention(
+          kernel,
+          "paged-overlap-independent",
+          "Orbit, handle the independent next-page item.",
+        );
+        const adapter = new DeterministicFakeAdapter(async (context) => {
+          if (context.cause.type !== "attention") {
+            throw new Error("The page overlap test must not create Run work.");
+          }
+          if (context.cause.attention.threadRootId === busyThread.entityId) {
+            if (
+              context.cause.triggeringRevision.body.endsWith("item 0.")
+            ) {
+              signalBusyStarted();
+              await release;
+            }
+          } else if (
+            context.cause.attention.threadRootId ===
+            independentThread.entityId
+          ) {
+            independentOverlapped = !busyReleased;
+            signalIndependentStarted();
+          }
+          await context.capabilities.ignoreAttention(
+            "Synthetic paged Attention handled.",
+          );
+        });
+        const runtime = createRuntime(kernel, adapter, {
+          projectIds: ["project-sample", "project-secondary"],
+          attentionConcurrency: 2,
+          hooks: {
+            attentionBufferChanged: ({ size, limit }) => {
+              maximumBuffered = Math.max(maximumBuffered, size);
+              observedBufferLimit = limit;
+            },
+          },
+        });
+
+        const pass = runtime.runOnce();
+        await busyStarted;
+        await independentStarted;
+        busyReleased = true;
+        releaseBusy();
+        const result = await pass;
+
+        expect(result.attentionsDispatched).toBe(101);
+        expect(independentOverlapped).toBe(true);
+        expect(observedBufferLimit).toBe(200);
+        expect(maximumBuffered).toBeLessThanOrEqual(observedBufferLimit);
+      } finally {
+        releaseBusy();
+        kernel.close();
+      }
+    },
+    20_000,
+  );
+
+  it("shares the global Attention concurrency bound across Projects", async () => {
+    const kernel = openKernel(":memory:");
+    let releaseBusy!: () => void;
+    let signalBusyStarted!: () => void;
+    let signalSecondaryStarted!: () => void;
+    const release = new Promise<void>((resolve) => {
+      releaseBusy = resolve;
+    });
+    const busyStarted = new Promise<void>((resolve) => {
+      signalBusyStarted = resolve;
+    });
+    const secondaryStarted = new Promise<void>((resolve) => {
+      signalSecondaryStarted = resolve;
+    });
+    let busyReleased = false;
+    let secondaryOverlapped = false;
+    let active = 0;
+    let maximumActive = 0;
+    try {
+      let firstPrimaryThreadId: string | undefined;
+      for (let index = 0; index < 200; index += 1) {
+        const thread = await mentionAgent(
+          kernel,
+          `project-overlap-primary-${index}`,
+        );
+        firstPrimaryThreadId ??= thread.entityId;
+      }
+      await kernel.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: "project-overlap-secondary",
+          projectId: "project-secondary",
+          channelId: "channel-secondary",
+          body: "Keel, handle independent Project work.",
+          targetAgentIds: ["agent-keel"],
+        },
+        humanContext,
+      );
+      const adapter = new DeterministicFakeAdapter(async (context) => {
+        if (context.cause.type !== "attention") {
+          throw new Error("The Project overlap test must not create Run work.");
+        }
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        try {
+          if (
+            context.cause.attention.projectId === "project-sample" &&
+            context.cause.attention.threadRootId === firstPrimaryThreadId
+          ) {
+            signalBusyStarted();
+            await release;
+          } else {
+            if (context.cause.attention.projectId === "project-secondary") {
+              secondaryOverlapped = !busyReleased;
+              signalSecondaryStarted();
+            }
+          }
+          await context.capabilities.ignoreAttention(
+            "Independent Project Attention handled.",
+          );
+        } finally {
+          active -= 1;
+        }
+      });
+      const runtime = createRuntime(kernel, adapter, {
+        projectIds: ["project-sample", "project-secondary"],
+        attentionConcurrency: 2,
+      });
+
+      const pass = runtime.runOnce();
+      await busyStarted;
+      await secondaryStarted;
+      busyReleased = true;
+      releaseBusy();
+      const result = await pass;
+
+      expect(result.attentionsDispatched).toBe(200);
+      expect(secondaryOverlapped).toBe(true);
+      expect(maximumActive).toBe(2);
+    } finally {
+      releaseBusy();
+      kernel.close();
+    }
+  }, 20_000);
+
   it("serializes same-thread Attention decisions within the concurrent pass", async () => {
     const kernel = openKernel(":memory:");
     const adapter = new DeterministicFakeAdapter(async (context) => {
@@ -386,6 +566,182 @@ describe("AgentRuntime", () => {
     }
   });
 
+  it("retries the domain when a lost Attention claim was already resolved", async () => {
+    const kernel = openKernel(":memory:");
+    try {
+      const thread = await startMention(
+        kernel,
+        "resolved-claim-race-root",
+        "Orbit, handle resolved claim race item 0.",
+      );
+      await kernel.execute(
+        {
+          type: "ReplyToThread",
+          idempotencyKey: "resolved-claim-race:1",
+          threadRootId: thread.entityId,
+          body: "Orbit, handle resolved claim race item 1.",
+          targetAgentIds: ["agent-orbit"],
+        },
+        humanContext,
+      );
+      const projection = await kernel.query(
+        {
+          type: "GetThreadProjection",
+          threadRootId: thread.entityId,
+        },
+        runtimeContext,
+      );
+      const orderedAttentions = [...projection.attentions].sort(
+        (left, right) => left.cursor - right.cursor,
+      );
+      const firstAttention = orderedAttentions[0]!;
+      let resolvedByCompetitor = false;
+      const runtime = createRuntime(
+        kernel,
+        new DeterministicFakeAdapter(async (context) => {
+          if (context.cause.type !== "attention") {
+            throw new Error("The claim race must not create Run work.");
+          }
+          await context.capabilities.ignoreAttention(
+            "The remaining Attention was retried.",
+          );
+        }),
+        {
+          hooks: {
+            beforeAttentionClaim: async (attention) => {
+              if (
+                attention.id !== firstAttention.id ||
+                resolvedByCompetitor
+              ) {
+                return;
+              }
+              resolvedByCompetitor = true;
+              const claim = await kernel.execute(
+                {
+                  type: "ClaimAttention",
+                  idempotencyKey: "resolved-claim-race:competitor-claim",
+                  attentionId: firstAttention.id,
+                  expectedAttentionRevision: firstAttention.revision,
+                  leaseDurationMs: 30_000,
+                },
+                runtimeContext,
+              );
+              const activation = await kernel.execute(
+                {
+                  type: "StartActivation",
+                  idempotencyKey:
+                    "resolved-claim-race:competitor-activation",
+                  attentionId: firstAttention.id,
+                  handlerLeaseToken:
+                    claim.relatedIds!.handlerLeaseToken!,
+                },
+                runtimeContext,
+              );
+              await kernel.execute(
+                {
+                  type: "IgnoreAttention",
+                  idempotencyKey:
+                    "resolved-claim-race:competitor-decision",
+                  attentionId: firstAttention.id,
+                  expectedAttentionRevision: claim.revision!,
+                  handlerLeaseToken:
+                    claim.relatedIds!.handlerLeaseToken!,
+                  reason: "A competing runtime resolved the head Attention.",
+                },
+                {
+                  principalId: "principal-orbit",
+                  activationId: activation.entityId,
+                },
+              );
+            },
+          },
+        },
+      );
+
+      const result = await runtime.drainUntilIdle();
+
+      expect(result.attentionsDispatched).toBe(1);
+      const after = await kernel.query(
+        {
+          type: "GetThreadProjection",
+          threadRootId: thread.entityId,
+        },
+        runtimeContext,
+      );
+      expect(
+        after.attentions.every(
+          (attention) => attention.status === "Ignored",
+        ),
+      ).toBe(true);
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("bounds buffered work while claim losses leave live leases", async () => {
+    const kernel = openKernel(":memory:");
+    let claimLosses = 0;
+    let providerExecutions = 0;
+    let maximumRetained = 0;
+    let retainedLimit = 0;
+    try {
+      for (let index = 0; index < 250; index += 1) {
+        await mentionAgent(kernel, `bounded-claim-loss-${index}`);
+      }
+      const runtime = createRuntime(
+        kernel,
+        new DeterministicFakeAdapter(async (context) => {
+          providerExecutions += 1;
+          await context.capabilities.ignoreAttention(
+            "Deferred Attention handled on the next pass.",
+          );
+        }),
+        {
+          attentionConcurrency: 2,
+          hooks: {
+            beforeAttentionClaim: async (attention) => {
+              if (claimLosses >= 200) {
+                return;
+              }
+              await kernel.execute(
+                {
+                  type: "ClaimAttention",
+                  idempotencyKey: `preempt:${attention.id}`,
+                  attentionId: attention.id,
+                  expectedAttentionRevision: attention.revision,
+                  leaseDurationMs: 30_000,
+                },
+                runtimeContext,
+              );
+              claimLosses += 1;
+            },
+            attentionBufferChanged: ({ size, limit }) => {
+              maximumRetained = Math.max(maximumRetained, size);
+              retainedLimit = limit;
+            },
+          },
+        },
+      );
+
+      let attentionsDispatched = 0;
+      let passes = 0;
+      while (providerExecutions < 50 && passes < 3) {
+        const result = await runtime.runOnce();
+        attentionsDispatched += result.attentionsDispatched;
+        passes += 1;
+      }
+
+      expect(attentionsDispatched).toBe(50);
+      expect(passes).toBeLessThanOrEqual(3);
+      expect(claimLosses).toBe(200);
+      expect(providerExecutions).toBe(50);
+      expect(retainedLimit).toBe(200);
+      expect(maximumRetained).toBeLessThanOrEqual(retainedLimit);
+    } finally {
+      kernel.close();
+    }
+  }, 20_000);
+
   it("does not claim a later same-thread Attention after losing the domain race", async () => {
     const kernel = openKernel(":memory:");
     let signalFirstProvider!: () => void;
@@ -393,6 +749,7 @@ describe("AgentRuntime", () => {
     const firstProviderStarted = new Promise<void>((resolve) => {
       signalFirstProvider = resolve;
     });
+
     const releaseFirst = new Promise<void>((resolve) => {
       releaseFirstProvider = resolve;
     });
@@ -482,9 +839,10 @@ describe("AgentRuntime", () => {
       await firstProviderStarted;
       const losingPass = await secondRuntime.runOnce();
       expect(losingPass.attentionsDispatched).toBe(0);
-      expect(secondClaims).toEqual([firstAttentionId]);
+      expect(secondClaims).toEqual([]);
       releaseFirstProvider();
       await firstPass;
+      await firstRuntime.drainUntilIdle();
 
       const after = await kernel.query(
         {
@@ -517,6 +875,63 @@ describe("AgentRuntime", () => {
       expect(run.inputs).toHaveLength(2);
     } finally {
       releaseFirstProvider();
+      kernel.close();
+    }
+  });
+
+  it("does not spin on later same-thread work behind a live lease", async () => {
+    const kernel = openKernel(":memory:");
+    let providerExecutions = 0;
+    const adapter = new DeterministicFakeAdapter(async () => {
+      providerExecutions += 1;
+    });
+    try {
+      const thread = await startMention(
+        kernel,
+        "live-lease-domain-root",
+        "Orbit, handle live lease item 0.",
+      );
+      for (let index = 1; index < 3; index += 1) {
+        await kernel.execute(
+          {
+            type: "ReplyToThread",
+            idempotencyKey: `live-lease-domain:${index}`,
+            threadRootId: thread.entityId,
+            body: `Orbit, handle live lease item ${index}.`,
+            targetAgentIds: ["agent-orbit"],
+          },
+          humanContext,
+        );
+      }
+      const projection = await kernel.query(
+        {
+          type: "GetThreadProjection",
+          threadRootId: thread.entityId,
+        },
+        runtimeContext,
+      );
+      const firstAttention = [...projection.attentions].sort(
+        (left, right) => left.cursor - right.cursor,
+      )[0]!;
+      await kernel.execute(
+        {
+          type: "ClaimAttention",
+          idempotencyKey: "live-lease-domain:claim",
+          attentionId: firstAttention.id,
+          expectedAttentionRevision: firstAttention.revision,
+          leaseDurationMs: 30_000,
+        },
+        runtimeContext,
+      );
+
+      await expect(
+        createRuntime(kernel, adapter).drainUntilIdle(4),
+      ).resolves.toEqual({
+        attentionsDispatched: 0,
+        outboxEventsProcessed: 3,
+      });
+      expect(providerExecutions).toBe(0);
+    } finally {
       kernel.close();
     }
   });
@@ -595,9 +1010,10 @@ describe("AgentRuntime", () => {
         const losingPass = await secondRuntime.runOnce();
 
         expect(losingPass.attentionsDispatched).toBe(0);
-        expect(secondClaims).toEqual([firstAttentionId]);
+        expect(secondClaims).toEqual([]);
         releaseFirstProvider();
-        await firstPass;
+        const firstResult = await firstPass;
+        const secondResult = await firstRuntime.runOnce();
         const after = await kernel.query(
           {
             type: "GetThreadProjection",
@@ -606,10 +1022,13 @@ describe("AgentRuntime", () => {
           humanContext,
         );
         expect(after.runs).toHaveLength(1);
+        const orderedAfter = [...after.attentions].sort(
+          (left, right) => left.cursor - right.cursor,
+        );
+        expect(firstResult.attentionsDispatched).toBe(100);
+        expect(secondResult.attentionsDispatched).toBe(1);
         expect(
-          after.attentions.every(
-            (attention) => attention.status === "Resolved",
-          ),
+          orderedAfter.every((attention) => attention.status === "Resolved"),
         ).toBe(true);
         const run = await kernel.query(
           {
@@ -833,7 +1252,7 @@ describe("AgentRuntime", () => {
     }
   });
 
-  it("reconciles an unfinished ProviderAttempt after an Attention decision", async () => {
+  it("immediately reconciles a finished Attention with an unfinished ProviderAttempt", async () => {
     let now = new Date("2026-09-21T08:00:00.000Z");
     const kernel = openKernel(":memory:", () => now);
     try {
@@ -895,7 +1314,18 @@ describe("AgentRuntime", () => {
         eligibleRuns: [],
       });
       await bridge.ignoreAttention("Decision persisted before process loss.");
-      now = new Date(now.getTime() + 31_000);
+      const recoverable = await kernel.query(
+        {
+          type: "ListRecoverableAttentionExecutions",
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      expect(recoverable.items[0]?.activation).toMatchObject({
+        id: activation.entityId,
+        finishedAt: now.toISOString(),
+        expiresAt: new Date(now.getTime() + 30_000).toISOString(),
+      });
 
       await createRuntime(
         kernel,
@@ -910,6 +1340,133 @@ describe("AgentRuntime", () => {
           event.entityId === attempt.entityId,
       );
       expect(finish?.payload).toMatchObject({ status: "Unknown" });
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("does not fail live Attention completion when recovery settles its attempt", async () => {
+    const kernel = openKernel(":memory:");
+    let signalDecisionCommitted!: () => void;
+    let releaseProvider!: () => void;
+    const decisionCommitted = new Promise<void>((resolve) => {
+      signalDecisionCommitted = resolve;
+    });
+
+    const providerRelease = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type !== "attention") {
+        throw new Error("The recovery race must not create Run work.");
+      }
+      await context.capabilities.ignoreAttention(
+        "Persist the decision before returning.",
+      );
+      signalDecisionCommitted();
+      await providerRelease;
+    });
+    try {
+      await mentionAgent(kernel, "live-decision-recovery-race");
+      const ownerPass = createRuntime(kernel, adapter).runOnce();
+      await decisionCommitted;
+
+      await createRuntime(kernel, new DeterministicFakeAdapter()).runOnce();
+      releaseProvider();
+      await expect(ownerPass).resolves.toMatchObject({
+        attentionsDispatched: 1,
+      });
+
+      const events = await kernel.readEvents(null, 500);
+      const attemptFinishes = events.filter(
+        (event) => event.type === "ProviderAttemptFinished",
+      );
+      expect(attemptFinishes).toHaveLength(1);
+      expect(attemptFinishes[0]?.payload).toMatchObject({
+        status: "Unknown",
+      });
+    } finally {
+      releaseProvider();
+      kernel.close();
+    }
+  });
+
+  it("does not fail Attention recovery when live completion settles first", async () => {
+    const kernel = openKernel(":memory:");
+    let signalDecisionCommitted!: () => void;
+    let releaseProvider!: () => void;
+    const decisionCommitted = new Promise<void>((resolve) => {
+      signalDecisionCommitted = resolve;
+    });
+    const providerRelease = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type !== "attention") {
+        throw new Error("The recovery race must not create Run work.");
+      }
+      await context.capabilities.ignoreAttention(
+        "Persist the decision before returning.",
+      );
+      signalDecisionCommitted();
+      await providerRelease;
+    });
+    try {
+      await mentionAgent(kernel, "recovery-after-live-completion-race");
+      const ownerPass = createRuntime(kernel, adapter).runOnce();
+      await decisionCommitted;
+
+      const recoveryPass = createRuntime(
+        kernel,
+        new DeterministicFakeAdapter(),
+        {
+          hooks: {
+            beforeAttentionRecoverySettlement: async () => {
+              releaseProvider();
+              await ownerPass;
+            },
+          },
+        },
+      ).runOnce();
+
+      await expect(recoveryPass).resolves.toMatchObject({
+        attentionsDispatched: 0,
+      });
+      const events = await kernel.readEvents(null, 500);
+      const attemptFinishes = events.filter(
+        (event) => event.type === "ProviderAttemptFinished",
+      );
+      expect(attemptFinishes).toHaveLength(1);
+      expect(attemptFinishes[0]?.payload).toMatchObject({
+        status: "Completed",
+      });
+    } finally {
+      releaseProvider();
+      kernel.close();
+    }
+  });
+
+  it("surfaces Attention buffer observer failures without hanging", async () => {
+    const kernel = openKernel(":memory:");
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type !== "attention") {
+        throw new Error("The observer test must not create Run work.");
+      }
+      await context.capabilities.ignoreAttention("Observer failure test.");
+    });
+    try {
+      await mentionAgent(kernel, "buffer-observer-failure");
+      const runtime = createRuntime(kernel, adapter, {
+        hooks: {
+          attentionBufferChanged: () => {
+            throw new Error("Synthetic Attention observer failure.");
+          },
+        },
+      });
+
+      await expect(runtime.runOnce()).rejects.toThrow(
+        "Synthetic Attention observer failure.",
+      );
     } finally {
       kernel.close();
     }
@@ -990,19 +1547,19 @@ describe("AgentRuntime", () => {
 
   it("does not reconcile a live Attention provider before lease expiry", async () => {
     const kernel = openKernel(":memory:");
-    let createdRun!: () => void;
+    let signalProviderStarted!: () => void;
     let releaseAttention!: () => void;
-    const runCreated = new Promise<void>((resolve) => {
-      createdRun = resolve;
+    const providerStarted = new Promise<void>((resolve) => {
+      signalProviderStarted = resolve;
     });
     const release = new Promise<void>((resolve) => {
       releaseAttention = resolve;
     });
     const adapter = new DeterministicFakeAdapter(async (context) => {
       if (context.cause.type === "attention") {
-        await context.capabilities.createRunFromAttention();
-        createdRun();
+        signalProviderStarted();
         await release;
+        await context.capabilities.createRunFromAttention();
         return;
       }
       await context.capabilities.complete();
@@ -1011,7 +1568,7 @@ describe("AgentRuntime", () => {
       await mentionAgent(kernel, "live-attention-recovery");
       const firstRuntime = createRuntime(kernel, adapter);
       const liveExecution = firstRuntime.runOnce();
-      await runCreated;
+      await providerStarted;
 
       const secondRuntime = createRuntime(kernel, adapter);
       await secondRuntime.runOnce();
