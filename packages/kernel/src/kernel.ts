@@ -151,20 +151,28 @@ export class TorsorKernel {
           );
         }
         const result = JSON.parse(text(cached.result_json)) as CommandResult;
-        if (
-          command.type !== "ClaimOutboxEvents" ||
-          this.#isLiveOutboxClaim(result, principal)
-        ) {
+        if (command.type === "ClaimOutboxEvents") {
+          const refreshed = this.#resolveCachedOutboxClaim(
+            command,
+            result,
+            principal,
+          );
+          if (JSON.stringify(refreshed) !== JSON.stringify(result)) {
+            this.#run(
+              `UPDATE idempotency_records
+                  SET result_json = ?
+                WHERE principal_id = ? AND command_name = ? AND idempotency_key = ?`,
+              JSON.stringify(refreshed),
+              text(principal.id),
+              command.type,
+              command.idempotencyKey,
+            );
+          }
           this.#database.exec("COMMIT");
-          return result;
+          return refreshed;
         }
-        this.#run(
-          `DELETE FROM idempotency_records
-            WHERE principal_id = ? AND command_name = ? AND idempotency_key = ?`,
-          text(principal.id),
-          command.type,
-          command.idempotencyKey,
-        );
+        this.#database.exec("COMMIT");
+        return result;
       }
 
       const correlationId = this.#idFactory("corr");
@@ -255,6 +263,10 @@ export class TorsorKernel {
           break;
         }
         case "ListOpenAttentions":
+          {
+          const snapshot = this.#resolveAttentionSnapshot(
+            query.snapshotEventId,
+          );
           if (text(principal.kind) === "agent") {
             const agent = this.#requireAgentForPrincipal(text(principal.id));
             if (
@@ -279,6 +291,8 @@ export class TorsorKernel {
               text(agent.project_id),
               text(agent.id),
               query.afterCursor ?? 0,
+              snapshot.sequence,
+              snapshot.eventId,
               boundedLimit(query.limit),
             );
             break;
@@ -290,9 +304,12 @@ export class TorsorKernel {
             query.projectId,
             query.targetAgentId,
             query.afterCursor ?? 0,
+            snapshot.sequence,
+            snapshot.eventId,
             boundedLimit(query.limit),
           );
           break;
+          }
         case "ListOutboxEvents":
           this.#requireKind(principal, "runtime");
           result = this.#listOutboxEvents(
@@ -349,6 +366,13 @@ export class TorsorKernel {
         return this.#sendToRun(command, principal, context, correlationId);
       case "CancelRun":
         return this.#cancelRun(command, principal, context, correlationId);
+      case "WithdrawRunInput":
+        return this.#withdrawRunInput(
+          command,
+          principal,
+          context,
+          correlationId,
+        );
       case "ClaimAttention":
         return this.#claimAttention(command, principal, correlationId);
       case "ResolveAttentionWithRun":
@@ -581,6 +605,101 @@ export class TorsorKernel {
     );
   }
 
+  #withdrawRunInput(
+    command: Extract<KernelCommand, { type: "WithdrawRunInput" }>,
+    principal: Row,
+    context: PrincipalContext,
+    correlationId: string,
+  ): CommandResult {
+    const input = this.#requireRunInput(command.runInputId);
+    const run = this.#requireMutableRun(
+      text(input.run_id),
+      command.expectedRunRevision,
+    );
+    this.#checkRevision(
+      integer(input.disposition_revision),
+      command.expectedDispositionRevision,
+      "RunInput disposition",
+    );
+    if (text(input.disposition) !== "Pending") {
+      throw new KernelError(
+        "Conflict",
+        "Only a Pending RunInput can be withdrawn.",
+      );
+    }
+    if (text(input.assigned_by_principal_id) !== text(principal.id)) {
+      throw new KernelError(
+        "Forbidden",
+        "Only the assigning principal can withdraw this RunInput.",
+      );
+    }
+    let activationId: string | null = null;
+    if (text(principal.kind) === "agent") {
+      activationId = text(
+        this.#requireRunActivation(context, principal, run).id,
+      );
+    } else if (text(principal.kind) !== "human") {
+      throw new KernelError(
+        "Forbidden",
+        "Only the assigning Human or Agent can withdraw this RunInput.",
+      );
+    }
+    requireNonEmpty(command.reason, "reason");
+    const runRevision = integer(run.revision) + 1;
+    const dispositionRevision = integer(input.disposition_revision) + 1;
+    this.#run(
+      `UPDATE run_inputs
+          SET disposition = 'Withdrawn',
+              disposition_revision = ?,
+              disposition_reason = ?,
+              superseded_by_run_input_id = NULL
+        WHERE id = ?`,
+      dispositionRevision,
+      command.reason,
+      command.runInputId,
+    );
+    this.#run(
+      "UPDATE runs SET revision = ?, updated_at = ? WHERE id = ?",
+      runRevision,
+      this.#now(),
+      text(run.id),
+    );
+    const cursor = this.#emitThreadEvent({
+      type: "RunInputWithdrawn",
+      projectId: text(run.project_id),
+      channelId: text(run.home_channel_id),
+      threadRootId: text(run.thread_root_id),
+      entityType: "RunInput",
+      entityId: command.runInputId,
+      actorPrincipalId: text(principal.id),
+      activationId,
+      causationId: command.runInputId,
+      correlationId,
+      payload: {
+        runId: text(run.id),
+        runRevision,
+        dispositionRevision,
+        reason: command.reason,
+      },
+    });
+    this.#enqueueOutbox(
+      "run-input.withdrawn",
+      "RunInput",
+      command.runInputId,
+      { runId: text(run.id), runRevision, dispositionRevision },
+    );
+    return {
+      commandType: command.type,
+      entityId: command.runInputId,
+      revision: dispositionRevision,
+      threadCursor: cursor,
+      relatedIds: {
+        runId: text(run.id),
+        runRevision: String(runRevision),
+      },
+    };
+  }
+
   #claimAttention(
     command: Extract<KernelCommand, { type: "ClaimAttention" }>,
     principal: Row,
@@ -643,7 +762,7 @@ export class TorsorKernel {
       expiresAt,
       command.attentionId,
     );
-    this.#emitEvent({
+    const eventSequence = this.#emitEvent({
       type: "AttentionClaimed",
       projectId: text(attention.project_id),
       channelId: text(attention.channel_id),
@@ -657,6 +776,7 @@ export class TorsorKernel {
       correlationId,
       payload: { revision, expiresAt },
     });
+    this.#recordAttentionHistory(command.attentionId, eventSequence);
     return {
       commandType: command.type,
       entityId: command.attentionId,
@@ -773,7 +893,7 @@ export class TorsorKernel {
       correlationId,
       payload: { state: "Active", ownerAgentId: text(agent.id) },
     });
-    this.#emitEvent({
+    const attentionEventSequence = this.#emitEvent({
       type: "AttentionResolved",
       projectId: text(attention.project_id),
       channelId: text(attention.channel_id),
@@ -787,6 +907,7 @@ export class TorsorKernel {
       correlationId,
       payload: { outcome: "RunCreated", runId },
     });
+    this.#recordAttentionHistory(command.attentionId, attentionEventSequence);
     this.#enqueueOutbox(
       "run.activation-requested",
       "Run",
@@ -1314,16 +1435,22 @@ export class TorsorKernel {
       now.getTime() + leaseDurationMs,
     ).toISOString();
     const candidates = this.#allRows(
-      `SELECT id
+      `SELECT id, lease_expires_at
          FROM outbox_events
         WHERE acknowledged_at IS NULL
-          AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
         ORDER BY sequence
         LIMIT ?`,
-      now.toISOString(),
       limit,
     );
+    const claimable: Row[] = [];
     for (const candidate of candidates) {
+      const currentExpiry = optionalText(candidate.lease_expires_at);
+      if (currentExpiry && new Date(currentExpiry) > now) {
+        break;
+      }
+      claimable.push(candidate);
+    }
+    for (const candidate of claimable) {
       this.#run(
         `UPDATE outbox_events
             SET lease_holder_principal_id = ?,
@@ -1337,7 +1464,7 @@ export class TorsorKernel {
         text(candidate.id),
       );
     }
-    const outboxEvents = candidates.map((candidate) =>
+    const outboxEvents = claimable.map((candidate) =>
       mapOutboxEvent(this.#requireOutboxEvent(text(candidate.id))),
     );
     return {
@@ -1364,7 +1491,7 @@ export class TorsorKernel {
     requireNonEmpty(command.leaseToken, "leaseToken");
     const now = this.#now();
     const leasedRows = this.#allRows(
-      `SELECT id
+      `SELECT id, sequence
          FROM outbox_events
         WHERE acknowledged_at IS NULL
           AND lease_holder_principal_id = ?
@@ -1381,6 +1508,20 @@ export class TorsorKernel {
       throw new KernelError(
         "InvalidCommand",
         "Outbox acknowledgement must include the entire leased batch.",
+      );
+    }
+    const firstSequence = integer(leasedRows[0]!.sequence);
+    const earlierPending = this.#getRow(
+      `SELECT id
+         FROM outbox_events
+        WHERE acknowledged_at IS NULL AND sequence < ?
+        LIMIT 1`,
+      firstSequence,
+    );
+    if (earlierPending) {
+      throw new KernelError(
+        "Conflict",
+        "Outbox acknowledgement must advance the oldest pending frontier.",
       );
     }
     for (const id of ids) {
@@ -1421,29 +1562,94 @@ export class TorsorKernel {
     };
   }
 
-  #isLiveOutboxClaim(result: CommandResult, principal: Row): boolean {
+  #resolveCachedOutboxClaim(
+    command: Extract<KernelCommand, { type: "ClaimOutboxEvents" }>,
+    result: CommandResult,
+    principal: Row,
+  ): CommandResult {
     if (
       !result.leaseToken ||
       !result.outboxEvents ||
       result.outboxEvents.length === 0
     ) {
-      return false;
+      return result;
     }
     const now = this.#clock();
-    return result.outboxEvents.every((cachedEvent) => {
-      const event = this.#getRow(
-        "SELECT * FROM outbox_events WHERE id = ?",
-        cachedEvent.id,
-      );
-      return (
-        event !== undefined &&
-        event.acknowledged_at === null &&
-        optionalText(event.lease_holder_principal_id) === text(principal.id) &&
-        optionalText(event.lease_token) === result.leaseToken &&
-        optionalText(event.lease_expires_at) !== null &&
-        new Date(text(event.lease_expires_at)) > now
-      );
+    const originalIds = result.outboxEvents.map((event) => event.id);
+    const rows = originalIds.map((id) =>
+      this.#getRow("SELECT * FROM outbox_events WHERE id = ?", id),
+    );
+    if (
+      rows.some(
+        (row) =>
+          row === undefined ||
+          row.acknowledged_at !== null,
+      )
+    ) {
+      return result;
+    }
+    const typedRows = rows as Row[];
+    const originalLeaseIsLive = typedRows.every(
+      (row) =>
+        optionalText(row.lease_holder_principal_id) === text(principal.id) &&
+        optionalText(row.lease_token) === result.leaseToken &&
+        optionalText(row.lease_expires_at) !== null &&
+        new Date(text(row.lease_expires_at)) > now,
+    );
+    if (originalLeaseIsLive) {
+      return result;
+    }
+    const anotherLiveLease = typedRows.some((row) => {
+      const expiry = optionalText(row.lease_expires_at);
+      return expiry !== null && new Date(expiry) > now;
     });
+    if (anotherLiveLease) {
+      return result;
+    }
+    const frontier = this.#allRows(
+      `SELECT id
+         FROM outbox_events
+        WHERE acknowledged_at IS NULL
+        ORDER BY sequence
+        LIMIT ?`,
+      originalIds.length,
+    ).map((row) => text(row.id));
+    if (
+      frontier.length !== originalIds.length ||
+      frontier.some((id, index) => id !== originalIds[index])
+    ) {
+      return result;
+    }
+    const leaseDurationMs = boundedDuration(
+      command.leaseDurationMs,
+      "leaseDurationMs",
+    );
+    const leaseToken = this.#idFactory("outbox_lease");
+    const leaseExpiresAt = new Date(
+      now.getTime() + leaseDurationMs,
+    ).toISOString();
+    for (const id of originalIds) {
+      this.#run(
+        `UPDATE outbox_events
+            SET lease_holder_principal_id = ?,
+                lease_token = ?,
+                lease_expires_at = ?,
+                delivery_attempts = delivery_attempts + 1
+          WHERE id = ?`,
+        text(principal.id),
+        leaseToken,
+        leaseExpiresAt,
+        id,
+      );
+    }
+    return {
+      ...result,
+      entityId: leaseToken,
+      leaseToken,
+      outboxEvents: originalIds.map((id) =>
+        mapOutboxEvent(this.#requireOutboxEvent(id)),
+      ),
+    };
   }
 
   #publishRunReply(
@@ -1842,12 +2048,6 @@ export class TorsorKernel {
     correlationId: string,
   ): CommandResult {
     const run = this.#requireRun(command.runId);
-    if (!terminalRunStates.includes(text(run.state) as RunState)) {
-      throw new KernelError(
-        "Conflict",
-        "Late output can only be recorded after a Run is terminal.",
-      );
-    }
     const provenance = this.#validateActivityProvenance(
       command.runId,
       command.activationId,
@@ -1856,6 +2056,16 @@ export class TorsorKernel {
       context,
       true,
     );
+    const activation = this.#requireActivation(provenance.activationId);
+    if (
+      !terminalRunStates.includes(text(run.state) as RunState) &&
+      this.#isCurrentRunActivation(activation, run)
+    ) {
+      throw new KernelError(
+        "Conflict",
+        "Output from the current Activation is not late output.",
+      );
+    }
     const activity = this.#insertActivity(
       command.runId,
       provenance.activationId,
@@ -1879,7 +2089,7 @@ export class TorsorKernel {
       payload: {
         runId: command.runId,
         sequence: activity.sequence,
-        terminalState: text(run.state),
+        runState: text(run.state),
       },
     });
     return {
@@ -2057,7 +2267,7 @@ export class TorsorKernel {
           targetAgentId,
           now,
         );
-        this.#emitEvent({
+        const createdEventSequence = this.#emitEvent({
           type: "AttentionOpened",
           projectId: input.projectId,
           channelId: input.channelId,
@@ -2071,6 +2281,12 @@ export class TorsorKernel {
           correlationId: input.correlationId,
           payload: { targetAgentId, triggerKind: "Mention" },
         });
+        this.#run(
+          "UPDATE attentions SET created_event_sequence = ? WHERE id = ?",
+          createdEventSequence,
+          attentionId,
+        );
+        this.#recordAttentionHistory(attentionId, createdEventSequence);
       }
     }
     const threadCursor = this.#emitThreadEvent({
@@ -2320,13 +2536,14 @@ export class TorsorKernel {
     return cursor;
   }
 
-  #emitEvent(event: EventInput): void {
-    this.#run(
+  #emitEvent(event: EventInput): number {
+    const result = this.#database.prepare(
       `INSERT INTO public_events
         (event_id, type, project_id, channel_id, thread_root_id, thread_cursor,
          entity_type, entity_id, actor_principal_id, activation_id,
          causation_id, correlation_id, payload_json, occurred_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
       this.#idFactory("event"),
       event.type,
       event.projectId,
@@ -2341,6 +2558,25 @@ export class TorsorKernel {
       event.correlationId,
       JSON.stringify(event.payload),
       this.#now(),
+    );
+    return Number(result.lastInsertRowid);
+  }
+
+  #recordAttentionHistory(
+    attentionId: string,
+    eventSequence: number,
+  ): void {
+    this.#run(
+      `INSERT INTO attention_history
+        (attention_id, event_sequence, status, revision,
+         handler_lease_holder_principal_id, handler_lease_expires_at,
+         resolved_run_id, resolved_at)
+       SELECT id, ?, status, revision, handler_lease_holder_principal_id,
+              handler_lease_expires_at, resolved_run_id, resolved_at
+         FROM attentions
+        WHERE id = ?`,
+      eventSequence,
+      attentionId,
     );
   }
 
@@ -2384,10 +2620,7 @@ export class TorsorKernel {
         ORDER BY a.name, a.id`,
       projectId,
     ).map(mapAgent);
-    const latest = this.#getRow(
-      "SELECT event_id FROM public_events WHERE project_id = ? ORDER BY sequence DESC LIMIT 1",
-      projectId,
-    );
+    const snapshot = this.#resolveAttentionSnapshot(undefined);
     return {
       project: mapProject(project),
       channels,
@@ -2396,9 +2629,11 @@ export class TorsorKernel {
         projectId,
         attentionTargetAgentId,
         0,
+        snapshot.sequence,
+        snapshot.eventId,
         100,
       ),
-      latestEventId: latest ? text(latest.event_id) : null,
+      latestEventId: snapshot.eventId,
     };
   }
 
@@ -2529,24 +2764,49 @@ export class TorsorKernel {
     projectId: string | undefined,
     targetAgentId: string | undefined,
     afterCursor: number,
+    snapshotEventSequence: number,
+    snapshotEventId: string | null,
     limit: number,
   ): AttentionPage {
-    const clauses = ["status = 'Open'", "sequence > ?"];
-    const parameters: SQLInputValue[] = [afterCursor];
+    const clauses = [
+      "history.status = 'Open'",
+      "attention.sequence > ?",
+      "attention.created_event_sequence IS NOT NULL",
+      "attention.created_event_sequence <= ?",
+    ];
+    const parameters: SQLInputValue[] = [
+      afterCursor,
+      snapshotEventSequence,
+    ];
     if (projectId) {
-      clauses.push("project_id = ?");
+      clauses.push("attention.project_id = ?");
       parameters.push(projectId);
     }
     if (targetAgentId) {
-      clauses.push("target_agent_id = ?");
+      clauses.push("attention.target_agent_id = ?");
       parameters.push(targetAgentId);
     }
     parameters.push(limit + 1);
     const rows = this.#allRows(
-      `SELECT * FROM attentions
+      `SELECT attention.sequence, attention.id, attention.message_revision_id,
+              attention.target_agent_id, attention.trigger_kind,
+              history.status, history.revision,
+              history.handler_lease_holder_principal_id,
+              history.handler_lease_expires_at, history.resolved_run_id,
+              attention.created_at, history.resolved_at
+         FROM attentions AS attention
+         JOIN attention_history AS history
+           ON history.attention_id = attention.id
+          AND history.event_sequence = (
+            SELECT MAX(candidate.event_sequence)
+              FROM attention_history AS candidate
+             WHERE candidate.attention_id = attention.id
+               AND candidate.event_sequence <= ?
+          )
         WHERE ${clauses.join(" AND ")}
-        ORDER BY sequence
+        ORDER BY attention.sequence
         LIMIT ?`,
+      snapshotEventSequence,
       ...parameters,
     );
     const hasMore = rows.length > limit;
@@ -2555,6 +2815,7 @@ export class TorsorKernel {
       items,
       nextCursor: hasMore ? items.at(-1)?.cursor ?? null : null,
       hasMore,
+      snapshotEventId,
     };
   }
 
@@ -2590,6 +2851,90 @@ export class TorsorKernel {
     if (version === CURRENT_SCHEMA_VERSION) {
       this.#database.exec(schemaSql);
       return;
+    }
+    if (version === 1) {
+      this.#database.exec("BEGIN IMMEDIATE");
+      try {
+        this.#database.exec(
+          `ALTER TABLE attentions
+             ADD COLUMN created_event_sequence INTEGER
+             REFERENCES public_events(sequence)`,
+        );
+        this.#database.exec(
+          `UPDATE attentions
+              SET created_event_sequence = (
+                SELECT sequence
+                  FROM public_events
+                 WHERE type = 'AttentionOpened'
+                   AND entity_type = 'Attention'
+                   AND entity_id = attentions.id
+                 ORDER BY sequence
+                 LIMIT 1
+              )`,
+        );
+        this.#database.exec(schemaSql);
+        this.#database.exec(
+          `INSERT OR IGNORE INTO attention_history
+            (attention_id, event_sequence, status, revision,
+             handler_lease_holder_principal_id, handler_lease_expires_at,
+             resolved_run_id, resolved_at)
+           SELECT id, created_event_sequence, 'Open', 1, NULL, NULL, NULL, NULL
+             FROM attentions
+            WHERE created_event_sequence IS NOT NULL`,
+        );
+        this.#database.exec(
+          `INSERT INTO attention_history
+            (attention_id, event_sequence, status, revision,
+             handler_lease_holder_principal_id, handler_lease_expires_at,
+             resolved_run_id, resolved_at)
+           SELECT event.entity_id,
+                  event.sequence,
+                  'Open',
+                  CAST(json_extract(event.payload_json, '$.revision') AS INTEGER),
+                  event.actor_principal_id,
+                  json_extract(event.payload_json, '$.expiresAt'),
+                  NULL,
+                  NULL
+             FROM public_events AS event
+            WHERE event.entity_type = 'Attention'
+              AND event.type = 'AttentionClaimed'`,
+        );
+        this.#database.exec(
+          `INSERT INTO attention_history
+            (attention_id, event_sequence, status, revision,
+             handler_lease_holder_principal_id, handler_lease_expires_at,
+             resolved_run_id, resolved_at)
+           SELECT event.entity_id,
+                  event.sequence,
+                  'Resolved',
+                  (
+                    SELECT COALESCE(
+                      MAX(CAST(json_extract(claim.payload_json, '$.revision') AS INTEGER)),
+                      1
+                    ) + 1
+                      FROM public_events AS claim
+                     WHERE claim.entity_type = 'Attention'
+                       AND claim.entity_id = event.entity_id
+                       AND claim.type = 'AttentionClaimed'
+                       AND claim.sequence < event.sequence
+                  ),
+                  NULL,
+                  NULL,
+                  json_extract(event.payload_json, '$.runId'),
+                  event.occurred_at
+             FROM public_events AS event
+            WHERE event.entity_type = 'Attention'
+              AND event.type = 'AttentionResolved'`,
+        );
+        this.#database.exec(
+          `PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`,
+        );
+        this.#database.exec("COMMIT");
+        return;
+      } catch (error) {
+        this.#database.exec("ROLLBACK");
+        throw this.#translateError(error);
+      }
     }
     if (version !== 0) {
       throw new KernelError(
@@ -2800,6 +3145,18 @@ export class TorsorKernel {
     }
   }
 
+  #isCurrentRunActivation(activation: Row, run: Row): boolean {
+    return (
+      optionalText(activation.run_id) === text(run.id) &&
+      activation.finished_at === null &&
+      activation.revoked_at === null &&
+      new Date(text(activation.expires_at)) > this.#clock() &&
+      text(run.state) === "Active" &&
+      integer(activation.run_activation_generation) ===
+        integer(run.activation_generation)
+    );
+  }
+
   #revokeRunActivations(
     runId: string,
     reason: string,
@@ -2836,6 +3193,29 @@ export class TorsorKernel {
       channelId: text(attention.channel_id),
       threadRootId: text(attention.thread_root_id),
     };
+  }
+
+  #resolveAttentionSnapshot(
+    snapshotEventId: string | null | undefined,
+  ): { sequence: number; eventId: string | null } {
+    if (snapshotEventId === null) {
+      return { sequence: 0, eventId: null };
+    }
+    if (snapshotEventId !== undefined) {
+      return {
+        sequence: this.#eventSequence(snapshotEventId),
+        eventId: snapshotEventId,
+      };
+    }
+    const latest = this.#getRow(
+      "SELECT sequence, event_id FROM public_events ORDER BY sequence DESC LIMIT 1",
+    );
+    return latest
+      ? {
+          sequence: integer(latest.sequence),
+          eventId: text(latest.event_id),
+        }
+      : { sequence: 0, eventId: null };
   }
 
   #eventSequence(eventId: string): number {
@@ -2906,6 +3286,14 @@ export class TorsorKernel {
     const row = this.#getRow("SELECT * FROM runs WHERE id = ?", id);
     if (!row) {
       throw new KernelError("NotFound", `Run ${id} does not exist.`);
+    }
+    return row;
+  }
+
+  #requireRunInput(id: string): Row {
+    const row = this.#getRow("SELECT * FROM run_inputs WHERE id = ?", id);
+    if (!row) {
+      throw new KernelError("NotFound", `RunInput ${id} does not exist.`);
     }
     return row;
   }

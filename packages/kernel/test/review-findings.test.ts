@@ -195,6 +195,88 @@ describe("independent review regressions", () => {
     }
   });
 
+  it("allows only the assigning Human to withdraw a RunInput", async () => {
+    const kernel = openMemoryKernel();
+    try {
+      const setup = await createRun(kernel);
+      const sent = await kernel.execute(
+        {
+          type: "SendToRun",
+          idempotencyKey: "withdraw-human-input",
+          runId: setup.runId,
+          expectedRunRevision: 1,
+          body: "This Human input may be explicitly withdrawn.",
+        },
+        humanContext,
+      );
+      const runInputId = sent.relatedIds!.runInputId!;
+
+      await expect(
+        kernel.execute(
+          {
+            type: "WithdrawRunInput",
+            idempotencyKey: "unrelated-human-withdrawal",
+            runInputId,
+            expectedRunRevision: 2,
+            expectedDispositionRevision: 1,
+            reason: "An unrelated Human cannot withdraw this input.",
+          },
+          { principalId: "principal-riley" },
+        ),
+      ).rejects.toMatchObject({ code: "Forbidden" });
+      await expect(
+        kernel.execute(
+          {
+            type: "WithdrawRunInput",
+            idempotencyKey: "unrelated-agent-withdrawal",
+            runInputId,
+            expectedRunRevision: 2,
+            expectedDispositionRevision: 1,
+            reason: "An unrelated Agent cannot withdraw this input.",
+          },
+          setup.agentContext,
+        ),
+      ).rejects.toMatchObject({ code: "Forbidden" });
+
+      const withdrawn = await kernel.execute(
+        {
+          type: "WithdrawRunInput",
+          idempotencyKey: "assigning-human-withdrawal",
+          runInputId,
+          expectedRunRevision: 2,
+          expectedDispositionRevision: 1,
+          reason: "The assigning Human withdrew the request.",
+        },
+        humanContext,
+      );
+      const cached = await kernel.execute(
+        {
+          type: "WithdrawRunInput",
+          idempotencyKey: "assigning-human-withdrawal",
+          runInputId,
+          expectedRunRevision: 2,
+          expectedDispositionRevision: 1,
+          reason: "The assigning Human withdrew the request.",
+        },
+        humanContext,
+      );
+      const projection = await kernel.query(
+        { type: "GetRunProjection", runId: setup.runId },
+        humanContext,
+      );
+      expect(cached).toEqual(withdrawn);
+      expect(projection.run.revision).toBe(3);
+      expect(
+        projection.inputs.find((input) => input.id === runInputId),
+      ).toMatchObject({
+        disposition: "Withdrawn",
+        dispositionRevision: 2,
+      });
+    } finally {
+      kernel.close();
+    }
+  });
+
   it("paginates every open Attention with a stable cursor", async () => {
     const kernel = openMemoryKernel();
     try {
@@ -240,6 +322,110 @@ describe("independent review regressions", () => {
     }
   });
 
+  it("keeps Attention pages bound to one event snapshot", async () => {
+    const kernel = openMemoryKernel();
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        await kernel.execute(
+          {
+            type: "StartThread",
+            idempotencyKey: `snapshot-attention-${index}`,
+            projectId: "project-sample",
+            channelId: "channel-general",
+            body: `Snapshot attention ${index}.`,
+            targetAgentIds: ["agent-orbit"],
+          },
+          humanContext,
+        );
+      }
+      const initial = await kernel.query(
+        {
+          type: "ListOpenAttentions",
+          projectId: "project-sample",
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      const first = await kernel.query(
+        {
+          type: "ListOpenAttentions",
+          projectId: "project-sample",
+          limit: 2,
+        },
+        runtimeContext,
+      );
+      expect(first.items).toHaveLength(2);
+      expect(first.hasMore).toBe(true);
+
+      await kernel.execute(
+        {
+          type: "ClaimAttention",
+          idempotencyKey: "snapshot-attention-claim",
+          attentionId: initial.items[2]!.id,
+          expectedAttentionRevision: initial.items[2]!.revision,
+          leaseDurationMs: 30_000,
+        },
+        runtimeContext,
+      );
+      await kernel.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: "snapshot-attention-late",
+          projectId: "project-sample",
+          channelId: "channel-general",
+          body: "Created after the Attention snapshot.",
+          targetAgentIds: ["agent-orbit"],
+        },
+        humanContext,
+      );
+      const second = await kernel.query(
+        {
+          type: "ListOpenAttentions",
+          projectId: "project-sample",
+          afterCursor: first.nextCursor!,
+          snapshotEventId: first.snapshotEventId,
+          limit: 2,
+        },
+        runtimeContext,
+      );
+      const events = await kernel.readEvents(first.snapshotEventId, 100);
+      const newAttentionEvents = events.filter(
+        (event) => event.type === "AttentionOpened",
+      );
+      const claimEvents = events.filter(
+        (event) => event.type === "AttentionClaimed",
+      );
+      const current = await kernel.query(
+        {
+          type: "ListOpenAttentions",
+          projectId: "project-sample",
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      const recoveredIds = new Set([
+        ...first.items.map((attention) => attention.id),
+        ...second.items.map((attention) => attention.id),
+        ...newAttentionEvents.map((event) => event.entityId),
+      ]);
+
+      expect(second.items).toHaveLength(1);
+      expect(second.items[0]).toMatchObject({
+        id: initial.items[2]!.id,
+        revision: 1,
+        handlerLeaseHolderPrincipalId: null,
+      });
+      expect(second.snapshotEventId).toBe(first.snapshotEventId);
+      expect(newAttentionEvents).toHaveLength(1);
+      expect(claimEvents).toHaveLength(1);
+      expect(recoveredIds).toEqual(
+        new Set(current.items.map((attention) => attention.id)),
+      );
+    } finally {
+      kernel.close();
+    }
+  });
+
   it("returns the latest activity window and paginates the full stream", async () => {
     const kernel = openMemoryKernel();
     try {
@@ -267,6 +453,7 @@ describe("independent review regressions", () => {
         earliestSequence: 6,
         latestSequence: 105,
       });
+
       expect(projection.activity.items).toHaveLength(100);
 
       const first = await kernel.query(
@@ -291,6 +478,60 @@ describe("independent review regressions", () => {
       expect(first.hasMore).toBe(true);
       expect(second.items).toHaveLength(5);
       expect(second.hasMore).toBe(false);
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("records stale Activation output while the Run remains Active", async () => {
+    const kernel = openMemoryKernel();
+    try {
+      const setup = await createRun(kernel);
+      const current = await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "superseding-active-generation",
+          runId: setup.runId,
+          expectedRunRevision: 1,
+        },
+        runtimeContext,
+      );
+      const before = await kernel.query(
+        { type: "GetRunProjection", runId: setup.runId },
+        humanContext,
+      );
+
+      await expect(
+        kernel.execute(
+          {
+            type: "RecordLateOutput",
+            idempotencyKey: "current-output-is-not-late",
+            runId: setup.runId,
+            activationId: current.entityId,
+            payload: { text: "Current output." },
+          },
+          runtimeContext,
+        ),
+      ).rejects.toMatchObject({ code: "Conflict" });
+      await kernel.execute(
+        {
+          type: "RecordLateOutput",
+          idempotencyKey: "superseded-output-is-late",
+          runId: setup.runId,
+          activationId: setup.activationId,
+          payload: { text: "Output from the superseded generation." },
+        },
+        runtimeContext,
+      );
+      const after = await kernel.query(
+        { type: "GetRunProjection", runId: setup.runId },
+        humanContext,
+      );
+      expect(after.run).toEqual(before.run);
+      expect(after.activity.items.at(-1)).toMatchObject({
+        kind: "late_output",
+        activationId: setup.activationId,
+      });
     } finally {
       kernel.close();
     }

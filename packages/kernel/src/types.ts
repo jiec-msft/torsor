@@ -111,6 +111,14 @@ export interface CancelRunCommand extends IdempotentCommand {
   readonly reason: string;
 }
 
+export interface WithdrawRunInputCommand extends IdempotentCommand {
+  readonly type: "WithdrawRunInput";
+  readonly runInputId: string;
+  readonly expectedRunRevision: number;
+  readonly expectedDispositionRevision: number;
+  readonly reason: string;
+}
+
 export interface ClaimAttentionCommand extends IdempotentCommand {
   readonly type: "ClaimAttention";
   readonly attentionId: string;
@@ -255,6 +263,7 @@ export type KernelCommand =
   | ReplyToThreadCommand
   | SendToRunCommand
   | CancelRunCommand
+  | WithdrawRunInputCommand
   | ClaimAttentionCommand
   | ResolveAttentionWithRunCommand
   | StartActivationCommand
@@ -299,6 +308,7 @@ export interface ListOpenAttentionsQuery {
   readonly projectId?: string;
   readonly targetAgentId?: string;
   readonly afterCursor?: number;
+  readonly snapshotEventId?: string | null;
   readonly limit?: number;
 }
 
@@ -433,6 +443,7 @@ export interface AttentionPage {
   readonly items: readonly AttentionView[];
   readonly nextCursor: number | null;
   readonly hasMore: boolean;
+  readonly snapshotEventId: string | null;
 }
 
 export interface ActivityPage {

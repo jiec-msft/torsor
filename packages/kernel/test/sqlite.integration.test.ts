@@ -117,10 +117,7 @@ describe("SQLite persistence", () => {
         runtimeContext,
       );
       expect(firstClaim.outboxEvents).toHaveLength(1);
-      expect(secondClaim.outboxEvents).toHaveLength(1);
-      expect(secondClaim.outboxEvents![0]!.cursor).toBeGreaterThan(
-        firstClaim.outboxEvents![0]!.cursor,
-      );
+      expect(secondClaim.outboxEvents).toEqual([]);
       await first.execute(
         {
           type: "AcknowledgeOutboxEvents",
@@ -129,6 +126,19 @@ describe("SQLite persistence", () => {
           leaseToken: firstClaim.leaseToken!,
         },
         runtimeContext,
+      );
+      const nextClaim = await second.execute(
+        {
+          type: "ClaimOutboxEvents",
+          idempotencyKey: "outbox-next-claim",
+          limit: 1,
+          leaseDurationMs: 1_000,
+        },
+        runtimeContext,
+      );
+      expect(nextClaim.outboxEvents).toHaveLength(1);
+      expect(nextClaim.outboxEvents![0]!.cursor).toBeGreaterThan(
+        firstClaim.outboxEvents![0]!.cursor,
       );
       first.close();
       second.close();
@@ -139,16 +149,16 @@ describe("SQLite persistence", () => {
         const recovered = await reopened.execute(
           {
             type: "ClaimOutboxEvents",
-            idempotencyKey: "outbox-second-claim",
+            idempotencyKey: "outbox-next-claim",
             limit: 1,
             leaseDurationMs: 1_000,
           },
           runtimeContext,
         );
         expect(recovered.outboxEvents?.map((event) => event.id)).toEqual([
-          secondClaim.outboxEvents![0]!.id,
+          nextClaim.outboxEvents![0]!.id,
         ]);
-        expect(recovered.leaseToken).not.toBe(secondClaim.leaseToken);
+        expect(recovered.leaseToken).not.toBe(nextClaim.leaseToken);
         expect(recovered.outboxEvents![0]!.deliveryAttempts).toBe(2);
         await reopened.execute(
           {
@@ -173,6 +183,106 @@ describe("SQLite persistence", () => {
         );
       } finally {
         reopened.close();
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("never retargets an expired Outbox idempotency key", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-outbox-key-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const options = {
+      databasePath,
+      bootstrap,
+      clock: () => now,
+    };
+    try {
+      const workerA = TorsorKernel.open(options);
+      await workerA.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: "retarget-first-message",
+          projectId: "project-sample",
+          channelId: "channel-general",
+          body: "Original Outbox target.",
+        },
+        humanContext,
+      );
+      const original = await workerA.execute(
+        {
+          type: "ClaimOutboxEvents",
+          idempotencyKey: "stable-claim-key",
+          limit: 1,
+          leaseDurationMs: 1_000,
+        },
+        runtimeContext,
+      );
+      workerA.close();
+
+      now = new Date("2026-09-21T08:00:02.000Z");
+      const workerB = TorsorKernel.open(options);
+      const recovered = await workerB.execute(
+        {
+          type: "ClaimOutboxEvents",
+          idempotencyKey: "other-worker-recovery",
+          limit: 1,
+          leaseDurationMs: 30_000,
+        },
+        runtimeContext,
+      );
+      await workerB.execute(
+        {
+          type: "AcknowledgeOutboxEvents",
+          idempotencyKey: "other-worker-ack",
+          outboxEventIds: recovered.outboxEvents!.map((event) => event.id),
+          leaseToken: recovered.leaseToken!,
+        },
+        runtimeContext,
+      );
+      await workerB.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: "retarget-second-message",
+          projectId: "project-sample",
+          channelId: "channel-general",
+          body: "A later Outbox event must not replace the original target.",
+        },
+        humanContext,
+      );
+      workerB.close();
+
+      const retried = TorsorKernel.open(options);
+      try {
+        const sameKey = await retried.execute(
+          {
+            type: "ClaimOutboxEvents",
+            idempotencyKey: "stable-claim-key",
+            limit: 1,
+            leaseDurationMs: 1_000,
+          },
+          runtimeContext,
+        );
+        expect(sameKey.outboxEvents?.map((event) => event.id)).toEqual(
+          original.outboxEvents?.map((event) => event.id),
+        );
+
+        const newKey = await retried.execute(
+          {
+            type: "ClaimOutboxEvents",
+            idempotencyKey: "new-claim-key",
+            limit: 1,
+            leaseDurationMs: 30_000,
+          },
+          runtimeContext,
+        );
+        expect(newKey.outboxEvents).toHaveLength(1);
+        expect(newKey.outboxEvents![0]!.id).not.toBe(
+          original.outboxEvents![0]!.id,
+        );
+      } finally {
+        retried.close();
       }
     } finally {
       await rm(directory, { recursive: true, force: true });
@@ -236,6 +346,63 @@ describe("SQLite persistence", () => {
     }
   });
 
+  it("persists Waiting revocation across reopen", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-waiting-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    try {
+      const first = TorsorKernel.open({ databasePath, bootstrap });
+      const setup = await createRun(first);
+      await first.execute(
+        {
+          type: "WaitRun",
+          idempotencyKey: "waiting-before-reopen",
+          runId: setup.runId,
+          expectedRunRevision: 1,
+          reason: "Waiting across a process restart.",
+        },
+        setup.agentContext,
+      );
+      first.close();
+
+      const reopened = TorsorKernel.open({ databasePath, bootstrap });
+      try {
+        await expect(
+          reopened.execute(
+            {
+              type: "StartProviderAttempt",
+              idempotencyKey: "waiting-provider-after-reopen",
+              activationId: setup.activationId,
+              adapter: "deterministic-fake",
+              adapterVersion: "1",
+              capabilitySnapshot: {},
+              runInputIds: [setup.runInputId],
+              requestIdempotencyKey: "waiting-provider-after-reopen",
+            },
+            runtimeContext,
+          ),
+        ).rejects.toMatchObject({ code: "Conflict" });
+        await expect(
+          reopened.execute(
+            {
+              type: "AppendRunActivity",
+              idempotencyKey: "waiting-activity-after-reopen",
+              runId: setup.runId,
+              activationId: setup.activationId,
+              kind: "status",
+              payload: { state: "stale" },
+              retentionClass: "durable",
+            },
+            runtimeContext,
+          ),
+        ).rejects.toMatchObject({ code: "Conflict" });
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("atomically reuses one Attention Activation across connections", async () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-attention-"));
     const databasePath = join(directory, "kernel.sqlite");
@@ -274,16 +441,14 @@ describe("SQLite persistence", () => {
           attentionId: attention.id,
           handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
         } as const;
-        const [left, right] = await Promise.all([
-          first.execute(
-            { ...command, idempotencyKey: "cross-connection-left" },
-            runtimeContext,
-          ),
-          second.execute(
-            { ...command, idempotencyKey: "cross-connection-right" },
-            runtimeContext,
-          ),
-        ]);
+        const left = await first.execute(
+          { ...command, idempotencyKey: "cross-connection-left" },
+          runtimeContext,
+        );
+        const right = await second.execute(
+          { ...command, idempotencyKey: "cross-connection-right" },
+          runtimeContext,
+        );
         expect(right.entityId).toBe(left.entityId);
         expect(
           (await first.readEvents(null, 500)).filter(
@@ -295,6 +460,74 @@ describe("SQLite persistence", () => {
       } finally {
         second.close();
         first.close();
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates complete Attention snapshot history from schema version 1", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-migration-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    try {
+      const first = TorsorKernel.open({ databasePath, bootstrap });
+      const setup = await createRun(first);
+      const events = await first.readEvents(null, 500);
+      const claimEvent = events.find(
+        (event) =>
+          event.type === "AttentionClaimed" &&
+          event.entityId === setup.attentionId,
+      )!;
+      const resolvedEvent = events.find(
+        (event) =>
+          event.type === "AttentionResolved" &&
+          event.entityId === setup.attentionId,
+      )!;
+      first.close();
+
+      const versionOne = new DatabaseSync(databasePath);
+      versionOne.exec(`
+        DROP TABLE attention_history;
+        ALTER TABLE attentions DROP COLUMN created_event_sequence;
+        PRAGMA user_version = 1;
+      `);
+      versionOne.close();
+
+      const migrated = TorsorKernel.open({ databasePath, bootstrap });
+      try {
+        const claimedSnapshot = await migrated.query(
+          {
+            type: "ListOpenAttentions",
+            projectId: "project-sample",
+            snapshotEventId: claimEvent.eventId,
+            limit: 10,
+          },
+          runtimeContext,
+        );
+        expect(claimedSnapshot.items).toContainEqual(
+          expect.objectContaining({
+            id: setup.attentionId,
+            revision: 2,
+            handlerLeaseHolderPrincipalId: "principal-runtime",
+          }),
+        );
+
+        const resolvedSnapshot = await migrated.query(
+          {
+            type: "ListOpenAttentions",
+            projectId: "project-sample",
+            snapshotEventId: resolvedEvent.eventId,
+            limit: 10,
+          },
+          runtimeContext,
+        );
+        expect(
+          resolvedSnapshot.items.some(
+            (attention) => attention.id === setup.attentionId,
+          ),
+        ).toBe(false);
+      } finally {
+        migrated.close();
       }
     } finally {
       await rm(directory, { recursive: true, force: true });

@@ -3,6 +3,7 @@ import { TorsorKernel, type KernelBootstrap } from "../src/index.js";
 export const bootstrap: KernelBootstrap = {
   principals: [
     { id: "principal-human", kind: "human", displayName: "Avery Stone" },
+    { id: "principal-riley", kind: "human", displayName: "Riley Park" },
     { id: "principal-runtime", kind: "runtime", displayName: "Local Runtime" },
     { id: "principal-orbit", kind: "agent", displayName: "Orbit" },
     { id: "principal-keel", kind: "agent", displayName: "Keel" },

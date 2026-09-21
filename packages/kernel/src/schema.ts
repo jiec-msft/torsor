@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 1;
+export const CURRENT_SCHEMA_VERSION = 2;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS attentions (
   resolved_by_principal_id TEXT REFERENCES principals(id),
   resolved_activation_id TEXT REFERENCES activation_attempts(id),
   resolved_run_id TEXT REFERENCES runs(id),
+  created_event_sequence INTEGER REFERENCES public_events(sequence),
   created_at TEXT NOT NULL,
   resolved_at TEXT,
   UNIQUE (message_revision_id, target_agent_id, trigger_kind)
@@ -272,4 +273,19 @@ CREATE TABLE IF NOT EXISTS public_events (
 
 CREATE INDEX IF NOT EXISTS public_events_thread_idx
   ON public_events(thread_root_id, thread_cursor);
+
+CREATE TABLE IF NOT EXISTS attention_history (
+  attention_id TEXT NOT NULL REFERENCES attentions(id),
+  event_sequence INTEGER NOT NULL REFERENCES public_events(sequence),
+  status TEXT NOT NULL CHECK (status IN ('Open', 'Resolved', 'Ignored')),
+  revision INTEGER NOT NULL CHECK (revision > 0),
+  handler_lease_holder_principal_id TEXT REFERENCES principals(id),
+  handler_lease_expires_at TEXT,
+  resolved_run_id TEXT REFERENCES runs(id),
+  resolved_at TEXT,
+  PRIMARY KEY (attention_id, event_sequence)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS attention_history_snapshot_idx
+  ON attention_history(attention_id, event_sequence);
 `;
