@@ -54,6 +54,7 @@ export function claimOutboxEvents(kernel: db.KernelContext, command: Extract<Ker
     commandType: command.type,
     entityId: leaseToken,
     leaseToken,
+    ...(outboxEvents.length > 0 ? { leaseExpiresAt } : {}),
     outboxEvents,
   };
 }
@@ -145,7 +146,19 @@ export function resolveCachedOutboxClaim(kernel: db.KernelContext, command: Extr
     optionalText(row.lease_expires_at) !== null &&
     new Date(text(row.lease_expires_at)) > now);
   if (originalLeaseIsLive) {
-    return result;
+    const persistedExpiry = text(typedRows[0]!.lease_expires_at);
+    if (
+      !typedRows.every(
+        (row) => text(row.lease_expires_at) === persistedExpiry,
+      )
+    ) {
+      throw new Error("A persisted Outbox claim has inconsistent lease expiry.");
+    }
+    return {
+      ...result,
+      leaseExpiresAt: persistedExpiry,
+      outboxEvents: typedRows.map(mapOutboxEvent),
+    };
   }
   const anotherLiveLease = typedRows.some((row) => {
     const expiry = optionalText(row.lease_expires_at);
@@ -178,6 +191,7 @@ export function resolveCachedOutboxClaim(kernel: db.KernelContext, command: Extr
     ...result,
     entityId: leaseToken,
     leaseToken,
+    leaseExpiresAt,
     outboxEvents: originalIds.map((id) => mapOutboxEvent(invariants.requireOutboxEvent(kernel, id))),
   };
 }

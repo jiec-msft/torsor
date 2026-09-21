@@ -29,24 +29,11 @@ function expectIndexedRecoverablePlan(planDetails: readonly string[]): void {
   expect(
     planDetails.some(
       (detail) =>
-        /\bSEARCH\s+expired\b/i.test(detail) &&
-        detail.includes("activation_attention_expired_idx") &&
-        detail.includes("expires_at"),
-    ),
-  ).toBe(true);
-  expect(
-    planDetails.some(
-      (detail) =>
-        /\bSEARCH\s+unsettled\b/i.test(detail) &&
-        detail.includes("provider_attempts_unsettled_activation_idx") &&
-        detail.includes("status"),
-    ),
-  ).toBe(true);
-  expect(
-    planDetails.some(
-      (detail) =>
-        /\bSEARCH\s+activation\b/i.test(detail) &&
-        /\bid\s*=\s*\?/i.test(detail),
+        /\bSEARCH\s+recovery\b/i.test(detail) &&
+        (
+          detail.includes("attention_recovery_unfinished_order_idx") ||
+          detail.includes("attention_recovery_finished_order_idx")
+        ),
     ),
   ).toBe(true);
   expect(
@@ -54,8 +41,11 @@ function expectIndexedRecoverablePlan(planDetails: readonly string[]): void {
   ).toBe(false);
   expect(
     planDetails.some(
-      (detail) => /\bSCAN\s+(?:expired|activation)\b/i.test(detail),
+      (detail) => /\bSCAN\s+recovery\b/i.test(detail),
     ),
+  ).toBe(false);
+  expect(
+    planDetails.some((detail) => /USE TEMP B-TREE/i.test(detail)),
   ).toBe(false);
 }
 
@@ -530,7 +520,128 @@ describe("Runtime recovery with SQLite", () => {
     }
   });
 
-  it("searches sparse recovery indexes instead of settled Activation history", async () => {
+  it("serializes concurrent same-domain Attention claims across Kernel instances", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-domain-race-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    let firstWorker: Worker | undefined;
+    let secondWorker: Worker | undefined;
+    try {
+      const kernel = TorsorKernel.open({ databasePath, bootstrap });
+      const firstMessage = await kernel.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: "domain-race-first-message",
+          projectId: "project-sample",
+          channelId: "channel-general",
+          body: "Orbit, process the first synthetic dispatch.",
+          targetAgentIds: ["agent-orbit"],
+        },
+        humanContext,
+      );
+      const secondMessage = await kernel.execute(
+        {
+          type: "ReplyToThread",
+          idempotencyKey: "domain-race-second-message",
+          threadRootId: firstMessage.entityId,
+          body: "Orbit, process the second synthetic dispatch.",
+          targetAgentIds: ["agent-orbit"],
+        },
+        humanContext,
+      );
+      const page = await kernel.query(
+        {
+          type: "ListOpenAttentions",
+          targetAgentId: "agent-orbit",
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      const firstAttention = page.items.find(
+        (item) =>
+          item.messageRevisionId ===
+          firstMessage.relatedIds!.messageRevisionId,
+      );
+      const secondAttention = page.items.find(
+        (item) =>
+          item.messageRevisionId ===
+          secondMessage.relatedIds!.messageRevisionId,
+      );
+      if (!firstAttention || !secondAttention) {
+        throw new Error("Expected two same-domain Attentions.");
+      }
+      kernel.close();
+
+      const signal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+      const startSignal = new Int32Array(signal);
+      const first = prepareRacingCommand(
+        databasePath,
+        signal,
+        {
+          type: "ClaimAttention",
+          idempotencyKey: "domain-race-first-claim",
+          attentionId: firstAttention.id,
+          expectedAttentionRevision: firstAttention.revision,
+          leaseDurationMs: 30_000,
+        },
+        runtimeContext,
+      );
+      const second = prepareRacingCommand(
+        databasePath,
+        signal,
+        {
+          type: "ClaimAttention",
+          idempotencyKey: "domain-race-second-claim",
+          attentionId: secondAttention.id,
+          expectedAttentionRevision: secondAttention.revision,
+          leaseDurationMs: 30_000,
+        },
+        runtimeContext,
+      );
+      firstWorker = first.worker;
+      secondWorker = second.worker;
+      await Promise.all([first.ready, second.ready]);
+      Atomics.store(startSignal, 0, 1);
+      Atomics.notify(startSignal, 0, 2);
+      const outcomes = await Promise.all([first.result, second.result]);
+      expect(
+        outcomes.filter((outcome) => outcome.status === "fulfilled"),
+      ).toHaveLength(1);
+      expect(
+        outcomes.filter((outcome) => outcome.status === "rejected"),
+      ).toEqual([
+        expect.objectContaining({
+          status: "rejected",
+          code: "DomainBusy",
+        }),
+      ]);
+      await first.worker.terminate();
+      await second.worker.terminate();
+      firstWorker = undefined;
+      secondWorker = undefined;
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      try {
+        expect(
+          database.prepare(
+            `SELECT COUNT(*) AS count
+               FROM attention_domain_fences`,
+          ).get(),
+        ).toMatchObject({ count: 1 });
+      } finally {
+        database.close();
+      }
+    } finally {
+      if (firstWorker) {
+        await firstWorker.terminate();
+      }
+      if (secondWorker) {
+        await secondWorker.terminate();
+      }
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("pages 100,000 recoverable rows through bounded ordered index searches", async () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-runtime-query-"));
     const databasePath = join(directory, "kernel.sqlite");
     try {
@@ -553,12 +664,24 @@ describe("Runtime recovery with SQLite", () => {
         const insertHistory = historyDatabase.prepare(
           `INSERT INTO activation_attempts
             (id, agent_id, attention_id, attention_lease_token, cause,
-             config_revision, started_at, expires_at, finished_at, outcome)
-           VALUES (?, 'agent-orbit', ?, ?, 'Attention', 3, ?, ?, ?, 'Completed')`,
+             config_revision, started_at, expires_at)
+           VALUES (?, 'agent-orbit', ?, ?, 'Attention', 3, ?, ?)`,
+        );
+        const insertRecovery = historyDatabase.prepare(
+          `INSERT INTO attention_recovery_executions
+            (activation_id, started_at, expires_at, unfinished,
+             expired_recoverable,
+             unsettled_provider_attempt_count,
+             finished_with_unsettled_provider)
+           VALUES (?, ?, ?, 1, 1, 0, 0)`,
+        );
+        historyDatabase.exec(
+          `DROP TRIGGER attention_recovery_activation_insert;
+           DROP TRIGGER attention_recovery_activation_update;`,
         );
         historyDatabase.exec("BEGIN");
-        for (let index = 0; index < 10_000; index += 1) {
-          const suffix = index.toString().padStart(5, "0");
+        for (let index = 0; index < 100_000; index += 1) {
+          const suffix = index.toString().padStart(6, "0");
           const timestamp = new Date(
             Date.UTC(2025, 0, 1, 0, 0, index),
           ).toISOString();
@@ -567,6 +690,10 @@ describe("Runtime recovery with SQLite", () => {
             source.attention_id,
             `lease-history-${suffix}`,
             timestamp,
+            timestamp,
+          );
+          insertRecovery.run(
+            `activation-history-${suffix}`,
             timestamp,
             timestamp,
           );
@@ -586,6 +713,11 @@ describe("Runtime recovery with SQLite", () => {
              '2026-09-21T07:59:30.000Z'
            )`,
         ).run(source.attention_id);
+        insertRecovery.run(
+          "activation-expired-recoverable",
+          "2026-09-21T07:59:00.000Z",
+          "2026-09-21T07:59:30.000Z",
+        );
         historyDatabase.exec("COMMIT");
         historyDatabase.prepare(
           `DELETE FROM activation_history
@@ -651,14 +783,18 @@ describe("Runtime recovery with SQLite", () => {
         },
       );
       try {
+        const initialStartedAt = performance.now();
         const initialPage = await reopened.query(
           { type: "ListRecoverableAttentionExecutions", limit: 1 },
           runtimeContext,
         );
+        const initialElapsedMs = performance.now() - initialStartedAt;
         expect(initialPage.items.map((item) => item.activation.id)).toEqual([
-          "activation-expired-recoverable",
+          "activation-history-000000",
         ]);
         expect(initialPage.hasMore).toBe(true);
+        expect(initialElapsedMs).toBeLessThan(2_000);
+        const continuationStartedAt = performance.now();
         const continuationPage = await reopened.query(
           {
             type: "ListRecoverableAttentionExecutions",
@@ -667,10 +803,13 @@ describe("Runtime recovery with SQLite", () => {
           },
           runtimeContext,
         );
+        const continuationElapsedMs =
+          performance.now() - continuationStartedAt;
         expect(
           continuationPage.items.map((item) => item.activation.id),
-        ).toEqual([execution.activationId]);
-        expect(continuationPage.hasMore).toBe(false);
+        ).toEqual(["activation-history-000001"]);
+        expect(continuationPage.hasMore).toBe(true);
+        expect(continuationElapsedMs).toBeLessThan(2_000);
       } finally {
         Reflect.deleteProperty(globalThis, queryHookSymbol);
       }
@@ -688,7 +827,7 @@ describe("Runtime recovery with SQLite", () => {
         status: "Started",
       });
       reopened.close();
-      expect(recordedQueries).toHaveLength(2);
+      expect(recordedQueries).toHaveLength(4);
 
       const database = new DatabaseSync(databasePath);
       const recordedPlans: string[][] = [];
@@ -698,14 +837,16 @@ describe("Runtime recovery with SQLite", () => {
              FROM sqlite_master
             WHERE type = 'index'
               AND name IN (
-                'activation_attention_expired_idx',
-                'provider_attempts_unsettled_activation_idx'
+                'attention_recovery_unfinished_order_idx',
+                'attention_recovery_finished_order_idx',
+                'attention_recovery_expiry_horizon_idx'
               )
             ORDER BY name`,
         ).all() as Array<{ readonly name: string }>;
         expect(indexes.map((row) => row.name)).toEqual([
-          "activation_attention_expired_idx",
-          "provider_attempts_unsettled_activation_idx",
+          "attention_recovery_expiry_horizon_idx",
+          "attention_recovery_finished_order_idx",
+          "attention_recovery_unfinished_order_idx",
         ]);
         for (const recordedQuery of recordedQueries) {
           const queryPlan = database.prepare(
@@ -715,11 +856,29 @@ describe("Runtime recovery with SQLite", () => {
           }>;
           recordedPlans.push(queryPlan.map((row) => row.detail));
         }
+        database.exec(
+          "DROP TRIGGER attention_recovery_activation_update;",
+        );
         database.prepare(
           `UPDATE activation_attempts
               SET finished_at = '2026-09-21T08:02:00.000Z',
                   outcome = 'Expired'
-            WHERE id = 'activation-expired-recoverable'`,
+            WHERE id = 'activation-expired-recoverable'
+               OR id LIKE 'activation-history-%'`,
+        ).run();
+        database.prepare(
+          `UPDATE attention_recovery_executions
+              SET unfinished = 0,
+                  expired_recoverable = 0,
+                  finished_with_unsettled_provider = 0
+            WHERE activation_id = 'activation-expired-recoverable'
+               OR activation_id LIKE 'activation-history-%'`,
+        ).run();
+        database.prepare(
+          `UPDATE kernel_runtime_state
+              SET attention_recovery_revision =
+                    attention_recovery_revision + 1
+            WHERE singleton = 1`,
         ).run();
         database.prepare(
           `UPDATE provider_attempts
@@ -746,24 +905,106 @@ describe("Runtime recovery with SQLite", () => {
           { type: "ListRecoverableAttentionExecutions", limit: 10 },
           runtimeContext,
         );
-        expect(page).toEqual({ items: [], nextCursor: null, hasMore: false });
+        expect(page).toMatchObject({
+          items: [],
+          nextCursor: null,
+          hasMore: false,
+        });
       } finally {
         Reflect.deleteProperty(globalThis, queryHookSymbol);
         settled.close();
       }
-      expect(recordedQueries).toHaveLength(3);
+      expect(recordedQueries).toHaveLength(6);
 
       const settledDatabase = new DatabaseSync(databasePath);
       try {
-        const noRowsQuery = recordedQueries[2]!;
-        const noRowsPlan = settledDatabase.prepare(
-          `EXPLAIN QUERY PLAN ${noRowsQuery.sql}`,
-        ).all(...noRowsQuery.parameters) as Array<{
-          readonly detail: string;
-        }>;
-        recordedPlans.push(noRowsPlan.map((row) => row.detail));
+        for (const noRowsQuery of recordedQueries.slice(4)) {
+          const noRowsPlan = settledDatabase.prepare(
+            `EXPLAIN QUERY PLAN ${noRowsQuery.sql}`,
+          ).all(...noRowsQuery.parameters) as Array<{
+            readonly detail: string;
+          }>;
+          recordedPlans.push(noRowsPlan.map((row) => row.detail));
+        }
+        settledDatabase.exec(
+          "DROP TRIGGER attention_recovery_activation_update;",
+        );
+        settledDatabase.prepare(
+          `UPDATE activation_attempts
+              SET expires_at = '2099-01-01T00:00:00.000Z',
+                  finished_at = NULL,
+                  outcome = NULL
+            WHERE id = 'activation-expired-recoverable'
+               OR id LIKE 'activation-history-%'`,
+        ).run();
+        settledDatabase.prepare(
+          `UPDATE attention_recovery_executions
+              SET expires_at = '2099-01-01T00:00:00.000Z',
+                  unfinished = 1,
+                  expired_recoverable = 0,
+                  finished_with_unsettled_provider = 0
+            WHERE activation_id = 'activation-expired-recoverable'
+               OR activation_id LIKE 'activation-history-%'`,
+        ).run();
+        settledDatabase.prepare(
+          `UPDATE kernel_runtime_state
+              SET attention_recovery_revision =
+                    attention_recovery_revision + 1
+            WHERE singleton = 1`,
+        ).run();
       } finally {
         settledDatabase.close();
+      }
+      const future = TorsorKernel.open({ databasePath, bootstrap });
+      Reflect.set(
+        globalThis,
+        queryHookSymbol,
+        (query: RecordedQuery) => {
+          recordedQueries.push(query);
+        },
+      );
+      try {
+        const snapshot = await future.query(
+          { type: "GetAttentionRecoverySnapshot" },
+          runtimeContext,
+        );
+        expect(snapshot.nextExpiryAt).toBe(
+          "2099-01-01T00:00:00.000Z",
+        );
+        const futureStartedAt = performance.now();
+        const page = await future.query(
+          {
+            type: "ListRecoverableAttentionExecutions",
+            recoverySnapshot: snapshot,
+            limit: 10,
+          },
+          runtimeContext,
+        );
+        expect(page).toMatchObject({
+          items: [],
+          nextCursor: null,
+          hasMore: false,
+        });
+        expect(performance.now() - futureStartedAt).toBeLessThan(2_000);
+      } finally {
+        Reflect.deleteProperty(globalThis, queryHookSymbol);
+        future.close();
+      }
+      expect(recordedQueries).toHaveLength(8);
+      const futureDatabase = new DatabaseSync(databasePath, {
+        readOnly: true,
+      });
+      try {
+        for (const futureQuery of recordedQueries.slice(6)) {
+          const futurePlan = futureDatabase.prepare(
+            `EXPLAIN QUERY PLAN ${futureQuery.sql}`,
+          ).all(...futureQuery.parameters) as Array<{
+            readonly detail: string;
+          }>;
+          recordedPlans.push(futurePlan.map((row) => row.detail));
+        }
+      } finally {
+        futureDatabase.close();
       }
       for (const planDetails of recordedPlans) {
         expectIndexedRecoverablePlan(planDetails);
@@ -771,7 +1012,7 @@ describe("Runtime recovery with SQLite", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("checks Runtime authority before returning a forged cached parking result", async () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-runtime-auth-"));

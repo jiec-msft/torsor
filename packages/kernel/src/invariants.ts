@@ -123,6 +123,161 @@ export function assertAttentionLease(kernel: db.KernelContext, attention: Row, l
   }
 }
 
+export function claimAttentionDomain(
+  kernel: db.KernelContext,
+  attention: Row,
+  leaseToken: string,
+  leaseExpiresAt: string,
+  at: Date,
+): void {
+  const domain = {
+    agentId: text(attention.target_agent_id),
+    projectId: text(attention.project_id),
+    channelId: text(attention.channel_id),
+    threadRootId: text(attention.thread_root_id),
+  };
+  const existing = db.getRow(
+    kernel,
+    `SELECT *
+       FROM attention_domain_fences
+      WHERE agent_id = ?
+        AND project_id = ?
+        AND channel_id = ?
+        AND thread_root_id = ?`,
+    domain.agentId,
+    domain.projectId,
+    domain.channelId,
+    domain.threadRootId,
+  );
+  if (existing) {
+    const existingExpiry = optionalText(existing.lease_expires_at);
+    const hasLiveLease =
+      existingExpiry !== null && new Date(existingExpiry) > at;
+    const hasUnsettledProvider =
+      integer(existing.unsettled_provider_attempt_count) > 0;
+    if (hasLiveLease || hasUnsettledProvider) {
+      throw new KernelError(
+        "DomainBusy",
+        "The Agent, Project, Channel, and Thread execution domain is busy.",
+        {
+          attentionId: text(existing.attention_id),
+          hasLiveHandlerLease: hasLiveLease,
+          hasUnsettledProviderAttempt: hasUnsettledProvider,
+        },
+      );
+    }
+    db.run(
+      kernel,
+      `UPDATE attention_domain_fences
+          SET attention_id = ?,
+              lease_token = ?,
+              lease_expires_at = ?,
+              unsettled_provider_attempt_count = 0
+        WHERE agent_id = ?
+          AND project_id = ?
+          AND channel_id = ?
+          AND thread_root_id = ?`,
+      text(attention.id),
+      leaseToken,
+      leaseExpiresAt,
+      domain.agentId,
+      domain.projectId,
+      domain.channelId,
+      domain.threadRootId,
+    );
+    return;
+  }
+  db.run(
+    kernel,
+    `INSERT INTO attention_domain_fences
+      (agent_id, project_id, channel_id, thread_root_id, attention_id,
+       lease_token, lease_expires_at, unsettled_provider_attempt_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+    domain.agentId,
+    domain.projectId,
+    domain.channelId,
+    domain.threadRootId,
+    text(attention.id),
+    leaseToken,
+    leaseExpiresAt,
+  );
+}
+
+export function releaseAttentionDomainLease(
+  kernel: db.KernelContext,
+  attentionId: string,
+): void {
+  db.run(
+    kernel,
+    `UPDATE attention_domain_fences
+        SET lease_token = NULL,
+            lease_expires_at = NULL
+      WHERE attention_id = ?`,
+    attentionId,
+  );
+  db.run(
+    kernel,
+    `DELETE FROM attention_domain_fences
+      WHERE attention_id = ?
+        AND unsettled_provider_attempt_count = 0`,
+    attentionId,
+  );
+}
+
+export function synchronizeAttentionDomainProviderAttempts(
+  kernel: db.KernelContext,
+  activation: Row,
+): void {
+  const attentionId = optionalText(activation.attention_id);
+  if (!attentionId) {
+    return;
+  }
+  const unsettled = db.getRow(
+    kernel,
+    `SELECT COUNT(*) AS count
+       FROM provider_attempts
+      WHERE activation_id IN (
+        SELECT id
+          FROM activation_attempts
+         WHERE attention_id = ?
+      )
+        AND status IN ('Started', 'Acknowledged')`,
+    attentionId,
+  );
+  const unsettledCount = unsettled ? integer(unsettled.count) : 0;
+  const fence = db.getRow(
+    kernel,
+    `SELECT attention_id
+       FROM attention_domain_fences
+      WHERE attention_id = ?`,
+    attentionId,
+  );
+  if (!fence) {
+    if (unsettledCount === 0) {
+      return;
+    }
+    throw new Error(
+      `Attention ${attentionId} has unsettled provider work without a domain fence.`,
+    );
+  }
+  db.run(
+    kernel,
+    `UPDATE attention_domain_fences
+        SET unsettled_provider_attempt_count = ?
+      WHERE attention_id = ?`,
+    unsettledCount,
+    attentionId,
+  );
+  db.run(
+    kernel,
+    `DELETE FROM attention_domain_fences
+      WHERE attention_id = ?
+        AND lease_token IS NULL
+        AND unsettled_provider_attempt_count = 0`,
+    attentionId,
+  );
+}
+
 export function checkThreadCursor(kernel: db.KernelContext, thread: Row, expected?: number): void {
   if (expected !== undefined && integer(thread.cursor) !== expected) {
     const events = db.allRows(kernel, `SELECT * FROM public_events

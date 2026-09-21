@@ -8,6 +8,7 @@ export class KernelError extends Error {
       | "Forbidden"
       | "InvalidCommand"
       | "Conflict"
+      | "DomainBusy"
       | "StaleRevision"
       | "ConditionalCheckFailed"
       | "TerminalRun"

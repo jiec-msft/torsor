@@ -129,14 +129,56 @@ once and end its handler Activation.
 
 Outbox consumers use `ClaimOutboxEvents`, `AcknowledgeOutboxEvents`, and
 `ListOutboxEvents`. Claims are ordered, leased, and recoverable after process
-restart or lease expiry.
+restart or lease expiry. Successful non-empty claims return `leaseExpiresAt`,
+which is the exact shared expiry persisted on every returned OutboxEvent.
+Idempotent recovery refreshes return the refreshed persisted expiry.
+
+`ClaimAttention` also returns the exact persisted `leaseExpiresAt`. Runtime
+must derive provider execution time from that authority rather than request
+time:
+
+```ts
+const executionBudget = Math.min(
+  providerTimeoutMs,
+  Date.parse(claim.leaseExpiresAt) - safetyMarginMs - Date.now(),
+);
+```
+
+Runtime must not start provider work when that budget is non-positive.
+A cached claim succeeds only while its original lease token remains current
+and unexpired. A superseded, expired, or reclaimed cached claim fails with
+`Conflict`.
+
+Attention dispatch is fenced by Agent, Project, Channel, and Thread. A claim
+that overlaps another live handler lease or an unsettled `Started` or
+`Acknowledged` Attention ProviderAttempt fails with `DomainBusy`. The fence
+survives Attention resolution and process restart until provider settlement;
+expired abandoned leases without unsettled provider work can be reclaimed.
 
 Runtime recovery can read one `ProviderAttempt` directly and page
 `ListRecoverableAttentionExecutions` in stable Activation start order without
-scanning public event history or settled Activation history. Expired unfinished
-Attention Activations and finished Attention Activations that still own a
-`Started` or `Acknowledged` ProviderAttempt are found through separate sparse
-indexes and merged into the stable page.
+scanning public event history, settled Activation history, or the complete
+recoverable backlog. A normalized current-state table exposes two order-aligned
+indexed ranges: expired unfinished Attention Activations and finished Attention
+Activations that still own a `Started` or `Acknowledged` ProviderAttempt. The
+Kernel merges at most `limit + 1` rows from each range and projects all
+ProviderAttempts for each selected Activation once.
+
+Runtime can prove a full recovery sweep stable with
+`GetAttentionRecoverySnapshot`. That write-serialized query advances
+clock-derived expiry eligibility through its authoritative `observedAt` using
+the expiry index, then returns the resulting revision and next future expiry.
+This advancement touches each newly expired Activation once; page queries do
+not revisit the full expired or future backlog. Pass the returned
+`AttentionRecoverySnapshot` to every
+`ListRecoverableAttentionExecutions` page. A relevant write changes its
+monotonic `revision`; continuations using the old snapshot fail with
+`StaleRevision`. After the sweep, read another snapshot and accept the sweep
+only when its revision still equals the captured revision and its `observedAt`
+is earlier than the captured `nextExpiryAt` (or that horizon is `null`).
+Crossing `nextExpiryAt` invalidates the sweep because the next snapshot will
+materialize newly expired work. This can cause a safe retry but cannot validate
+a sweep that missed newly recoverable work.
 
 `ParkRunAfterProviderAttemptFailure` is a Runtime-only atomic transition for a
 current `Failed` or `Unknown` ProviderAttempt. It revision- and
@@ -150,9 +192,8 @@ finalize content in durable storage and verify its digest before
 location into a finalized Artifact. A failed or incomplete upload must not
 publish the descriptor.
 
-The current direct schema version is 8. Version 8 adds creation-event markers
-for immutable projection components, narrow temporal tables for mutable
-projection fields, and sparse indexes for projection pages, Project event
-scans, Agent status, and Activation validity.
+The current direct schema version is 9. Version 9 adds normalized Attention
+recovery current state and ordered indexes, the recovery mutation revision,
+and durable Agent/Project/Channel/Thread execution fences.
 This pre-release schema is intentionally breaking: stop old processes and
-recreate disposable databases rather than migrating version 7.
+recreate disposable databases rather than migrating version 8.

@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 8;
+export const CURRENT_SCHEMA_VERSION = 9;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -258,9 +258,65 @@ CREATE INDEX IF NOT EXISTS provider_attempts_unsettled_activation_idx
   ON provider_attempts(status, activation_id)
   WHERE status IN ('Started', 'Acknowledged');
 
-CREATE INDEX IF NOT EXISTS activation_attention_expired_idx
-  ON activation_attempts(expires_at, started_at, id)
-  WHERE cause = 'Attention' AND finished_at IS NULL;
+CREATE TABLE IF NOT EXISTS kernel_runtime_state (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  attention_recovery_revision INTEGER NOT NULL
+    CHECK (attention_recovery_revision >= 0)
+) STRICT;
+
+INSERT OR IGNORE INTO kernel_runtime_state
+  (singleton, attention_recovery_revision)
+VALUES (1, 0);
+
+CREATE TABLE IF NOT EXISTS attention_recovery_executions (
+  activation_id TEXT PRIMARY KEY REFERENCES activation_attempts(id),
+  started_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  unfinished INTEGER NOT NULL CHECK (unfinished IN (0, 1)),
+  expired_recoverable INTEGER NOT NULL
+    CHECK (expired_recoverable IN (0, 1)),
+  unsettled_provider_attempt_count INTEGER NOT NULL
+    CHECK (unsettled_provider_attempt_count >= 0),
+  finished_with_unsettled_provider INTEGER NOT NULL
+    CHECK (finished_with_unsettled_provider IN (0, 1))
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS attention_recovery_unfinished_order_idx
+  ON attention_recovery_executions(
+    expired_recoverable,
+    started_at,
+    activation_id
+  );
+
+CREATE INDEX IF NOT EXISTS attention_recovery_finished_order_idx
+  ON attention_recovery_executions(
+    finished_with_unsettled_provider,
+    started_at,
+    activation_id
+  );
+
+CREATE INDEX IF NOT EXISTS attention_recovery_expiry_horizon_idx
+  ON attention_recovery_executions(
+    unfinished,
+    expired_recoverable,
+    expires_at
+  );
+
+CREATE TABLE IF NOT EXISTS attention_domain_fences (
+  agent_id TEXT NOT NULL REFERENCES agents(id),
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  channel_id TEXT NOT NULL REFERENCES channels(id),
+  thread_root_id TEXT NOT NULL,
+  attention_id TEXT NOT NULL UNIQUE REFERENCES attentions(id),
+  lease_token TEXT,
+  lease_expires_at TEXT,
+  unsettled_provider_attempt_count INTEGER NOT NULL DEFAULT 0
+    CHECK (unsettled_provider_attempt_count >= 0),
+  PRIMARY KEY (agent_id, project_id, channel_id, thread_root_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS attention_domain_fences_attention_idx
+  ON attention_domain_fences(attention_id);
 
 CREATE INDEX IF NOT EXISTS activation_live_run_expiry_idx
   ON activation_attempts(expires_at, run_id, agent_id, run_activation_generation)
@@ -442,4 +498,156 @@ CREATE TABLE IF NOT EXISTS attention_history (
 
 CREATE INDEX IF NOT EXISTS attention_history_snapshot_idx
   ON attention_history(attention_id, event_sequence);
+
+CREATE TRIGGER IF NOT EXISTS attention_recovery_activation_insert
+AFTER INSERT ON activation_attempts
+WHEN NEW.cause = 'Attention'
+BEGIN
+  INSERT INTO attention_recovery_executions
+    (activation_id, started_at, expires_at, unfinished, expired_recoverable,
+     unsettled_provider_attempt_count, finished_with_unsettled_provider)
+  VALUES (
+    NEW.id,
+    NEW.started_at,
+    NEW.expires_at,
+    CASE WHEN NEW.finished_at IS NULL THEN 1 ELSE 0 END,
+    0,
+    0,
+    0
+  );
+  UPDATE kernel_runtime_state
+     SET attention_recovery_revision = attention_recovery_revision + 1
+   WHERE singleton = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS attention_recovery_activation_update
+AFTER UPDATE OF started_at, expires_at, revoked_at, revocation_reason,
+  finished_at, outcome, detail ON activation_attempts
+WHEN OLD.cause = 'Attention' AND (
+  OLD.started_at IS NOT NEW.started_at OR
+  OLD.expires_at IS NOT NEW.expires_at OR
+  OLD.revoked_at IS NOT NEW.revoked_at OR
+  OLD.revocation_reason IS NOT NEW.revocation_reason OR
+  OLD.finished_at IS NOT NEW.finished_at OR
+  OLD.outcome IS NOT NEW.outcome OR
+  OLD.detail IS NOT NEW.detail
+)
+BEGIN
+  UPDATE attention_recovery_executions
+     SET started_at = NEW.started_at,
+         expires_at = NEW.expires_at,
+         unfinished = CASE WHEN NEW.finished_at IS NULL THEN 1 ELSE 0 END,
+         expired_recoverable =
+           CASE
+             WHEN NEW.finished_at IS NULL
+              AND NEW.expires_at = OLD.expires_at
+             THEN expired_recoverable
+             ELSE 0
+           END,
+         finished_with_unsettled_provider =
+           CASE
+             WHEN NEW.finished_at IS NOT NULL
+              AND unsettled_provider_attempt_count > 0
+             THEN 1
+             ELSE 0
+           END
+   WHERE activation_id = NEW.id;
+  UPDATE kernel_runtime_state
+     SET attention_recovery_revision = attention_recovery_revision + 1
+   WHERE singleton = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS attention_recovery_provider_insert
+AFTER INSERT ON provider_attempts
+WHEN EXISTS (
+  SELECT 1
+    FROM attention_recovery_executions
+   WHERE activation_id = NEW.activation_id
+)
+BEGIN
+  UPDATE attention_recovery_executions
+     SET unsettled_provider_attempt_count = (
+           SELECT COUNT(*)
+             FROM provider_attempts
+            WHERE activation_id = NEW.activation_id
+              AND status IN ('Started', 'Acknowledged')
+         ),
+         finished_with_unsettled_provider =
+           CASE
+             WHEN unfinished = 0
+              AND EXISTS (
+                SELECT 1
+                  FROM provider_attempts
+                 WHERE activation_id = NEW.activation_id
+                   AND status IN ('Started', 'Acknowledged')
+              )
+             THEN 1
+             ELSE 0
+           END
+   WHERE activation_id = NEW.activation_id;
+  UPDATE kernel_runtime_state
+     SET attention_recovery_revision = attention_recovery_revision + 1
+   WHERE singleton = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS attention_recovery_provider_update
+AFTER UPDATE OF status, detail, finished_at ON provider_attempts
+WHEN EXISTS (
+  SELECT 1
+    FROM attention_recovery_executions
+   WHERE activation_id = NEW.activation_id
+) AND (
+  OLD.status IS NOT NEW.status OR
+  OLD.detail IS NOT NEW.detail OR
+  OLD.finished_at IS NOT NEW.finished_at
+)
+BEGIN
+  UPDATE attention_recovery_executions
+     SET unsettled_provider_attempt_count = (
+           SELECT COUNT(*)
+             FROM provider_attempts
+            WHERE activation_id = NEW.activation_id
+              AND status IN ('Started', 'Acknowledged')
+         ),
+         finished_with_unsettled_provider =
+           CASE
+             WHEN unfinished = 0
+              AND EXISTS (
+                SELECT 1
+                  FROM provider_attempts
+                 WHERE activation_id = NEW.activation_id
+                   AND status IN ('Started', 'Acknowledged')
+              )
+             THEN 1
+             ELSE 0
+           END
+   WHERE activation_id = NEW.activation_id;
+  UPDATE kernel_runtime_state
+     SET attention_recovery_revision = attention_recovery_revision + 1
+   WHERE singleton = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS attention_recovery_attention_update
+AFTER UPDATE OF status, revision, handler_lease_holder_principal_id,
+  handler_lease_token, handler_lease_expires_at, resolution_outcome,
+  resolved_by_principal_id, resolved_activation_id, resolved_run_id,
+  resolved_at ON attentions
+WHEN (
+  OLD.status IS NOT NEW.status OR
+  OLD.revision IS NOT NEW.revision OR
+  OLD.handler_lease_holder_principal_id
+    IS NOT NEW.handler_lease_holder_principal_id OR
+  OLD.handler_lease_token IS NOT NEW.handler_lease_token OR
+  OLD.handler_lease_expires_at IS NOT NEW.handler_lease_expires_at OR
+  OLD.resolution_outcome IS NOT NEW.resolution_outcome OR
+  OLD.resolved_by_principal_id IS NOT NEW.resolved_by_principal_id OR
+  OLD.resolved_activation_id IS NOT NEW.resolved_activation_id OR
+  OLD.resolved_run_id IS NOT NEW.resolved_run_id OR
+  OLD.resolved_at IS NOT NEW.resolved_at
+)
+BEGIN
+  UPDATE kernel_runtime_state
+     SET attention_recovery_revision = attention_recovery_revision + 1
+   WHERE singleton = 1;
+END;
 `;

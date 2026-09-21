@@ -125,6 +125,13 @@ export function claimAttention(kernel: db.KernelContext, command: Extract<Kernel
   const leaseToken = kernel.idFactory("lease");
   const revision = integer(attention.revision) + 1;
   const expiresAt = new Date(now.getTime() + command.leaseDurationMs).toISOString();
+  invariants.claimAttentionDomain(
+    kernel,
+    attention,
+    leaseToken,
+    expiresAt,
+    now,
+  );
   const changedActivations = db.allRows(kernel, `UPDATE activation_attempts
           SET revoked_at = COALESCE(revoked_at, ?),
               revocation_reason = COALESCE(revocation_reason, 'attention_lease_replaced')
@@ -159,6 +166,7 @@ export function claimAttention(kernel: db.KernelContext, command: Extract<Kernel
     commandType: command.type,
     entityId: command.attentionId,
     revision,
+    leaseExpiresAt: expiresAt,
     relatedIds: { handlerLeaseToken: leaseToken },
   };
 }
@@ -201,6 +209,7 @@ export function resolveAttentionWithRun(kernel: db.KernelContext, command: Extra
               handler_lease_token = NULL,
               handler_lease_expires_at = NULL
         WHERE id = ?`, revision, text(principal.id), text(activation.id), runId, now, command.attentionId);
+  invariants.releaseAttentionDomainLease(kernel, command.attentionId);
   const cursor = invariants.emitThreadEvent(kernel, {
     type: "RunCreated",
     projectId: text(attention.project_id),
@@ -277,6 +286,7 @@ export function ignoreAttention(kernel: db.KernelContext, command: Extract<Kerne
               handler_lease_token = NULL,
               handler_lease_expires_at = NULL
         WHERE id = ?`, revision, text(principal.id), text(activation.id), now, command.attentionId);
+  invariants.releaseAttentionDomainLease(kernel, command.attentionId);
   const eventSequence = invariants.emitEvent(kernel, {
     type: "AttentionIgnored",
     projectId: text(attention.project_id),
@@ -381,6 +391,7 @@ export function resolveAttentionWithExistingRun(kernel: db.KernelContext, comman
               handler_lease_token = NULL,
               handler_lease_expires_at = NULL
         WHERE id = ?`, attentionRevision, text(principal.id), text(activation.id), command.runId, now, command.attentionId);
+  invariants.releaseAttentionDomainLease(kernel, command.attentionId);
   const cursor = invariants.emitThreadEvent(kernel, {
     type: "RunInputAdded",
     projectId: text(run.project_id),
@@ -446,5 +457,38 @@ export function resolveAttentionWithExistingRun(kernel: db.KernelContext, comman
       runInputId: input.id,
       activationId: text(activation.id),
     },
+  };
+}
+
+export function resolveCachedAttentionClaim(
+  kernel: db.KernelContext,
+  result: CommandResult,
+  principal: Row,
+): CommandResult {
+  const leaseToken = result.relatedIds?.handlerLeaseToken;
+  if (!leaseToken) {
+    throw new KernelError(
+      "Conflict",
+      "The cached Attention claim does not contain a handler lease token.",
+    );
+  }
+  const attention = invariants.requireAttention(kernel, result.entityId);
+  const expiresAt = optionalText(attention.handler_lease_expires_at);
+  if (
+    text(attention.status) !== "Open" ||
+    optionalText(attention.handler_lease_holder_principal_id) !==
+      text(principal.id) ||
+    optionalText(attention.handler_lease_token) !== leaseToken ||
+    expiresAt === null ||
+    new Date(expiresAt) <= kernel.clock()
+  ) {
+    throw new KernelError(
+      "Conflict",
+      "The cached Attention claim lease is no longer current.",
+    );
+  }
+  return {
+    ...result,
+    leaseExpiresAt: expiresAt,
   };
 }

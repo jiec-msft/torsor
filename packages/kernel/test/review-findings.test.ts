@@ -884,6 +884,14 @@ describe("independent review regressions", () => {
         runtimeContext,
       );
       expect(claim.outboxEvents).toHaveLength(2);
+      expect(claim.leaseExpiresAt).toBe(
+        "2026-09-21T08:00:30.000Z",
+      );
+      expect(
+        claim.outboxEvents?.every(
+          (event) => event.leaseExpiresAt === claim.leaseExpiresAt,
+        ),
+      ).toBe(true);
 
       await expect(
         kernel.execute(

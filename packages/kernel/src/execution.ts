@@ -236,6 +236,7 @@ export function startProviderAttempt(kernel: db.KernelContext, command: Extract<
          capability_snapshot_json, run_input_ids_json, request_idempotency_key,
          diagnostic_session_id, status, started_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Started', ?)`, providerAttemptId, command.activationId, runId, command.adapter, command.adapterVersion, JSON.stringify(command.capabilitySnapshot), JSON.stringify(runInputIds), command.requestIdempotencyKey, command.diagnosticSessionId ?? null, db.now(kernel));
+  invariants.synchronizeAttentionDomainProviderAttempts(kernel, activation);
   const scope = invariants.activationScope(kernel, activation);
   invariants.emitEvent(kernel, {
     type: "ProviderAttemptStarted",
@@ -452,6 +453,7 @@ export function setProviderAttemptStatus(kernel: db.KernelContext, providerAttem
   db.run(kernel, `UPDATE provider_attempts
           SET status = ?, detail = ?, finished_at = ?
         WHERE id = ?`, status, detail, finishedAt, providerAttemptId);
+  invariants.synchronizeAttentionDomainProviderAttempts(kernel, activation);
   const scope = invariants.activationScope(kernel, activation);
   invariants.emitEvent(kernel, {
     type: status === "Acknowledged"

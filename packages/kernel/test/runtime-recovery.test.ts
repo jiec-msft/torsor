@@ -871,7 +871,136 @@ describe("Runtime provider recovery", () => {
           { type: "ListRecoverableAttentionExecutions", limit: 10 },
           runtimeContext,
         ),
-      ).toEqual({ items: [], nextCursor: null, hasMore: false });
+      ).toMatchObject({ items: [], nextCursor: null, hasMore: false });
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("invalidates a sweep when an older execution becomes recoverable behind its cursor", async () => {
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const kernel = openMemoryKernel(() => now);
+    try {
+      const behindCursor = await createAttentionExecution(
+        kernel,
+        "snapshot-behind-cursor",
+      );
+      await startAttentionProviderAttempt(
+        kernel,
+        behindCursor.activationId,
+        "snapshot-behind-cursor",
+      );
+      now = new Date("2026-09-21T08:00:01.000Z");
+      const stableHead = await createAttentionExecution(
+        kernel,
+        "snapshot-stable-head",
+        1_000,
+      );
+      await createAttentionExecution(
+        kernel,
+        "snapshot-stable-tail",
+        1_000,
+      );
+      now = new Date("2026-09-21T08:00:03.000Z");
+      const snapshot = await kernel.query(
+        { type: "GetAttentionRecoverySnapshot" },
+        runtimeContext,
+      );
+      const first = await kernel.query(
+        {
+          type: "ListRecoverableAttentionExecutions",
+          recoverySnapshot: snapshot,
+          limit: 1,
+        },
+        runtimeContext,
+      );
+      expect(first.items.map((item) => item.activation.id)).toEqual([
+        stableHead.activationId,
+      ]);
+
+      await kernel.execute(
+        {
+          type: "FinishActivation",
+          idempotencyKey: "snapshot-behind-cursor-finish",
+          activationId: behindCursor.activationId,
+          outcome: "Failed",
+        },
+        runtimeContext,
+      );
+
+      await expect(
+        kernel.query(
+          {
+            type: "ListRecoverableAttentionExecutions",
+            afterCursor: first.nextCursor!,
+            recoverySnapshot: snapshot,
+            limit: 1,
+          },
+          runtimeContext,
+        ),
+      ).rejects.toMatchObject({ code: "StaleRevision" });
+      const after = await kernel.query(
+        { type: "GetAttentionRecoverySnapshot" },
+        runtimeContext,
+      );
+      expect(after.revision).toBeGreaterThan(snapshot.revision);
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("invalidates a sweep when the clock crosses its earliest expiry horizon", async () => {
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const kernel = openMemoryKernel(() => now);
+    try {
+      await createAttentionExecution(
+        kernel,
+        "snapshot-future-expiry",
+        5_000,
+      );
+      now = new Date("2026-09-21T08:00:01.000Z");
+      const stableHead = await createAttentionExecution(
+        kernel,
+        "snapshot-clock-head",
+        1_000,
+      );
+      await createAttentionExecution(
+        kernel,
+        "snapshot-clock-tail",
+        1_000,
+      );
+      now = new Date("2026-09-21T08:00:03.000Z");
+      const snapshot = await kernel.query(
+        { type: "GetAttentionRecoverySnapshot" },
+        runtimeContext,
+      );
+      expect(snapshot.nextExpiryAt).toBe(
+        "2026-09-21T08:00:05.000Z",
+      );
+      const first = await kernel.query(
+        {
+          type: "ListRecoverableAttentionExecutions",
+          recoverySnapshot: snapshot,
+          limit: 1,
+        },
+        runtimeContext,
+      );
+      expect(first.items.map((item) => item.activation.id)).toEqual([
+        stableHead.activationId,
+      ]);
+
+      now = new Date("2026-09-21T08:00:06.000Z");
+      await expect(
+        kernel.query(
+          {
+            type: "ListRecoverableAttentionExecutions",
+            afterCursor: first.nextCursor!,
+            recoverySnapshot: snapshot,
+            limit: 1,
+          },
+          runtimeContext,
+        ),
+      ).rejects.toMatchObject({ code: "StaleRevision" });
     } finally {
       kernel.close();
     }
