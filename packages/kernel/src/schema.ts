@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 3;
+export const CURRENT_SCHEMA_VERSION = 4;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -245,8 +245,6 @@ CREATE TABLE IF NOT EXISTS outbox_events (
   lease_holder_principal_id TEXT REFERENCES principals(id),
   lease_token TEXT,
   lease_expires_at TEXT,
-  lease_protocol_generation INTEGER NOT NULL DEFAULT 0
-    CHECK (lease_protocol_generation >= 0),
   created_at TEXT NOT NULL,
   acknowledged_at TEXT,
   acknowledged_by_principal_id TEXT REFERENCES principals(id)
@@ -254,27 +252,6 @@ CREATE TABLE IF NOT EXISTS outbox_events (
 
 CREATE INDEX IF NOT EXISTS outbox_pending_idx
   ON outbox_events(acknowledged_at, lease_expires_at, sequence);
-
-CREATE TRIGGER IF NOT EXISTS outbox_lease_protocol_fence
-BEFORE UPDATE OF lease_token, delivery_attempts ON outbox_events
-FOR EACH ROW
-WHEN NEW.lease_token IS NOT NULL
- AND NEW.delivery_attempts > OLD.delivery_attempts
- AND NEW.lease_protocol_generation != OLD.lease_protocol_generation + 1
-BEGIN
-  SELECT RAISE(ABORT, 'outbox lease protocol generation mismatch');
-END;
-
-CREATE TRIGGER IF NOT EXISTS outbox_ack_protocol_fence
-BEFORE UPDATE OF acknowledged_at, lease_token ON outbox_events
-FOR EACH ROW
-WHEN OLD.acknowledged_at IS NULL
- AND NEW.acknowledged_at IS NOT NULL
- AND OLD.lease_token IS NOT NULL
- AND NEW.lease_protocol_generation != 0
-BEGIN
-  SELECT RAISE(ABORT, 'outbox acknowledgement protocol generation mismatch');
-END;
 
 CREATE TABLE IF NOT EXISTS public_events (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,

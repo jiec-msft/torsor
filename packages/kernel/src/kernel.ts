@@ -113,10 +113,10 @@ export class TorsorKernel {
     this.#database = new DatabaseSync(options.databasePath);
     try {
       this.#database.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+      this.#initializeSchema();
       if (options.databasePath !== ":memory:") {
         this.#database.exec("PRAGMA journal_mode = WAL;");
       }
-      this.#initializeSchema();
       this.#applyBootstrap(options.bootstrap);
     } catch (error) {
       this.#database.close();
@@ -1476,7 +1476,6 @@ export class TorsorKernel {
             SET lease_holder_principal_id = ?,
                 lease_token = ?,
                 lease_expires_at = ?,
-                lease_protocol_generation = lease_protocol_generation + 1,
                 delivery_attempts = delivery_attempts + 1
           WHERE id = ?`,
         text(principal.id),
@@ -1523,7 +1522,6 @@ export class TorsorKernel {
         WHERE acknowledged_at IS NULL
           AND lease_holder_principal_id = ?
           AND lease_token = ?
-          AND lease_protocol_generation > 0
         ORDER BY sequence`,
       text(principal.id),
       command.leaseToken,
@@ -1568,7 +1566,6 @@ export class TorsorKernel {
       if (
         optionalText(event.lease_holder_principal_id) !== text(principal.id) ||
         optionalText(event.lease_token) !== command.leaseToken ||
-        integer(event.lease_protocol_generation) <= 0 ||
         !optionalText(event.lease_expires_at) ||
         new Date(text(event.lease_expires_at)) <= this.#clock()
       ) {
@@ -1585,8 +1582,7 @@ export class TorsorKernel {
                 acknowledged_by_principal_id = ?,
                 lease_holder_principal_id = NULL,
                 lease_token = NULL,
-                lease_expires_at = NULL,
-                lease_protocol_generation = 0
+                lease_expires_at = NULL
           WHERE id = ?`,
         now,
         text(principal.id),
@@ -1675,7 +1671,6 @@ export class TorsorKernel {
             SET lease_holder_principal_id = ?,
                 lease_token = ?,
                 lease_expires_at = ?,
-                lease_protocol_generation = lease_protocol_generation + 1,
                 delivery_attempts = delivery_attempts + 1
           WHERE id = ?`,
         text(principal.id),
@@ -2895,119 +2890,22 @@ export class TorsorKernel {
         this.#database.exec("COMMIT");
         return;
       }
-      if (version === 1 || version === 2) {
-        this.#database.exec(
-          `ALTER TABLE outbox_events
-             ADD COLUMN lease_protocol_generation INTEGER NOT NULL DEFAULT 0
-             CHECK (lease_protocol_generation >= 0)`,
-        );
-        // Clearing legacy tokens fences acknowledgements; the trigger installed
-        // below fences every subsequent lease attempt that omits the generation.
-        this.#database.exec(
-          `UPDATE outbox_events
-              SET lease_holder_principal_id = NULL,
-                  lease_token = NULL,
-                  lease_expires_at = NULL,
-                  lease_protocol_generation = 0
-            WHERE acknowledged_at IS NULL`,
-        );
-        if (version === 1) {
-          this.#database.exec(
-            `ALTER TABLE attentions
-               ADD COLUMN created_event_sequence INTEGER
-               REFERENCES public_events(sequence)`,
-          );
-          this.#database.exec(
-            `UPDATE attentions
-                SET created_event_sequence = (
-                  SELECT sequence
-                    FROM public_events
-                   WHERE type = 'AttentionOpened'
-                     AND entity_type = 'Attention'
-                     AND entity_id = attentions.id
-                   ORDER BY sequence
-                   LIMIT 1
-                )`,
-          );
-        }
-        this.#database.exec(schemaSql);
-        if (version === 1) {
-          this.#database.exec(
-            `INSERT OR IGNORE INTO attention_history
-              (attention_id, event_sequence, status, revision,
-               handler_lease_holder_principal_id, handler_lease_expires_at,
-               resolved_run_id, resolved_at)
-             SELECT id, created_event_sequence, 'Open', 1, NULL, NULL, NULL, NULL
-               FROM attentions
-              WHERE created_event_sequence IS NOT NULL`,
-          );
-          this.#database.exec(
-            `INSERT INTO attention_history
-              (attention_id, event_sequence, status, revision,
-               handler_lease_holder_principal_id, handler_lease_expires_at,
-               resolved_run_id, resolved_at)
-             SELECT event.entity_id,
-                    event.sequence,
-                    'Open',
-                    CAST(json_extract(event.payload_json, '$.revision') AS INTEGER),
-                    event.actor_principal_id,
-                    json_extract(event.payload_json, '$.expiresAt'),
-                    NULL,
-                    NULL
-               FROM public_events AS event
-              WHERE event.entity_type = 'Attention'
-                AND event.type = 'AttentionClaimed'`,
-          );
-          this.#database.exec(
-            `INSERT INTO attention_history
-              (attention_id, event_sequence, status, revision,
-               handler_lease_holder_principal_id, handler_lease_expires_at,
-               resolved_run_id, resolved_at)
-             SELECT event.entity_id,
-                    event.sequence,
-                    'Resolved',
-                    (
-                      SELECT COALESCE(
-                        MAX(CAST(json_extract(claim.payload_json, '$.revision') AS INTEGER)),
-                        1
-                      ) + 1
-                        FROM public_events AS claim
-                       WHERE claim.entity_type = 'Attention'
-                         AND claim.entity_id = event.entity_id
-                         AND claim.type = 'AttentionClaimed'
-                         AND claim.sequence < event.sequence
-                    ),
-                    NULL,
-                    NULL,
-                    json_extract(event.payload_json, '$.runId'),
-                    event.occurred_at
-               FROM public_events AS event
-              WHERE event.entity_type = 'Attention'
-                AND event.type = 'AttentionResolved'`,
-          );
-        }
-        this.#database.exec(
-          `PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`,
-        );
-        this.#database.exec("COMMIT");
-        return;
-      }
       if (version !== 0) {
         throw new KernelError(
           "Conflict",
-          `Unsupported kernel schema version ${version}; expected ${CURRENT_SCHEMA_VERSION}.`,
+          `Incompatible development database schema version ${version}; expected ${CURRENT_SCHEMA_VERSION}. Stop old Torsor processes and recreate the disposable local database.`,
         );
       }
       const existing = this.#initializeSchemaGet(
         `SELECT name
            FROM sqlite_master
-          WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+          WHERE name NOT LIKE 'sqlite_%'
           LIMIT 1`,
       );
       if (existing) {
         throw new KernelError(
           "Conflict",
-          "The database contains an unversioned kernel schema and cannot be migrated safely.",
+          "The database uses an incompatible unversioned development schema. Stop old Torsor processes and recreate the disposable local database.",
         );
       }
       this.#database.exec(schemaSql);
