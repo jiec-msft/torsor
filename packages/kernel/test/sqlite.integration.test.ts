@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { Worker } from "node:worker_threads";
 
 import { describe, expect, it } from "vitest";
 
@@ -16,6 +18,428 @@ import {
 interface SchemaInitializationOperation {
   readonly kind: "exec" | "read";
   readonly sql: string;
+}
+
+interface HeldWriteLock {
+  readonly committed: Promise<void>;
+  readonly release: () => void;
+  readonly worker: Worker;
+}
+
+interface HeldActivationCommand {
+  readonly release: () => void;
+  readonly result: Promise<{ readonly entityId: string }>;
+  readonly worker: Worker;
+}
+
+interface PreparedActivationCommand {
+  readonly attempting: Promise<void>;
+  readonly result: Promise<{ readonly entityId: string }>;
+  readonly start: () => void;
+  readonly worker: Worker;
+}
+
+interface PendingKernelOpen {
+  readonly attempting: Promise<void>;
+  readonly opened: Promise<void>;
+  readonly worker: Worker;
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(",")}}`;
+}
+
+function commandHash(command: unknown): string {
+  return createHash("sha256").update(canonicalJson(command)).digest("hex");
+}
+
+async function holdWriteLock(
+  databasePath: string,
+): Promise<HeldWriteLock> {
+  const signal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const releaseSignal = new Int32Array(signal);
+  const worker = new Worker(
+    `
+      const { DatabaseSync } = require("node:sqlite");
+      const { parentPort, workerData } = require("node:worker_threads");
+      const releaseSignal = new Int32Array(workerData.signal);
+      const database = new DatabaseSync(workerData.databasePath);
+      database.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE");
+      parentPort.postMessage({ type: "locked" });
+      try {
+        if (Atomics.wait(releaseSignal, 0, 0, 5000) === "timed-out") {
+          throw new Error("Timed out waiting to release the write lock.");
+        }
+        database.exec("COMMIT");
+        parentPort.postMessage({ type: "committed" });
+        database.close();
+      } catch (error) {
+        parentPort.postMessage({
+          type: "error",
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    `,
+    {
+      eval: true,
+      workerData: {
+        databasePath,
+        signal,
+      },
+    },
+  );
+  let resolveLocked!: () => void;
+  let rejectLocked!: (error: Error) => void;
+  let resolveCommitted!: () => void;
+  let rejectCommitted!: (error: Error) => void;
+  const locked = new Promise<void>((resolve, reject) => {
+    resolveLocked = resolve;
+    rejectLocked = reject;
+  });
+  const committed = new Promise<void>((resolve, reject) => {
+    resolveCommitted = resolve;
+    rejectCommitted = reject;
+  });
+  worker.on("message", (message: { type: string; message?: string }) => {
+    if (message.type === "locked") {
+      resolveLocked();
+    } else if (message.type === "committed") {
+      resolveCommitted();
+    } else if (message.type === "error") {
+      const error = new Error(message.message ?? "Write-lock worker failed.");
+      rejectLocked(error);
+      rejectCommitted(error);
+    }
+  });
+  worker.on("error", (error) => {
+    rejectLocked(error);
+    rejectCommitted(error);
+  });
+  worker.on("exit", (code) => {
+    if (code !== 0) {
+      const error = new Error(`Write-lock worker exited with code ${code}.`);
+      rejectLocked(error);
+      rejectCommitted(error);
+    }
+  });
+  await locked;
+  return {
+    committed,
+    release: () => {
+      Atomics.store(releaseSignal, 0, 1);
+      Atomics.notify(releaseSignal, 0);
+    },
+    worker,
+  };
+}
+
+async function startActivationHoldingBeforeCommit(
+  databasePath: string,
+  command: Readonly<Record<string, unknown>>,
+): Promise<HeldActivationCommand> {
+  const signal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const releaseSignal = new Int32Array(signal);
+  const worker = new Worker(
+    `
+      const { parentPort, workerData } = require("node:worker_threads");
+      const releaseSignal = new Int32Array(workerData.signal);
+      import(workerData.moduleUrl)
+        .then(async ({ TorsorKernel }) => {
+          const kernel = TorsorKernel.open({
+            databasePath: workerData.databasePath,
+            bootstrap: workerData.bootstrap,
+          });
+          globalThis[Symbol.for("torsor.kernel.command-before-commit")] = (
+            operation,
+          ) => {
+            if (operation.commandType === "StartActivation") {
+              parentPort.postMessage({ type: "holding" });
+              if (Atomics.wait(releaseSignal, 0, 0, 5000) === "timed-out") {
+                throw new Error("Timed out waiting to commit the Activation.");
+              }
+            }
+          };
+          try {
+            const result = await kernel.execute(
+              workerData.command,
+              workerData.principalContext,
+            );
+            parentPort.postMessage({
+              type: "result",
+              result: { entityId: result.entityId },
+            });
+          } finally {
+            kernel.close();
+          }
+        })
+        .catch((error) => {
+          parentPort.postMessage({
+            type: "error",
+            message: error instanceof Error ? error.stack ?? error.message : String(error),
+          });
+        });
+    `,
+    {
+      eval: true,
+      workerData: {
+        bootstrap,
+        command,
+        databasePath,
+        moduleUrl: new URL("../dist/index.js", import.meta.url).href,
+        principalContext: runtimeContext,
+        signal,
+      },
+    },
+  );
+  let resolveHolding!: () => void;
+  let rejectHolding!: (error: Error) => void;
+  let resolveResult!: (result: { readonly entityId: string }) => void;
+  let rejectResult!: (error: Error) => void;
+  const holding = new Promise<void>((resolve, reject) => {
+    resolveHolding = resolve;
+    rejectHolding = reject;
+  });
+  const result = new Promise<{ readonly entityId: string }>(
+    (resolve, reject) => {
+      resolveResult = resolve;
+      rejectResult = reject;
+    },
+  );
+  worker.on(
+    "message",
+    (message: {
+      type: string;
+      message?: string;
+      result?: { readonly entityId: string };
+    }) => {
+      if (message.type === "holding") {
+        resolveHolding();
+      } else if (message.type === "result" && message.result) {
+        resolveResult(message.result);
+      } else if (message.type === "error") {
+        const error = new Error(
+          message.message ?? "Activation command worker failed.",
+        );
+        rejectHolding(error);
+        rejectResult(error);
+      }
+    },
+  );
+  worker.on("error", (error) => {
+    rejectHolding(error);
+    rejectResult(error);
+  });
+  worker.on("exit", (code) => {
+    if (code !== 0) {
+      const error = new Error(`Activation command worker exited with code ${code}.`);
+      rejectHolding(error);
+      rejectResult(error);
+    }
+  });
+  await holding;
+  return {
+    release: () => {
+      Atomics.store(releaseSignal, 0, 1);
+      Atomics.notify(releaseSignal, 0);
+    },
+    result,
+    worker,
+  };
+}
+
+async function prepareActivationCommand(
+  databasePath: string,
+  command: Readonly<Record<string, unknown>>,
+): Promise<PreparedActivationCommand> {
+  const signal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const startSignal = new Int32Array(signal);
+  const worker = new Worker(
+    `
+      const { parentPort, workerData } = require("node:worker_threads");
+      const startSignal = new Int32Array(workerData.signal);
+      import(workerData.moduleUrl)
+        .then(async ({ TorsorKernel }) => {
+          const kernel = TorsorKernel.open({
+            databasePath: workerData.databasePath,
+            bootstrap: workerData.bootstrap,
+          });
+          globalThis[Symbol.for("torsor.kernel.command-transaction-operation")] = (
+            operation,
+          ) => {
+            if (operation.kind === "exec" && operation.sql === "BEGIN IMMEDIATE") {
+              parentPort.postMessage({ type: "attempting" });
+            }
+          };
+          parentPort.postMessage({ type: "ready" });
+          if (Atomics.wait(startSignal, 0, 0, 5000) === "timed-out") {
+            throw new Error("Timed out waiting to start the Activation contender.");
+          }
+          try {
+            const result = await kernel.execute(
+              workerData.command,
+              workerData.principalContext,
+            );
+            parentPort.postMessage({
+              type: "result",
+              result: { entityId: result.entityId },
+            });
+          } finally {
+            kernel.close();
+          }
+        })
+        .catch((error) => {
+          parentPort.postMessage({
+            type: "error",
+            message: error instanceof Error ? error.stack ?? error.message : String(error),
+          });
+        });
+    `,
+    {
+      eval: true,
+      workerData: {
+        bootstrap,
+        command,
+        databasePath,
+        moduleUrl: new URL("../dist/index.js", import.meta.url).href,
+        principalContext: runtimeContext,
+        signal,
+      },
+    },
+  );
+  let resolveReady!: () => void;
+  let rejectReady!: (error: Error) => void;
+  let resolveAttempting!: () => void;
+  let rejectAttempting!: (error: Error) => void;
+  let resolveResult!: (result: { readonly entityId: string }) => void;
+  let rejectResult!: (error: Error) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  const attempting = new Promise<void>((resolve, reject) => {
+    resolveAttempting = resolve;
+    rejectAttempting = reject;
+  });
+  const result = new Promise<{ readonly entityId: string }>(
+    (resolve, reject) => {
+      resolveResult = resolve;
+      rejectResult = reject;
+    },
+  );
+  worker.on(
+    "message",
+    (message: {
+      type: string;
+      message?: string;
+      result?: { readonly entityId: string };
+    }) => {
+      if (message.type === "ready") {
+        resolveReady();
+      } else if (message.type === "attempting") {
+        resolveAttempting();
+      } else if (message.type === "result" && message.result) {
+        resolveResult(message.result);
+      } else if (message.type === "error") {
+        const error = new Error(
+          message.message ?? "Activation contender worker failed.",
+        );
+        rejectReady(error);
+        rejectAttempting(error);
+        rejectResult(error);
+      }
+    },
+  );
+  worker.on("error", (error) => {
+    rejectReady(error);
+    rejectAttempting(error);
+    rejectResult(error);
+  });
+  await ready;
+  return {
+    attempting,
+    result,
+    start: () => {
+      Atomics.store(startSignal, 0, 1);
+      Atomics.notify(startSignal, 0);
+    },
+    worker,
+  };
+}
+
+function openKernelInWorker(databasePath: string): PendingKernelOpen {
+  const worker = new Worker(
+    `
+      const { parentPort, workerData } = require("node:worker_threads");
+      globalThis[Symbol.for("torsor.kernel.schema-initialization-operation")] = (
+        operation,
+      ) => {
+        if (operation.kind === "exec" && operation.sql === "BEGIN IMMEDIATE") {
+          parentPort.postMessage({ type: "attempting" });
+        }
+      };
+      import(workerData.moduleUrl)
+        .then(({ TorsorKernel }) => {
+          const kernel = TorsorKernel.open({
+            databasePath: workerData.databasePath,
+            bootstrap: workerData.bootstrap,
+          });
+          kernel.close();
+          parentPort.postMessage({ type: "opened" });
+        })
+        .catch((error) => {
+          parentPort.postMessage({
+            type: "error",
+            message: error instanceof Error ? error.stack ?? error.message : String(error),
+          });
+        });
+    `,
+    {
+      eval: true,
+      workerData: {
+        bootstrap,
+        databasePath,
+        moduleUrl: new URL("../dist/index.js", import.meta.url).href,
+      },
+    },
+  );
+  let resolveAttempting!: () => void;
+  let rejectAttempting!: (error: Error) => void;
+  let resolveOpened!: () => void;
+  let rejectOpened!: (error: Error) => void;
+  const attempting = new Promise<void>((resolve, reject) => {
+    resolveAttempting = resolve;
+    rejectAttempting = reject;
+  });
+  const opened = new Promise<void>((resolve, reject) => {
+    resolveOpened = resolve;
+    rejectOpened = reject;
+  });
+  worker.on("message", (message: { type: string; message?: string }) => {
+    if (message.type === "attempting") {
+      resolveAttempting();
+    } else if (message.type === "opened") {
+      resolveOpened();
+    } else if (message.type === "error") {
+      const error = new Error(message.message ?? "Kernel open worker failed.");
+      rejectAttempting(error);
+      rejectOpened(error);
+    }
+  });
+  worker.on("error", (error) => {
+    rejectAttempting(error);
+    rejectOpened(error);
+  });
+  return { attempting, opened, worker };
 }
 
 describe("SQLite persistence", () => {
@@ -498,12 +922,14 @@ describe("SQLite persistence", () => {
     }
   });
 
-  it("atomically reuses one Attention Activation across connections", async () => {
+  it("waits for a competing Attention Activation transaction and reuses its winner", async () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-attention-"));
     const databasePath = join(directory, "kernel.sqlite");
+    let winner: HeldActivationCommand | undefined;
+    let contender: PreparedActivationCommand | undefined;
     try {
-      const first = TorsorKernel.open({ databasePath, bootstrap });
-      await first.execute(
+      const kernel = TorsorKernel.open({ databasePath, bootstrap });
+      await kernel.execute(
         {
           type: "StartThread",
           idempotencyKey: "cross-connection-attention",
@@ -514,12 +940,12 @@ describe("SQLite persistence", () => {
         },
         humanContext,
       );
-      const page = await first.query(
+      const page = await kernel.query(
         { type: "ListOpenAttentions", targetAgentId: "agent-orbit" },
         runtimeContext,
       );
       const attention = page.items[0]!;
-      const claim = await first.execute(
+      const claim = await kernel.execute(
         {
           type: "ClaimAttention",
           idempotencyKey: "cross-connection-claim",
@@ -529,34 +955,209 @@ describe("SQLite persistence", () => {
         },
         runtimeContext,
       );
-      const second = TorsorKernel.open({ databasePath, bootstrap });
       try {
-        const command = {
+        const contenderCommand = {
           type: "StartActivation",
+          idempotencyKey: "cross-connection-contender",
           attentionId: attention.id,
           handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
         } as const;
-        const left = await first.execute(
-          { ...command, idempotencyKey: "cross-connection-left" },
-          runtimeContext,
+        contender = await prepareActivationCommand(
+          databasePath,
+          contenderCommand,
         );
-        const right = await second.execute(
-          { ...command, idempotencyKey: "cross-connection-right" },
-          runtimeContext,
-        );
-        expect(right.entityId).toBe(left.entityId);
+        winner = await startActivationHoldingBeforeCommit(databasePath, {
+          ...contenderCommand,
+          idempotencyKey: "cross-connection-winner",
+        });
+        contender.start();
+        await contender.attempting;
+        winner.release();
+        const [winnerResult, contenderResult] = await Promise.all([
+          winner.result,
+          contender.result,
+        ]);
+
+        expect(contenderResult.entityId).toBe(winnerResult.entityId);
+        const database = new DatabaseSync(databasePath, { readOnly: true });
+        try {
+          expect(
+            database
+              .prepare(
+                `SELECT COUNT(*) AS count
+                   FROM activation_attempts
+                  WHERE attention_id = ? AND attention_lease_token = ?`,
+              )
+              .get(
+                attention.id,
+                claim.relatedIds!.handlerLeaseToken!,
+              ),
+          ).toMatchObject({ count: 1 });
+        } finally {
+          database.close();
+        }
         expect(
-          (await first.readEvents(null, 500)).filter(
+          (await kernel.readEvents(null, 500)).filter(
             (event) =>
               event.type === "ActivationStarted" &&
-              event.entityId === left.entityId,
+              event.entityId === winnerResult.entityId,
           ),
         ).toHaveLength(1);
       } finally {
-        second.close();
-        first.close();
+        if (contender) {
+          await contender.worker.terminate();
+          contender = undefined;
+        }
+        if (winner) {
+          await winner.worker.terminate();
+          winner = undefined;
+        }
+        kernel.close();
       }
     } finally {
+      if (contender) {
+        await contender.worker.terminate();
+      }
+      if (winner) {
+        await winner.worker.terminate();
+      }
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects cached Agent retries for Runtime-only authority commands", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-authority-cache-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    try {
+      const kernel = TorsorKernel.open({ databasePath, bootstrap });
+      await kernel.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: "cached-authority-thread",
+          projectId: "project-sample",
+          channelId: "channel-general",
+          body: "Orbit, Runtime must mediate this dispatch.",
+          targetAgentIds: ["agent-orbit"],
+        },
+        humanContext,
+      );
+      const page = await kernel.query(
+        { type: "ListOpenAttentions", targetAgentId: "agent-orbit" },
+        runtimeContext,
+      );
+      const attention = page.items[0]!;
+      kernel.close();
+
+      const claimCommand = {
+        type: "ClaimAttention",
+        idempotencyKey: "legacy-agent-claim-cache",
+        attentionId: attention.id,
+        expectedAttentionRevision: attention.revision,
+        leaseDurationMs: 30_000,
+      } as const;
+      const activationCommand = {
+        type: "StartActivation",
+        idempotencyKey: "legacy-agent-activation-cache",
+        attentionId: attention.id,
+        handlerLeaseToken: "legacy-agent-lease",
+      } as const;
+      const database = new DatabaseSync(databasePath);
+      try {
+        const insert = database.prepare(
+          `INSERT INTO idempotency_records
+            (principal_id, command_name, idempotency_key, payload_hash,
+             result_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        );
+        insert.run(
+          "principal-orbit",
+          claimCommand.type,
+          claimCommand.idempotencyKey,
+          commandHash(claimCommand),
+          JSON.stringify({
+            commandType: claimCommand.type,
+            entityId: attention.id,
+            revision: attention.revision + 1,
+            relatedIds: { handlerLeaseToken: "legacy-agent-lease" },
+          }),
+          "2026-09-21T08:00:00.000Z",
+        );
+        insert.run(
+          "principal-orbit",
+          activationCommand.type,
+          activationCommand.idempotencyKey,
+          commandHash(activationCommand),
+          JSON.stringify({
+            commandType: activationCommand.type,
+            entityId: "activation-from-agent-cache",
+          }),
+          "2026-09-21T08:00:00.000Z",
+        );
+      } finally {
+        database.close();
+      }
+
+      const reopened = TorsorKernel.open({ databasePath, bootstrap });
+      try {
+        await expect(
+          reopened.execute(claimCommand, { principalId: "principal-orbit" }),
+        ).rejects.toMatchObject({ code: "Forbidden" });
+        await expect(
+          reopened.execute(activationCommand, {
+            principalId: "principal-orbit",
+            activationId: "activation-stale",
+          }),
+        ).rejects.toMatchObject({ code: "Forbidden" });
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("waits for a current-schema writer before opening another connection", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-init-race-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    let holder: HeldWriteLock | undefined;
+    let pendingOpen: PendingKernelOpen | undefined;
+    try {
+      const initialized = TorsorKernel.open({ databasePath, bootstrap });
+      await initialized.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: "open-contention-thread",
+          projectId: "project-sample",
+          channelId: "channel-general",
+          body: "Preserve current-schema state through opener contention.",
+        },
+        humanContext,
+      );
+      initialized.close();
+
+      holder = await holdWriteLock(databasePath);
+      pendingOpen = openKernelInWorker(databasePath);
+      await pendingOpen.attempting;
+      holder.release();
+      await Promise.all([holder.committed, pendingOpen.opened]);
+      const follower = TorsorKernel.open({ databasePath, bootstrap });
+      try {
+        const projection = await follower.query(
+          { type: "GetBootstrap", projectId: "project-sample" },
+          humanContext,
+        );
+        expect(projection.project.id).toBe("project-sample");
+        expect((await follower.readEvents(null, 100))).toHaveLength(1);
+      } finally {
+        follower.close();
+      }
+    } finally {
+      if (pendingOpen) {
+        await pendingOpen.worker.terminate();
+      }
+      if (holder) {
+        await holder.worker.terminate();
+      }
       await rm(directory, { recursive: true, force: true });
     }
   });
@@ -589,44 +1190,6 @@ describe("SQLite persistence", () => {
       });
       expect(operations[2]).toMatchObject({ kind: "read" });
       expect(operations[2]!.sql).toContain("sqlite_master");
-    } finally {
-      Reflect.deleteProperty(globalThis, hookSymbol);
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  it("re-reads schema state after another opener wins initialization", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "torsor-init-race-"));
-    const databasePath = join(directory, "kernel.sqlite");
-    const hookSymbol = Symbol.for(
-      "torsor.kernel.schema-initialization-operation",
-    );
-    let competingOpenCompleted = false;
-    try {
-      Reflect.set(
-        globalThis,
-        hookSymbol,
-        (operation: SchemaInitializationOperation) => {
-          if (operation.kind === "exec" && operation.sql === "BEGIN IMMEDIATE") {
-            Reflect.deleteProperty(globalThis, hookSymbol);
-            const competing = TorsorKernel.open({ databasePath, bootstrap });
-            competingOpenCompleted = true;
-            competing.close();
-          }
-        },
-      );
-
-      const follower = TorsorKernel.open({ databasePath, bootstrap });
-      try {
-        expect(competingOpenCompleted).toBe(true);
-        const projection = await follower.query(
-          { type: "GetBootstrap", projectId: "project-sample" },
-          humanContext,
-        );
-        expect(projection.project.id).toBe("project-sample");
-      } finally {
-        follower.close();
-      }
     } finally {
       Reflect.deleteProperty(globalThis, hookSymbol);
       await rm(directory, { recursive: true, force: true });

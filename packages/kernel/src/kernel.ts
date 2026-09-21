@@ -64,6 +64,12 @@ const terminalRunStates: readonly RunState[] = [
 const schemaInitializationHookSymbol = Symbol.for(
   "torsor.kernel.schema-initialization-operation",
 );
+const commandTransactionHookSymbol = Symbol.for(
+  "torsor.kernel.command-transaction-operation",
+);
+const commandBeforeCommitHookSymbol = Symbol.for(
+  "torsor.kernel.command-before-commit",
+);
 
 // Internal test seam for asserting lock/read order without exposing SQLite publicly.
 function recordSchemaInitializationOperation(
@@ -72,6 +78,22 @@ function recordSchemaInitializationOperation(
   const hook = Reflect.get(globalThis, schemaInitializationHookSymbol);
   if (typeof hook === "function") {
     hook(operation);
+  }
+}
+
+function recordCommandTransactionOperation(
+  operation: Readonly<{ kind: "exec"; sql: "BEGIN IMMEDIATE" }>,
+): void {
+  const hook = Reflect.get(globalThis, commandTransactionHookSymbol);
+  if (typeof hook === "function") {
+    hook(operation);
+  }
+}
+
+function recordCommandBeforeCommit(commandType: KernelCommand["type"]): void {
+  const hook = Reflect.get(globalThis, commandBeforeCommitHookSymbol);
+  if (typeof hook === "function") {
+    hook({ commandType });
   }
 }
 
@@ -145,7 +167,17 @@ export class TorsorKernel {
       text(principal.kind) === "human"
         ? { principalId: principalContext.principalId }
         : principalContext;
+    if (
+      command.type === "ClaimAttention" ||
+      command.type === "StartActivation"
+    ) {
+      this.#requireKind(principal, "runtime");
+    }
     const payloadHash = hashPayload(command);
+    recordCommandTransactionOperation({
+      kind: "exec",
+      sql: "BEGIN IMMEDIATE",
+    });
     this.#database.exec("BEGIN IMMEDIATE");
     try {
       const cached = this.#getRow(
@@ -206,6 +238,7 @@ export class TorsorKernel {
         JSON.stringify(result),
         this.#now(),
       );
+      recordCommandBeforeCommit(command.type);
       this.#database.exec("COMMIT");
       return result;
     } catch (error) {
@@ -718,9 +751,7 @@ export class TorsorKernel {
     principal: Row,
     correlationId: string,
   ): CommandResult {
-    if (!["runtime", "agent"].includes(text(principal.kind))) {
-      throw new KernelError("Forbidden", "Only runtime or Agent principals can claim Attention.");
-    }
+    this.#requireKind(principal, "runtime");
     if (
       !Number.isInteger(command.leaseDurationMs) ||
       command.leaseDurationMs < 1_000 ||
@@ -740,12 +771,6 @@ export class TorsorKernel {
       command.expectedAttentionRevision,
       "Attention",
     );
-    if (text(principal.kind) === "agent") {
-      const agent = this.#requireAgentForPrincipal(text(principal.id));
-      if (text(agent.id) !== text(attention.target_agent_id)) {
-        throw new KernelError("Forbidden", "An Agent may only claim its own Attention.");
-      }
-    }
     const now = this.#clock();
     const existingExpiry = optionalText(attention.handler_lease_expires_at);
     if (existingExpiry && new Date(existingExpiry) > now) {
@@ -944,9 +969,7 @@ export class TorsorKernel {
     principal: Row,
     correlationId: string,
   ): CommandResult {
-    if (!["runtime", "agent"].includes(text(principal.kind))) {
-      throw new KernelError("Forbidden", "Only runtime or Agent principals can start an Activation.");
-    }
+    this.#requireKind(principal, "runtime");
     if ((command.runId ? 1 : 0) + (command.attentionId ? 1 : 0) !== 1) {
       throw new KernelError(
         "InvalidCommand",
@@ -1057,15 +1080,6 @@ export class TorsorKernel {
         attentionLeaseToken,
       );
       if (existing) {
-        if (text(principal.kind) === "agent") {
-          const principalAgent = this.#requireAgentForPrincipal(text(principal.id));
-          if (text(principalAgent.id) !== text(attention.target_agent_id)) {
-            throw new KernelError(
-              "Forbidden",
-              "An Agent may only start its own Activation.",
-            );
-          }
-        }
         return {
           commandType: command.type,
           entityId: text(existing.id),
@@ -1080,12 +1094,6 @@ export class TorsorKernel {
       projectId = text(attention.project_id);
       channelId = text(attention.channel_id);
       threadRootId = text(attention.thread_root_id);
-    }
-    if (text(principal.kind) === "agent") {
-      const principalAgent = this.#requireAgentForPrincipal(text(principal.id));
-      if (text(principalAgent.id) !== text(agent.id)) {
-        throw new KernelError("Forbidden", "An Agent may only start its own Activation.");
-      }
     }
     const activationId = this.#idFactory("activation");
     this.#run(

@@ -133,6 +133,160 @@ describe("independent review regressions", () => {
     }
   });
 
+  it("allows only Runtime authority to claim Attention and mint Activations", async () => {
+    const kernel = openMemoryKernel();
+    try {
+      const setup = await createRun(kernel);
+      const current = await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "runtime-replacement-activation",
+          runId: setup.runId,
+          expectedRunRevision: 1,
+        },
+        runtimeContext,
+      );
+      await kernel.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: "runtime-authority-attention",
+          projectId: "project-sample",
+          channelId: "channel-general",
+          body: "Orbit, wait for trusted Runtime dispatch.",
+          targetAgentIds: ["agent-orbit"],
+        },
+        humanContext,
+      );
+      const page = await kernel.query(
+        { type: "ListOpenAttentions", targetAgentId: "agent-orbit" },
+        runtimeContext,
+      );
+      const attention = page.items[0]!;
+
+      await expect(
+        kernel.execute(
+          {
+            type: "ClaimAttention",
+            idempotencyKey: "stale-agent-claim",
+            attentionId: attention.id,
+            expectedAttentionRevision: attention.revision,
+            leaseDurationMs: 30_000,
+          },
+          { principalId: "principal-orbit" },
+        ),
+      ).rejects.toMatchObject({ code: "Forbidden" });
+
+      const claim = await kernel.execute(
+        {
+          type: "ClaimAttention",
+          idempotencyKey: "runtime-authority-claim",
+          attentionId: attention.id,
+          expectedAttentionRevision: attention.revision,
+          leaseDurationMs: 30_000,
+        },
+        runtimeContext,
+      );
+      await expect(
+        kernel.execute(
+          {
+            type: "StartActivation",
+            idempotencyKey: "stale-agent-attention-activation",
+            attentionId: attention.id,
+            handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
+          },
+          setup.agentContext,
+        ),
+      ).rejects.toMatchObject({ code: "Forbidden" });
+      const attentionActivation = await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "runtime-attention-activation",
+          attentionId: attention.id,
+          handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
+        },
+        runtimeContext,
+      );
+      const attentionRetry = await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "runtime-attention-activation-retry",
+          attentionId: attention.id,
+          handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
+        },
+        runtimeContext,
+      );
+      expect(attentionRetry.entityId).toBe(attentionActivation.entityId);
+
+      await expect(
+        kernel.execute(
+          {
+            type: "StartActivation",
+            idempotencyKey: "stale-agent-run-replacement",
+            runId: setup.runId,
+            expectedRunRevision: 1,
+          },
+          setup.agentContext,
+        ),
+      ).rejects.toMatchObject({ code: "Forbidden" });
+
+      const projection = await kernel.query(
+        { type: "GetRunProjection", runId: setup.runId },
+        humanContext,
+      );
+      expect(projection.run.activationGeneration).toBe(2);
+      expect(
+        projection.activations.find(
+          (activation) => activation.id === current.entityId,
+        ),
+      ).toMatchObject({
+        runActivationGeneration: 2,
+        revokedAt: null,
+      });
+
+      await expect(
+        kernel.execute(
+          {
+            type: "AppendRunActivity",
+            idempotencyKey: "stale-agent-authoritative-activity",
+            runId: setup.runId,
+            activationId: setup.activationId,
+            kind: "status",
+            payload: { state: "must-remain-stale" },
+            retentionClass: "durable",
+          },
+          setup.agentContext,
+        ),
+      ).rejects.toMatchObject({ code: "Conflict" });
+
+      const runtimeReplacement = await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "runtime-next-replacement",
+          runId: setup.runId,
+          expectedRunRevision: 1,
+        },
+        runtimeContext,
+      );
+      const runtimeRetry = await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "runtime-next-replacement",
+          runId: setup.runId,
+          expectedRunRevision: 1,
+        },
+        runtimeContext,
+      );
+      expect(runtimeRetry).toEqual(runtimeReplacement);
+      const finalProjection = await kernel.query(
+        { type: "GetRunProjection", runId: setup.runId },
+        humanContext,
+      );
+      expect(finalProjection.run.activationGeneration).toBe(3);
+    } finally {
+      kernel.close();
+    }
+  });
+
   it("ignores forged Activation provenance on Human commands", async () => {
     const kernel = openMemoryKernel();
     try {
