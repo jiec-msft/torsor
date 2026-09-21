@@ -559,7 +559,7 @@ describe("AgentRuntime", () => {
   );
 
   it(
-    "rotates through more ready Projects than the candidate buffer",
+    "rotates through more ready Projects and rescans exhausted Projects after refill",
     async () => {
       const projectCount = 102;
       const fairnessBootstrap =
@@ -685,6 +685,255 @@ describe("AgentRuntime", () => {
       }
     },
     60_000,
+  );
+
+  it(
+    "resumes a hot Project at page two within one Project rotation",
+    async () => {
+      const projectCount = 102;
+      const fairnessBootstrap =
+        createProjectFairnessBootstrap(projectCount);
+      const kernel = openKernel(
+        ":memory:",
+        () => new Date("2026-09-21T08:00:00.000Z"),
+        fairnessBootstrap,
+      );
+      const projectIds = Array.from(
+        { length: projectCount },
+        (_, index) => `project-fair-${index}`,
+      );
+      let releaseFirst!: () => void;
+      let signalFirstStarted!: () => void;
+      let signalBufferFilled!: () => void;
+      const release = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      const firstStarted = new Promise<void>((resolve) => {
+        signalFirstStarted = resolve;
+      });
+      const bufferFilled = new Promise<void>((resolve) => {
+        signalBufferFilled = resolve;
+      });
+      let firstBlocked = false;
+      let invocationOrdinal = 0;
+      let projectZeroOrdinal = Number.POSITIVE_INFINITY;
+      let projectOneOhOneFirstAttentionId = "";
+      const projectOneOhOneClaimAttempts: string[] = [];
+      try {
+        for (let index = 0; index < 101; index += 1) {
+          const thread = await startProjectMention(
+            kernel,
+            {
+              projectId: "project-fair-0",
+              channelId: "channel-fair-0",
+              agentId: "agent-fair-0",
+            },
+            `project-page-continuation:0:${index}`,
+            `Fair Agent 0, handle page item ${index}.`,
+          );
+          if (index < 100) {
+            const projection = await kernel.query(
+              {
+                type: "GetThreadProjection",
+                threadRootId: thread.entityId,
+              },
+              runtimeContext,
+            );
+            const attention = projection.attentions[0]!;
+            await kernel.execute(
+              {
+                type: "ClaimAttention",
+                idempotencyKey:
+                  `project-page-continuation:0:${index}:lease`,
+                attentionId: attention.id,
+                expectedAttentionRevision: attention.revision,
+                leaseDurationMs: 300_000,
+              },
+              runtimeContext,
+            );
+          }
+        }
+        for (let index = 1; index < projectCount; index += 1) {
+          const initialThread = await startProjectMention(
+            kernel,
+            {
+              projectId: `project-fair-${index}`,
+              channelId: `channel-fair-${index}`,
+              agentId: `agent-fair-${index}`,
+            },
+            `project-page-continuation:${index}:initial`,
+            `Fair Agent ${index}, handle initial independent work.`,
+          );
+          if (index === projectCount - 1) {
+            const projection = await kernel.query(
+              {
+                type: "GetThreadProjection",
+                threadRootId: initialThread.entityId,
+              },
+              runtimeContext,
+            );
+            projectOneOhOneFirstAttentionId =
+              projection.attentions[0]!.id;
+          }
+          await startProjectMention(
+            kernel,
+            {
+              projectId: `project-fair-${index}`,
+              channelId: `channel-fair-${index}`,
+              agentId: `agent-fair-${index}`,
+            },
+            `project-page-continuation:${index}:refill`,
+            `Fair Agent ${index}, handle refilled independent work.`,
+          );
+        }
+        const adapter = new DeterministicFakeAdapter(async (context) => {
+          if (context.cause.type !== "attention") {
+            throw new Error(
+              "The Project continuation test must not create Run work.",
+            );
+          }
+          invocationOrdinal += 1;
+          const projectId = context.cause.attention.projectId;
+          if (projectId === "project-fair-0") {
+            projectZeroOrdinal = invocationOrdinal;
+          }
+          if (!firstBlocked) {
+            firstBlocked = true;
+            signalFirstStarted();
+            await release;
+          }
+          await context.capabilities.ignoreAttention(
+            "Resumed Project page candidate.",
+          );
+        });
+        const runtime = createRuntime(kernel, adapter, {
+          projectIds: [...projectIds, "project-fair-0"],
+          attentionConcurrency: 1,
+          attentionLeaseMs: 120_000,
+          outboxLeaseMs: 120_000,
+          providerTimeoutMs: 60_000,
+          hooks: {
+            attentionBufferChanged: ({ size, limit }) => {
+              if (size === limit) {
+                signalBufferFilled();
+              }
+            },
+            beforeAttentionClaim: async (attention) => {
+              if (attention.projectId === "project-fair-101") {
+                projectOneOhOneClaimAttempts.push(attention.id);
+              }
+            },
+          },
+        });
+
+        const pass = runtime.runOnce();
+        await firstStarted;
+        await bufferFilled;
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
+        const projectOneOhOneProjection = await kernel.query(
+          {
+            type: "GetThreadProjection",
+            threadRootId: (
+              await kernel.query(
+                {
+                  type: "ListOpenAttentions",
+                  projectId: "project-fair-101",
+                  limit: 1,
+                },
+                runtimeContext,
+              )
+            ).items[0]!.threadRootId,
+          },
+          runtimeContext,
+        );
+        const projectOneOhOneAttention =
+          projectOneOhOneProjection.attentions.find(
+            (attention) =>
+              attention.id === projectOneOhOneFirstAttentionId,
+          )!;
+        const competingClaim = await kernel.execute(
+          {
+            type: "ClaimAttention",
+            idempotencyKey:
+              "project-page-continuation:101:competing-claim",
+            attentionId: projectOneOhOneAttention.id,
+            expectedAttentionRevision:
+              projectOneOhOneAttention.revision,
+            leaseDurationMs: 120_000,
+          },
+          runtimeContext,
+        );
+        const competingActivation = await kernel.execute(
+          {
+            type: "StartActivation",
+            idempotencyKey:
+              "project-page-continuation:101:competing-activation",
+            attentionId: projectOneOhOneAttention.id,
+            handlerLeaseToken:
+              competingClaim.relatedIds!.handlerLeaseToken!,
+          },
+          runtimeContext,
+        );
+        await kernel.execute(
+          {
+            type: "IgnoreAttention",
+            idempotencyKey:
+              "project-page-continuation:101:competing-ignore",
+            attentionId: projectOneOhOneAttention.id,
+            expectedAttentionRevision: competingClaim.revision!,
+            handlerLeaseToken:
+              competingClaim.relatedIds!.handlerLeaseToken!,
+            reason: "Competing Runtime resolved the saturated candidate.",
+          },
+          {
+            principalId: "principal-fair-101",
+            activationId: competingActivation.entityId,
+          },
+        );
+        const replacement = await startProjectMention(
+          kernel,
+          {
+            projectId: "project-fair-101",
+            channelId: "channel-fair-101",
+            agentId: "agent-fair-101",
+          },
+          "project-page-continuation:101:replacement",
+          "Fair Agent 101, handle replacement work.",
+        );
+        const replacementProjection = await kernel.query(
+          {
+            type: "GetThreadProjection",
+            threadRootId: replacement.entityId,
+          },
+          runtimeContext,
+        );
+        const replacementAttentionId =
+          replacementProjection.attentions[0]!.id;
+        releaseFirst();
+        const result = await pass;
+
+        expect(result.attentionsDispatched).toBe(
+          1 + (projectCount - 1) * 2,
+        );
+        expect(projectZeroOrdinal).toBeLessThanOrEqual(projectCount);
+        expect(projectOneOhOneClaimAttempts).toContain(
+          projectOneOhOneFirstAttentionId,
+        );
+        expect(
+          projectOneOhOneClaimAttempts.indexOf(
+            projectOneOhOneFirstAttentionId,
+          ),
+        ).toBeLessThan(
+          projectOneOhOneClaimAttempts.indexOf(replacementAttentionId),
+        );
+      } finally {
+        releaseFirst();
+        kernel.close();
+      }
+    },
+    90_000,
   );
 
   it(

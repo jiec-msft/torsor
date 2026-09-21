@@ -18,8 +18,15 @@ The runtime provides:
   share of the global candidate buffer, with a minimum of one candidate. Thus,
   when ready Projects outnumber the candidate buffer, a concurrency-one
   runtime gives every Project its first provider start within one ready-Project
-  rotation. Later-page candidates replace queued candidates within the same
-  bounded Project reservoir rather than joining an unbounded FIFO.
+  rotation. Per-Project snapshot and keyset continuations also persist across
+  saturated admission rounds, so a full first page cannot repeatedly hide
+  ready work on a later page. A continuation is cleared after its snapshot is
+  exhausted; the next pass starts a fresh snapshot so empty/refilled Projects,
+  claim losses, evictions, and newly opened Attentions are reconsidered.
+  Continuations are keyed by the stable Project ID and consume only bounded
+  metadata per known Project. Later-page candidates replace queued candidates
+  within the same bounded Project reservoir rather than joining an unbounded
+  FIFO.
 - Ordered, leased outbox consumption with idempotent command keys.
 - A provider-neutral adapter contract and deterministic fake adapter.
 - A GitHub Copilot CLI ACP stdio adapter using `copilot --acp --stdio`.

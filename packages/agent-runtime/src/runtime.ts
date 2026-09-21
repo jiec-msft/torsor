@@ -92,6 +92,11 @@ type AttentionAdmissionResult =
   | "deferred"
   | "global-full";
 
+interface AttentionProjectDiscoveryContinuation {
+  readonly afterCursor: number;
+  readonly snapshotEventId: string | null;
+}
+
 const ATTENTION_PAGE_SIZE = 100;
 const ATTENTION_PROJECT_QUEUE_RESERVE = 1;
 
@@ -111,6 +116,10 @@ export class AgentRuntime {
   readonly #clock: () => Date;
   readonly #hooks: AgentRuntimeHooks;
   readonly #agents = new Map<string, BootstrapAgent>();
+  readonly #attentionProjectDiscoveryContinuations = new Map<
+    string,
+    AttentionProjectDiscoveryContinuation
+  >();
   #attentionProjectOffset = 0;
 
   constructor(options: AgentRuntimeOptions) {
@@ -281,12 +290,16 @@ export class AgentRuntime {
       ...projectIds.slice(offset),
       ...projectIds.slice(0, offset),
     ];
-    let states = orderedProjectIds.map((projectId, orderedIndex) => ({
-      projectId,
-      projectIndex: (offset + orderedIndex) % projectIds.length,
-      afterCursor: undefined as number | undefined,
-      snapshotEventId: undefined as string | null | undefined,
-    }));
+    let states = orderedProjectIds.map((projectId, orderedIndex) => {
+      const continuation =
+        this.#attentionProjectDiscoveryContinuations.get(projectId);
+      return {
+        projectId,
+        projectIndex: (offset + orderedIndex) % projectIds.length,
+        afterCursor: continuation?.afterCursor,
+        snapshotEventId: continuation?.snapshotEventId,
+      };
+    });
     const leasedDomains = new Set<string>();
     let firstError: unknown;
     let globallyDeferredProjectIndex: number | undefined;
@@ -322,6 +335,15 @@ export class AgentRuntime {
         ): result is NonNullable<(typeof results)[number]> =>
           result !== undefined,
       );
+      for (const { state, page } of pages) {
+        this.#attentionProjectDiscoveryContinuations.set(
+          state.projectId,
+          {
+            afterCursor: state.afterCursor ?? 0,
+            snapshotEventId: page.snapshotEventId,
+          },
+        );
+      }
       for (let index = 0; index < ATTENTION_PAGE_SIZE; index += 1) {
         for (const { state, page } of pages) {
           const attention = page.items[index];
@@ -362,12 +384,23 @@ export class AgentRuntime {
       }
       for (const { state, page } of pages) {
         if (page.hasMore && page.nextCursor !== null) {
+          const continuation = {
+            afterCursor: page.nextCursor,
+            snapshotEventId: page.snapshotEventId,
+          };
+          this.#attentionProjectDiscoveryContinuations.set(
+            state.projectId,
+            continuation,
+          );
           states.push({
             projectId: state.projectId,
             projectIndex: state.projectIndex,
-            afterCursor: page.nextCursor,
-            snapshotEventId: page.snapshotEventId,
+            ...continuation,
           });
+        } else {
+          this.#attentionProjectDiscoveryContinuations.delete(
+            state.projectId,
+          );
         }
       }
     }
