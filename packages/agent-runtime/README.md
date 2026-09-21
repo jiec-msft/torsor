@@ -10,8 +10,9 @@ The runtime provides:
 - Explicit Agent decisions to ignore an Attention, continue one eligible
   same-thread Run, or create a new Run.
 - Configurably bounded Attention concurrency across independent Agent/Thread
-  domains and Projects, with page-round-robin discovery, pass-local fair
-  admission, and same-domain ordering preserved across pages and claim races.
+  domains and Projects, with page-round-robin discovery, bounded per-domain
+  admission, in-pass reconsideration, and same-domain ordering preserved
+  across pages and claim races.
 - Ordered, leased outbox consumption with idempotent command keys.
 - A provider-neutral adapter contract and deterministic fake adapter.
 - A GitHub Copilot CLI ACP stdio adapter using `copilot --acp --stdio`.
@@ -22,11 +23,17 @@ Provider session IDs are diagnostic only. Recovery always rebuilds provider
 input from Kernel projections and never treats a provider session as
 authoritative state. Provider delivery failures park Runs through one atomic
 Kernel command, and expired Attention executions are discovered through
-bounded targeted projections rather than public-event history scans.
+bounded targeted projections rather than public-event history scans. Recovery
+restarts bounded keyset sweeps after settlements so an older Activation that
+becomes eligible behind an advanced cursor is still reconciled in the same
+drain.
 
 The current Kernel contract does not expose lease renewal. The runtime
 therefore claims one outbox event at a time and requires Attention and outbox
 leases to exceed the configured provider timeout by a safety margin.
+The current claim result contract does not return the authoritative Attention
+lease expiry, so provider execution cannot yet shrink its timeout to account
+for setup time already consumed after the claim.
 
 Because the Kernel outbox is globally ordered, runtime instances coordinate
 through the same leased stream. `projectIds` supplies the Projects whose

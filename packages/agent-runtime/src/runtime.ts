@@ -8,6 +8,7 @@ import {
   type JsonValue,
   type OutboxEventView,
   type ProviderAttemptStatus,
+  type RecoverableAttentionExecutionView,
   type RunProjection,
   type TorsorKernel,
 } from "@torsor/kernel";
@@ -45,6 +46,14 @@ export interface AgentRuntimeHooks {
     readonly activationId: string;
     readonly providerAttemptId: string;
   }) => Promise<void>;
+  readonly afterAttentionRecoveryPage?: (input: {
+    readonly itemCount: number;
+    readonly hasMore: boolean;
+    readonly nextCursor: {
+      readonly startedAt: string;
+      readonly activationId: string;
+    } | null;
+  }) => Promise<void>;
   readonly beforeOutboxAcknowledge?: (
     events: readonly OutboxEventView[],
   ) => Promise<void>;
@@ -74,6 +83,7 @@ export interface RuntimePassResult {
 
 interface RuntimePassExecution extends RuntimePassResult {
   readonly attentionsDeferred: number;
+  readonly attentionRecoveries: number;
 }
 
 type AttentionDispatchResult = "dispatched" | "blocked" | "retry";
@@ -152,6 +162,7 @@ export class AgentRuntime {
   async runOnce(): Promise<RuntimePassResult> {
     const {
       attentionsDeferred: _attentionsDeferred,
+      attentionRecoveries: _attentionRecoveries,
       ...result
     } = await this.#runPass();
     return result;
@@ -159,12 +170,14 @@ export class AgentRuntime {
 
   async #runPass(): Promise<RuntimePassExecution> {
     await this.#refreshAgents();
-    await this.#reconcileOrphanedAttentionExecutions();
+    const attentionRecoveries =
+      await this.#reconcileOrphanedAttentionExecutions();
     const attentionResult = await this.#dispatchOpenAttentions();
     const outboxEventsProcessed = await this.#drainOutboxBatch();
     return {
       attentionsDispatched: attentionResult.dispatched,
       attentionsDeferred: attentionResult.deferred,
+      attentionRecoveries,
       outboxEventsProcessed,
     };
   }
@@ -179,6 +192,7 @@ export class AgentRuntime {
       if (
         result.attentionsDispatched === 0 &&
         result.attentionsDeferred === 0 &&
+        result.attentionRecoveries === 0 &&
         result.outboxEventsProcessed === 0
       ) {
         return { attentionsDispatched, outboxEventsProcessed };
@@ -198,33 +212,46 @@ export class AgentRuntime {
     readonly dispatched: number;
     readonly deferred: number;
   }> {
-    const scheduler = new AttentionScheduler({
-      concurrency: this.#attentionConcurrency,
-      bufferLimit: this.#attentionConcurrency * 100,
-      domainLimit: 100,
-      ...(this.#hooks.attentionBufferChanged
-        ? { onBufferChanged: this.#hooks.attentionBufferChanged }
-        : {}),
-      dispatch: async (attention) => {
-        const agent = this.#agents.get(attention.targetAgentId);
-        if (!agent) {
-          throw new Error(
-            `Attention ${attention.id} targets unknown Agent ${attention.targetAgentId}.`,
-          );
-        }
-        return this.#dispatchAttention(attention, agent);
-      },
-    });
-    const producerError = await this.#enqueueOpenAttentions(scheduler);
-    const result = await scheduler.drain();
-    if (producerError !== undefined) {
-      throw producerError;
+    let dispatched = 0;
+    let deferred = 0;
+    for (let round = 0; round < 100; round += 1) {
+      const scheduler = new AttentionScheduler({
+        concurrency: this.#attentionConcurrency,
+        bufferLimit: this.#attentionConcurrency * 100,
+        domainLimit: this.#attentionConcurrency,
+        ...(this.#hooks.attentionBufferChanged
+          ? { onBufferChanged: this.#hooks.attentionBufferChanged }
+          : {}),
+        dispatch: async (attention) => {
+          const agent = this.#agents.get(attention.targetAgentId);
+          if (!agent) {
+            throw new Error(
+              `Attention ${attention.id} targets unknown Agent ${attention.targetAgentId}.`,
+            );
+          }
+          return this.#dispatchAttention(attention, agent);
+        },
+      });
+      const producerError = await this.#enqueueOpenAttentions(
+        scheduler,
+        this.#attentionConcurrency * 100,
+      );
+      const result = await scheduler.drain();
+      if (producerError !== undefined) {
+        throw producerError;
+      }
+      dispatched += result.dispatched;
+      deferred = result.deferred;
+      if (deferred === 0) {
+        return { dispatched, deferred };
+      }
     }
-    return result;
+    return { dispatched, deferred };
   }
 
   async #enqueueOpenAttentions(
     scheduler: AttentionScheduler,
+    leasedDomainLimit: number,
   ): Promise<unknown> {
     const projectIds = [...this.#projectIds];
     const offset =
@@ -246,6 +273,7 @@ export class AgentRuntime {
       afterCursor: undefined as number | undefined,
       snapshotEventId: undefined as string | null | undefined,
     }));
+    const leasedDomains = new Set<string>();
     let firstError: unknown;
     while (states.length > 0 && firstError === undefined) {
       const batch = states.splice(0, this.#attentionConcurrency);
@@ -289,6 +317,19 @@ export class AgentRuntime {
             attention.handlerLeaseExpiresAt !== null &&
             new Date(attention.handlerLeaseExpiresAt) > this.#clock()
           ) {
+            if (leasedDomains.size < leasedDomainLimit) {
+              leasedDomains.add(attentionConflictDomain(attention));
+            }
+            continue;
+          }
+          const domain = attentionConflictDomain(attention);
+          if (leasedDomains.has(domain)) {
+            continue;
+          }
+          if (
+            leasedDomains.size >= leasedDomainLimit &&
+            (await this.#hasEarlierOpenAttention(attention))
+          ) {
             continue;
           }
           scheduler.enqueue(attention);
@@ -322,21 +363,7 @@ export class AgentRuntime {
     attention: AttentionView,
     agent: BootstrapAgent,
   ): Promise<AttentionDispatchResult> {
-    const orderingProjection = await this.#kernel.query(
-      {
-        type: "GetThreadProjection",
-        threadRootId: attention.threadRootId,
-      },
-      this.#runtimeContext,
-    );
-    if (
-      orderingProjection.attentions.some(
-        (candidate) =>
-          candidate.targetAgentId === attention.targetAgentId &&
-          candidate.status === "Open" &&
-          candidate.cursor < attention.cursor,
-      )
-    ) {
+    if (await this.#hasEarlierOpenAttention(attention)) {
       return "blocked";
     }
     await this.#hooks.beforeAttentionClaim?.(attention);
@@ -440,6 +467,24 @@ export class AgentRuntime {
       requestIdempotencyKey: `attention:${attention.id}:${handlerLeaseToken}`,
     });
     return "dispatched";
+  }
+
+  async #hasEarlierOpenAttention(
+    attention: AttentionView,
+  ): Promise<boolean> {
+    const projection = await this.#kernel.query(
+      {
+        type: "GetThreadProjection",
+        threadRootId: attention.threadRootId,
+      },
+      this.#runtimeContext,
+    );
+    return projection.attentions.some(
+      (candidate) =>
+        candidate.targetAgentId === attention.targetAgentId &&
+        candidate.status === "Open" &&
+        candidate.cursor < attention.cursor,
+    );
   }
 
   async #drainOutboxBatch(): Promise<number> {
@@ -1078,82 +1123,139 @@ export class AgentRuntime {
     }
   }
 
-  async #reconcileOrphanedAttentionExecutions(): Promise<void> {
-    let afterCursor:
-      | {
-          readonly startedAt: string;
-          readonly activationId: string;
-        }
-      | undefined;
-    for (;;) {
-      const page = await this.#kernel.query(
-        {
-          type: "ListRecoverableAttentionExecutions",
-          ...(afterCursor ? { afterCursor } : {}),
-          limit: 100,
-        },
-        this.#runtimeContext,
-      );
-      for (const execution of page.items) {
-        if (
-          execution.activation.finishedAt === null &&
-          new Date(execution.activation.expiresAt) > this.#clock()
-        ) {
-          continue;
-        }
-        let outcome: "Completed" | "Failed" | "Expired" = "Expired";
-        let detail =
-          "The Attention Activation expired before it was reconciled.";
-        const latestAttempt = execution.providerAttempts.at(-1);
-        let latestStatus = latestAttempt?.status;
-        for (const attempt of execution.providerAttempts) {
+  async #reconcileOrphanedAttentionExecutions(): Promise<number> {
+    let recoveries = 0;
+    let cleanSweeps = 0;
+    let lastStalledHead: string | undefined;
+    for (let sweep = 0; sweep < 100; sweep += 1) {
+      let afterCursor:
+        | {
+            readonly startedAt: string;
+            readonly activationId: string;
+          }
+        | undefined;
+      let sweepRecoveries = 0;
+      for (;;) {
+        const page = await this.#kernel.query(
+          {
+            type: "ListRecoverableAttentionExecutions",
+            ...(afterCursor ? { afterCursor } : {}),
+            limit: 100,
+          },
+          this.#runtimeContext,
+        );
+        for (const execution of page.items) {
           if (
-            attempt.status !== "Started" &&
-            attempt.status !== "Acknowledged"
+            execution.activation.finishedAt === null &&
+            new Date(execution.activation.expiresAt) > this.#clock()
           ) {
             continue;
           }
-          await this.#hooks.beforeAttentionRecoverySettlement?.({
-            activationId: execution.activation.id,
-            providerAttemptId: attempt.id,
-          });
-          const settledStatus = await this.#settleProviderAttempt({
-            providerAttemptId: attempt.id,
-            idempotencyKey: `${attempt.id}:attention-reconciled-unknown`,
-            status: "Unknown",
-            detail:
-              "Runtime recovered an unfinished expired Attention ProviderAttempt.",
-          });
-          if (attempt.id === latestAttempt?.id) {
-            latestStatus = settledStatus;
-          }
-          detail = "Recovered an uncertain expired Attention ProviderAttempt.";
+          sweepRecoveries +=
+            await this.#reconcileAttentionExecution(execution);
         }
-        if (latestStatus === "Completed") {
-          outcome = "Completed";
-          detail = "Recovered a completed Attention ProviderAttempt.";
-        } else if (latestStatus === "Failed") {
-          outcome = "Failed";
-          detail = "Recovered a failed Attention ProviderAttempt.";
+        await this.#hooks.afterAttentionRecoveryPage?.({
+          itemCount: page.items.length,
+          hasMore: page.hasMore,
+          nextCursor: page.nextCursor,
+        });
+        if (!page.hasMore || !page.nextCursor) {
+          break;
         }
-        if (execution.activation.finishedAt === null) {
-          await this.#kernel.execute(
-            {
-              type: "FinishActivation",
-              idempotencyKey: `${execution.activation.id}:attention-reconciled-${outcome.toLowerCase()}`,
-              activationId: execution.activation.id,
-              outcome,
-              detail,
-            },
-            this.#runtimeContext,
-          );
-        }
+        afterCursor = page.nextCursor;
       }
-      if (!page.hasMore || !page.nextCursor) {
+      recoveries += sweepRecoveries;
+      if (sweepRecoveries > 0) {
+        cleanSweeps = 0;
+        lastStalledHead = undefined;
+        continue;
+      }
+      const verification = await this.#kernel.query(
+        {
+          type: "ListRecoverableAttentionExecutions",
+          limit: 1,
+        },
+        this.#runtimeContext,
+      );
+      const head = verification.items[0];
+      if (head) {
+        const headKey = JSON.stringify({
+          activationId: head.activation.id,
+          finishedAt: head.activation.finishedAt,
+          attempts: head.providerAttempts.map((attempt) => [
+            attempt.id,
+            attempt.status,
+          ]),
+        });
+        if (headKey === lastStalledHead) {
+          break;
+        }
+        lastStalledHead = headKey;
+        cleanSweeps = 0;
+        continue;
+      }
+      cleanSweeps += 1;
+      if (cleanSweeps >= 2) {
         break;
       }
-      afterCursor = page.nextCursor;
     }
+    return recoveries;
+  }
+
+  async #reconcileAttentionExecution(
+    execution: RecoverableAttentionExecutionView,
+  ): Promise<number> {
+    let recoveries = 0;
+    let outcome: "Completed" | "Failed" | "Expired" = "Expired";
+    let detail =
+      "The Attention Activation expired before it was reconciled.";
+    const latestAttempt = execution.providerAttempts.at(-1);
+    let latestStatus = latestAttempt?.status;
+    for (const attempt of execution.providerAttempts) {
+      if (
+        attempt.status !== "Started" &&
+        attempt.status !== "Acknowledged"
+      ) {
+        continue;
+      }
+      await this.#hooks.beforeAttentionRecoverySettlement?.({
+        activationId: execution.activation.id,
+        providerAttemptId: attempt.id,
+      });
+      const settledStatus = await this.#settleProviderAttempt({
+        providerAttemptId: attempt.id,
+        idempotencyKey: `${attempt.id}:attention-reconciled-unknown`,
+        status: "Unknown",
+        detail:
+          "Runtime recovered an unfinished expired Attention ProviderAttempt.",
+      });
+      recoveries += 1;
+      if (attempt.id === latestAttempt?.id) {
+        latestStatus = settledStatus;
+      }
+      detail = "Recovered an uncertain expired Attention ProviderAttempt.";
+    }
+    if (latestStatus === "Completed") {
+      outcome = "Completed";
+      detail = "Recovered a completed Attention ProviderAttempt.";
+    } else if (latestStatus === "Failed") {
+      outcome = "Failed";
+      detail = "Recovered a failed Attention ProviderAttempt.";
+    }
+    if (execution.activation.finishedAt === null) {
+      await this.#kernel.execute(
+        {
+          type: "FinishActivation",
+          idempotencyKey: `${execution.activation.id}:attention-reconciled-${outcome.toLowerCase()}`,
+          activationId: execution.activation.id,
+          outcome,
+          detail,
+        },
+        this.#runtimeContext,
+      );
+      recoveries += 1;
+    }
+    return recoveries;
   }
 }
 

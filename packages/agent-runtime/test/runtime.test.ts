@@ -372,7 +372,7 @@ describe("AgentRuntime", () => {
       releaseBusy();
       const result = await pass;
 
-      expect(result.attentionsDispatched).toBe(200);
+      expect(result.attentionsDispatched).toBe(201);
       expect(secondaryOverlapped).toBe(true);
       expect(maximumActive).toBe(2);
     } finally {
@@ -380,6 +380,126 @@ describe("AgentRuntime", () => {
       kernel.close();
     }
   }, 20_000);
+
+  it(
+    "admits a fifth later domain before four early domains drain",
+    async () => {
+      const kernel = openKernel(":memory:");
+      let releaseEarly!: () => void;
+      let signalEarlyStarted!: () => void;
+      let signalFifthStarted!: () => void;
+      const release = new Promise<void>((resolve) => {
+        releaseEarly = resolve;
+      });
+      const earlyStarted = new Promise<void>((resolve) => {
+        signalEarlyStarted = resolve;
+      });
+      const fifthStarted = new Promise<void>((resolve) => {
+        signalFifthStarted = resolve;
+      });
+      const earlyThreadIds: string[] = [];
+      let active = 0;
+      let maximumActive = 0;
+      let maximumDomainActive = 0;
+      let totalExecutions = 0;
+      let earlyHeadsStarted = 0;
+      let executionsWhenFifthStarted = Number.POSITIVE_INFINITY;
+      const domainActive = new Map<string, number>();
+      let maximumBuffered = 0;
+      let bufferLimit = 0;
+      try {
+        for (let domain = 0; domain < 4; domain += 1) {
+          const thread = await startMention(
+            kernel,
+            `fair-admission-domain:${domain}:0`,
+            `Orbit, handle fair domain ${domain} item 0.`,
+          );
+          earlyThreadIds.push(thread.entityId);
+          for (let item = 1; item < 101; item += 1) {
+            await kernel.execute(
+              {
+                type: "ReplyToThread",
+                idempotencyKey:
+                  `fair-admission-domain:${domain}:${item}`,
+                threadRootId: thread.entityId,
+                body: `Orbit, handle fair domain ${domain} item ${item}.`,
+                targetAgentIds: ["agent-orbit"],
+              },
+              humanContext,
+            );
+          }
+        }
+        const fifthThread = await startMention(
+          kernel,
+          "fair-admission-fifth",
+          "Orbit, handle the fifth later domain.",
+        );
+        const adapter = new DeterministicFakeAdapter(async (context) => {
+          if (context.cause.type !== "attention") {
+            throw new Error("The fairness test must not create Run work.");
+          }
+          const domain = context.cause.attention.threadRootId;
+          active += 1;
+          maximumActive = Math.max(maximumActive, active);
+          const nextDomainActive = (domainActive.get(domain) ?? 0) + 1;
+          domainActive.set(domain, nextDomainActive);
+          maximumDomainActive = Math.max(
+            maximumDomainActive,
+            nextDomainActive,
+          );
+          totalExecutions += 1;
+          try {
+            if (
+              earlyThreadIds.includes(domain) &&
+              context.cause.triggeringRevision.body.endsWith("item 0.")
+            ) {
+              earlyHeadsStarted += 1;
+              if (earlyHeadsStarted === 4) {
+                signalEarlyStarted();
+              }
+              await release;
+            }
+            if (domain === fifthThread.entityId) {
+              executionsWhenFifthStarted = totalExecutions;
+              signalFifthStarted();
+            }
+            await context.capabilities.ignoreAttention(
+              "Fairly admitted synthetic Attention.",
+            );
+          } finally {
+            active -= 1;
+            domainActive.set(domain, nextDomainActive - 1);
+          }
+        });
+        const runtime = createRuntime(kernel, adapter, {
+          attentionConcurrency: 4,
+          hooks: {
+            attentionBufferChanged: ({ size, limit }) => {
+              maximumBuffered = Math.max(maximumBuffered, size);
+              bufferLimit = limit;
+            },
+          },
+        });
+
+        const pass = runtime.runOnce();
+        await earlyStarted;
+        releaseEarly();
+        await fifthStarted;
+        const result = await pass;
+
+        expect(result.attentionsDispatched).toBe(405);
+        expect(executionsWhenFifthStarted).toBeLessThanOrEqual(8);
+        expect(maximumActive).toBe(4);
+        expect(maximumDomainActive).toBe(1);
+        expect(bufferLimit).toBe(400);
+        expect(maximumBuffered).toBeLessThanOrEqual(bufferLimit);
+      } finally {
+        releaseEarly();
+        kernel.close();
+      }
+    },
+    30_000,
+  );
 
   it("serializes same-thread Attention decisions within the concurrent pass", async () => {
     const kernel = openKernel(":memory:");
@@ -737,6 +857,66 @@ describe("AgentRuntime", () => {
       expect(providerExecutions).toBe(50);
       expect(retainedLimit).toBe(200);
       expect(maximumRetained).toBeLessThanOrEqual(retainedLimit);
+    } finally {
+      kernel.close();
+    }
+  }, 20_000);
+
+  it("reconsiders later work when a saturated batch loses every claim", async () => {
+    const kernel = openKernel(":memory:");
+    let laterThreadId = "";
+    let claimLosses = 0;
+    let laterExecutions = 0;
+    try {
+      for (let index = 0; index < 101; index += 1) {
+        const thread = await mentionAgent(
+          kernel,
+          `saturated-claim-race-${index}`,
+        );
+        if (index === 100) {
+          laterThreadId = thread.entityId;
+        }
+      }
+      const runtime = createRuntime(
+        kernel,
+        new DeterministicFakeAdapter(async (context) => {
+          if (context.cause.type !== "attention") {
+            throw new Error("The saturation race must not create Run work.");
+          }
+          expect(context.cause.attention.threadRootId).toBe(laterThreadId);
+          laterExecutions += 1;
+          await context.capabilities.ignoreAttention(
+            "Later work survived saturated claim losses.",
+          );
+        }),
+        {
+          attentionConcurrency: 1,
+          hooks: {
+            beforeAttentionClaim: async (attention) => {
+              if (attention.threadRootId === laterThreadId) {
+                return;
+              }
+              await kernel.execute(
+                {
+                  type: "ClaimAttention",
+                  idempotencyKey: `saturated-preempt:${attention.id}`,
+                  attentionId: attention.id,
+                  expectedAttentionRevision: attention.revision,
+                  leaseDurationMs: 30_000,
+                },
+                runtimeContext,
+              );
+              claimLosses += 1;
+            },
+          },
+        },
+      );
+
+      const result = await runtime.runOnce();
+
+      expect(result.attentionsDispatched).toBe(1);
+      expect(claimLosses).toBe(100);
+      expect(laterExecutions).toBe(1);
     } finally {
       kernel.close();
     }
@@ -2785,6 +2965,148 @@ describe("AgentRuntime", () => {
     }
   });
 
+  it(
+    "restarts recovery after an older Activation becomes recoverable behind the cursor",
+    async () => {
+      let now = new Date("2026-09-21T08:00:00.000Z");
+      const kernel = openKernel(":memory:", () => now);
+      let older:
+        | Awaited<ReturnType<typeof prepareAttentionAttempt>>
+        | undefined;
+      let transitioned = false;
+      let recoveryPages = 0;
+      try {
+        older = await prepareAttentionAttempt(
+          kernel,
+          "recovery-cursor-older",
+          300_000,
+        );
+        for (let index = 0; index < 100; index += 1) {
+          const execution = await prepareAttentionAttempt(
+            kernel,
+            `recovery-cursor-newer-${index}`,
+            300_000,
+          );
+          await kernel.execute(
+            {
+              type: "FinishActivation",
+              idempotencyKey:
+                `recovery-cursor-newer-${index}:finish`,
+              activationId: execution.activationId,
+              outcome: "Completed",
+            },
+            runtimeContext,
+          );
+        }
+        await clearOutbox(kernel);
+        const runtime = createRuntime(
+          kernel,
+          new DeterministicFakeAdapter(),
+          {
+            clock: () => now,
+            hooks: {
+              afterAttentionRecoveryPage: async ({
+                itemCount,
+                hasMore,
+              }) => {
+                recoveryPages += 1;
+                if (
+                  transitioned ||
+                  itemCount !== 100 ||
+                  hasMore
+                ) {
+                  return;
+                }
+                transitioned = true;
+                await kernel.execute(
+                  {
+                    type: "FinishActivation",
+                    idempotencyKey:
+                      "recovery-cursor-older:finish-after-page",
+                    activationId: older!.activationId,
+                    outcome: "Completed",
+                  },
+                  runtimeContext,
+                );
+              },
+            },
+          },
+        );
+
+        await runtime.drainUntilIdle();
+
+        expect(transitioned).toBe(true);
+        expect(recoveryPages).toBeGreaterThanOrEqual(3);
+        expect(
+          await kernel.query(
+            {
+              type: "GetProviderAttempt",
+              providerAttemptId: older.attemptId,
+            },
+            runtimeContext,
+          ),
+        ).toMatchObject({ status: "Unknown" });
+      } finally {
+        kernel.close();
+      }
+    },
+    30_000,
+  );
+
+  it("verifies recovery again after a clean-sweep mutation", async () => {
+    const kernel = openKernel(":memory:");
+    let pages = 0;
+    let transitioned = false;
+    try {
+      const execution = await prepareAttentionAttempt(
+        kernel,
+        "recovery-clean-sweep-mutation",
+        300_000,
+      );
+      await clearOutbox(kernel);
+      const runtime = createRuntime(
+        kernel,
+        new DeterministicFakeAdapter(),
+        {
+          hooks: {
+            afterAttentionRecoveryPage: async ({ itemCount }) => {
+              pages += 1;
+              if (pages !== 2 || itemCount !== 0) {
+                return;
+              }
+              transitioned = true;
+              await kernel.execute(
+                {
+                  type: "FinishActivation",
+                  idempotencyKey:
+                    "recovery-clean-sweep-mutation:finish",
+                  activationId: execution.activationId,
+                  outcome: "Completed",
+                },
+                runtimeContext,
+              );
+            },
+          },
+        },
+      );
+
+      await runtime.drainUntilIdle();
+
+      expect(transitioned).toBe(true);
+      expect(
+        await kernel.query(
+          {
+            type: "GetProviderAttempt",
+            providerAttemptId: execution.attemptId,
+          },
+          runtimeContext,
+        ),
+      ).toMatchObject({ status: "Unknown" });
+    } finally {
+      kernel.close();
+    }
+  });
+
   it("cancels provider execution when durable Run state is cancelled", async () => {
     const kernel = openKernel(":memory:");
     const attentionAdapter = new DeterministicFakeAdapter();
@@ -2915,6 +3237,89 @@ function createBarrier(participants: number): { wait(): Promise<void> } {
       await open;
     },
   };
+}
+
+async function prepareAttentionAttempt(
+  kernel: TorsorKernel,
+  key: string,
+  durationMs: number,
+): Promise<{
+  readonly activationId: string;
+  readonly attemptId: string;
+}> {
+  const thread = await mentionAgent(kernel, key);
+  const projection = await kernel.query(
+    {
+      type: "GetThreadProjection",
+      threadRootId: thread.entityId,
+    },
+    runtimeContext,
+  );
+  const attention = projection.attentions[0]!;
+  const claim = await kernel.execute(
+    {
+      type: "ClaimAttention",
+      idempotencyKey: `${key}:claim`,
+      attentionId: attention.id,
+      expectedAttentionRevision: attention.revision,
+      leaseDurationMs: durationMs,
+    },
+    runtimeContext,
+  );
+  const activation = await kernel.execute(
+    {
+      type: "StartActivation",
+      idempotencyKey: `${key}:activation`,
+      attentionId: attention.id,
+      handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
+      durationMs,
+    },
+    runtimeContext,
+  );
+  const attempt = await kernel.execute(
+    {
+      type: "StartProviderAttempt",
+      idempotencyKey: `${key}:attempt`,
+      activationId: activation.entityId,
+      adapter: "synthetic-recovery-race",
+      adapterVersion: "1",
+      capabilitySnapshot: { attentionDecision: true },
+      runInputIds: [],
+      requestIdempotencyKey: `${key}:provider-request`,
+    },
+    runtimeContext,
+  );
+  return {
+    activationId: activation.entityId,
+    attemptId: attempt.entityId,
+  };
+}
+
+async function clearOutbox(kernel: TorsorKernel): Promise<void> {
+  for (let batch = 0; ; batch += 1) {
+    const claim = await kernel.execute(
+      {
+        type: "ClaimOutboxEvents",
+        idempotencyKey: `test-clear-outbox:${batch}`,
+        limit: 100,
+        leaseDurationMs: 30_000,
+      },
+      runtimeContext,
+    );
+    const events = claim.outboxEvents ?? [];
+    if (events.length === 0) {
+      return;
+    }
+    await kernel.execute(
+      {
+        type: "AcknowledgeOutboxEvents",
+        idempotencyKey: `test-clear-outbox:${batch}:ack`,
+        outboxEventIds: events.map((event) => event.id),
+        leaseToken: claim.leaseToken!,
+      },
+      runtimeContext,
+    );
+  }
 }
 
 async function prepareNonIdempotentDeliveryCrash(
