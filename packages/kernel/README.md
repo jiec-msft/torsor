@@ -13,6 +13,88 @@ kernel.readEvents(afterEventId, limit);
 `readEvents` is a trusted-internal synchronization feed for the local
 server/runtime boundary. A transport must apply its own authenticated
 Project/Channel authorization before exposing event envelopes to a client.
+Authenticated transports should use the public `ReadPublicEvents` query
+instead of calling `readEvents`.
+
+Server-facing projection pages are atomic Kernel queries:
+
+```ts
+const threads = await kernel.query(
+  {
+    type: "ListThreadProjections",
+    projectId,
+    channelId,
+    afterEventId,
+    snapshotEventId,
+    limit,
+  },
+  principalContext,
+);
+
+const runs = await kernel.query(
+  {
+    type: "ListRunProjections",
+    projectId,
+    channelId,
+    afterEventId,
+    snapshotEventId,
+    limit,
+  },
+  principalContext,
+);
+```
+
+Both return complete projections, `nextAfterEventId`, `hasMore`, and the
+authoritative `snapshotEventId`. The first page captures the latest committed
+command boundary. Later pages reuse that snapshot, so concurrent creates are
+excluded and updated entities are reconstructed from immutable components plus
+narrow Run, RunInput, Activation, ProviderAttempt, and Attention versions.
+Large unchanged Message, activity, and Artifact payloads are referenced once
+rather than copied at every command boundary.
+
+Every event cursor is scoped to `projectId`. A cursor from another Project and
+a nonexistent cursor both fail with `NotFound` and the generic message
+`Event cursor does not exist in the requested Project.` The default snapshot is
+the latest committed event in the requested Project, not the global event log.
+
+Authorized event replay is a bounded scan:
+
+```ts
+const page = await kernel.query(
+  {
+    type: "ReadPublicEvents",
+    projectId,
+    afterEventId,
+    limit,
+  },
+  principalContext,
+);
+```
+
+`events` contains only envelopes visible to the authenticated principal.
+`scannedThroughEventId` advances across filtered Project events and is the next
+`afterEventId`; `hasMore` reports whether more Project events remain. For an
+Agent principal, the Kernel validates the current Activation and restricts
+events to its authorized Channel and Thread.
+
+Project Agent status is also Kernel-derived:
+
+```ts
+const status = await kernel.query(
+  {
+    type: "GetProjectAgentStatus",
+    projectId,
+    agentId,
+  },
+  principalContext,
+);
+```
+
+Each Agent row includes live Run and Attention Activation counts, total live
+Activations, nonterminal Run count, and `active`, `waiting`, or `idle`.
+Attention-only work is `active`. Finished, revoked, expired, stale-generation,
+resolved-Attention, and terminal-Run Activations are excluded using the Kernel
+clock and the same authoritative scope rules used by capabilities.
 
 Open a file-backed production database or the same adapter in memory:
 
@@ -67,3 +149,10 @@ finalize content in durable storage and verify its digest before
 `PublishArtifact`; the kernel does not upload blobs or turn a temporary upload
 location into a finalized Artifact. A failed or incomplete upload must not
 publish the descriptor.
+
+The current direct schema version is 8. Version 8 adds creation-event markers
+for immutable projection components, narrow temporal tables for mutable
+projection fields, and sparse indexes for projection pages, Project event
+scans, Agent status, and Activation validity.
+This pre-release schema is intentionally breaking: stop old processes and
+recreate disposable databases rather than migrating version 7.

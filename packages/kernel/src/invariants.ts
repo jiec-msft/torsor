@@ -36,6 +36,32 @@ type ThreadEventInput = Omit<EventInput, "threadRootId" | "threadCursor"> & {
   threadRootId: string;
 };
 
+type ActivationScopeState =
+  | Readonly<{ kind: "Run"; run: Row }>
+  | Readonly<{ kind: "Attention"; attention: Row }>;
+
+export type PrincipalReadScope = Readonly<{
+  projectId: string;
+  channelId: string | null;
+  threadRootId: string | null;
+  runId: string | null;
+}>;
+
+type ActivationValidity =
+  | Readonly<{ live: true }>
+  | Readonly<{
+      live: false;
+      reason:
+        | "finished"
+        | "revoked"
+        | "expired"
+        | "wrong_agent"
+        | "run_not_active"
+        | "stale_run_generation"
+        | "attention_not_open"
+        | "attention_lease_stale";
+    }>;
+
 export function requireRunActivation(kernel: db.KernelContext, context: PrincipalContext, principal: Row, run: Row): Row {
   requireKind(kernel, principal, "agent");
   if (!context.activationId) {
@@ -135,9 +161,10 @@ export function recordAttentionHistory(kernel: db.KernelContext, attentionId: st
   db.run(kernel, `INSERT INTO attention_history
         (attention_id, event_sequence, status, revision,
          handler_lease_holder_principal_id, handler_lease_expires_at,
-         resolved_run_id, resolved_at)
+         resolution_outcome, resolved_run_id, resolved_at)
        SELECT id, ?, status, revision, handler_lease_holder_principal_id,
-              handler_lease_expires_at, resolved_run_id, resolved_at
+              handler_lease_expires_at, resolution_outcome, resolved_run_id,
+              resolved_at
          FROM attentions
         WHERE id = ?`, eventSequence, attentionId);
 }
@@ -169,85 +196,206 @@ export function assertProjectAccess(kernel: db.KernelContext, principal: Row, pr
 }
 
 export function assertAgentQueryScope(kernel: db.KernelContext, principal: Row, context: PrincipalContext, projectId: string, threadRootId: string, runId?: string): void {
-  if (text(principal.kind) !== "agent") {
+  const scope = resolvePrincipalReadScope(
+    kernel,
+    principal,
+    context,
+    projectId,
+  );
+  if (scope.threadRootId === null) {
     return;
   }
-  if (!context.activationId) {
-    throw new KernelError("Unauthorized", "An Agent query requires an authenticated Activation context.");
-  }
-  const agent = requireAgentForPrincipal(kernel, text(principal.id));
-  const activation = requireLiveActivation(kernel, context.activationId);
-  if (text(activation.agent_id) !== text(agent.id)) {
-    throw new KernelError("Forbidden", "The Activation belongs to another Agent.");
-  }
-  assertActivationScopeCurrent(kernel, activation);
-  const activationRunId = optionalText(activation.run_id);
-  if (runId && activationRunId !== runId) {
+  if (runId && scope.runId !== runId) {
     throw new KernelError("Forbidden", "The Activation cannot read this Run.");
   }
-  if (activationRunId) {
-    const run = requireRun(kernel, activationRunId);
-    if (text(run.project_id) !== projectId ||
-      text(run.thread_root_id) !== threadRootId) {
-      throw new KernelError("Forbidden", "The Activation cannot read this Thread.");
-    }
-    return;
-  }
-  const attention = requireAttention(kernel, text(activation.attention_id));
-  if (text(attention.project_id) !== projectId ||
-    text(attention.thread_root_id) !== threadRootId) {
+  if (scope.threadRootId !== threadRootId) {
     throw new KernelError("Forbidden", "The Activation cannot read this Thread.");
   }
 }
 
+export function resolvePrincipalReadScope(
+  kernel: db.KernelContext,
+  principal: Row,
+  context: PrincipalContext,
+  projectId: string,
+): PrincipalReadScope {
+  requireProject(kernel, projectId);
+  assertProjectAccess(kernel, principal, projectId);
+  if (text(principal.kind) !== "agent") {
+    return {
+      projectId,
+      channelId: null,
+      threadRootId: null,
+      runId: null,
+    };
+  }
+  if (!context.activationId) {
+    throw new KernelError(
+      "Unauthorized",
+      "An Agent query requires an authenticated Activation context.",
+    );
+  }
+  const agent = requireAgentForPrincipal(kernel, text(principal.id));
+  const activation = requireLiveActivation(kernel, context.activationId);
+  if (text(activation.agent_id) !== text(agent.id)) {
+    throw new KernelError(
+      "Forbidden",
+      "The Activation belongs to another Agent.",
+    );
+  }
+  assertActivationScopeCurrent(kernel, activation);
+  const scope = activationScope(kernel, activation);
+  if (scope.projectId !== projectId) {
+    throw new KernelError("Forbidden", "The Activation cannot read this Project.");
+  }
+  return {
+    ...scope,
+    runId: optionalText(activation.run_id),
+  };
+}
+
 export function assertActivationScopeCurrent(kernel: db.KernelContext, activation: Row): void {
-  if (activation.revoked_at !== null) {
-    throw new KernelError("Conflict", `The Activation was revoked: ${optionalText(activation.revocation_reason) ?? "unspecified"}.`);
-  }
-  if (new Date(text(activation.expires_at)) <= kernel.clock()) {
-    throw new KernelError("Conflict", "The Activation has expired.");
-  }
-  const runId = optionalText(activation.run_id);
-  if (runId) {
-    const run = requireRun(kernel, runId);
-    if (text(run.state) !== "Active") {
-      throw new KernelError(isTerminalRunState(text(run.state))
-        ? "TerminalRun"
-        : "Conflict", "Execution side effects require an Active Run.", { state: text(run.state) });
-    }
-    if (integer(activation.run_activation_generation) !==
-      integer(run.activation_generation)) {
-      throw new KernelError("Conflict", "The Activation was superseded by a newer Run activation generation.");
-    }
+  const scope = loadActivationScopeState(kernel, activation);
+  const validity = activationValidityAt(activation, scope, kernel.clock());
+  if (validity.live) {
     return;
   }
-  const attention = requireAttention(kernel, text(activation.attention_id));
-  if (text(attention.status) !== "Open") {
-    throw new KernelError("Conflict", "The Activation scope ended when its Attention was resolved.");
-  }
-  if (optionalText(attention.handler_lease_token) !==
-    optionalText(activation.attention_lease_token) ||
-    !optionalText(attention.handler_lease_expires_at) ||
-    new Date(text(attention.handler_lease_expires_at)) <= kernel.clock()) {
-    throw new KernelError("Conflict", "The Activation scope ended when its Attention handler lease expired or changed.");
+  switch (validity.reason) {
+    case "finished":
+      throw new KernelError("Conflict", "The Activation is already finished.");
+    case "revoked":
+      throw new KernelError(
+        "Conflict",
+        `The Activation was revoked: ${optionalText(activation.revocation_reason) ?? "unspecified"}.`,
+      );
+    case "expired":
+      throw new KernelError("Conflict", "The Activation has expired.");
+    case "wrong_agent":
+      throw new KernelError(
+        "Conflict",
+        "The Activation Agent no longer matches its Run or Attention scope.",
+      );
+    case "run_not_active": {
+      const run = (scope as Extract<ActivationScopeState, { kind: "Run" }>).run;
+      throw new KernelError(
+        isTerminalRunState(text(run.state)) ? "TerminalRun" : "Conflict",
+        "Execution side effects require an Active Run.",
+        { state: text(run.state) },
+      );
+    }
+    case "stale_run_generation":
+      throw new KernelError(
+        "Conflict",
+        "The Activation was superseded by a newer Run activation generation.",
+      );
+    case "attention_not_open":
+      throw new KernelError(
+        "Conflict",
+        "The Activation scope ended when its Attention was resolved.",
+      );
+    case "attention_lease_stale":
+      throw new KernelError(
+        "Conflict",
+        "The Activation scope ended when its Attention handler lease expired or changed.",
+      );
   }
 }
 
 export function isCurrentRunActivation(kernel: db.KernelContext, activation: Row, run: Row): boolean {
-  return (optionalText(activation.run_id) === text(run.id) &&
-    activation.finished_at === null &&
-    activation.revoked_at === null &&
-    new Date(text(activation.expires_at)) > kernel.clock() &&
-    text(run.state) === "Active" &&
-    integer(activation.run_activation_generation) ===
-    integer(run.activation_generation));
+  return optionalText(activation.run_id) === text(run.id) &&
+    activationValidityAt(
+      activation,
+      { kind: "Run", run },
+      kernel.clock(),
+    ).live;
+}
+
+export function isActivationLiveAt(
+  activation: Row,
+  scope: Readonly<{
+    runState: string | null;
+    runActivationGeneration: number | null;
+    scopeAgentId: string | null;
+    attentionStatus: string | null;
+    attentionLeaseToken: string | null;
+    attentionLeaseExpiresAt: string | null;
+  }>,
+  at: Date,
+): boolean {
+  const activationScopeState: ActivationScopeState =
+    optionalText(activation.run_id) !== null
+      ? {
+          kind: "Run",
+          run: {
+            state: scope.runState,
+            activation_generation: scope.runActivationGeneration,
+            owner_agent_id: scope.scopeAgentId,
+          },
+        }
+      : {
+          kind: "Attention",
+          attention: {
+            status: scope.attentionStatus,
+            target_agent_id: scope.scopeAgentId,
+            handler_lease_token: scope.attentionLeaseToken,
+            handler_lease_expires_at: scope.attentionLeaseExpiresAt,
+          },
+        };
+  return activationValidityAt(activation, activationScopeState, at).live;
+}
+
+export function liveRunActivationPredicate(
+  activationAlias: string,
+  runAlias: string,
+): string {
+  return `${activationAlias}.cause = 'Run'
+        AND ${activationAlias}.finished_at IS NULL
+        AND ${activationAlias}.revoked_at IS NULL
+        AND ${activationAlias}.expires_at > ?
+        AND ${runAlias}.state = 'Active'
+        AND ${activationAlias}.run_activation_generation = ${runAlias}.activation_generation
+        AND ${activationAlias}.agent_id = ${runAlias}.owner_agent_id`;
+}
+
+export function liveAttentionActivationPredicate(
+  activationAlias: string,
+  attentionAlias: string,
+): string {
+  return `${activationAlias}.cause = 'Attention'
+        AND ${activationAlias}.finished_at IS NULL
+        AND ${activationAlias}.revoked_at IS NULL
+        AND ${activationAlias}.expires_at > ?
+        AND ${attentionAlias}.status = 'Open'
+        AND ${attentionAlias}.handler_lease_token = ${activationAlias}.attention_lease_token
+        AND ${attentionAlias}.handler_lease_expires_at IS NOT NULL
+        AND ${attentionAlias}.handler_lease_expires_at > ?
+        AND ${activationAlias}.agent_id = ${attentionAlias}.target_agent_id`;
 }
 
 export function revokeRunActivations(kernel: db.KernelContext, runId: string, reason: string, revokedAt: string): void {
-  db.run(kernel, `UPDATE activation_attempts
+  const changed = db.allRows(kernel, `UPDATE activation_attempts
           SET revoked_at = COALESCE(revoked_at, ?),
               revocation_reason = COALESCE(revocation_reason, ?)
-        WHERE run_id = ? AND finished_at IS NULL AND revoked_at IS NULL`, revokedAt, reason, runId);
+        WHERE run_id = ? AND finished_at IS NULL AND revoked_at IS NULL
+        RETURNING id`, revokedAt, reason, runId);
+  markActivationChanges(
+    kernel,
+    changed.map((row) => text(row.id)),
+  );
+}
+
+export function markActivationChanges(
+  kernel: db.KernelContext,
+  activationIds: readonly string[],
+): void {
+  for (const activationId of activationIds) {
+    db.run(
+      kernel,
+      `INSERT OR IGNORE INTO projection_activation_changes (activation_id)
+       VALUES (?)`,
+      activationId,
+    );
+  }
 }
 
 export function activationScope(kernel: db.KernelContext, activation: Row): {
@@ -272,7 +420,11 @@ export function activationScope(kernel: db.KernelContext, activation: Row): {
   };
 }
 
-export function resolveAttentionSnapshot(kernel: db.KernelContext, snapshotEventId: string | null | undefined): {
+export function resolvePublicSnapshot(
+  kernel: db.KernelContext,
+  projectId: string,
+  snapshotEventId: string | null | undefined,
+): {
   sequence: number;
   eventId: string | null;
 } {
@@ -280,12 +432,44 @@ export function resolveAttentionSnapshot(kernel: db.KernelContext, snapshotEvent
     return { sequence: 0, eventId: null };
   }
   if (snapshotEventId !== undefined) {
+    const event = db.getRow(
+      kernel,
+      `SELECT correlation_id
+         FROM public_events
+        WHERE project_id = ? AND event_id = ?`,
+      projectId,
+      snapshotEventId,
+    );
+    if (!event) {
+      throw invalidProjectEventCursor();
+    }
+    const boundary = db.getRow(
+      kernel,
+      `SELECT sequence, event_id
+         FROM public_events
+        WHERE project_id = ? AND correlation_id = ?
+        ORDER BY sequence DESC
+        LIMIT 1`,
+      projectId,
+      text(event.correlation_id),
+    );
+    if (!boundary) {
+      throw new Error("Stored event correlation has no command boundary.");
+    }
     return {
-      sequence: eventSequence(kernel, snapshotEventId),
-      eventId: snapshotEventId,
+      sequence: integer(boundary.sequence),
+      eventId: text(boundary.event_id),
     };
   }
-  const latest = db.getRow(kernel, "SELECT sequence, event_id FROM public_events ORDER BY sequence DESC LIMIT 1");
+  const latest = db.getRow(
+    kernel,
+    `SELECT sequence, event_id
+       FROM public_events
+      WHERE project_id = ?
+      ORDER BY sequence DESC
+      LIMIT 1`,
+    projectId,
+  );
   return latest
     ? {
       sequence: integer(latest.sequence),
@@ -294,10 +478,77 @@ export function resolveAttentionSnapshot(kernel: db.KernelContext, snapshotEvent
     : { sequence: 0, eventId: null };
 }
 
+export function resolveAttentionSnapshot(kernel: db.KernelContext, snapshotEventId: string | null | undefined): {
+  sequence: number;
+  eventId: string | null;
+} {
+  if (snapshotEventId === null) {
+    return { sequence: 0, eventId: null };
+  }
+  if (snapshotEventId !== undefined) {
+    const event = db.getRow(
+      kernel,
+      "SELECT correlation_id FROM public_events WHERE event_id = ?",
+      snapshotEventId,
+    );
+    if (!event) {
+      throw new KernelError(
+        "NotFound",
+        `Event ${snapshotEventId} does not exist.`,
+      );
+    }
+    const boundary = db.getRow(
+      kernel,
+      `SELECT sequence, event_id
+         FROM public_events
+        WHERE correlation_id = ?
+        ORDER BY sequence DESC
+        LIMIT 1`,
+      text(event.correlation_id),
+    );
+    if (!boundary) {
+      throw new Error("Stored event correlation has no command boundary.");
+    }
+    return {
+      sequence: integer(boundary.sequence),
+      eventId: text(boundary.event_id),
+    };
+  }
+  const latest = db.getRow(
+    kernel,
+    "SELECT sequence, event_id FROM public_events ORDER BY sequence DESC LIMIT 1",
+  );
+  return latest
+    ? {
+        sequence: integer(latest.sequence),
+        eventId: text(latest.event_id),
+      }
+    : { sequence: 0, eventId: null };
+}
+
 export function eventSequence(kernel: db.KernelContext, eventId: string): number {
   const row = db.getRow(kernel, "SELECT sequence FROM public_events WHERE event_id = ?", eventId);
   if (!row) {
     throw new KernelError("NotFound", `Event ${eventId} does not exist.`);
+  }
+  return integer(row.sequence);
+}
+
+export function projectEventSequence(
+  kernel: db.KernelContext,
+  projectId: string,
+  eventId: string,
+): number {
+  const row = db.getRow(
+    kernel,
+    `SELECT sequence
+       FROM public_events
+      WHERE project_id = ? AND event_id = ?`,
+    projectId,
+    eventId,
+  );
+  if (!row) {
+    throw invalidProjectEventCursor();
   }
   return integer(row.sequence);
 }
@@ -324,6 +575,14 @@ export function requireAgent(kernel: db.KernelContext, id: string): Row {
   const row = db.getRow(kernel, "SELECT * FROM agents WHERE id = ?", id);
   if (!row) {
     throw new KernelError("NotFound", `Agent ${id} does not exist.`);
+  }
+  return row;
+}
+
+export function requireProject(kernel: db.KernelContext, id: string): Row {
+  const row = db.getRow(kernel, "SELECT * FROM projects WHERE id = ?", id);
+  if (!row) {
+    throw new KernelError("NotFound", `Project ${id} does not exist.`);
   }
   return row;
 }
@@ -398,6 +657,77 @@ export function requireOutboxEvent(kernel: db.KernelContext, id: string): Row {
     throw new KernelError("NotFound", `OutboxEvent ${id} does not exist.`);
   }
   return row;
+}
+
+function loadActivationScopeState(
+  kernel: db.KernelContext,
+  activation: Row,
+): ActivationScopeState {
+  const runId = optionalText(activation.run_id);
+  return runId
+    ? { kind: "Run", run: requireRun(kernel, runId) }
+    : {
+        kind: "Attention",
+        attention: requireAttention(kernel, text(activation.attention_id)),
+      };
+}
+
+function activationValidityAt(
+  activation: Row,
+  scope: ActivationScopeState,
+  at: Date,
+): ActivationValidity {
+  if (activation.finished_at !== null) {
+    return { live: false, reason: "finished" };
+  }
+  if (activation.revoked_at !== null) {
+    return { live: false, reason: "revoked" };
+  }
+  if (new Date(text(activation.expires_at)) <= at) {
+    return { live: false, reason: "expired" };
+  }
+  if (scope.kind === "Run") {
+    if (text(activation.agent_id) !== text(scope.run.owner_agent_id)) {
+      return { live: false, reason: "wrong_agent" };
+    }
+    if (text(scope.run.state) !== "Active") {
+      return { live: false, reason: "run_not_active" };
+    }
+    if (
+      integer(activation.run_activation_generation) !==
+      integer(scope.run.activation_generation)
+    ) {
+      return { live: false, reason: "stale_run_generation" };
+    }
+    return { live: true };
+  }
+  if (
+    text(activation.agent_id) !== text(scope.attention.target_agent_id)
+  ) {
+    return { live: false, reason: "wrong_agent" };
+  }
+  if (text(scope.attention.status) !== "Open") {
+    return { live: false, reason: "attention_not_open" };
+  }
+  const leaseExpiresAt = optionalText(
+    scope.attention.handler_lease_expires_at,
+  );
+  if (
+    optionalText(scope.attention.handler_lease_token) !==
+      optionalText(activation.attention_lease_token) ||
+    leaseExpiresAt === null ||
+    new Date(leaseExpiresAt) <= at
+  ) {
+    return { live: false, reason: "attention_lease_stale" };
+  }
+  return { live: true };
+}
+
+function invalidProjectEventCursor(): KernelError {
+  return new KernelError(
+    "NotFound",
+    "Event cursor does not exist in the requested Project.",
+  );
 }
 
 export function validateDisposition(kernel: db.KernelContext, disposition: RunInputDisposition, reason: string): void {

@@ -36,6 +36,11 @@ export function openKernelContext(options: KernelOpenOptions): KernelContext {
       `PRAGMA foreign_keys = ON; PRAGMA busy_timeout = ${sqliteBusyTimeoutMs()};`,
     );
     initializeSchema(context);
+    context.database.exec(
+      `CREATE TEMP TABLE IF NOT EXISTS projection_activation_changes (
+         activation_id TEXT PRIMARY KEY
+       ) STRICT;`,
+    );
     if (options.databasePath !== ":memory:") {
       context.database.exec("PRAGMA journal_mode = WAL;");
     }

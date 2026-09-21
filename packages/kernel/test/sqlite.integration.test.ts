@@ -501,7 +501,7 @@ describe("SQLite persistence", () => {
       const metadata = new DatabaseSync(databasePath, { readOnly: true });
       try {
         expect(metadata.prepare("PRAGMA user_version").get()).toMatchObject({
-          user_version: 6,
+          user_version: 8,
         });
       } finally {
         metadata.close();
@@ -1063,6 +1063,76 @@ describe("SQLite persistence", () => {
       if (winner) {
         await winner.worker.terminate();
       }
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps projection page metadata and rows on one committed read snapshot", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-query-snapshot-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    let held: HeldActivationCommand | undefined;
+    let kernel: TorsorKernel | undefined;
+    try {
+      kernel = TorsorKernel.open({ databasePath, bootstrap });
+      const setup = await createRun(kernel);
+      await kernel.execute(
+        {
+          type: "WaitRun",
+          idempotencyKey: "query-snapshot-wait",
+          runId: setup.runId,
+          expectedRunRevision: 1,
+          reason: "Prepare a committed Waiting projection.",
+        },
+        setup.agentContext,
+      );
+
+      held = await startActivationHoldingBeforeCommit(
+        databasePath,
+        {
+          type: "StartActivation",
+          idempotencyKey: "query-snapshot-resume",
+          runId: setup.runId,
+          expectedRunRevision: 2,
+        },
+      );
+      const whileUncommitted = await kernel.query(
+        {
+          type: "ListRunProjections",
+          projectId: "project-sample",
+          limit: 10,
+        },
+        humanContext,
+      );
+      expect(whileUncommitted.items[0]?.run).toMatchObject({
+        id: setup.runId,
+        state: "Waiting",
+        revision: 2,
+      });
+
+      held.release();
+      await held.result;
+      const afterCommit = await kernel.query(
+        {
+          type: "ListRunProjections",
+          projectId: "project-sample",
+          limit: 10,
+        },
+        humanContext,
+      );
+      expect(afterCommit.items[0]?.run).toMatchObject({
+        id: setup.runId,
+        state: "Active",
+        revision: 3,
+      });
+      expect(afterCommit.snapshotEventId).not.toBe(
+        whileUncommitted.snapshotEventId,
+      );
+    } finally {
+      held?.release();
+      if (held) {
+        await held.worker.terminate();
+      }
+      kernel?.close();
       await rm(directory, { recursive: true, force: true });
     }
   });

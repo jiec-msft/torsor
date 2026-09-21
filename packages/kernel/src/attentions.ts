@@ -81,7 +81,7 @@ function finishAttentionActivation(
   now: string,
   reason: string,
 ): void {
-  db.run(
+  const changed = db.allRows(
     kernel,
     `UPDATE activation_attempts
         SET revoked_at = ?,
@@ -89,12 +89,17 @@ function finishAttentionActivation(
             finished_at = ?,
             outcome = 'Completed',
             detail = ?
-      WHERE id = ?`,
+      WHERE id = ?
+      RETURNING id`,
     now,
     reason,
     now,
     reason,
     activationId,
+  );
+  invariants.markActivationChanges(
+    kernel,
+    changed.map((row) => text(row.id)),
   );
 }
 
@@ -120,10 +125,15 @@ export function claimAttention(kernel: db.KernelContext, command: Extract<Kernel
   const leaseToken = kernel.idFactory("lease");
   const revision = integer(attention.revision) + 1;
   const expiresAt = new Date(now.getTime() + command.leaseDurationMs).toISOString();
-  db.run(kernel, `UPDATE activation_attempts
+  const changedActivations = db.allRows(kernel, `UPDATE activation_attempts
           SET revoked_at = COALESCE(revoked_at, ?),
               revocation_reason = COALESCE(revocation_reason, 'attention_lease_replaced')
-        WHERE attention_id = ? AND revoked_at IS NULL`, now.toISOString(), command.attentionId);
+        WHERE attention_id = ? AND revoked_at IS NULL
+        RETURNING id`, now.toISOString(), command.attentionId);
+  invariants.markActivationChanges(
+    kernel,
+    changedActivations.map((row) => text(row.id)),
+  );
   db.run(kernel, `UPDATE attentions
           SET revision = ?,
               handler_lease_holder_principal_id = ?,
