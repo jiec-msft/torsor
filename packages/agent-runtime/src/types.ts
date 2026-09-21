@@ -3,8 +3,11 @@ import type {
   BootstrapAgent,
   CompletionException,
   JsonValue,
+  MessageRevisionView,
+  MessageView,
   ProviderAttemptStatus,
   RunProjection,
+  RunView,
   ThreadProjection,
 } from "@torsor/kernel";
 
@@ -21,6 +24,10 @@ export type ProviderCause =
   | {
       readonly type: "attention";
       readonly attention: AttentionView;
+      readonly thread: ThreadProjection;
+      readonly triggeringMessage: MessageView;
+      readonly triggeringRevision: MessageRevisionView;
+      readonly eligibleRuns: readonly RunView[];
     }
   | {
       readonly type: "run";
@@ -38,22 +45,21 @@ export interface CompleteRunInput {
   };
 }
 
-export interface ArtifactInput {
-  readonly contentDigest: string;
-  readonly baseRevision: string;
-  readonly mediaType: string;
-  readonly storageLocation: string;
-  readonly metadata?: JsonValue;
-}
+export type AttentionDecision =
+  | { readonly type: "ignore"; readonly reason: string }
+  | { readonly type: "continue"; readonly runId: string }
+  | { readonly type: "create"; readonly runId: string };
 
 export interface ActivationCapabilityBridge {
   readonly activationId: string;
   readonly providerAttemptId: string;
   readonly causeType: ProviderCause["type"];
-  readonly createdRunId: string | null;
+  readonly attentionDecision: AttentionDecision | null;
   readonly terminalAction: "complete" | "fail" | "wait" | null;
 
   createRunFromAttention(): Promise<string>;
+  continueAttentionWithRun(runId: string): Promise<string>;
+  ignoreAttention(reason: string): Promise<void>;
   appendActivity(
     kind: string,
     payload: JsonValue,
@@ -64,7 +70,6 @@ export interface ActivationCapabilityBridge {
     readonly targetAgentIds?: readonly string[];
     readonly expectedThreadCursor?: number;
   }): Promise<string>;
-  publishArtifact(input: ArtifactInput): Promise<string>;
   reportStatus(status: string, detail?: string): Promise<string>;
   complete(input?: CompleteRunInput): Promise<void>;
   fail(reason: string): Promise<void>;

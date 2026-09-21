@@ -3,12 +3,13 @@ import type {
   BootstrapAgent,
   JsonValue,
   RunProjection,
+  RunView,
   TorsorKernel,
 } from "@torsor/kernel";
 
 import type {
   ActivationCapabilityBridge,
-  ArtifactInput,
+  AttentionDecision,
   CompleteRunInput,
 } from "./types.js";
 
@@ -24,6 +25,7 @@ interface AttentionBridgeOptions extends BridgeBaseOptions {
   readonly attention: AttentionView;
   readonly attentionRevision: number;
   readonly handlerLeaseToken: string;
+  readonly eligibleRuns: readonly RunView[];
 }
 
 interface RunBridgeOptions extends BridgeBaseOptions {
@@ -40,7 +42,7 @@ export class KernelActivationCapabilityBridge
   readonly providerAttemptId: string;
   readonly causeType: "attention" | "run";
 
-  #createdRunId: string | null = null;
+  #attentionDecision: AttentionDecision | null = null;
   #terminalAction: "complete" | "fail" | "wait" | null = null;
   #nextCommand = 0;
   #runRevision: number | null;
@@ -53,8 +55,8 @@ export class KernelActivationCapabilityBridge
       options.causeType === "run" ? options.projection.run.revision : null;
   }
 
-  get createdRunId(): string | null {
-    return this.#createdRunId;
+  get attentionDecision(): AttentionDecision | null {
+    return this.#attentionDecision;
   }
 
   get terminalAction(): "complete" | "fail" | "wait" | null {
@@ -65,9 +67,7 @@ export class KernelActivationCapabilityBridge
     if (this.options.causeType !== "attention") {
       throw new Error("Only an Attention Activation can create its initial Run.");
     }
-    if (this.#createdRunId) {
-      return this.#createdRunId;
-    }
+    this.#assertNoAttentionDecision();
     const result = await this.options.kernel.execute(
       {
         type: "ResolveAttentionWithRun",
@@ -78,8 +78,52 @@ export class KernelActivationCapabilityBridge
       },
       this.#agentContext(),
     );
-    this.#createdRunId = result.entityId;
+    this.#attentionDecision = { type: "create", runId: result.entityId };
     return result.entityId;
+  }
+
+  async continueAttentionWithRun(runId: string): Promise<string> {
+    if (this.options.causeType !== "attention") {
+      throw new Error("Only an Attention Activation can continue a Run.");
+    }
+    this.#assertNoAttentionDecision();
+    const eligible = this.options.eligibleRuns.find((run) => run.id === runId);
+    if (!eligible) {
+      throw new Error(`Run ${runId} is not eligible for this Attention.`);
+    }
+    const result = await this.options.kernel.execute(
+      {
+        type: "ResolveAttentionWithExistingRun",
+        idempotencyKey: this.#key("continue-run"),
+        attentionId: this.options.attention.id,
+        expectedAttentionRevision: this.options.attentionRevision,
+        handlerLeaseToken: this.options.handlerLeaseToken,
+        runId,
+        expectedRunRevision: eligible.revision,
+      },
+      this.#agentContext(),
+    );
+    this.#attentionDecision = { type: "continue", runId };
+    return result.relatedIds?.runInputId ?? result.entityId;
+  }
+
+  async ignoreAttention(reason: string): Promise<void> {
+    if (this.options.causeType !== "attention") {
+      throw new Error("Only an Attention Activation can ignore Attention.");
+    }
+    this.#assertNoAttentionDecision();
+    await this.options.kernel.execute(
+      {
+        type: "IgnoreAttention",
+        idempotencyKey: this.#key("ignore-attention"),
+        attentionId: this.options.attention.id,
+        expectedAttentionRevision: this.options.attentionRevision,
+        handlerLeaseToken: this.options.handlerLeaseToken,
+        reason,
+      },
+      this.#agentContext(),
+    );
+    this.#attentionDecision = { type: "ignore", reason: reason.trim() };
   }
 
   async appendActivity(
@@ -123,25 +167,6 @@ export class KernelActivationCapabilityBridge
         ...(input.expectedThreadCursor === undefined
           ? {}
           : { expectedThreadCursor: input.expectedThreadCursor }),
-      },
-      this.#agentContext(),
-    );
-    return result.entityId;
-  }
-
-  async publishArtifact(input: ArtifactInput): Promise<string> {
-    const run = this.#requireRun();
-    const result = await this.options.kernel.execute(
-      {
-        type: "PublishArtifact",
-        idempotencyKey: this.#key("publish-artifact"),
-        runId: run.run.id,
-        expectedRunRevision: this.#requireRunRevision(),
-        contentDigest: input.contentDigest,
-        baseRevision: input.baseRevision,
-        mediaType: input.mediaType,
-        storageLocation: input.storageLocation,
-        ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
       },
       this.#agentContext(),
     );
@@ -245,6 +270,14 @@ export class KernelActivationCapabilityBridge
     if (this.#terminalAction) {
       throw new Error(
         `The Activation already reported terminal action ${this.#terminalAction}.`,
+      );
+    }
+  }
+
+  #assertNoAttentionDecision(): void {
+    if (this.#attentionDecision) {
+      throw new Error(
+        `The Activation already made Attention decision ${this.#attentionDecision.type}.`,
       );
     }
   }

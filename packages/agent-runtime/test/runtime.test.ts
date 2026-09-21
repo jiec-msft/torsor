@@ -14,7 +14,9 @@ import {
   AgentRuntime,
   CopilotAcpAdapter,
   DeterministicFakeAdapter,
+  KernelActivationCapabilityBridge,
   ProviderExecutionError,
+  type CopilotAcpLimits,
   type ProviderAdapter,
 } from "../src/index.js";
 
@@ -102,6 +104,344 @@ describe("AgentRuntime", () => {
       expect(projection.messages.at(-1)?.revisions[0]?.body).toBe(
         "The deterministic fake completed the requested work.",
       );
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("presents ten independent triggering messages for explicit decisions", async () => {
+    const kernel = openKernel(":memory:");
+    const seenBodies: string[] = [];
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type !== "attention") {
+        throw new Error("Ignoring Attention must not create Run work.");
+      }
+      const cause = context.cause;
+      seenBodies.push(cause.triggeringRevision.body);
+      expect(
+        cause.triggeringMessage.revisions.some(
+          (revision) => revision.id === cause.attention.messageRevisionId,
+        ),
+      ).toBe(true);
+      expect(cause.eligibleRuns).toEqual([]);
+      await context.capabilities.ignoreAttention("No durable work requested.");
+    });
+    try {
+      for (let index = 0; index < 10; index += 1) {
+        await kernel.execute(
+          {
+            type: "StartThread",
+            idempotencyKey: `independent-thread:${index}`,
+            projectId: "project-sample",
+            channelId: "channel-general",
+            body: `Independent request ${index}.`,
+            targetAgentIds: ["agent-orbit"],
+          },
+          humanContext,
+        );
+      }
+
+      await createRuntime(kernel, adapter).drainUntilIdle();
+
+      expect(seenBodies).toEqual(
+        Array.from(
+          { length: 10 },
+          (_, index) => `Independent request ${index}.`,
+        ),
+      );
+      const events = await kernel.readEvents(null, 500);
+      expect(
+        events.filter((event) => event.type === "AttentionIgnored"),
+      ).toHaveLength(10);
+      expect(events.some((event) => event.type === "RunCreated")).toBe(false);
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("continues only the existing Run explicitly selected by the provider", async () => {
+    const kernel = openKernel(":memory:");
+    let runExecutions = 0;
+    let selectedRunId: string | undefined;
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        if (context.cause.eligibleRuns.length === 0) {
+          selectedRunId =
+            await context.capabilities.createRunFromAttention();
+        } else {
+          expect(context.cause.eligibleRuns.map((run) => run.id)).toEqual([
+            selectedRunId,
+          ]);
+          await context.capabilities.continueAttentionWithRun(selectedRunId!);
+        }
+        return;
+      }
+      runExecutions += 1;
+      if (runExecutions === 1) {
+        await context.capabilities.wait("Waiting for the follow-up.");
+      } else {
+        await context.capabilities.complete();
+      }
+    });
+    try {
+      const thread = await mentionAgent(kernel, "continue-existing-run");
+      const runtime = createRuntime(kernel, adapter);
+      await runtime.drainUntilIdle();
+
+      await kernel.execute(
+        {
+          type: "ReplyToThread",
+          idempotencyKey: "continue-existing-run:follow-up",
+          threadRootId: thread.entityId,
+          body: "Continue the same durable work.",
+          targetAgentIds: ["agent-orbit"],
+        },
+        humanContext,
+      );
+      await runtime.drainUntilIdle();
+
+      const projection = await kernel.query(
+        { type: "GetThreadProjection", threadRootId: thread.entityId },
+        humanContext,
+      );
+      expect(projection.runs).toHaveLength(1);
+      expect(projection.runs[0]).toMatchObject({
+        id: selectedRunId,
+        state: "Completed",
+      });
+      const run = await kernel.query(
+        { type: "GetRunProjection", runId: selectedRunId! },
+        humanContext,
+      );
+      expect(run.inputs).toHaveLength(2);
+      expect(run.inputs[1]?.sourceAttentionId).toBe(
+        projection.attentions[1]?.id,
+      );
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("persists an ignore decision without creating Run work", async () => {
+    const kernel = openKernel(":memory:");
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type !== "attention") {
+        throw new Error("No Run should be dispatched.");
+      }
+      await context.capabilities.ignoreAttention("Informational mention only.");
+    });
+    try {
+      const thread = await mentionAgent(kernel, "ignore-attention");
+      await createRuntime(kernel, adapter).drainUntilIdle();
+
+      const projection = await kernel.query(
+        { type: "GetThreadProjection", threadRootId: thread.entityId },
+        humanContext,
+      );
+      expect(projection.attentions[0]).toMatchObject({
+        status: "Ignored",
+        resolutionOutcome: "Ignored",
+      });
+      expect(projection.runs).toEqual([]);
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("does not repeat an Attention decision on duplicate runtime delivery", async () => {
+    const kernel = openKernel(":memory:");
+    let decisions = 0;
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type !== "attention") {
+        throw new Error("No Run should be dispatched.");
+      }
+      decisions += 1;
+      await context.capabilities.ignoreAttention("Handled exactly once.");
+    });
+    try {
+      await mentionAgent(kernel, "duplicate-attention-delivery");
+      const runtime = createRuntime(kernel, adapter);
+      await runtime.drainUntilIdle();
+      await runtime.drainUntilIdle();
+
+      expect(decisions).toBe(1);
+      const events = await kernel.readEvents(null, 500);
+      expect(
+        events.filter((event) => event.type === "AttentionIgnored"),
+      ).toHaveLength(1);
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("rejects a stale Attention decision after lease replacement", async () => {
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const kernel = openKernel(":memory:", () => now);
+    try {
+      await mentionAgent(kernel, "stale-attention-decision");
+      const open = await kernel.query(
+        {
+          type: "ListOpenAttentions",
+          projectId: "project-sample",
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      const attention = open.items[0]!;
+      const firstClaim = await kernel.execute(
+        {
+          type: "ClaimAttention",
+          idempotencyKey: "stale-attention:first-claim",
+          attentionId: attention.id,
+          expectedAttentionRevision: attention.revision,
+          leaseDurationMs: 30_000,
+        },
+        runtimeContext,
+      );
+      const firstActivation = await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "stale-attention:first-activation",
+          attentionId: attention.id,
+          handlerLeaseToken: firstClaim.relatedIds!.handlerLeaseToken!,
+        },
+        runtimeContext,
+      );
+      const bootstrapView = await kernel.query(
+        { type: "GetBootstrap", projectId: "project-sample" },
+        runtimeContext,
+      );
+      const firstBridge = new KernelActivationCapabilityBridge({
+        kernel,
+        agent: bootstrapView.agents[0]!,
+        activationId: firstActivation.entityId,
+        providerAttemptId: "provider-attempt-stale",
+        causeType: "attention",
+        attention,
+        attentionRevision: firstClaim.revision!,
+        handlerLeaseToken: firstClaim.relatedIds!.handlerLeaseToken!,
+        eligibleRuns: [],
+      });
+
+      now = new Date(now.getTime() + 31_000);
+      const replacementClaim = await kernel.execute(
+        {
+          type: "ClaimAttention",
+          idempotencyKey: "stale-attention:replacement-claim",
+          attentionId: attention.id,
+          expectedAttentionRevision: firstClaim.revision!,
+          leaseDurationMs: 30_000,
+        },
+        runtimeContext,
+      );
+      await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "stale-attention:replacement-activation",
+          attentionId: attention.id,
+          handlerLeaseToken:
+            replacementClaim.relatedIds!.handlerLeaseToken!,
+        },
+        runtimeContext,
+      );
+
+      await expect(
+        firstBridge.ignoreAttention("This stale decision must not persist."),
+      ).rejects.toBeInstanceOf(KernelError);
+      const stillOpen = await kernel.query(
+        {
+          type: "ListOpenAttentions",
+          projectId: "project-sample",
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      expect(stillOpen.items[0]).toMatchObject({
+        id: attention.id,
+        revision: replacementClaim.revision,
+      });
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("reconciles an unfinished ProviderAttempt after an Attention decision", async () => {
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const kernel = openKernel(":memory:", () => now);
+    try {
+      await mentionAgent(kernel, "decision-attempt-recovery");
+      const open = await kernel.query(
+        {
+          type: "ListOpenAttentions",
+          projectId: "project-sample",
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      const attention = open.items[0]!;
+      const claim = await kernel.execute(
+        {
+          type: "ClaimAttention",
+          idempotencyKey: "decision-recovery:claim",
+          attentionId: attention.id,
+          expectedAttentionRevision: attention.revision,
+          leaseDurationMs: 30_000,
+        },
+        runtimeContext,
+      );
+      const activation = await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "decision-recovery:activation",
+          attentionId: attention.id,
+          handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
+        },
+        runtimeContext,
+      );
+      const attempt = await kernel.execute(
+        {
+          type: "StartProviderAttempt",
+          idempotencyKey: "decision-recovery:attempt",
+          activationId: activation.entityId,
+          adapter: "synthetic-crash",
+          adapterVersion: "1",
+          capabilitySnapshot: { attentionDecision: true },
+          runInputIds: [],
+          requestIdempotencyKey: "decision-recovery:provider-request",
+        },
+        runtimeContext,
+      );
+      const bootstrapView = await kernel.query(
+        { type: "GetBootstrap", projectId: "project-sample" },
+        runtimeContext,
+      );
+      const bridge = new KernelActivationCapabilityBridge({
+        kernel,
+        agent: bootstrapView.agents[0]!,
+        activationId: activation.entityId,
+        providerAttemptId: attempt.entityId,
+        causeType: "attention",
+        attention,
+        attentionRevision: claim.revision!,
+        handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
+        eligibleRuns: [],
+      });
+      await bridge.ignoreAttention("Decision persisted before process loss.");
+      now = new Date(now.getTime() + 31_000);
+
+      await createRuntime(
+        kernel,
+        new DeterministicFakeAdapter(),
+        { clock: () => now },
+      ).runOnce();
+
+      const events = await kernel.readEvents(null, 500);
+      const finish = events.find(
+        (event) =>
+          event.type === "ProviderAttemptFinished" &&
+          event.entityId === attempt.entityId,
+      );
+      expect(finish?.payload).toMatchObject({ status: "Unknown" });
     } finally {
       kernel.close();
     }
@@ -268,6 +608,52 @@ describe("AgentRuntime", () => {
       expect(run.activity.items).toHaveLength(0);
       expect(run.providerAttempts.at(-1)?.status).toBe("Failed");
       expect(run.run.activationGeneration).toBe(2);
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("cancels a provider when its Run Activation is superseded", async () => {
+    const kernel = openKernel(":memory:");
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+        return;
+      }
+      await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "supersede-running-provider",
+          runId: context.cause.run.run.id,
+          expectedRunRevision: context.cause.run.run.revision,
+        },
+        runtimeContext,
+      );
+      if (context.signal.aborted) {
+        throw context.signal.reason;
+      }
+      await new Promise<void>((_resolve, reject) => {
+        context.signal.addEventListener(
+          "abort",
+          () => reject(context.signal.reason),
+          { once: true },
+        );
+      });
+    });
+    try {
+      await mentionAgent(kernel, "superseded-provider");
+      const runtime = createRuntime(kernel, adapter, {
+        cancellationPollMs: 5,
+      });
+      await runtime.runOnce();
+
+      await expect(runtime.runOnce()).rejects.toMatchObject({
+        outcome: "Unknown",
+      });
+      const run = await getOnlyRun(kernel);
+      expect(run.run.state).toBe("Active");
+      expect(run.run.activationGeneration).toBe(2);
+      expect(run.providerAttempts.at(-1)?.status).toBe("Unknown");
     } finally {
       kernel.close();
     }
@@ -568,6 +954,7 @@ describe("AgentRuntime", () => {
       const copilot = new CopilotAcpAdapter({
         command: process.execPath,
         commandArgs: [fixture],
+        unsafeAllowCustomCommandArgs: true,
         cwd: process.cwd(),
       });
       const runtime = createRuntime(kernel, copilot);
@@ -607,9 +994,9 @@ describe("AgentRuntime", () => {
       await attentionRuntime.runOnce();
       const copilot = new CopilotAcpAdapter({
         command: process.execPath,
-        commandArgs: [fixture],
+        commandArgs: [fixture, "invalid-plan"],
+        unsafeAllowCustomCommandArgs: true,
         cwd: process.cwd(),
-        environment: { MOCK_ACP_PLAN: "invalid" },
       });
       const runtime = createRuntime(kernel, copilot);
       await expect(runtime.runOnce()).rejects.toMatchObject({
@@ -626,6 +1013,317 @@ describe("AgentRuntime", () => {
       expect(run.inputs[0]?.disposition).toBe("Pending");
       expect(run.providerAttempts.at(-1)?.status).toBe("Failed");
     } finally {
+      kernel.close();
+    }
+  });
+
+  it("launches Copilot ACP with deny-by-default tools and a sanitized environment", () => {
+    const adapter = new CopilotAcpAdapter({
+      environment: {
+        COPILOT_PROVIDER_API_KEY: "synthetic-provider-key",
+      },
+    });
+    const launch = adapter.getLaunchConfiguration();
+
+    expect(launch.command).toBe("copilot");
+    expect(launch.args).toEqual(
+      expect.arrayContaining([
+        "--acp",
+        "--disable-builtin-mcps",
+        "--available-tools=torsor-runtime-action-channel",
+        "--deny-tool=shell",
+        "--deny-tool=write",
+        "--deny-tool=url",
+      ]),
+    );
+    expect(launch.environment).toMatchObject({
+      COPILOT_PROVIDER_API_KEY: "synthetic-provider-key",
+    });
+    expect(launch.environment).not.toHaveProperty("GITHUB_TOKEN");
+    expect(launch.environment).not.toHaveProperty("GH_TOKEN");
+    expect(launch.environment).not.toHaveProperty("COPILOT_ALLOW_ALL");
+    expect(() =>
+      new CopilotAcpAdapter({
+        environment: { COPILOT_ALLOW_ALL: "true" },
+      }),
+    ).toThrow("not in the explicit provider allowlist");
+    expect(() =>
+      new CopilotAcpAdapter({
+        commandArgs: ["--acp"],
+      }),
+    ).toThrow("unsafeAllowCustomCommandArgs=true");
+  });
+
+  it("cancels ACP permission requests without exposing a built-in tool", async () => {
+    const kernel = openKernel(":memory:");
+    try {
+      await prepareAcpRun(kernel, "permission-request");
+      const runtime = createRuntime(
+        kernel,
+        createFixtureAcpAdapter("permission"),
+      );
+
+      await runtime.runOnce();
+
+      const run = await getOnlyRun(kernel);
+      expect(run.run.state).toBe("Completed");
+      expect(run.providerAttempts.at(-1)?.status).toBe("Completed");
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("settles a permission request racing with ACP shutdown", async () => {
+    const kernel = openKernel(":memory:");
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown) => {
+      unhandled.push(error);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      await prepareAcpRun(kernel, "trailing-permission");
+      const runtime = createRuntime(
+        kernel,
+        createFixtureAcpAdapter("trailing-permission"),
+      );
+
+      await runtime.runOnce();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      expect(unhandled).toEqual([]);
+      const run = await getOnlyRun(kernel);
+      expect(run.run.state).toBe("Completed");
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      kernel.close();
+    }
+  });
+
+  it("fails closed when ACP reports forbidden tool activity", async () => {
+    const kernel = openKernel(":memory:");
+    try {
+      await prepareAcpRun(kernel, "forbidden-tool");
+      const runtime = createRuntime(
+        kernel,
+        createFixtureAcpAdapter("tool-activity"),
+      );
+
+      await expect(runtime.runOnce()).rejects.toThrow(
+        "deny-by-default tool policy",
+      );
+      const run = await getOnlyRun(kernel);
+      expect(run.run.state).toBe("Waiting");
+      expect(run.providerAttempts.at(-1)?.status).toBe("Failed");
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("fails closed on forbidden ACP activity trailing the prompt response", async () => {
+    const kernel = openKernel(":memory:");
+    try {
+      await prepareAcpRun(kernel, "trailing-forbidden-tool");
+      const runtime = createRuntime(
+        kernel,
+        createFixtureAcpAdapter("trailing-tool"),
+      );
+
+      await expect(runtime.runOnce()).rejects.toThrow(
+        "deny-by-default tool policy",
+      );
+      const run = await getOnlyRun(kernel);
+      expect(run.run.state).toBe("Waiting");
+      expect(run.providerAttempts.at(-1)?.status).toBe("Failed");
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("fails closed on delayed ACP activity after the prompt response", async () => {
+    const kernel = openKernel(":memory:");
+    try {
+      await prepareAcpRun(kernel, "delayed-forbidden-tool");
+      const runtime = createRuntime(
+        kernel,
+        createFixtureAcpAdapter("delayed-trailing-tool"),
+      );
+
+      await expect(runtime.runOnce()).rejects.toThrow(
+        "deny-by-default tool policy",
+      );
+      const run = await getOnlyRun(kernel);
+      expect(run.run.state).toBe("Waiting");
+      expect(run.providerAttempts.at(-1)?.status).toBe("Failed");
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("rejects model-supplied Artifact descriptors before Kernel effects", async () => {
+    const kernel = openKernel(":memory:");
+    try {
+      await prepareAcpRun(kernel, "untrusted-artifact");
+      const runtime = createRuntime(
+        kernel,
+        createFixtureAcpAdapter("artifact"),
+      );
+
+      await expect(runtime.runOnce()).rejects.toThrow(
+        "Unsupported action type publish_artifact",
+      );
+      const events = await kernel.readEvents(null, 500);
+      expect(events.some((event) => event.type === "ArtifactPublished")).toBe(
+        false,
+      );
+      const run = await getOnlyRun(kernel);
+      expect(run.run.state).toBe("Waiting");
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it.each([
+    {
+      name: "frame bytes",
+      mode: "oversized-frame",
+      parameter: 65,
+      limits: { maxFrameBytes: 64 },
+      message: "ACP frame exceeded 64 bytes",
+    },
+    {
+      name: "stream bytes",
+      mode: "long-field",
+      parameter: 512,
+      limits: { maxStreamBytes: 128, maxFieldLength: 1024 },
+      message: "ACP output stream exceeded 128 bytes",
+    },
+    {
+      name: "activity bytes",
+      mode: "long-field",
+      parameter: 512,
+      limits: {
+        maxStreamBytes: 2048,
+        maxActivityBytes: 128,
+        maxFieldLength: 1024,
+      },
+      message: "persisted ACP activity exceeded 128 bytes",
+    },
+    {
+      name: "pending persistence operations",
+      mode: "split-actions",
+      parameter: 8,
+      limits: { maxPendingPersistenceOperations: 1 },
+      message: "ACP persistence exceeded 1 pending operations",
+    },
+    {
+      name: "JSON depth",
+      mode: "deep-json",
+      parameter: 12,
+      limits: { maxJsonDepth: 6 },
+      message: "action envelope exceeded JSON depth 6",
+    },
+    {
+      name: "action count",
+      mode: "many-actions",
+      parameter: 3,
+      limits: { maxActionCount: 2 },
+      message: "action envelope exceeded 2 actions",
+    },
+    {
+      name: "target count",
+      mode: "many-targets",
+      parameter: 3,
+      limits: { maxTargetCount: 2 },
+      message: "targetAgentIds exceeded 2 entries",
+    },
+    {
+      name: "field length",
+      mode: "long-field",
+      parameter: 65,
+      limits: { maxFieldLength: 64 },
+      message: "action.status exceeded 64 characters",
+    },
+  ])(
+    "rejects ACP output beyond the $name limit",
+    async ({ mode, parameter, limits, message }) => {
+      const kernel = openKernel(":memory:");
+      try {
+        await prepareAcpRun(kernel, `limit-${mode}`);
+        const runtime = createRuntime(
+          kernel,
+          createFixtureAcpAdapter(mode, parameter, limits),
+        );
+
+        await expect(runtime.runOnce()).rejects.toThrow(message);
+        const run = await getOnlyRun(kernel);
+        expect(run.run.state).toBe("Waiting");
+        expect(run.providerAttempts.at(-1)?.status).toBe("Failed");
+      } finally {
+        kernel.close();
+      }
+    },
+  );
+
+  it.each(["malformed", "prompt-error", "exit"])(
+    "settles ACP writes and process state after %s failure",
+    async (mode) => {
+      const kernel = openKernel(":memory:");
+      try {
+        await prepareAcpRun(kernel, `cleanup-${mode}`);
+        const runtime = createRuntime(
+          kernel,
+          createFixtureAcpAdapter(mode),
+        );
+
+        await expect(runtime.runOnce()).rejects.toBeInstanceOf(
+          ProviderExecutionError,
+        );
+        const run = await getOnlyRun(kernel);
+        expect(run.run.state).toBe("Waiting");
+        expect(["Failed", "Unknown"]).toContain(
+          run.providerAttempts.at(-1)?.status,
+        );
+      } finally {
+        kernel.close();
+      }
+    },
+  );
+
+  it("stops ACP ingestion when cancellation races with streamed updates", async () => {
+    const kernel = openKernel(":memory:");
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown) => {
+      unhandled.push(error);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      await prepareAcpRun(kernel, "cancellation-update-race");
+      const runtime = createRuntime(
+        kernel,
+        createFixtureAcpAdapter("slow-split", 2),
+        { cancellationPollMs: 1 },
+      );
+      const execution = runtime.runOnce();
+      const before = await waitForRunActivity(kernel);
+      await kernel.execute(
+        {
+          type: "CancelRun",
+          idempotencyKey: "cancel-acp-update-race",
+          runId: before.run.id,
+          expectedRunRevision: before.run.revision,
+          reason: "Revoke while ACP output is still arriving.",
+        },
+        humanContext,
+      );
+
+      await expect(execution).rejects.toMatchObject({ outcome: "Unknown" });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(unhandled).toEqual([]);
+      const after = await getOnlyRun(kernel);
+      expect(after.run.state).toBe("Cancelled");
+      expect(after.providerAttempts.at(-1)?.status).toBe("Unknown");
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
       kernel.close();
     }
   });
@@ -900,4 +1598,65 @@ async function mentionAgent(kernel: TorsorKernel, key: string) {
     },
     humanContext,
   );
+}
+
+function createFixtureAcpAdapter(
+  mode: string,
+  parameter?: number,
+  limits?: Partial<CopilotAcpLimits>,
+): CopilotAcpAdapter {
+  const fixture = fileURLToPath(
+    new URL("./fixtures/mock-acp-server.mjs", import.meta.url),
+  );
+  return new CopilotAcpAdapter({
+    command: process.execPath,
+    commandArgs: [
+      fixture,
+      mode,
+      ...(parameter === undefined ? [] : [String(parameter)]),
+    ],
+    unsafeAllowCustomCommandArgs: true,
+    cwd: process.cwd(),
+    ...(limits ? { limits } : {}),
+  });
+}
+
+async function prepareAcpRun(
+  kernel: TorsorKernel,
+  key: string,
+): Promise<void> {
+  await mentionAgent(kernel, key);
+  await createRuntime(kernel, new DeterministicFakeAdapter(), {
+    outboxBatchSize: 1,
+  }).runOnce();
+}
+
+async function getOnlyRun(kernel: TorsorKernel) {
+  const events = await kernel.readEvents(null, 500);
+  const runIds = [
+    ...new Set(
+      events
+        .filter((event) => event.type === "RunCreated")
+        .map((event) => event.entityId),
+    ),
+  ];
+  expect(runIds).toHaveLength(1);
+  return kernel.query(
+    { type: "GetRunProjection", runId: runIds[0]! },
+    humanContext,
+  );
+}
+
+async function waitForRunActivity(kernel: TorsorKernel) {
+  const deadline = Date.now() + 2_000;
+  for (;;) {
+    const run = await getOnlyRun(kernel);
+    if (run.activity.items.length > 0) {
+      return run;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error("ACP fixture did not stream activity before cancellation.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }

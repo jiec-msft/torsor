@@ -2,6 +2,8 @@ export { KernelActivationCapabilityBridge } from "./capability-bridge.js";
 export {
   CopilotAcpAdapter,
   type CopilotAcpAdapterOptions,
+  type CopilotAcpLaunchConfiguration,
+  type CopilotAcpLimits,
 } from "./copilot-acp-adapter.js";
 export {
   DeterministicFakeAdapter,
@@ -17,7 +19,7 @@ export {
   ProviderExecutionError,
   ProviderProtocolError,
   type ActivationCapabilityBridge,
-  type ArtifactInput,
+  type AttentionDecision,
   type CompleteRunInput,
   type ProviderAdapter,
   type ProviderCapabilityProfile,

@@ -236,7 +236,42 @@ export class AgentRuntime {
       },
       this.#runtimeContext,
     );
-    const cause = { type: "attention", attention } as const;
+    const thread = await this.#kernel.query(
+      {
+        type: "GetThreadProjection",
+        threadRootId: attention.threadRootId,
+      },
+      this.#runtimeContext,
+    );
+    const triggeringMessage = thread.messages.find((message) =>
+      message.revisions.some(
+        (revision) => revision.id === attention.messageRevisionId,
+      ),
+    );
+    const triggeringRevision = triggeringMessage?.revisions.find(
+      (revision) => revision.id === attention.messageRevisionId,
+    );
+    if (!triggeringMessage || !triggeringRevision) {
+      throw new Error(
+        `Attention ${attention.id} triggering Message revision is not in its Thread projection.`,
+      );
+    }
+    const eligibleRuns = thread.runs.filter(
+      (run) =>
+        run.ownerAgentId === attention.targetAgentId &&
+        run.projectId === attention.projectId &&
+        run.homeChannelId === attention.channelId &&
+        run.threadRootId === attention.threadRootId &&
+        (run.state === "Active" || run.state === "Waiting"),
+    );
+    const cause = {
+      type: "attention",
+      attention,
+      thread,
+      triggeringMessage,
+      triggeringRevision,
+      eligibleRuns,
+    } as const;
     await this.#executeProvider({
       activationId: activation.entityId,
       agent,
@@ -493,6 +528,7 @@ export class AgentRuntime {
             attention: input.cause.attention,
             attentionRevision: input.attentionRevision!,
             handlerLeaseToken: input.handlerLeaseToken!,
+            eligibleRuns: input.cause.eligibleRuns,
           })
         : new KernelActivationCapabilityBridge({
             kernel: this.#kernel,
@@ -505,6 +541,7 @@ export class AgentRuntime {
     const controller = new AbortController();
     const stopMonitor = this.#monitorExecution(
       input.cause,
+      input.activationId,
       controller,
       () => bridge.terminalAction !== null,
     );
@@ -521,9 +558,9 @@ export class AgentRuntime {
         }),
         controller.signal,
       );
-      if (input.cause.type === "attention" && !bridge.createdRunId) {
+      if (input.cause.type === "attention" && !bridge.attentionDecision) {
         throw new ProviderProtocolError(
-          "Attention provider execution ended without creating a Run.",
+          "Attention provider execution ended without ignore, continue, or create.",
         );
       }
       if (input.cause.type === "run" && !bridge.terminalAction) {
@@ -541,20 +578,22 @@ export class AgentRuntime {
         },
         this.#runtimeContext,
       );
-      await this.#kernel.execute(
-        {
-          type: "FinishActivation",
-          idempotencyKey: `${input.activationId}:completed`,
-          activationId: input.activationId,
-          outcome: "Completed",
-          ...(result.diagnosticSessionId
-            ? {
-                detail: `Provider diagnostic session: ${result.diagnosticSessionId}`,
-              }
-            : {}),
-        },
-        this.#runtimeContext,
-      );
+      if (input.cause.type === "run") {
+        await this.#kernel.execute(
+          {
+            type: "FinishActivation",
+            idempotencyKey: `${input.activationId}:completed`,
+            activationId: input.activationId,
+            outcome: "Completed",
+            ...(result.diagnosticSessionId
+              ? {
+                  detail: `Provider diagnostic session: ${result.diagnosticSessionId}`,
+                }
+              : {}),
+          },
+          this.#runtimeContext,
+        );
+      }
     } catch (error) {
       const providerError =
         error instanceof ProviderExecutionError
@@ -614,16 +653,18 @@ export class AgentRuntime {
           this.#runtimeContext,
         );
       }
-      await this.#kernel.execute(
-        {
-          type: "FinishActivation",
-          idempotencyKey: `${input.activationId}:failed`,
-          activationId: input.activationId,
-          outcome: controller.signal.aborted ? "Expired" : "Failed",
-          detail: providerError.message,
-        },
-        this.#runtimeContext,
-      );
+      if (input.cause.type === "run" || !bridge.attentionDecision) {
+        await this.#kernel.execute(
+          {
+            type: "FinishActivation",
+            idempotencyKey: `${input.activationId}:failed`,
+            activationId: input.activationId,
+            outcome: controller.signal.aborted ? "Expired" : "Failed",
+            detail: providerError.message,
+          },
+          this.#runtimeContext,
+        );
+      }
       throw providerError;
     } finally {
       stopMonitor();
@@ -632,6 +673,7 @@ export class AgentRuntime {
 
   #monitorExecution(
     cause: ProviderCause,
+    activationId: string,
     controller: AbortController,
     hasProviderTerminalAction: () => boolean,
   ): () => void {
@@ -654,10 +696,29 @@ export class AgentRuntime {
           { type: "GetRunProjection", runId: cause.run.run.id },
           this.#runtimeContext,
         );
+        if (hasProviderTerminalAction()) {
+          return;
+        }
+        const activation = projection.activations.find(
+          (candidate) => candidate.id === activationId,
+        );
+        if (
+          !activation ||
+          activation.finishedAt !== null ||
+          activation.revokedAt !== null ||
+          new Date(activation.expiresAt) <= this.#clock() ||
+          activation.runActivationGeneration !==
+            projection.run.activationGeneration
+        ) {
+          controller.abort(
+            new ProviderExecutionError(
+              "Run Activation was superseded while the provider was executing.",
+              "Unknown",
+            ),
+          );
+          return;
+        }
         if (projection.run.state !== "Active") {
-          if (hasProviderTerminalAction()) {
-            return;
-          }
           controller.abort(
             new ProviderExecutionError(
               `Run entered ${projection.run.state} while the provider was executing.`,
@@ -909,8 +970,17 @@ export class AgentRuntime {
             event.type === "ProviderAttemptAcknowledged"
               ? "Acknowledged"
               : requireProviderStatus(event.payload);
-        } else if (event.type === "ActivationFinished") {
-          finishedActivations.add(event.entityId);
+        } else if (
+          event.type === "ActivationFinished" ||
+          ((event.type === "AttentionResolved" ||
+            event.type === "AttentionIgnored") &&
+            event.activationId)
+        ) {
+          finishedActivations.add(
+            event.type === "ActivationFinished"
+              ? event.entityId
+              : event.activationId!,
+          );
         }
       }
       if (events.length < 500) {
@@ -919,10 +989,8 @@ export class AgentRuntime {
       afterEventId = events.at(-1)!.eventId;
     }
     for (const [activationId, expiresAt] of attentionActivationExpirations) {
-      if (
-        finishedActivations.has(activationId) ||
-        expiresAt > this.#clock()
-      ) {
+      const activationFinished = finishedActivations.has(activationId);
+      if (expiresAt > this.#clock()) {
         continue;
       }
       const attemptEntry = [...attempts.entries()].find(
@@ -955,6 +1023,9 @@ export class AgentRuntime {
           outcome = "Failed";
           detail = "Recovered a failed Attention ProviderAttempt.";
         }
+      }
+      if (activationFinished) {
+        continue;
       }
       await this.#kernel.execute(
         {

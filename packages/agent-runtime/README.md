@@ -7,6 +7,8 @@ Run, RunInput, provenance, revisions, terminal state, and outbox delivery.
 The runtime provides:
 
 - Runtime-owned Attention claims and Activation creation.
+- Explicit Agent decisions to ignore an Attention, continue one eligible
+  same-thread Run, or create a new Run.
 - Ordered, leased outbox consumption with idempotent command keys.
 - A provider-neutral adapter contract and deterministic fake adapter.
 - A GitHub Copilot CLI ACP stdio adapter using `copilot --acp --stdio`.
@@ -26,7 +28,24 @@ the global stream. `projectIds` supplies the Projects whose existing open
 Attentions are scanned at startup; Projects encountered in outbox events are
 loaded dynamically.
 
-The Copilot adapter intentionally exposes no filesystem, terminal, Worktree, or
-Git integration in this slice. It asks Copilot for a validated JSON action
-envelope and applies only the narrow Kernel-backed capabilities represented by
-that envelope.
+The Copilot adapter starts with a deny-by-default provider policy. It filters
+the model-visible tool list to a nonexistent Runtime sentinel, explicitly
+denies shell, write, and URL permissions, disables built-in MCP servers and
+custom instructions, supplies no session MCP servers, and launches with a
+minimal environment allowlist. Custom command arguments are rejected unless
+the caller explicitly enables the unsafe development option used by test
+fixtures.
+
+Copilot returns a bounded JSON action envelope rather than invoking Kernel
+commands directly. Frame, stream, persisted activity, pending write, JSON
+depth, action, target, and field limits are enforced before unbounded effects.
+The bridge then applies only server-bound Kernel capabilities; provider output
+cannot choose provenance, Agent identity, Activation identity, or
+ProviderAttempt identity.
+
+Artifact publication is intentionally unavailable to providers until the
+runtime has a trusted finalizer that persists bytes and computes the immutable
+digest and location. The Copilot process is also not an operating-system
+sandbox; this slice relies on the CLI tool-availability boundary and sanitized
+environment and does not provide Worktree, Git, terminal, or multi-host
+execution.

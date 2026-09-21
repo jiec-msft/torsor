@@ -1,5 +1,4 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createInterface } from "node:readline";
 
 import type { JsonValue } from "@torsor/kernel";
 
@@ -11,12 +10,32 @@ import {
   type ProviderExecutionResult,
 } from "./types.js";
 
+export interface CopilotAcpLimits {
+  readonly maxFrameBytes: number;
+  readonly maxStreamBytes: number;
+  readonly maxActivityBytes: number;
+  readonly maxPendingPersistenceOperations: number;
+  readonly maxJsonDepth: number;
+  readonly maxActionCount: number;
+  readonly maxTargetCount: number;
+  readonly maxFieldLength: number;
+}
+
+export interface CopilotAcpLaunchConfiguration {
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly environment: Readonly<Record<string, string>>;
+}
+
 export interface CopilotAcpAdapterOptions {
   readonly command?: string;
   readonly commandArgs?: readonly string[];
+  readonly unsafeAllowCustomCommandArgs?: boolean;
   readonly cwd?: string;
   readonly environment?: Readonly<Record<string, string>>;
   readonly shutdownGraceMs?: number;
+  readonly limits?: Partial<CopilotAcpLimits>;
 }
 
 interface RpcResponse {
@@ -39,6 +58,8 @@ interface RpcRequest {
 
 type CopilotAction =
   | { readonly type: "create_run" }
+  | { readonly type: "continue_run"; readonly runId: string }
+  | { readonly type: "ignore_attention"; readonly reason: string }
   | {
       readonly type: "append_activity";
       readonly kind: string;
@@ -50,14 +71,6 @@ type CopilotAction =
       readonly body: string;
       readonly targetAgentIds?: readonly string[];
       readonly expectedThreadCursor?: number;
-    }
-  | {
-      readonly type: "publish_artifact";
-      readonly contentDigest: string;
-      readonly baseRevision: string;
-      readonly mediaType: string;
-      readonly storageLocation: string;
-      readonly metadata?: JsonValue;
     }
   | {
       readonly type: "report_status";
@@ -76,9 +89,37 @@ type CopilotAction =
   | { readonly type: "fail"; readonly reason: string }
   | { readonly type: "wait"; readonly reason: string };
 
+const defaultLimits: CopilotAcpLimits = {
+  maxFrameBytes: 256 * 1024,
+  maxStreamBytes: 512 * 1024,
+  maxActivityBytes: 256 * 1024,
+  maxPendingPersistenceOperations: 16,
+  maxJsonDepth: 16,
+  maxActionCount: 32,
+  maxTargetCount: 16,
+  maxFieldLength: 16 * 1024,
+};
+
+const secureCopilotArgs = [
+  "--acp",
+  "--stdio",
+  "--no-auto-update",
+  "--no-remote",
+  "--no-remote-export",
+  "--no-ask-user",
+  "--no-custom-instructions",
+  "--no-bash-env",
+  "--disallow-temp-dir",
+  "--disable-builtin-mcps",
+  "--available-tools=torsor-runtime-action-channel",
+  "--deny-tool=shell",
+  "--deny-tool=write",
+  "--deny-tool=url",
+] as const;
+
 export class CopilotAcpAdapter implements ProviderAdapter {
   readonly name = "github-copilot-cli-acp";
-  readonly version = "1";
+  readonly version = "2";
   readonly capabilities = {
     acceptsInputWhileRunning: false,
     supportsCancel: true,
@@ -88,46 +129,87 @@ export class CopilotAcpAdapter implements ProviderAdapter {
     supportsIdempotentRequests: false,
   } as const;
 
-  readonly #command: string;
-  readonly #commandArgs: readonly string[];
-  readonly #cwd: string;
-  readonly #environment: Readonly<Record<string, string>>;
+  readonly #launch: CopilotAcpLaunchConfiguration;
   readonly #shutdownGraceMs: number;
+  readonly #limits: CopilotAcpLimits;
 
   constructor(options: CopilotAcpAdapterOptions = {}) {
-    this.#command = options.command ?? "copilot";
-    this.#commandArgs = options.commandArgs ?? [
-      "--acp",
-      "--stdio",
-      "--no-auto-update",
-      "--no-remote",
-      "--no-remote-export",
-      "--no-ask-user",
-    ];
-    this.#cwd = options.cwd ?? process.cwd();
-    this.#environment = options.environment ?? {};
+    if (options.commandArgs && !options.unsafeAllowCustomCommandArgs) {
+      throw new Error(
+        "Custom ACP command arguments require unsafeAllowCustomCommandArgs=true.",
+      );
+    }
+    this.#launch = {
+      command: options.command ?? "copilot",
+      args: options.commandArgs
+        ? [...options.commandArgs]
+        : [...secureCopilotArgs],
+      cwd: options.cwd ?? process.cwd(),
+      environment: buildSanitizedEnvironment(options.environment ?? {}),
+    };
     this.#shutdownGraceMs = options.shutdownGraceMs ?? 2_000;
+    this.#limits = validateLimits({
+      ...defaultLimits,
+      ...options.limits,
+    });
+  }
+
+  getLaunchConfiguration(): CopilotAcpLaunchConfiguration {
+    return {
+      command: this.#launch.command,
+      args: [...this.#launch.args],
+      cwd: this.#launch.cwd,
+      environment: { ...this.#launch.environment },
+    };
   }
 
   async execute(
     context: ProviderExecutionContext,
   ): Promise<ProviderExecutionResult> {
-    const processHandle = spawn(this.#command, [...this.#commandArgs], {
-      cwd: this.#cwd,
-      env: { ...process.env, ...this.#environment },
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    const connection = new NdjsonRpcConnection(processHandle);
+    const processHandle = spawn(
+      this.#launch.command,
+      [...this.#launch.args],
+      {
+        cwd: this.#launch.cwd,
+        env: { ...this.#launch.environment },
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      },
+    );
+    const connection = new NdjsonRpcConnection(
+      processHandle,
+      this.#limits.maxFrameBytes,
+    );
     let sessionId: string | null = null;
+    let acceptUpdates = true;
+    let streamBytes = 0;
+    let activityBytes = 0;
+    let primaryError: unknown;
+    let executionResult: ProviderExecutionResult | undefined;
     const outputChunks: string[] = [];
-    const updateTasks: Promise<unknown>[] = [];
     const stderrChunks: string[] = [];
+    let stderrBytes = 0;
+    const persistence = new PersistenceQueue(
+      this.#limits.maxPendingPersistenceOperations,
+      (error) => {
+        acceptUpdates = false;
+        connection.fail(error);
+        processHandle.kill();
+      },
+    );
+
     processHandle.stderr.setEncoding("utf8");
     processHandle.stderr.on("data", (chunk: string) => {
-      if (stderrChunks.join("").length < 16_384) {
-        stderrChunks.push(chunk);
+      const bytes = Buffer.byteLength(chunk);
+      if (stderrBytes >= 16_384) {
+        return;
       }
+      stderrChunks.push(
+        bytes + stderrBytes <= 16_384
+          ? chunk
+          : Buffer.from(chunk).subarray(0, 16_384 - stderrBytes).toString(),
+      );
+      stderrBytes = Math.min(16_384, stderrBytes + bytes);
     });
 
     connection.onRequest = async (request) => {
@@ -139,50 +221,78 @@ export class CopilotAcpAdapter implements ProviderAdapter {
       );
     };
     connection.onNotification = (notification) => {
-      if (notification.method !== "session/update") {
+      if (!acceptUpdates || notification.method !== "session/update") {
         return;
       }
-      const update = getRecord(getRecord(notification.params, "params").update, "update");
+      const params = getRecord(notification.params, "session/update params");
+      const update = getRecord(params.update, "session/update update");
+      assertJsonDepth(update, this.#limits.maxJsonDepth, "session update");
       const updateType = getOptionalString(update.sessionUpdate);
-      if (updateType === "agent_message_chunk") {
-        const content = getRecord(update.content, "content");
-        if (content.type === "text" && typeof content.text === "string") {
-          outputChunks.push(content.text);
-          if (context.cause.type === "run") {
-            updateTasks.push(
-              context.capabilities.appendActivity(
-                "agent_message_chunk",
-                {
-                  text: content.text,
-                  ...(typeof update.messageId === "string"
-                    ? { messageId: update.messageId }
-                    : {}),
-                },
-                "transient",
-              ),
-            );
-          }
-        }
-        return;
-      }
       if (
-        context.cause.type === "run" &&
-        (updateType === "tool_call" || updateType === "tool_call_update")
+        updateType === "tool_call" ||
+        updateType === "tool_call_update"
       ) {
-        updateTasks.push(
-          context.capabilities.appendActivity(
-            updateType,
-            toJsonValue(update),
-            "durable",
-          ),
+        throw new ProviderProtocolError(
+          "Copilot emitted tool activity despite the deny-by-default tool policy.",
         );
       }
+      if (updateType !== "agent_message_chunk") {
+        return;
+      }
+      const content = getRecord(update.content, "agent message content");
+      if (content.type !== "text" || typeof content.text !== "string") {
+        return;
+      }
+      const chunkBytes = Buffer.byteLength(content.text);
+      streamBytes = addWithinLimit(
+        streamBytes,
+        chunkBytes,
+        this.#limits.maxStreamBytes,
+        "ACP output stream",
+      );
+      outputChunks.push(content.text);
+      if (context.cause.type !== "run") {
+        return;
+      }
+      const payload = {
+        text: content.text,
+        ...(typeof update.messageId === "string"
+          ? {
+              messageId: requireBoundedString(
+                update.messageId,
+                "messageId",
+                this.#limits.maxFieldLength,
+              ),
+            }
+          : {}),
+      };
+      const payloadBytes = Buffer.byteLength(JSON.stringify(payload));
+      activityBytes = addWithinLimit(
+        activityBytes,
+        payloadBytes,
+        this.#limits.maxActivityBytes,
+        "persisted ACP activity",
+      );
+      persistence.enqueue(
+        () => context.capabilities.appendActivity(
+          "agent_message_chunk",
+          payload,
+          "transient",
+        ),
+      );
     };
 
     const abort = () => {
+      acceptUpdates = false;
+      const reason = abortReason(context.signal);
       if (sessionId) {
-        connection.notify("session/cancel", { sessionId });
+        try {
+          connection.notify("session/cancel", { sessionId });
+        } catch {
+          // The abort reason remains authoritative if the notification cannot be sent.
+        }
       }
+      connection.fail(reason);
       processHandle.kill();
     };
     context.signal.addEventListener("abort", abort, { once: true });
@@ -207,56 +317,128 @@ export class CopilotAcpAdapter implements ProviderAdapter {
       }
       const session = getRecord(
         await connection.request("session/new", {
-          cwd: this.#cwd,
+          cwd: this.#launch.cwd,
           mcpServers: [],
         }),
         "session/new result",
       );
-      sessionId = requireString(session.sessionId, "sessionId");
-      const prompt = buildPrompt(context);
+      sessionId = requireBoundedString(
+        session.sessionId,
+        "sessionId",
+        this.#limits.maxFieldLength,
+      );
       const promptResult = getRecord(
         await connection.request("session/prompt", {
           sessionId,
-          prompt: [{ type: "text", text: prompt }],
+          prompt: [{ type: "text", text: buildPrompt(context) }],
         }),
         "session/prompt result",
       );
-      await Promise.all(updateTasks);
-      const stopReason = requireString(promptResult.stopReason, "stopReason");
+      connection.allowProcessExit();
+      await stopProcess(processHandle, this.#shutdownGraceMs);
+      acceptUpdates = false;
+      await persistence.drain();
+      connection.seal();
+      const stopReason = requireBoundedString(
+        promptResult.stopReason,
+        "stopReason",
+        64,
+      );
       if (stopReason !== "end_turn") {
         throw new ProviderExecutionError(
           `Copilot ACP stopped with ${stopReason}.`,
           stopReason === "cancelled" ? "Unknown" : "Failed",
         );
       }
-      const actions = parseActions(outputChunks.join(""));
+      const actions = parseActions(outputChunks.join(""), this.#limits);
       validateActionPlan(actions, context.cause.type);
       await applyActions(actions, context);
-      return {
+      executionResult = {
         detail: `Copilot ACP completed session ${sessionId}.`,
         diagnosticSessionId: sessionId,
       };
     } catch (error) {
-      if (context.signal.aborted) {
-        const reason = context.signal.reason;
-        throw reason instanceof Error
-          ? reason
-          : new ProviderExecutionError("Copilot ACP execution was aborted.", "Unknown");
-      }
-      if (error instanceof ProviderExecutionError) {
-        throw error;
-      }
-      const stderr = stderrChunks.join("").trim();
-      throw new ProviderExecutionError(
-        stderr
-          ? `Copilot ACP failed: ${errorMessage(error)}; stderr: ${stderr}`
-          : `Copilot ACP failed: ${errorMessage(error)}`,
-        "Unknown",
-      );
+      primaryError = error;
     } finally {
+      acceptUpdates = false;
+      try {
+        await persistence.drain();
+      } catch (error) {
+        primaryError ??= error;
+      }
       context.signal.removeEventListener("abort", abort);
       connection.close();
       await stopProcess(processHandle, this.#shutdownGraceMs);
+    }
+
+    if (primaryError !== undefined) {
+      throw normalizeExecutionError(
+        primaryError,
+        context.signal,
+        stderrChunks.join("").trim(),
+      );
+    }
+    if (!executionResult) {
+      throw new ProviderExecutionError(
+        "Copilot ACP ended without a result.",
+        "Unknown",
+      );
+    }
+    return executionResult;
+  }
+}
+
+class PersistenceQueue {
+  readonly #pending = new Set<Promise<void>>();
+  #firstError: Error | null = null;
+
+  constructor(
+    private readonly limit: number,
+    private readonly onFirstError: (error: Error) => void,
+  ) {}
+
+  enqueue(operation: () => Promise<unknown>): void {
+    if (this.#firstError) {
+      throw this.#firstError;
+    }
+    if (this.#pending.size >= this.limit) {
+      throw new ProviderProtocolError(
+        `ACP persistence exceeded ${this.limit} pending operations.`,
+      );
+    }
+    let started: Promise<unknown>;
+    try {
+      started = operation();
+    } catch (error) {
+      const normalized =
+        error instanceof Error ? error : new Error(String(error));
+      this.#firstError = normalized;
+      this.onFirstError(normalized);
+      throw normalized;
+    }
+    const tracked = started.then(
+      () => {},
+      (error: unknown) => {
+        const normalized =
+          error instanceof Error ? error : new Error(String(error));
+        if (!this.#firstError) {
+          this.#firstError = normalized;
+          this.onFirstError(normalized);
+        }
+      },
+    );
+    this.#pending.add(tracked);
+    void tracked.then(() => {
+      this.#pending.delete(tracked);
+    });
+  }
+
+  async drain(): Promise<void> {
+    while (this.#pending.size > 0) {
+      await Promise.all([...this.#pending]);
+    }
+    if (this.#firstError) {
+      throw this.#firstError;
     }
   }
 }
@@ -270,7 +452,12 @@ class NdjsonRpcConnection {
   };
 
   #nextId = 0;
+  #allowProcessExit = false;
+  #shuttingDown = false;
   #closed = false;
+  #sealed = false;
+  #failed: Error | null = null;
+  #buffer = Buffer.alloc(0);
   readonly #pending = new Map<
     number,
     {
@@ -278,15 +465,16 @@ class NdjsonRpcConnection {
       readonly reject: (error: Error) => void;
     }
   >();
-  readonly #lines;
 
-  constructor(private readonly processHandle: ChildProcessWithoutNullStreams) {
-    this.#lines = createInterface({ input: processHandle.stdout });
-    this.#lines.on("line", (line) => {
+  constructor(
+    private readonly processHandle: ChildProcessWithoutNullStreams,
+    private readonly maxFrameBytes: number,
+  ) {
+    processHandle.stdout.on("data", (chunk: Buffer) => {
       try {
-        this.#receive(line);
+        this.#receiveChunk(chunk);
       } catch (error) {
-        this.#rejectPending(
+        this.fail(
           error instanceof Error
             ? error
             : new ProviderProtocolError(String(error)),
@@ -294,13 +482,18 @@ class NdjsonRpcConnection {
       }
     });
     processHandle.once("error", (error) => {
-      this.#rejectPending(error);
+      this.fail(error);
     });
     processHandle.once("exit", (code, signal) => {
-      if (!this.#closed && this.#pending.size > 0) {
-        this.#rejectPending(
+      if (
+        !this.#allowProcessExit &&
+        !this.#closed &&
+        !this.#sealed &&
+        !this.#failed
+      ) {
+        this.fail(
           new Error(
-            `ACP process exited before completing requests (code=${String(code)}, signal=${String(signal)}).`,
+            `ACP process exited before completion (code=${String(code)}, signal=${String(signal)}).`,
           ),
         );
       }
@@ -308,6 +501,9 @@ class NdjsonRpcConnection {
   }
 
   request(method: string, params: unknown): Promise<unknown> {
+    if (this.#failed) {
+      return Promise.reject(this.#failed);
+    }
     const id = this.#nextId;
     this.#nextId += 1;
     return new Promise((resolve, reject) => {
@@ -322,25 +518,84 @@ class NdjsonRpcConnection {
   }
 
   notify(method: string, params: unknown): void {
-    if (!this.#closed) {
+    if (!this.#closed && !this.#failed) {
       this.#send({ jsonrpc: "2.0", method, params });
     }
   }
 
+  fail(error: Error): void {
+    if (this.#failed) {
+      return;
+    }
+    this.#failed = error;
+    for (const pending of this.#pending.values()) {
+      pending.reject(error);
+    }
+    this.#pending.clear();
+  }
+
   close(): void {
     this.#closed = true;
-    this.#lines.close();
-    this.#rejectPending(new Error("ACP connection closed."));
+    this.processHandle.stdout.removeAllListeners("data");
+    this.fail(new Error("ACP connection closed."));
     this.processHandle.stdin.end();
   }
 
-  #receive(line: string): void {
+  allowProcessExit(): void {
+    this.#allowProcessExit = true;
+    this.#shuttingDown = true;
+  }
+
+  seal(): void {
+    if (this.#failed) {
+      throw this.#failed;
+    }
+    if (this.#buffer.length > 0) {
+      const error = new ProviderProtocolError(
+        "ACP process ended with an incomplete NDJSON frame.",
+      );
+      this.fail(error);
+      throw error;
+    }
+    this.#sealed = true;
+    this.processHandle.stdout.removeAllListeners("data");
+  }
+
+  #receiveChunk(chunk: Buffer): void {
+    if (this.#closed || this.#failed) {
+      return;
+    }
+    this.#buffer = Buffer.concat([this.#buffer, chunk]);
+    for (;;) {
+      const newline = this.#buffer.indexOf(0x0a);
+      if (newline < 0) {
+        if (this.#buffer.length > this.maxFrameBytes) {
+          throw new ProviderProtocolError(
+            `ACP frame exceeded ${this.maxFrameBytes} bytes.`,
+          );
+        }
+        return;
+      }
+      const frame = this.#buffer.subarray(0, newline);
+      this.#buffer = this.#buffer.subarray(newline + 1);
+      if (frame.length === 0) {
+        continue;
+      }
+      if (frame.length > this.maxFrameBytes) {
+        throw new ProviderProtocolError(
+          `ACP frame exceeded ${this.maxFrameBytes} bytes.`,
+        );
+      }
+      this.#receiveFrame(frame.toString("utf8"));
+    }
+  }
+
+  #receiveFrame(frame: string): void {
     let message: unknown;
     try {
-      message = JSON.parse(line);
+      message = JSON.parse(frame);
     } catch {
-      this.#rejectPending(new Error("ACP process emitted invalid NDJSON."));
-      return;
+      throw new ProviderProtocolError("ACP process emitted invalid NDJSON.");
     }
     const record = getRecord(message, "ACP message");
     if (typeof record.id === "number" && ("result" in record || "error" in record)) {
@@ -363,38 +618,56 @@ class NdjsonRpcConnection {
     }
     const request = record as unknown as RpcRequest;
     if (typeof request.method !== "string") {
-      return;
+      throw new ProviderProtocolError("ACP request is missing method.");
     }
     if (typeof request.id !== "number") {
       this.onNotification(request);
       return;
     }
-    void this.onRequest(request).then(
-      (result) => {
-        this.#send({ jsonrpc: "2.0", id: request.id, result });
-      },
-      (error: unknown) => {
-        this.#send({
-          jsonrpc: "2.0",
-          id: request.id,
-          error: { code: -32601, message: errorMessage(error) },
-        });
-      },
+    void this.onRequest(request)
+      .then(
+        (result) => {
+          if (this.#canRespond()) {
+            this.#send({ jsonrpc: "2.0", id: request.id, result });
+          }
+        },
+        (error: unknown) => {
+          if (this.#canRespond()) {
+            this.#send({
+              jsonrpc: "2.0",
+              id: request.id,
+              error: { code: -32601, message: errorMessage(error) },
+            });
+          }
+        },
+      )
+      .catch((error: unknown) => {
+        if (!this.#shuttingDown && !this.#closed && !this.#failed) {
+          this.fail(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+        }
+      });
+  }
+
+  #canRespond(): boolean {
+    return (
+      !this.#shuttingDown &&
+      !this.#closed &&
+      !this.#failed &&
+      this.processHandle.stdin.writable
     );
   }
 
   #send(message: unknown): void {
-    if (this.#closed || !this.processHandle.stdin.writable) {
-      throw new Error("ACP connection is not writable.");
+    if (
+      this.#closed ||
+      this.#failed ||
+      !this.processHandle.stdin.writable
+    ) {
+      throw this.#failed ?? new Error("ACP connection is not writable.");
     }
     this.processHandle.stdin.write(`${JSON.stringify(message)}\n`);
-  }
-
-  #rejectPending(error: Error): void {
-    for (const pending of this.#pending.values()) {
-      pending.reject(error);
-    }
-    this.#pending.clear();
   }
 }
 
@@ -404,6 +677,16 @@ function buildPrompt(context: ProviderExecutionContext): string {
       ? {
           cause: "attention",
           attention: context.cause.attention,
+          triggeringMessage: context.cause.triggeringMessage,
+          triggeringRevision: context.cause.triggeringRevision,
+          thread: {
+            projectId: context.cause.thread.projectId,
+            channelId: context.cause.thread.channelId,
+            threadRootId: context.cause.thread.threadRootId,
+            cursor: context.cause.thread.cursor,
+            messages: context.cause.thread.messages,
+          },
+          eligibleRuns: context.cause.eligibleRuns,
           agent: context.agent,
         }
       : {
@@ -414,21 +697,28 @@ function buildPrompt(context: ProviderExecutionContext): string {
         };
   const required =
     context.cause.type === "attention"
-      ? "Return exactly one create_run action."
+      ? "Return exactly one of: ignore_attention(reason), continue_run(runId from eligibleRuns), or create_run. Do not infer a Run match outside eligibleRuns."
       : "End with exactly one complete, fail, or wait action.";
+  const allowed =
+    context.cause.type === "attention"
+      ? "Allowed actions: ignore_attention, continue_run, create_run."
+      : "Allowed actions: append_activity, publish_reply, report_status, complete, fail, wait. Artifact publication is disabled until a trusted finalizer exists.";
   return [
     "You are executing one bounded Torsor Activation.",
     "The JSON below is rebuilt from durable Kernel state and is authoritative.",
-    "Do not claim that provider session history is authoritative.",
+    "Provider sessions and model memory are never authoritative recovery state.",
     "Return only one JSON object with an actions array and no Markdown.",
     required,
-    "Allowed actions are create_run, append_activity, publish_reply, publish_artifact, report_status, complete, fail, and wait.",
-    "Provenance, Agent identity, Run identity, revisions, Activation identity, and ProviderAttempt identity are server-bound and must not be included.",
+    allowed,
+    "Provenance, Agent identity, Run identity, revisions, Activation identity, and ProviderAttempt identity are server-bound.",
     JSON.stringify(state),
   ].join("\n");
 }
 
-function parseActions(output: string): readonly CopilotAction[] {
+function parseActions(
+  output: string,
+  limits: CopilotAcpLimits,
+): readonly CopilotAction[] {
   const trimmed = output.trim();
   const normalized = trimmed.startsWith("```")
     ? trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")
@@ -441,26 +731,64 @@ function parseActions(output: string): readonly CopilotAction[] {
       "Copilot ACP did not return a valid JSON action envelope.",
     );
   }
+  assertJsonDepth(parsed, limits.maxJsonDepth, "action envelope");
   const record = getRecord(parsed, "action envelope");
   if (!Array.isArray(record.actions) || record.actions.length === 0) {
     throw new ProviderProtocolError(
       "Copilot ACP action envelope must contain at least one action.",
     );
   }
-  return record.actions.map(parseAction);
+  if (record.actions.length > limits.maxActionCount) {
+    throw new ProviderProtocolError(
+      `Copilot ACP action envelope exceeded ${limits.maxActionCount} actions.`,
+    );
+  }
+  return record.actions.map((action) => parseAction(action, limits));
 }
 
-function parseAction(value: unknown): CopilotAction {
+function parseAction(
+  value: unknown,
+  limits: CopilotAcpLimits,
+): CopilotAction {
   const action = getRecord(value, "action");
-  const type = requireString(action.type, "action.type");
+  const type = requireBoundedString(
+    action.type,
+    "action.type",
+    64,
+  );
   switch (type) {
     case "create_run":
       return { type };
+    case "continue_run":
+      return {
+        type,
+        runId: requireBoundedString(
+          action.runId,
+          "action.runId",
+          limits.maxFieldLength,
+        ),
+      };
+    case "ignore_attention":
+      return {
+        type,
+        reason: requireBoundedString(
+          action.reason,
+          "action.reason",
+          limits.maxFieldLength,
+        ),
+      };
     case "append_activity":
       return {
         type,
-        kind: requireString(action.kind, "action.kind"),
-        payload: toJsonValue(action.payload),
+        kind: requireBoundedString(
+          action.kind,
+          "action.kind",
+          Math.min(256, limits.maxFieldLength),
+        ),
+        payload: toJsonValue(
+          action.payload,
+          limits.maxJsonDepth,
+        ),
         ...(action.retentionClass === undefined
           ? {}
           : {
@@ -474,31 +802,35 @@ function parseAction(value: unknown): CopilotAction {
     case "publish_reply":
       return {
         type,
-        body: requireString(action.body, "action.body"),
-        ...optionalStringArray(action.targetAgentIds, "action.targetAgentIds"),
-        ...optionalNumber(action.expectedThreadCursor, "expectedThreadCursor"),
-      };
-    case "publish_artifact":
-      return {
-        type,
-        contentDigest: requireString(action.contentDigest, "action.contentDigest"),
-        baseRevision: requireString(action.baseRevision, "action.baseRevision"),
-        mediaType: requireString(action.mediaType, "action.mediaType"),
-        storageLocation: requireString(
-          action.storageLocation,
-          "action.storageLocation",
+        body: requireBoundedString(
+          action.body,
+          "action.body",
+          limits.maxFieldLength,
         ),
-        ...(action.metadata === undefined
-          ? {}
-          : { metadata: toJsonValue(action.metadata) }),
+        ...optionalStringArray(
+          action.targetAgentIds,
+          "action.targetAgentIds",
+          limits,
+        ),
+        ...optionalNumber(action.expectedThreadCursor, "expectedThreadCursor"),
       };
     case "report_status":
       return {
         type,
-        status: requireString(action.status, "action.status"),
+        status: requireBoundedString(
+          action.status,
+          "action.status",
+          Math.min(256, limits.maxFieldLength),
+        ),
         ...(action.detail === undefined
           ? {}
-          : { detail: requireString(action.detail, "action.detail") }),
+          : {
+              detail: requireBoundedString(
+                action.detail,
+                "action.detail",
+                limits.maxFieldLength,
+              ),
+            }),
       };
     case "complete":
       return {
@@ -509,12 +841,26 @@ function parseAction(value: unknown): CopilotAction {
         ),
         ...(action.finalReply === undefined
           ? {}
-          : { finalReply: parseReply(action.finalReply) }),
+          : { finalReply: parseReply(action.finalReply, limits) }),
       };
     case "fail":
-      return { type, reason: requireString(action.reason, "action.reason") };
+      return {
+        type,
+        reason: requireBoundedString(
+          action.reason,
+          "action.reason",
+          limits.maxFieldLength,
+        ),
+      };
     case "wait":
-      return { type, reason: requireString(action.reason, "action.reason") };
+      return {
+        type,
+        reason: requireBoundedString(
+          action.reason,
+          "action.reason",
+          limits.maxFieldLength,
+        ),
+      };
     default:
       throw new ProviderProtocolError(`Unsupported action type ${type}.`);
   }
@@ -525,9 +871,18 @@ async function applyActions(
   context: ProviderExecutionContext,
 ): Promise<void> {
   for (const action of actions) {
+    if (context.signal.aborted) {
+      throw abortReason(context.signal);
+    }
     switch (action.type) {
       case "create_run":
         await context.capabilities.createRunFromAttention();
+        break;
+      case "continue_run":
+        await context.capabilities.continueAttentionWithRun(action.runId);
+        break;
+      case "ignore_attention":
+        await context.capabilities.ignoreAttention(action.reason);
         break;
       case "append_activity":
         await context.capabilities.appendActivity(
@@ -538,9 +893,6 @@ async function applyActions(
         break;
       case "publish_reply":
         await context.capabilities.publishReply(action);
-        break;
-      case "publish_artifact":
-        await context.capabilities.publishArtifact(action);
         break;
       case "report_status":
         await context.capabilities.reportStatus(action.status, action.detail);
@@ -563,16 +915,27 @@ function validateActionPlan(
   causeType: ProviderExecutionContext["cause"]["type"],
 ): void {
   if (causeType === "attention") {
-    if (actions.length !== 1 || actions[0]?.type !== "create_run") {
+    if (
+      actions.length !== 1 ||
+      !["create_run", "continue_run", "ignore_attention"].includes(
+        actions[0]!.type,
+      )
+    ) {
       throw new ProviderProtocolError(
-        "An Attention Activation must return exactly one create_run action.",
+        "An Attention Activation must return exactly one ignore_attention, continue_run, or create_run action.",
       );
     }
     return;
   }
-  if (actions.some((action) => action.type === "create_run")) {
+  if (
+    actions.some((action) =>
+      action.type === "create_run" ||
+      action.type === "continue_run" ||
+      action.type === "ignore_attention"
+    )
+  ) {
     throw new ProviderProtocolError(
-      "A Run Activation cannot contain create_run.",
+      "A Run Activation cannot contain Attention decision actions.",
     );
   }
   const terminalIndexes = actions.flatMap((action, index) =>
@@ -592,15 +955,26 @@ function validateActionPlan(
   }
 }
 
-function parseReply(value: unknown): {
+function parseReply(
+  value: unknown,
+  limits: CopilotAcpLimits,
+): {
   readonly body: string;
   readonly targetAgentIds?: readonly string[];
   readonly expectedThreadCursor?: number;
 } {
   const reply = getRecord(value, "finalReply");
   return {
-    body: requireString(reply.body, "finalReply.body"),
-    ...optionalStringArray(reply.targetAgentIds, "finalReply.targetAgentIds"),
+    body: requireBoundedString(
+      reply.body,
+      "finalReply.body",
+      limits.maxFieldLength,
+    ),
+    ...optionalStringArray(
+      reply.targetAgentIds,
+      "finalReply.targetAgentIds",
+      limits,
+    ),
     ...optionalNumber(reply.expectedThreadCursor, "expectedThreadCursor"),
   };
 }
@@ -608,6 +982,7 @@ function parseReply(value: unknown): {
 function optionalStringArray(
   value: unknown,
   name: string,
+  limits: CopilotAcpLimits,
 ): { readonly targetAgentIds?: readonly string[] } {
   if (value === undefined) {
     return {};
@@ -615,7 +990,20 @@ function optionalStringArray(
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
     throw new ProviderProtocolError(`${name} must be an array of strings.`);
   }
-  return { targetAgentIds: value as string[] };
+  if (value.length > limits.maxTargetCount) {
+    throw new ProviderProtocolError(
+      `${name} exceeded ${limits.maxTargetCount} entries.`,
+    );
+  }
+  return {
+    targetAgentIds: value.map((item, index) =>
+      requireBoundedString(
+        item,
+        `${name}[${index}]`,
+        limits.maxFieldLength,
+      ),
+    ),
+  };
 }
 
 function optionalNumber<K extends string>(
@@ -651,9 +1039,18 @@ function getRecord(value: unknown, name: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function requireString(value: unknown, name: string): string {
+function requireBoundedString(
+  value: unknown,
+  name: string,
+  maxLength: number,
+): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new ProviderProtocolError(`${name} must be a non-empty string.`);
+  }
+  if (value.length > maxLength) {
+    throw new ProviderProtocolError(
+      `${name} exceeded ${maxLength} characters.`,
+    );
   }
   return value;
 }
@@ -662,7 +1059,8 @@ function getOptionalString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
-function toJsonValue(value: unknown): JsonValue {
+function toJsonValue(value: unknown, maxDepth: number): JsonValue {
+  assertJsonDepth(value, maxDepth, "JSON value");
   if (
     value === null ||
     typeof value === "string" ||
@@ -674,33 +1072,200 @@ function toJsonValue(value: unknown): JsonValue {
     return value;
   }
   if (Array.isArray(value)) {
-    return value.map(toJsonValue);
+    return value.map((item) => toJsonValue(item, maxDepth - 1));
   }
   if (value && typeof value === "object") {
     return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, toJsonValue(item)]),
+      Object.entries(value).map(([key, item]) => [
+        key,
+        toJsonValue(item, maxDepth - 1),
+      ]),
     );
   }
   throw new ProviderProtocolError("Value is not JSON serializable.");
+}
+
+function assertJsonDepth(
+  value: unknown,
+  maxDepth: number,
+  name: string,
+  depth = 0,
+): void {
+  if (depth > maxDepth) {
+    throw new ProviderProtocolError(
+      `${name} exceeded JSON depth ${maxDepth}.`,
+    );
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      assertJsonDepth(item, maxDepth, name, depth + 1);
+    }
+  } else if (value && typeof value === "object") {
+    for (const item of Object.values(value)) {
+      assertJsonDepth(item, maxDepth, name, depth + 1);
+    }
+  }
+}
+
+function addWithinLimit(
+  current: number,
+  addition: number,
+  limit: number,
+  name: string,
+): number {
+  if (addition > limit - current) {
+    throw new ProviderProtocolError(`${name} exceeded ${limit} bytes.`);
+  }
+  return current + addition;
+}
+
+function validateLimits(limits: CopilotAcpLimits): CopilotAcpLimits {
+  for (const [name, value] of Object.entries(limits)) {
+    if (!Number.isInteger(value) || value < 1) {
+      throw new Error(`Copilot ACP limit ${name} must be a positive integer.`);
+    }
+  }
+  return limits;
+}
+
+function buildSanitizedEnvironment(
+  explicit: Readonly<Record<string, string>>,
+): Readonly<Record<string, string>> {
+  const allowedHostNames = new Set(
+    [
+      "PATH",
+      "PATHEXT",
+      "SYSTEMROOT",
+      "WINDIR",
+      "COMSPEC",
+      "TEMP",
+      "TMP",
+      "HOME",
+      "USERPROFILE",
+      "APPDATA",
+      "LOCALAPPDATA",
+      "LANG",
+      "LC_ALL",
+      "TERM",
+    ].map((name) => name.toUpperCase()),
+  );
+  const environment: Record<string, string> = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (
+      value !== undefined &&
+      allowedHostNames.has(name.toUpperCase())
+    ) {
+      environment[name] = value;
+    }
+  }
+  for (const [name, value] of Object.entries(explicit)) {
+    const upper = name.toUpperCase();
+    if (
+      upper === "COPILOT_ALLOW_ALL" ||
+      upper === "COPILOT_ASSISTED_APPROVAL" ||
+      upper === "GH_TOKEN" ||
+      upper === "GITHUB_TOKEN" ||
+      upper === "COPILOT_GITHUB_TOKEN" ||
+      (!upper.startsWith("COPILOT_PROVIDER_") &&
+        upper !== "COPILOT_PROVIDERS_CONFIG" &&
+        upper !== "COPILOT_HOME")
+    ) {
+      throw new Error(
+        `Copilot ACP environment variable ${name} is not in the explicit provider allowlist.`,
+      );
+    }
+    environment[name] = value;
+  }
+  return environment;
+}
+
+function normalizeExecutionError(
+  error: unknown,
+  signal: AbortSignal,
+  stderr: string,
+): Error {
+  if (signal.aborted) {
+    return abortReason(signal);
+  }
+  if (error instanceof ProviderExecutionError) {
+    return error;
+  }
+  const message = errorMessage(error);
+  return new ProviderExecutionError(
+    stderr
+      ? `Copilot ACP failed: ${message}; stderr: ${stderr}`
+      : `Copilot ACP failed: ${message}`,
+    "Unknown",
+  );
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new ProviderExecutionError("Copilot ACP execution was aborted.", "Unknown");
 }
 
 async function stopProcess(
   processHandle: ChildProcessWithoutNullStreams,
   graceMs: number,
 ): Promise<void> {
-  if (processHandle.exitCode !== null || processHandle.signalCode !== null) {
+  if (isProcessClosed(processHandle)) {
     return;
   }
+  const gracefulClose = waitForClose(processHandle, graceMs);
   processHandle.stdin.end();
-  processHandle.kill();
-  await Promise.race([
-    new Promise<void>((resolve) => {
-      processHandle.once("exit", () => resolve());
-    }),
-    new Promise<void>((resolve) => {
-      setTimeout(resolve, graceMs);
-    }),
-  ]);
+  if (await gracefulClose) {
+    return;
+  }
+  if (processHandle.exitCode === null && processHandle.signalCode === null) {
+    const terminatedClose = waitForClose(processHandle, graceMs);
+    processHandle.kill();
+    if (await terminatedClose) {
+      return;
+    }
+  }
+  if (processHandle.exitCode === null && processHandle.signalCode === null) {
+    const forcedClose = waitForClose(processHandle, graceMs);
+    processHandle.kill("SIGKILL");
+    if (await forcedClose) {
+      return;
+    }
+  }
+  if (!isProcessClosed(processHandle)) {
+    throw new ProviderProtocolError(
+      "Copilot ACP process did not terminate after forced shutdown.",
+    );
+  }
+}
+
+function waitForClose(
+  processHandle: ChildProcessWithoutNullStreams,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (isProcessClosed(processHandle)) {
+    return Promise.resolve(true);
+  }
+  return new Promise((resolve) => {
+    const onClose = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      processHandle.removeListener("close", onClose);
+      resolve(false);
+    }, timeoutMs);
+    processHandle.once("close", onClose);
+  });
+}
+
+function isProcessClosed(
+  processHandle: ChildProcessWithoutNullStreams,
+): boolean {
+  return (
+    (processHandle.exitCode !== null || processHandle.signalCode !== null) &&
+    processHandle.stdout.destroyed &&
+    processHandle.stderr.destroyed
+  );
 }
 
 function errorMessage(error: unknown): string {
