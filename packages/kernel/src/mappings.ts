@@ -82,6 +82,9 @@ export function mapAttention(row: Row): AttentionView {
   return {
     cursor: integer(row.sequence),
     id: text(row.id),
+    projectId: text(row.project_id),
+    channelId: text(row.channel_id),
+    threadRootId: text(row.thread_root_id),
     messageRevisionId: text(row.message_revision_id),
     targetAgentId: text(row.target_agent_id),
     triggerKind: text(row.trigger_kind),
@@ -91,6 +94,8 @@ export function mapAttention(row: Row): AttentionView {
       row.handler_lease_holder_principal_id,
     ),
     handlerLeaseExpiresAt: optionalText(row.handler_lease_expires_at),
+    resolutionOutcome:
+      optionalText(row.resolution_outcome) as AttentionView["resolutionOutcome"],
     resolvedRunId: optionalText(row.resolved_run_id),
     createdAt: text(row.created_at),
     resolvedAt: optionalText(row.resolved_at),

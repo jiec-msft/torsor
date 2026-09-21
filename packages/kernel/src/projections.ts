@@ -146,11 +146,14 @@ export function listOpenAttentions(kernel: db.KernelContext, projectId: string |
     parameters.push(targetAgentId);
   }
   parameters.push(limit + 1);
-  const rows = db.allRows(kernel, `SELECT attention.sequence, attention.id, attention.message_revision_id,
+  const rows = db.allRows(kernel, `SELECT attention.sequence, attention.id,
+              attention.project_id, attention.channel_id,
+              attention.thread_root_id, attention.message_revision_id,
               attention.target_agent_id, attention.trigger_kind,
               history.status, history.revision,
               history.handler_lease_holder_principal_id,
-              history.handler_lease_expires_at, history.resolved_run_id,
+              history.handler_lease_expires_at, NULL AS resolution_outcome,
+              history.resolved_run_id,
               attention.created_at, history.resolved_at
          FROM attentions AS attention
          JOIN attention_history AS history

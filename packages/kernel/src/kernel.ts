@@ -1,4 +1,9 @@
-import { claimAttention, resolveAttentionWithRun } from "./attentions.js";
+import {
+  claimAttention,
+  ignoreAttention,
+  resolveAttentionWithExistingRun,
+  resolveAttentionWithRun,
+} from "./attentions.js";
 import { replyToThread, startThread } from "./collaboration.js";
 import {
   allRows,
@@ -421,6 +426,22 @@ export class TorsorKernel {
         );
       case "ResolveAttentionWithRun":
         return resolveAttentionWithRun(
+          this.#context,
+          command,
+          principal,
+          context,
+          correlationId,
+        );
+      case "IgnoreAttention":
+        return ignoreAttention(
+          this.#context,
+          command,
+          principal,
+          context,
+          correlationId,
+        );
+      case "ResolveAttentionWithExistingRun":
+        return resolveAttentionWithExistingRun(
           this.#context,
           command,
           principal,
