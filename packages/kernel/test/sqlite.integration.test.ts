@@ -33,15 +33,19 @@ interface HeldActivationCommand {
 }
 
 interface PreparedActivationCommand {
+  readonly allowLockAttempt: () => void;
   readonly attempting: Promise<void>;
+  readonly proceeding: Promise<void>;
   readonly result: Promise<{ readonly entityId: string }>;
   readonly start: () => void;
   readonly worker: Worker;
 }
 
 interface PendingKernelOpen {
+  readonly allowLockAttempt: () => void;
   readonly attempting: Promise<void>;
   readonly opened: Promise<void>;
+  readonly proceeding: Promise<void>;
   readonly worker: Worker;
 }
 
@@ -61,6 +65,30 @@ function canonicalJson(value: unknown): string {
 
 function commandHash(command: unknown): string {
   return createHash("sha256").update(canonicalJson(command)).digest("hex");
+}
+
+async function expectUnsettled<T>(
+  operation: Promise<T>,
+  durationMs = 100,
+): Promise<void> {
+  const outcome: {
+    failure?: unknown;
+    state: "pending" | "fulfilled" | "rejected";
+  } = { state: "pending" };
+  void operation.then(
+    () => {
+      outcome.state = "fulfilled";
+    },
+    (error: unknown) => {
+      outcome.state = "rejected";
+      outcome.failure = error;
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, durationMs));
+  if (outcome.state === "rejected") {
+    throw outcome.failure;
+  }
+  expect(outcome.state).toBe("pending");
 }
 
 async function holdWriteLock(
@@ -261,12 +289,12 @@ async function prepareActivationCommand(
   databasePath: string,
   command: Readonly<Record<string, unknown>>,
 ): Promise<PreparedActivationCommand> {
-  const signal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
-  const startSignal = new Int32Array(signal);
+  const signal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+  const control = new Int32Array(signal);
   const worker = new Worker(
     `
       const { parentPort, workerData } = require("node:worker_threads");
-      const startSignal = new Int32Array(workerData.signal);
+      const control = new Int32Array(workerData.signal);
       import(workerData.moduleUrl)
         .then(async ({ TorsorKernel }) => {
           const kernel = TorsorKernel.open({
@@ -278,10 +306,14 @@ async function prepareActivationCommand(
           ) => {
             if (operation.kind === "exec" && operation.sql === "BEGIN IMMEDIATE") {
               parentPort.postMessage({ type: "attempting" });
+              if (Atomics.wait(control, 1, 0, 5000) === "timed-out") {
+                throw new Error("Timed out waiting to attempt the Activation lock.");
+              }
+              parentPort.postMessage({ type: "proceeding" });
             }
           };
           parentPort.postMessage({ type: "ready" });
-          if (Atomics.wait(startSignal, 0, 0, 5000) === "timed-out") {
+          if (Atomics.wait(control, 0, 0, 5000) === "timed-out") {
             throw new Error("Timed out waiting to start the Activation contender.");
           }
           try {
@@ -320,6 +352,8 @@ async function prepareActivationCommand(
   let rejectReady!: (error: Error) => void;
   let resolveAttempting!: () => void;
   let rejectAttempting!: (error: Error) => void;
+  let resolveProceeding!: () => void;
+  let rejectProceeding!: (error: Error) => void;
   let resolveResult!: (result: { readonly entityId: string }) => void;
   let rejectResult!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => {
@@ -329,6 +363,10 @@ async function prepareActivationCommand(
   const attempting = new Promise<void>((resolve, reject) => {
     resolveAttempting = resolve;
     rejectAttempting = reject;
+  });
+  const proceeding = new Promise<void>((resolve, reject) => {
+    resolveProceeding = resolve;
+    rejectProceeding = reject;
   });
   const result = new Promise<{ readonly entityId: string }>(
     (resolve, reject) => {
@@ -347,6 +385,8 @@ async function prepareActivationCommand(
         resolveReady();
       } else if (message.type === "attempting") {
         resolveAttempting();
+      } else if (message.type === "proceeding") {
+        resolveProceeding();
       } else if (message.type === "result" && message.result) {
         resolveResult(message.result);
       } else if (message.type === "error") {
@@ -355,6 +395,7 @@ async function prepareActivationCommand(
         );
         rejectReady(error);
         rejectAttempting(error);
+        rejectProceeding(error);
         rejectResult(error);
       }
     },
@@ -362,29 +403,53 @@ async function prepareActivationCommand(
   worker.on("error", (error) => {
     rejectReady(error);
     rejectAttempting(error);
+    rejectProceeding(error);
     rejectResult(error);
+  });
+  worker.on("exit", (code) => {
+    if (code !== 0) {
+      const error = new Error(
+        `Activation contender worker exited with code ${code}.`,
+      );
+      rejectReady(error);
+      rejectAttempting(error);
+      rejectProceeding(error);
+      rejectResult(error);
+    }
   });
   await ready;
   return {
+    allowLockAttempt: () => {
+      Atomics.store(control, 1, 1);
+      Atomics.notify(control, 1);
+    },
     attempting,
+    proceeding,
     result,
     start: () => {
-      Atomics.store(startSignal, 0, 1);
-      Atomics.notify(startSignal, 0);
+      Atomics.store(control, 0, 1);
+      Atomics.notify(control, 0);
     },
     worker,
   };
 }
 
 function openKernelInWorker(databasePath: string): PendingKernelOpen {
+  const signal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const attemptSignal = new Int32Array(signal);
   const worker = new Worker(
     `
       const { parentPort, workerData } = require("node:worker_threads");
+      const attemptSignal = new Int32Array(workerData.signal);
       globalThis[Symbol.for("torsor.kernel.schema-initialization-operation")] = (
         operation,
       ) => {
         if (operation.kind === "exec" && operation.sql === "BEGIN IMMEDIATE") {
           parentPort.postMessage({ type: "attempting" });
+          if (Atomics.wait(attemptSignal, 0, 0, 5000) === "timed-out") {
+            throw new Error("Timed out waiting to attempt the schema lock.");
+          }
+          parentPort.postMessage({ type: "proceeding" });
         }
       };
       import(workerData.moduleUrl)
@@ -409,16 +474,23 @@ function openKernelInWorker(databasePath: string): PendingKernelOpen {
         bootstrap,
         databasePath,
         moduleUrl: new URL("../dist/index.js", import.meta.url).href,
+        signal,
       },
     },
   );
   let resolveAttempting!: () => void;
   let rejectAttempting!: (error: Error) => void;
+  let resolveProceeding!: () => void;
+  let rejectProceeding!: (error: Error) => void;
   let resolveOpened!: () => void;
   let rejectOpened!: (error: Error) => void;
   const attempting = new Promise<void>((resolve, reject) => {
     resolveAttempting = resolve;
     rejectAttempting = reject;
+  });
+  const proceeding = new Promise<void>((resolve, reject) => {
+    resolveProceeding = resolve;
+    rejectProceeding = reject;
   });
   const opened = new Promise<void>((resolve, reject) => {
     resolveOpened = resolve;
@@ -427,19 +499,40 @@ function openKernelInWorker(databasePath: string): PendingKernelOpen {
   worker.on("message", (message: { type: string; message?: string }) => {
     if (message.type === "attempting") {
       resolveAttempting();
+    } else if (message.type === "proceeding") {
+      resolveProceeding();
     } else if (message.type === "opened") {
       resolveOpened();
     } else if (message.type === "error") {
       const error = new Error(message.message ?? "Kernel open worker failed.");
       rejectAttempting(error);
+      rejectProceeding(error);
       rejectOpened(error);
     }
   });
   worker.on("error", (error) => {
     rejectAttempting(error);
+    rejectProceeding(error);
     rejectOpened(error);
   });
-  return { attempting, opened, worker };
+  worker.on("exit", (code) => {
+    if (code !== 0) {
+      const error = new Error(`Kernel open worker exited with code ${code}.`);
+      rejectAttempting(error);
+      rejectProceeding(error);
+      rejectOpened(error);
+    }
+  });
+  return {
+    allowLockAttempt: () => {
+      Atomics.store(attemptSignal, 0, 1);
+      Atomics.notify(attemptSignal, 0);
+    },
+    attempting,
+    opened,
+    proceeding,
+    worker,
+  };
 }
 
 describe("SQLite persistence", () => {
@@ -972,6 +1065,9 @@ describe("SQLite persistence", () => {
         });
         contender.start();
         await contender.attempting;
+        contender.allowLockAttempt();
+        await contender.proceeding;
+        await expectUnsettled(contender.result);
         winner.release();
         const [winnerResult, contenderResult] = await Promise.all([
           winner.result,
@@ -1138,6 +1234,9 @@ describe("SQLite persistence", () => {
       holder = await holdWriteLock(databasePath);
       pendingOpen = openKernelInWorker(databasePath);
       await pendingOpen.attempting;
+      pendingOpen.allowLockAttempt();
+      await pendingOpen.proceeding;
+      await expectUnsettled(pendingOpen.opened);
       holder.release();
       await Promise.all([holder.committed, pendingOpen.opened]);
       const follower = TorsorKernel.open({ databasePath, bootstrap });
