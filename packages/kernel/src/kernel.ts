@@ -26,14 +26,18 @@ import {
 } from "./execution.js";
 import {
   assertAgentQueryScope,
+  assertProjectChannel,
   assertProjectAccess,
   eventSequence,
   requireAgentForPrincipal,
   requireKind,
   requirePrincipal,
+  requireProject,
   requireRun,
   requireThread,
   resolveAttentionSnapshot,
+  resolvePrincipalReadScope,
+  resolvePublicSnapshot,
 } from "./invariants.js";
 import {
   acknowledgeOutboxEvents,
@@ -42,6 +46,7 @@ import {
 } from "./outbox.js";
 import {
   getBootstrap,
+  getProjectAgentStatus,
   getProviderAttempt,
   getRunProjection,
   getThreadProjection,
@@ -49,6 +54,10 @@ import {
   listOpenAttentions,
   listOutboxEvents,
   listRecoverableAttentionExecutions,
+  listRunProjections,
+  listThreadProjections,
+  readAuthorizedPublicEvents,
+  recordProjectionHistories,
 } from "./projections.js";
 import {
   cancelRun,
@@ -184,6 +193,7 @@ export class TorsorKernel {
         principal,
         correlationId,
       );
+      recordProjectionHistories(this.#context, correlationId);
       run(
         this.#context,
         `INSERT INTO idempotency_records
@@ -354,6 +364,135 @@ export class TorsorKernel {
             this.#context,
             query.afterCursor,
             boundedLimit(query.limit),
+          );
+          break;
+        case "ListThreadProjections": {
+          if (query.channelId) {
+            assertProjectChannel(
+              this.#context,
+              query.projectId,
+              query.channelId,
+            );
+          }
+          const scope = resolvePrincipalReadScope(
+            this.#context,
+            principal,
+            principalContext,
+            query.projectId,
+          );
+          if (
+            query.channelId &&
+            scope.channelId &&
+            query.channelId !== scope.channelId
+          ) {
+            throw new KernelError(
+              "Forbidden",
+              "The Activation cannot read this Channel.",
+            );
+          }
+          const snapshot = resolvePublicSnapshot(
+            this.#context,
+            query.snapshotEventId,
+          );
+          const after = resolvePublicSnapshot(
+            this.#context,
+            query.afterEventId ?? null,
+          );
+          if (after.sequence > snapshot.sequence) {
+            throw new KernelError(
+              "InvalidCommand",
+              "The page cursor is after the requested snapshot.",
+            );
+          }
+          result = listThreadProjections(
+            this.#context,
+            query.projectId,
+            query.channelId,
+            after.sequence,
+            snapshot.sequence,
+            snapshot.eventId,
+            boundedLimit(query.limit),
+            scope,
+          );
+          break;
+        }
+        case "ListRunProjections": {
+          if (query.channelId) {
+            assertProjectChannel(
+              this.#context,
+              query.projectId,
+              query.channelId,
+            );
+          }
+          const scope = resolvePrincipalReadScope(
+            this.#context,
+            principal,
+            principalContext,
+            query.projectId,
+          );
+          if (
+            query.channelId &&
+            scope.channelId &&
+            query.channelId !== scope.channelId
+          ) {
+            throw new KernelError(
+              "Forbidden",
+              "The Activation cannot read this Channel.",
+            );
+          }
+          const snapshot = resolvePublicSnapshot(
+            this.#context,
+            query.snapshotEventId,
+          );
+          const after = resolvePublicSnapshot(
+            this.#context,
+            query.afterEventId ?? null,
+          );
+          if (after.sequence > snapshot.sequence) {
+            throw new KernelError(
+              "InvalidCommand",
+              "The page cursor is after the requested snapshot.",
+            );
+          }
+          result = listRunProjections(
+            this.#context,
+            query.projectId,
+            query.channelId,
+            after.sequence,
+            snapshot.sequence,
+            snapshot.eventId,
+            boundedLimit(query.limit),
+            scope,
+          );
+          break;
+        }
+        case "ReadPublicEvents": {
+          const scope = resolvePrincipalReadScope(
+            this.#context,
+            principal,
+            principalContext,
+            query.projectId,
+          );
+          const afterEventId = query.afterEventId ?? null;
+          result = readAuthorizedPublicEvents(
+            this.#context,
+            query.projectId,
+            afterEventId,
+            afterEventId
+              ? eventSequence(this.#context, afterEventId)
+              : 0,
+            boundedLimit(query.limit),
+            scope,
+          );
+          break;
+        }
+        case "GetProjectAgentStatus":
+          requireProject(this.#context, query.projectId);
+          assertProjectAccess(this.#context, principal, query.projectId);
+          result = getProjectAgentStatus(
+            this.#context,
+            query.projectId,
+            query.agentId,
           );
           break;
         default:

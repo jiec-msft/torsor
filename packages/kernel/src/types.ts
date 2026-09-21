@@ -370,6 +370,37 @@ export interface ListRecoverableAttentionExecutionsQuery {
   readonly limit?: number;
 }
 
+export interface ListThreadProjectionsQuery {
+  readonly type: "ListThreadProjections";
+  readonly projectId: string;
+  readonly channelId?: string;
+  readonly afterEventId?: string | null;
+  readonly snapshotEventId?: string | null;
+  readonly limit?: number;
+}
+
+export interface ListRunProjectionsQuery {
+  readonly type: "ListRunProjections";
+  readonly projectId: string;
+  readonly channelId?: string;
+  readonly afterEventId?: string | null;
+  readonly snapshotEventId?: string | null;
+  readonly limit?: number;
+}
+
+export interface ReadPublicEventsQuery {
+  readonly type: "ReadPublicEvents";
+  readonly projectId: string;
+  readonly afterEventId?: string | null;
+  readonly limit?: number;
+}
+
+export interface GetProjectAgentStatusQuery {
+  readonly type: "GetProjectAgentStatus";
+  readonly projectId: string;
+  readonly agentId?: string;
+}
+
 export type KernelQuery =
   | GetBootstrapQuery
   | GetThreadProjectionQuery
@@ -378,7 +409,11 @@ export type KernelQuery =
   | ListOpenAttentionsQuery
   | ListOutboxEventsQuery
   | GetProviderAttemptQuery
-  | ListRecoverableAttentionExecutionsQuery;
+  | ListRecoverableAttentionExecutionsQuery
+  | ListThreadProjectionsQuery
+  | ListRunProjectionsQuery
+  | ReadPublicEventsQuery
+  | GetProjectAgentStatusQuery;
 
 export interface MessageRevisionView {
   readonly id: string;
@@ -607,6 +642,42 @@ export interface RunProjection {
   readonly artifacts: readonly ArtifactView[];
 }
 
+export interface ThreadProjectionPage {
+  readonly items: readonly ThreadProjection[];
+  readonly nextAfterEventId: string | null;
+  readonly hasMore: boolean;
+  readonly snapshotEventId: string | null;
+}
+
+export interface RunProjectionPage {
+  readonly items: readonly RunProjection[];
+  readonly nextAfterEventId: string | null;
+  readonly hasMore: boolean;
+  readonly snapshotEventId: string | null;
+}
+
+export interface AuthorizedPublicEventPage {
+  readonly events: readonly PublicEventEnvelope[];
+  readonly scannedThroughEventId: string | null;
+  readonly hasMore: boolean;
+}
+
+export type ProjectAgentDerivedStatus = "active" | "waiting" | "idle";
+
+export interface ProjectAgentStatusView {
+  readonly agentId: string;
+  readonly liveRunActivationCount: number;
+  readonly liveAttentionActivationCount: number;
+  readonly liveActivationCount: number;
+  readonly nonterminalRunCount: number;
+  readonly status: ProjectAgentDerivedStatus;
+}
+
+export interface ProjectAgentStatusProjection {
+  readonly projectId: string;
+  readonly agents: readonly ProjectAgentStatusView[];
+}
+
 export interface QueryResultMap {
   readonly GetBootstrap: BootstrapProjection;
   readonly GetThreadProjection: ThreadProjection;
@@ -616,6 +687,10 @@ export interface QueryResultMap {
   readonly ListOutboxEvents: OutboxPage;
   readonly GetProviderAttempt: ProviderAttemptView;
   readonly ListRecoverableAttentionExecutions: RecoverableAttentionExecutionPage;
+  readonly ListThreadProjections: ThreadProjectionPage;
+  readonly ListRunProjections: RunProjectionPage;
+  readonly ReadPublicEvents: AuthorizedPublicEventPage;
+  readonly GetProjectAgentStatus: ProjectAgentStatusProjection;
 }
 
 export type QueryResult<Q extends KernelQuery> = QueryResultMap[Q["type"]];

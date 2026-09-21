@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 6;
+export const CURRENT_SCHEMA_VERSION = 7;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -40,8 +40,17 @@ CREATE TABLE IF NOT EXISTS threads (
   root_message_id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),
   channel_id TEXT NOT NULL REFERENCES channels(id),
+  created_event_sequence INTEGER REFERENCES public_events(sequence),
   cursor INTEGER NOT NULL DEFAULT 0 CHECK (cursor >= 0)
 ) STRICT;
+
+CREATE INDEX IF NOT EXISTS threads_project_page_idx
+  ON threads(project_id, created_event_sequence, root_message_id)
+  WHERE created_event_sequence IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS threads_project_channel_page_idx
+  ON threads(project_id, channel_id, created_event_sequence, root_message_id)
+  WHERE created_event_sequence IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
@@ -106,6 +115,9 @@ CREATE TABLE IF NOT EXISTS attentions (
 CREATE INDEX IF NOT EXISTS attentions_open_idx
   ON attentions(status, target_agent_id, created_at);
 
+CREATE INDEX IF NOT EXISTS attentions_project_agent_status_idx
+  ON attentions(project_id, target_agent_id, status, id);
+
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),
@@ -118,6 +130,7 @@ CREATE TABLE IF NOT EXISTS runs (
   activation_generation INTEGER NOT NULL DEFAULT 0 CHECK (activation_generation >= 0),
   next_input_sequence INTEGER NOT NULL DEFAULT 1 CHECK (next_input_sequence > 0),
   next_activity_sequence INTEGER NOT NULL DEFAULT 1 CHECK (next_activity_sequence > 0),
+  created_event_sequence INTEGER REFERENCES public_events(sequence),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   terminal_reason TEXT,
@@ -126,6 +139,17 @@ CREATE TABLE IF NOT EXISTS runs (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS runs_thread_idx ON runs(thread_root_id, created_at);
+
+CREATE INDEX IF NOT EXISTS runs_project_page_idx
+  ON runs(project_id, created_event_sequence, id)
+  WHERE created_event_sequence IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS runs_project_channel_page_idx
+  ON runs(project_id, home_channel_id, created_event_sequence, id)
+  WHERE created_event_sequence IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS runs_project_agent_state_idx
+  ON runs(project_id, owner_agent_id, state);
 
 CREATE TABLE IF NOT EXISTS run_inputs (
   id TEXT PRIMARY KEY,
@@ -207,6 +231,14 @@ CREATE INDEX IF NOT EXISTS activation_attention_expired_idx
   ON activation_attempts(expires_at, started_at, id)
   WHERE cause = 'Attention' AND finished_at IS NULL;
 
+CREATE INDEX IF NOT EXISTS activation_current_run_idx
+  ON activation_attempts(run_id, expires_at, run_activation_generation, agent_id)
+  WHERE cause = 'Run' AND finished_at IS NULL AND revoked_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS activation_current_attention_idx
+  ON activation_attempts(attention_id, expires_at, agent_id)
+  WHERE cause = 'Attention' AND finished_at IS NULL AND revoked_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS run_activity_events (
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES runs(id),
@@ -284,6 +316,32 @@ CREATE TABLE IF NOT EXISTS public_events (
 
 CREATE INDEX IF NOT EXISTS public_events_thread_idx
   ON public_events(thread_root_id, thread_cursor);
+
+CREATE INDEX IF NOT EXISTS public_events_project_sequence_idx
+  ON public_events(project_id, sequence);
+
+CREATE INDEX IF NOT EXISTS public_events_correlation_sequence_idx
+  ON public_events(correlation_id, sequence);
+
+CREATE TABLE IF NOT EXISTS thread_projection_history (
+  thread_root_id TEXT NOT NULL REFERENCES threads(root_message_id),
+  event_sequence INTEGER NOT NULL REFERENCES public_events(sequence),
+  projection_json TEXT NOT NULL,
+  PRIMARY KEY (thread_root_id, event_sequence)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS thread_projection_snapshot_idx
+  ON thread_projection_history(thread_root_id, event_sequence DESC);
+
+CREATE TABLE IF NOT EXISTS run_projection_history (
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  event_sequence INTEGER NOT NULL REFERENCES public_events(sequence),
+  projection_json TEXT NOT NULL,
+  PRIMARY KEY (run_id, event_sequence)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS run_projection_snapshot_idx
+  ON run_projection_history(run_id, event_sequence DESC);
 
 CREATE TABLE IF NOT EXISTS attention_history (
   attention_id TEXT NOT NULL REFERENCES attentions(id),

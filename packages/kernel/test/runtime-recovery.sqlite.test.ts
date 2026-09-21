@@ -588,6 +588,22 @@ describe("Runtime recovery with SQLite", () => {
         ).run(source.attention_id);
         historyDatabase.exec("COMMIT");
         historyDatabase.prepare(
+          `DELETE FROM thread_projection_history
+            WHERE event_sequence IN (
+              SELECT sequence
+                FROM public_events
+               WHERE entity_type IN ('ActivationAttempt', 'ProviderAttempt')
+            )`,
+        ).run();
+        historyDatabase.prepare(
+          `DELETE FROM run_projection_history
+            WHERE event_sequence IN (
+              SELECT sequence
+                FROM public_events
+               WHERE entity_type IN ('ActivationAttempt', 'ProviderAttempt')
+            )`,
+        ).run();
+        historyDatabase.prepare(
           `DELETE FROM public_events
             WHERE entity_type IN ('ActivationAttempt', 'ProviderAttempt')`,
         ).run();
