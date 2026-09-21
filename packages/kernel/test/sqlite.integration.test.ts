@@ -289,6 +289,104 @@ describe("SQLite persistence", () => {
     }
   });
 
+  it("rejects a migrated noncontiguous Outbox acknowledgement atomically", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-outbox-v1-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    const options = {
+      databasePath,
+      bootstrap,
+      clock: () => new Date("2026-09-21T08:00:00.000Z"),
+    };
+    try {
+      const first = TorsorKernel.open(options);
+      for (let index = 1; index <= 3; index += 1) {
+        await first.execute(
+          {
+            type: "StartThread",
+            idempotencyKey: `legacy-outbox-${index}`,
+            projectId: "project-sample",
+            channelId: "channel-general",
+            body: `Legacy Outbox event ${index}.`,
+          },
+          humanContext,
+        );
+      }
+      const beforeMigration = await first.query(
+        {
+          type: "ListOutboxEvents",
+          includeAcknowledged: true,
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      first.close();
+
+      const versionOne = new DatabaseSync(databasePath);
+      versionOne.exec(`
+        DROP TABLE attention_history;
+        ALTER TABLE attentions DROP COLUMN created_event_sequence;
+        PRAGMA user_version = 1;
+      `);
+      const setLease = versionOne.prepare(
+        `UPDATE outbox_events
+            SET lease_holder_principal_id = 'principal-runtime',
+                lease_token = ?,
+                lease_expires_at = '2026-09-21T08:01:00.000Z',
+                delivery_attempts = 1
+          WHERE id = ?`,
+      );
+      setLease.run("lease-c", beforeMigration.items[0]!.id);
+      setLease.run("lease-b", beforeMigration.items[1]!.id);
+      setLease.run("lease-c", beforeMigration.items[2]!.id);
+      versionOne.close();
+
+      const migrated = TorsorKernel.open(options);
+      try {
+        await expect(
+          migrated.execute(
+            {
+              type: "AcknowledgeOutboxEvents",
+              idempotencyKey: "legacy-noncontiguous-ack",
+              outboxEventIds: [
+                beforeMigration.items[0]!.id,
+                beforeMigration.items[2]!.id,
+              ],
+              leaseToken: "lease-c",
+            },
+            runtimeContext,
+          ),
+        ).rejects.toMatchObject({
+          code: "Conflict",
+          message:
+            "Outbox acknowledgement must exactly advance the oldest pending prefix.",
+        });
+
+        const afterRejection = await migrated.query(
+          {
+            type: "ListOutboxEvents",
+            includeAcknowledged: true,
+            limit: 10,
+          },
+          runtimeContext,
+        );
+        expect(afterRejection.items.map((event) => event.acknowledgedAt)).toEqual(
+          [null, null, null],
+        );
+        expect(
+          afterRejection.items.map((event) => event.leaseHolderPrincipalId),
+        ).toEqual([
+          "principal-runtime",
+          "principal-runtime",
+          "principal-runtime",
+        ]);
+      } finally {
+        migrated.close();
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("persists stale Run activation generation across reopen", async () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-activation-"));
     const databasePath = join(directory, "kernel.sqlite");
@@ -530,6 +628,83 @@ describe("SQLite persistence", () => {
         migrated.close();
       }
     } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("re-reads schema state after another opener wins initialization", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-init-race-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    const hookSymbol = Symbol.for(
+      "torsor.kernel.schema-initialization-before-lock",
+    );
+    let competingOpenCompleted = false;
+    try {
+      Reflect.set(globalThis, hookSymbol, () => {
+        Reflect.deleteProperty(globalThis, hookSymbol);
+        const competing = TorsorKernel.open({ databasePath, bootstrap });
+        competingOpenCompleted = true;
+        competing.close();
+      });
+
+      const follower = TorsorKernel.open({ databasePath, bootstrap });
+      try {
+        expect(competingOpenCompleted).toBe(true);
+        const projection = await follower.query(
+          { type: "GetBootstrap", projectId: "project-sample" },
+          humanContext,
+        );
+        expect(projection.project.id).toBe("project-sample");
+      } finally {
+        follower.close();
+      }
+    } finally {
+      Reflect.deleteProperty(globalThis, hookSymbol);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("re-reads schema version after another opener wins migration", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-migration-race-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    const hookSymbol = Symbol.for(
+      "torsor.kernel.schema-initialization-before-lock",
+    );
+    let competingOpenCompleted = false;
+    try {
+      const initial = TorsorKernel.open({ databasePath, bootstrap });
+      initial.close();
+      const versionOne = new DatabaseSync(databasePath);
+      versionOne.exec(`
+        DROP TABLE attention_history;
+        ALTER TABLE attentions DROP COLUMN created_event_sequence;
+        PRAGMA user_version = 1;
+      `);
+      versionOne.close();
+
+      Reflect.set(globalThis, hookSymbol, () => {
+        Reflect.deleteProperty(globalThis, hookSymbol);
+        const competing = TorsorKernel.open({ databasePath, bootstrap });
+        competingOpenCompleted = true;
+        competing.close();
+      });
+
+      const follower = TorsorKernel.open({ databasePath, bootstrap });
+      try {
+        expect(competingOpenCompleted).toBe(true);
+        const migrated = new DatabaseSync(databasePath, { readOnly: true });
+        try {
+          expect(
+            migrated.prepare("PRAGMA user_version").get(),
+          ).toMatchObject({ user_version: 2 });
+        } finally {
+          migrated.close();
+        }
+      } finally {
+        follower.close();
+      }
+    } finally {
+      Reflect.deleteProperty(globalThis, hookSymbol);
       await rm(directory, { recursive: true, force: true });
     }
   });

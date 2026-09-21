@@ -61,6 +61,16 @@ const terminalRunStates: readonly RunState[] = [
   "Failed",
   "Cancelled",
 ];
+const schemaInitializationHookSymbol = Symbol.for(
+  "torsor.kernel.schema-initialization-before-lock",
+);
+
+function runSchemaInitializationInterleavingHook(): void {
+  const hook = Reflect.get(globalThis, schemaInitializationHookSymbol);
+  if (typeof hook === "function") {
+    hook();
+  }
+}
 
 export class KernelError extends Error {
   constructor(
@@ -1481,11 +1491,17 @@ export class TorsorKernel {
     correlationId: string,
   ): CommandResult {
     this.#requireKind(principal, "runtime");
-    const ids = unique(command.outboxEventIds);
-    if (ids.length === 0) {
+    if (command.outboxEventIds.length === 0) {
       throw new KernelError(
         "InvalidCommand",
         "At least one OutboxEvent is required.",
+      );
+    }
+    const ids = unique(command.outboxEventIds);
+    if (ids.length !== command.outboxEventIds.length) {
+      throw new KernelError(
+        "InvalidCommand",
+        "Outbox acknowledgement must not contain duplicate event IDs.",
       );
     }
     requireNonEmpty(command.leaseToken, "leaseToken");
@@ -1503,29 +1519,37 @@ export class TorsorKernel {
     const leasedIds = leasedRows.map((row) => text(row.id));
     if (
       leasedIds.length !== ids.length ||
-      leasedIds.some((id) => !ids.includes(id))
+      leasedIds.some((id, index) => id !== ids[index])
     ) {
       throw new KernelError(
         "InvalidCommand",
-        "Outbox acknowledgement must include the entire leased batch.",
+        "Outbox acknowledgement must include the entire leased batch in cursor order.",
       );
     }
-    const firstSequence = integer(leasedRows[0]!.sequence);
-    const earlierPending = this.#getRow(
-      `SELECT id
+    const pendingPrefix = this.#allRows(
+      `SELECT id, sequence
          FROM outbox_events
-        WHERE acknowledged_at IS NULL AND sequence < ?
-        LIMIT 1`,
-      firstSequence,
+        WHERE acknowledged_at IS NULL
+        ORDER BY sequence
+        LIMIT ?`,
+      leasedRows.length,
     );
-    if (earlierPending) {
+    if (
+      pendingPrefix.length !== leasedRows.length ||
+      pendingPrefix.some(
+        (row, index) =>
+          text(row.id) !== text(leasedRows[index]!.id) ||
+          integer(row.sequence) !== integer(leasedRows[index]!.sequence),
+      )
+    ) {
       throw new KernelError(
         "Conflict",
-        "Outbox acknowledgement must advance the oldest pending frontier.",
+        "Outbox acknowledgement must exactly advance the oldest pending prefix.",
       );
     }
-    for (const id of ids) {
-      const event = this.#requireOutboxEvent(id);
+    const events = ids.map((id) => this.#requireOutboxEvent(id));
+    for (const event of events) {
+      const id = text(event.id);
       if (event.acknowledged_at !== null) {
         throw new KernelError("Conflict", `OutboxEvent ${id} is already acknowledged.`);
       }
@@ -1540,6 +1564,8 @@ export class TorsorKernel {
           `OutboxEvent ${id} is not held by the current live lease.`,
         );
       }
+    }
+    for (const event of events) {
       this.#run(
         `UPDATE outbox_events
             SET acknowledged_at = ?,
@@ -1549,7 +1575,7 @@ export class TorsorKernel {
           WHERE id = ?`,
         now,
         text(principal.id),
-        id,
+        text(event.id),
       );
     }
     return {
@@ -2844,17 +2870,19 @@ export class TorsorKernel {
   }
 
   #initializeSchema(): void {
-    const versionRow = this.#database.prepare("PRAGMA user_version").get() as
-      | Row
-      | undefined;
-    const version = versionRow ? integer(versionRow.user_version) : 0;
-    if (version === CURRENT_SCHEMA_VERSION) {
-      this.#database.exec(schemaSql);
-      return;
-    }
-    if (version === 1) {
-      this.#database.exec("BEGIN IMMEDIATE");
-      try {
+    runSchemaInitializationInterleavingHook();
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      const versionRow = this.#database.prepare("PRAGMA user_version").get() as
+        | Row
+        | undefined;
+      const version = versionRow ? integer(versionRow.user_version) : 0;
+      if (version === CURRENT_SCHEMA_VERSION) {
+        this.#database.exec(schemaSql);
+        this.#database.exec("COMMIT");
+        return;
+      }
+      if (version === 1) {
         this.#database.exec(
           `ALTER TABLE attentions
              ADD COLUMN created_event_sequence INTEGER
@@ -2931,33 +2959,27 @@ export class TorsorKernel {
         );
         this.#database.exec("COMMIT");
         return;
-      } catch (error) {
-        this.#database.exec("ROLLBACK");
-        throw this.#translateError(error);
       }
-    }
-    if (version !== 0) {
-      throw new KernelError(
-        "Conflict",
-        `Unsupported kernel schema version ${version}; expected ${CURRENT_SCHEMA_VERSION}.`,
-      );
-    }
-    const existing = this.#database
-      .prepare(
-        `SELECT name
-           FROM sqlite_master
-          WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-          LIMIT 1`,
-      )
-      .get() as Row | undefined;
-    if (existing) {
-      throw new KernelError(
-        "Conflict",
-        "The database contains an unversioned kernel schema and cannot be migrated safely.",
-      );
-    }
-    this.#database.exec("BEGIN IMMEDIATE");
-    try {
+      if (version !== 0) {
+        throw new KernelError(
+          "Conflict",
+          `Unsupported kernel schema version ${version}; expected ${CURRENT_SCHEMA_VERSION}.`,
+        );
+      }
+      const existing = this.#database
+        .prepare(
+          `SELECT name
+             FROM sqlite_master
+            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+            LIMIT 1`,
+        )
+        .get() as Row | undefined;
+      if (existing) {
+        throw new KernelError(
+          "Conflict",
+          "The database contains an unversioned kernel schema and cannot be migrated safely.",
+        );
+      }
       this.#database.exec(schemaSql);
       this.#database.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
       this.#database.exec("COMMIT");
