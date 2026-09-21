@@ -20,6 +20,7 @@ import {
   failProviderAttempt,
   finishActivation,
   finishProviderAttempt,
+  parkRunAfterProviderAttemptFailure,
   startActivation,
   startProviderAttempt,
 } from "./execution.js";
@@ -41,11 +42,13 @@ import {
 } from "./outbox.js";
 import {
   getBootstrap,
+  getProviderAttempt,
   getRunProjection,
   getThreadProjection,
   listActivity,
   listOpenAttentions,
   listOutboxEvents,
+  listRecoverableAttentionExecutions,
 } from "./projections.js";
 import {
   cancelRun,
@@ -123,7 +126,8 @@ export class TorsorKernel {
         : principalContext;
     if (
       command.type === "ClaimAttention" ||
-      command.type === "StartActivation"
+      command.type === "StartActivation" ||
+      command.type === "ParkRunAfterProviderAttemptFailure"
     ) {
       requireKind(this.#context, principal, "runtime");
     }
@@ -336,6 +340,22 @@ export class TorsorKernel {
             query.includeAcknowledged ?? false,
           );
           break;
+        case "GetProviderAttempt":
+          result = getProviderAttempt(
+            this.#context,
+            query.providerAttemptId,
+            principal,
+            principalContext,
+          );
+          break;
+        case "ListRecoverableAttentionExecutions":
+          requireKind(this.#context, principal, "runtime");
+          result = listRecoverableAttentionExecutions(
+            this.#context,
+            query.afterCursor,
+            boundedLimit(query.limit),
+          );
+          break;
         default:
           result = assertNever(query);
       }
@@ -485,6 +505,13 @@ export class TorsorKernel {
           command,
           principal,
           context,
+          correlationId,
+        );
+      case "ParkRunAfterProviderAttemptFailure":
+        return parkRunAfterProviderAttemptFailure(
+          this.#context,
+          command,
+          principal,
           correlationId,
         );
       case "ClaimOutboxEvents":
