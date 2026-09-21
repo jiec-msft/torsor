@@ -29,6 +29,7 @@ import {
   assertProjectChannel,
   assertProjectAccess,
   eventSequence,
+  projectEventSequence,
   requireAgentForPrincipal,
   requireKind,
   requirePrincipal,
@@ -39,6 +40,7 @@ import {
   resolvePrincipalReadScope,
   resolvePublicSnapshot,
 } from "./invariants.js";
+import { recordProjectionVersions } from "./history.js";
 import {
   acknowledgeOutboxEvents,
   claimOutboxEvents,
@@ -57,7 +59,6 @@ import {
   listRunProjections,
   listThreadProjections,
   readAuthorizedPublicEvents,
-  recordProjectionHistories,
 } from "./projections.js";
 import {
   cancelRun,
@@ -193,7 +194,7 @@ export class TorsorKernel {
         principal,
         correlationId,
       );
-      recordProjectionHistories(this.#context, correlationId);
+      recordProjectionVersions(this.#context, correlationId);
       run(
         this.#context,
         `INSERT INTO idempotency_records
@@ -289,10 +290,6 @@ export class TorsorKernel {
         }
         case "ListOpenAttentions":
           {
-            const snapshot = resolveAttentionSnapshot(
-              this.#context,
-              query.snapshotEventId,
-            );
             if (text(principal.kind) === "agent") {
               const agent = requireAgentForPrincipal(
                 this.#context,
@@ -316,6 +313,11 @@ export class TorsorKernel {
                   "An Agent may only list its own Attention.",
                 );
               }
+              const snapshot = resolvePublicSnapshot(
+                this.#context,
+                text(agent.project_id),
+                query.snapshotEventId,
+              );
               result = listOpenAttentions(
                 this.#context,
                 text(agent.project_id),
@@ -330,6 +332,16 @@ export class TorsorKernel {
             if (query.projectId) {
               assertProjectAccess(this.#context, principal, query.projectId);
             }
+            const snapshot = query.projectId
+              ? resolvePublicSnapshot(
+                  this.#context,
+                  query.projectId,
+                  query.snapshotEventId,
+                )
+              : resolveAttentionSnapshot(
+                  this.#context,
+                  query.snapshotEventId,
+                );
             result = listOpenAttentions(
               this.#context,
               query.projectId,
@@ -392,10 +404,12 @@ export class TorsorKernel {
           }
           const snapshot = resolvePublicSnapshot(
             this.#context,
+            query.projectId,
             query.snapshotEventId,
           );
           const after = resolvePublicSnapshot(
             this.#context,
+            query.projectId,
             query.afterEventId ?? null,
           );
           if (after.sequence > snapshot.sequence) {
@@ -442,10 +456,12 @@ export class TorsorKernel {
           }
           const snapshot = resolvePublicSnapshot(
             this.#context,
+            query.projectId,
             query.snapshotEventId,
           );
           const after = resolvePublicSnapshot(
             this.#context,
+            query.projectId,
             query.afterEventId ?? null,
           );
           if (after.sequence > snapshot.sequence) {
@@ -479,7 +495,11 @@ export class TorsorKernel {
             query.projectId,
             afterEventId,
             afterEventId
-              ? eventSequence(this.#context, afterEventId)
+              ? projectEventSequence(
+                  this.#context,
+                  query.projectId,
+                  afterEventId,
+                )
               : 0,
             boundedLimit(query.limit),
             scope,

@@ -341,6 +341,210 @@ describe("Kernel server query primitives", () => {
     }
   });
 
+  it("reconstructs mutable projection components exactly as of a snapshot", async () => {
+    const kernel = openMemoryKernel();
+    try {
+      const opened = await openAttention(kernel, "component-history");
+      const claimedSnapshot = await kernel.query(
+        {
+          type: "ListThreadProjections",
+          projectId: "project-sample",
+        },
+        humanContext,
+      );
+      const resolved = await kernel.execute(
+        {
+          type: "ResolveAttentionWithRun",
+          idempotencyKey: "component-history-resolve",
+          attentionId: opened.attention.id,
+          expectedAttentionRevision: opened.claim.revision!,
+          handlerLeaseToken: opened.claim.relatedIds!.handlerLeaseToken!,
+        },
+        opened.agentContext,
+      );
+      const activation = await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "component-history-run-activation",
+          runId: resolved.entityId,
+          expectedRunRevision: 1,
+        },
+        runtimeContext,
+      );
+      const runContext = {
+        principalId: "principal-orbit",
+        activationId: activation.entityId,
+      } as const;
+      const provider = await kernel.execute(
+        {
+          type: "StartProviderAttempt",
+          idempotencyKey: "component-history-provider",
+          activationId: activation.entityId,
+          adapter: "deterministic-fake",
+          adapterVersion: "1",
+          capabilitySnapshot: { streaming: true },
+          runInputIds: [resolved.relatedIds!.runInputId!],
+          requestIdempotencyKey: "component-history-request",
+        },
+        runContext,
+      );
+      await kernel.execute(
+        {
+          type: "AppendRunActivity",
+          idempotencyKey: "component-history-activity",
+          runId: resolved.entityId,
+          activationId: activation.entityId,
+          kind: "progress",
+          payload: { text: "Historical output." },
+          retentionClass: "durable",
+        },
+        runContext,
+      );
+      const sent = await kernel.execute(
+        {
+          type: "SendToRun",
+          idempotencyKey: "component-history-send",
+          runId: resolved.entityId,
+          expectedRunRevision: 1,
+          body: "Additional synthetic input.",
+          targetAgentIds: ["agent-keel"],
+        },
+        humanContext,
+      );
+      const activeSnapshot = await kernel.query(
+        {
+          type: "ListRunProjections",
+          projectId: "project-sample",
+        },
+        humanContext,
+      );
+      const replacementActivation = await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "component-history-replacement-activation",
+          runId: resolved.entityId,
+          expectedRunRevision: 2,
+        },
+        runtimeContext,
+      );
+      const replacementContext = {
+        principalId: "principal-orbit",
+        activationId: replacementActivation.entityId,
+      } as const;
+
+      await kernel.execute(
+        {
+          type: "WithdrawRunInput",
+          idempotencyKey: "component-history-withdraw",
+          runInputId: sent.relatedIds!.runInputId!,
+          expectedRunRevision: 2,
+          expectedDispositionRevision: 1,
+          reason: "Withdraw after the historical snapshot.",
+        },
+        humanContext,
+      );
+      await kernel.execute(
+        {
+          type: "FinishProviderAttempt",
+          idempotencyKey: "component-history-provider-finish",
+          providerAttemptId: provider.entityId,
+          status: "Completed",
+        },
+        runtimeContext,
+      );
+      await kernel.execute(
+        {
+          type: "WaitRun",
+          idempotencyKey: "component-history-wait",
+          runId: resolved.entityId,
+          expectedRunRevision: 3,
+          reason: "Wait after the historical snapshot.",
+        },
+        replacementContext,
+      );
+
+      const claimed = await kernel.query(
+        {
+          type: "ListThreadProjections",
+          projectId: "project-sample",
+          snapshotEventId: claimedSnapshot.snapshotEventId,
+        },
+        humanContext,
+      );
+      expect(claimed.items[0]?.messages[0]).toMatchObject({
+        targetAgentIds: ["agent-orbit"],
+        latestRevision: 1,
+      });
+      expect(claimed.items[0]?.attentions[0]).toMatchObject({
+        status: "Open",
+        revision: 2,
+        handlerLeaseHolderPrincipalId: "principal-runtime",
+      });
+      expect(claimed.items[0]?.runs).toEqual([]);
+
+      const historical = await kernel.query(
+        {
+          type: "ListRunProjections",
+          projectId: "project-sample",
+          snapshotEventId: activeSnapshot.snapshotEventId,
+        },
+        humanContext,
+      );
+      const historicalRun = historical.items[0]!;
+      expect(historicalRun.run).toMatchObject({
+        state: "Active",
+        revision: 2,
+        activationGeneration: 1,
+      });
+      expect(historicalRun.inputs).toHaveLength(2);
+      expect(historicalRun.inputs[1]).toMatchObject({
+        disposition: "Pending",
+        dispositionRevision: 1,
+      });
+      expect(historicalRun.activations[0]).toMatchObject({
+        revokedAt: null,
+        finishedAt: null,
+      });
+      expect(historicalRun.providerAttempts[0]).toMatchObject({
+        status: "Started",
+        finishedAt: null,
+      });
+      expect(historicalRun.activity.items[0]).toMatchObject({
+        kind: "progress",
+        payload: { text: "Historical output." },
+      });
+
+      const current = await kernel.query(
+        {
+          type: "ListRunProjections",
+          projectId: "project-sample",
+        },
+        humanContext,
+      );
+      const currentRun = current.items[0]!;
+      expect(currentRun.run).toMatchObject({
+        state: "Waiting",
+        revision: 4,
+        activationGeneration: 2,
+      });
+      expect(currentRun.inputs[1]).toMatchObject({
+        disposition: "Withdrawn",
+        dispositionRevision: 2,
+      });
+      expect(currentRun.activations).toHaveLength(2);
+      expect(
+        currentRun.activations.every(
+          (currentActivation) => currentActivation.revokedAt !== null,
+        ),
+      ).toBe(true);
+      expect(currentRun.providerAttempts[0]).toMatchObject({
+        status: "Completed",
+      });
+    } finally {
+      kernel.close();
+    }
+  });
+
   it("reads bounded authorized event scans without rescanning filtered rows", async () => {
     const kernel = openExtendedKernel();
     try {
@@ -462,6 +666,61 @@ describe("Kernel server query primitives", () => {
           scoped.runContext,
         ),
       ).rejects.toMatchObject({ code: "Conflict" });
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("includes internally appended parked-run activity in temporal projections", async () => {
+    const kernel = openMemoryKernel();
+    try {
+      const setup = await createActiveRun(kernel, "parked-activity");
+      const provider = await kernel.execute(
+        {
+          type: "StartProviderAttempt",
+          idempotencyKey: "parked-activity-provider",
+          activationId: setup.runActivationId,
+          adapter: "deterministic-fake",
+          adapterVersion: "1",
+          capabilitySnapshot: {},
+          runInputIds: [setup.runInputId],
+          requestIdempotencyKey: "parked-activity-request",
+        },
+        runtimeContext,
+      );
+      await kernel.execute(
+        {
+          type: "FailProviderAttempt",
+          idempotencyKey: "parked-activity-fail",
+          providerAttemptId: provider.entityId,
+          error: "Synthetic provider failure.",
+        },
+        runtimeContext,
+      );
+      await kernel.execute(
+        {
+          type: "ParkRunAfterProviderAttemptFailure",
+          idempotencyKey: "parked-activity-park",
+          runId: setup.runId,
+          providerAttemptId: provider.entityId,
+          expectedRunRevision: 1,
+          expectedActivationGeneration: 1,
+          reason: "Park after provider failure.",
+        },
+        runtimeContext,
+      );
+      const page = await kernel.query(
+        {
+          type: "ListRunProjections",
+          projectId: "project-sample",
+        },
+        humanContext,
+      );
+      expect(page.items[0]?.activity.items).toEqual([
+        expect.objectContaining({
+          kind: "provider_attempt_failure_parked",
+        }),
+      ]);
     } finally {
       kernel.close();
     }
@@ -692,6 +951,205 @@ describe("Kernel server query primitives", () => {
           { principalId: "principal-nova" },
         ),
       ).rejects.toMatchObject({ code: "Forbidden" });
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("scopes snapshots and cursors to the requested Project", async () => {
+    const kernel = openExtendedKernel();
+    try {
+      const firstSample = await kernel.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: "cursor-sample-first",
+          projectId: "project-sample",
+          channelId: "channel-general",
+          body: "First Sample Project event.",
+        },
+        humanContext,
+      );
+      const other = await kernel.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: "cursor-other",
+          projectId: "project-other",
+          channelId: "channel-other",
+          body: "Newer foreign Project event.",
+        },
+        humanContext,
+      );
+      await kernel.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: "cursor-sample-second",
+          projectId: "project-sample",
+          channelId: "channel-general",
+          body: "Second Sample Project event.",
+        },
+        humanContext,
+      );
+
+      const otherPage = await kernel.query(
+        {
+          type: "ListThreadProjections",
+          projectId: "project-other",
+          limit: 10,
+        },
+        humanContext,
+      );
+      const foreignEventId = otherPage.snapshotEventId!;
+      const samplePage = await kernel.query(
+        {
+          type: "ListThreadProjections",
+          projectId: "project-sample",
+          limit: 1,
+        },
+        humanContext,
+      );
+      expect(samplePage.items[0]?.threadRootId).toBe(firstSample.entityId);
+      expect(samplePage.snapshotEventId).not.toBe(foreignEventId);
+
+      const invalidEventId = "event-does-not-exist";
+      const captureError = async (
+        operation: () => Promise<unknown>,
+      ): Promise<{ code: unknown; message: string }> => {
+        try {
+          await operation();
+          throw new Error("Expected the cursor to be rejected.");
+        } catch (error) {
+          const value = error as { code?: unknown; message?: unknown };
+          return {
+            code: value.code,
+            message: String(value.message),
+          };
+        }
+      };
+      const foreignSnapshotError = await captureError(() =>
+        kernel.query(
+          {
+            type: "ListThreadProjections",
+            projectId: "project-sample",
+            snapshotEventId: foreignEventId,
+          },
+          humanContext,
+        )
+      );
+      const invalidSnapshotError = await captureError(() =>
+        kernel.query(
+          {
+            type: "ListThreadProjections",
+            projectId: "project-sample",
+            snapshotEventId: invalidEventId,
+          },
+          humanContext,
+        )
+      );
+      expect(foreignSnapshotError).toEqual(invalidSnapshotError);
+      expect(foreignSnapshotError.code).toBe("NotFound");
+
+      const foreignAfterError = await captureError(() =>
+        kernel.query(
+          {
+            type: "ListThreadProjections",
+            projectId: "project-sample",
+            afterEventId: foreignEventId,
+          },
+          humanContext,
+        )
+      );
+      const invalidAfterError = await captureError(() =>
+        kernel.query(
+          {
+            type: "ListThreadProjections",
+            projectId: "project-sample",
+            afterEventId: invalidEventId,
+          },
+          humanContext,
+        )
+      );
+      expect(foreignAfterError).toEqual(invalidAfterError);
+
+      const foreignReplayError = await captureError(() =>
+        kernel.query(
+          {
+            type: "ReadPublicEvents",
+            projectId: "project-sample",
+            afterEventId: foreignEventId,
+          },
+          humanContext,
+        )
+      );
+      const invalidReplayError = await captureError(() =>
+        kernel.query(
+          {
+            type: "ReadPublicEvents",
+            projectId: "project-sample",
+            afterEventId: invalidEventId,
+          },
+          humanContext,
+        )
+      );
+      expect(foreignReplayError).toEqual(invalidReplayError);
+      const foreignAttentionError = await captureError(() =>
+        kernel.query(
+          {
+            type: "ListOpenAttentions",
+            projectId: "project-sample",
+            snapshotEventId: foreignEventId,
+          },
+          runtimeContext,
+        )
+      );
+      const invalidAttentionError = await captureError(() =>
+        kernel.query(
+          {
+            type: "ListOpenAttentions",
+            projectId: "project-sample",
+            snapshotEventId: invalidEventId,
+          },
+          runtimeContext,
+        )
+      );
+      expect(foreignAttentionError).toEqual(invalidAttentionError);
+      expect(other.entityId).not.toBe("");
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("normalizes unscoped Attention snapshots to a command boundary", async () => {
+    const kernel = openMemoryKernel();
+    try {
+      await kernel.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: "attention-boundary-thread",
+          projectId: "project-sample",
+          channelId: "channel-general",
+          body: "Notify both synthetic Agents atomically.",
+          targetAgentIds: ["agent-orbit", "agent-keel"],
+        },
+        humanContext,
+      );
+      const events = await kernel.readEvents(null, 10);
+      const firstAttentionEvent = events.find(
+        (event) => event.type === "AttentionOpened",
+      );
+      expect(firstAttentionEvent).toBeDefined();
+      const page = await kernel.query(
+        {
+          type: "ListOpenAttentions",
+          snapshotEventId: firstAttentionEvent!.eventId,
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      expect(page.items.map((attention) => attention.targetAgentId)).toEqual([
+        "agent-orbit",
+        "agent-keel",
+      ]);
+      expect(page.snapshotEventId).toBe(events.at(-1)?.eventId);
     } finally {
       kernel.close();
     }

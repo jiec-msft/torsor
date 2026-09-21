@@ -161,9 +161,10 @@ export function recordAttentionHistory(kernel: db.KernelContext, attentionId: st
   db.run(kernel, `INSERT INTO attention_history
         (attention_id, event_sequence, status, revision,
          handler_lease_holder_principal_id, handler_lease_expires_at,
-         resolved_run_id, resolved_at)
+         resolution_outcome, resolved_run_id, resolved_at)
        SELECT id, ?, status, revision, handler_lease_holder_principal_id,
-              handler_lease_expires_at, resolved_run_id, resolved_at
+              handler_lease_expires_at, resolution_outcome, resolved_run_id,
+              resolved_at
          FROM attentions
         WHERE id = ?`, eventSequence, attentionId);
 }
@@ -343,11 +344,58 @@ export function isActivationLiveAt(
   return activationValidityAt(activation, activationScopeState, at).live;
 }
 
+export function liveRunActivationPredicate(
+  activationAlias: string,
+  runAlias: string,
+): string {
+  return `${activationAlias}.cause = 'Run'
+        AND ${activationAlias}.finished_at IS NULL
+        AND ${activationAlias}.revoked_at IS NULL
+        AND ${activationAlias}.expires_at > ?
+        AND ${runAlias}.state = 'Active'
+        AND ${activationAlias}.run_activation_generation = ${runAlias}.activation_generation
+        AND ${activationAlias}.agent_id = ${runAlias}.owner_agent_id`;
+}
+
+export function liveAttentionActivationPredicate(
+  activationAlias: string,
+  attentionAlias: string,
+): string {
+  return `${activationAlias}.cause = 'Attention'
+        AND ${activationAlias}.finished_at IS NULL
+        AND ${activationAlias}.revoked_at IS NULL
+        AND ${activationAlias}.expires_at > ?
+        AND ${attentionAlias}.status = 'Open'
+        AND ${attentionAlias}.handler_lease_token = ${activationAlias}.attention_lease_token
+        AND ${attentionAlias}.handler_lease_expires_at IS NOT NULL
+        AND ${attentionAlias}.handler_lease_expires_at > ?
+        AND ${activationAlias}.agent_id = ${attentionAlias}.target_agent_id`;
+}
+
 export function revokeRunActivations(kernel: db.KernelContext, runId: string, reason: string, revokedAt: string): void {
-  db.run(kernel, `UPDATE activation_attempts
+  const changed = db.allRows(kernel, `UPDATE activation_attempts
           SET revoked_at = COALESCE(revoked_at, ?),
               revocation_reason = COALESCE(revocation_reason, ?)
-        WHERE run_id = ? AND finished_at IS NULL AND revoked_at IS NULL`, revokedAt, reason, runId);
+        WHERE run_id = ? AND finished_at IS NULL AND revoked_at IS NULL
+        RETURNING id`, revokedAt, reason, runId);
+  markActivationChanges(
+    kernel,
+    changed.map((row) => text(row.id)),
+  );
+}
+
+export function markActivationChanges(
+  kernel: db.KernelContext,
+  activationIds: readonly string[],
+): void {
+  for (const activationId of activationIds) {
+    db.run(
+      kernel,
+      `INSERT OR IGNORE INTO projection_activation_changes (activation_id)
+       VALUES (?)`,
+      activationId,
+    );
+  }
 }
 
 export function activationScope(kernel: db.KernelContext, activation: Row): {
@@ -372,7 +420,65 @@ export function activationScope(kernel: db.KernelContext, activation: Row): {
   };
 }
 
-export function resolvePublicSnapshot(kernel: db.KernelContext, snapshotEventId: string | null | undefined): {
+export function resolvePublicSnapshot(
+  kernel: db.KernelContext,
+  projectId: string,
+  snapshotEventId: string | null | undefined,
+): {
+  sequence: number;
+  eventId: string | null;
+} {
+  if (snapshotEventId === null) {
+    return { sequence: 0, eventId: null };
+  }
+  if (snapshotEventId !== undefined) {
+    const event = db.getRow(
+      kernel,
+      `SELECT correlation_id
+         FROM public_events
+        WHERE project_id = ? AND event_id = ?`,
+      projectId,
+      snapshotEventId,
+    );
+    if (!event) {
+      throw invalidProjectEventCursor();
+    }
+    const boundary = db.getRow(
+      kernel,
+      `SELECT sequence, event_id
+         FROM public_events
+        WHERE project_id = ? AND correlation_id = ?
+        ORDER BY sequence DESC
+        LIMIT 1`,
+      projectId,
+      text(event.correlation_id),
+    );
+    if (!boundary) {
+      throw new Error("Stored event correlation has no command boundary.");
+    }
+    return {
+      sequence: integer(boundary.sequence),
+      eventId: text(boundary.event_id),
+    };
+  }
+  const latest = db.getRow(
+    kernel,
+    `SELECT sequence, event_id
+       FROM public_events
+      WHERE project_id = ?
+      ORDER BY sequence DESC
+      LIMIT 1`,
+    projectId,
+  );
+  return latest
+    ? {
+      sequence: integer(latest.sequence),
+      eventId: text(latest.event_id),
+    }
+    : { sequence: 0, eventId: null };
+}
+
+export function resolveAttentionSnapshot(kernel: db.KernelContext, snapshotEventId: string | null | undefined): {
   sequence: number;
   eventId: string | null;
 } {
@@ -386,7 +492,10 @@ export function resolvePublicSnapshot(kernel: db.KernelContext, snapshotEventId:
       snapshotEventId,
     );
     if (!event) {
-      throw new KernelError("NotFound", `Event ${snapshotEventId} does not exist.`);
+      throw new KernelError(
+        "NotFound",
+        `Event ${snapshotEventId} does not exist.`,
+      );
     }
     const boundary = db.getRow(
       kernel,
@@ -405,26 +514,41 @@ export function resolvePublicSnapshot(kernel: db.KernelContext, snapshotEventId:
       eventId: text(boundary.event_id),
     };
   }
-  const latest = db.getRow(kernel, "SELECT sequence, event_id FROM public_events ORDER BY sequence DESC LIMIT 1");
+  const latest = db.getRow(
+    kernel,
+    "SELECT sequence, event_id FROM public_events ORDER BY sequence DESC LIMIT 1",
+  );
   return latest
     ? {
-      sequence: integer(latest.sequence),
-      eventId: text(latest.event_id),
-    }
+        sequence: integer(latest.sequence),
+        eventId: text(latest.event_id),
+      }
     : { sequence: 0, eventId: null };
-}
-
-export function resolveAttentionSnapshot(kernel: db.KernelContext, snapshotEventId: string | null | undefined): {
-  sequence: number;
-  eventId: string | null;
-} {
-  return resolvePublicSnapshot(kernel, snapshotEventId);
 }
 
 export function eventSequence(kernel: db.KernelContext, eventId: string): number {
   const row = db.getRow(kernel, "SELECT sequence FROM public_events WHERE event_id = ?", eventId);
   if (!row) {
     throw new KernelError("NotFound", `Event ${eventId} does not exist.`);
+  }
+  return integer(row.sequence);
+}
+
+export function projectEventSequence(
+  kernel: db.KernelContext,
+  projectId: string,
+  eventId: string,
+): number {
+  const row = db.getRow(
+    kernel,
+    `SELECT sequence
+       FROM public_events
+      WHERE project_id = ? AND event_id = ?`,
+    projectId,
+    eventId,
+  );
+  if (!row) {
+    throw invalidProjectEventCursor();
   }
   return integer(row.sequence);
 }
@@ -597,6 +721,13 @@ function activationValidityAt(
     return { live: false, reason: "attention_lease_stale" };
   }
   return { live: true };
+}
+
+function invalidProjectEventCursor(): KernelError {
+  return new KernelError(
+    "NotFound",
+    "Event cursor does not exist in the requested Project.",
+  );
 }
 
 export function validateDisposition(kernel: db.KernelContext, disposition: RunInputDisposition, reason: string): void {

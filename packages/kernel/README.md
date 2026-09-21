@@ -47,8 +47,15 @@ const runs = await kernel.query(
 Both return complete projections, `nextAfterEventId`, `hasMore`, and the
 authoritative `snapshotEventId`. The first page captures the latest committed
 command boundary. Later pages reuse that snapshot, so concurrent creates are
-excluded and updated entities are read from durable as-of projection
-materialization rather than current rows.
+excluded and updated entities are reconstructed from immutable components plus
+narrow Run, RunInput, Activation, ProviderAttempt, and Attention versions.
+Large unchanged Message, activity, and Artifact payloads are referenced once
+rather than copied at every command boundary.
+
+Every event cursor is scoped to `projectId`. A cursor from another Project and
+a nonexistent cursor both fail with `NotFound` and the generic message
+`Event cursor does not exist in the requested Project.` The default snapshot is
+the latest committed event in the requested Project, not the global event log.
 
 Authorized event replay is a bounded scan:
 
@@ -143,8 +150,9 @@ finalize content in durable storage and verify its digest before
 location into a finalized Artifact. A failed or incomplete upload must not
 publish the descriptor.
 
-The current direct schema version is 7. Version 7 adds durable Thread and Run
-creation-event cursors, command-boundary projection history, and indexes for
-projection pages, Project event scans, Agent status, and Activation validity.
+The current direct schema version is 8. Version 8 adds creation-event markers
+for immutable projection components, narrow temporal tables for mutable
+projection fields, and sparse indexes for projection pages, Project event
+scans, Agent status, and Activation validity.
 This pre-release schema is intentionally breaking: stop old processes and
-recreate disposable databases rather than migrating version 6.
+recreate disposable databases rather than migrating version 7.

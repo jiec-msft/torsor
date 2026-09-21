@@ -588,7 +588,15 @@ describe("Runtime recovery with SQLite", () => {
         ).run(source.attention_id);
         historyDatabase.exec("COMMIT");
         historyDatabase.prepare(
-          `DELETE FROM thread_projection_history
+          `DELETE FROM activation_history
+            WHERE event_sequence IN (
+              SELECT sequence
+                FROM public_events
+               WHERE entity_type = 'ActivationAttempt'
+            )`,
+        ).run();
+        historyDatabase.prepare(
+          `DELETE FROM run_history
             WHERE event_sequence IN (
               SELECT sequence
                 FROM public_events
@@ -596,11 +604,29 @@ describe("Runtime recovery with SQLite", () => {
             )`,
         ).run();
         historyDatabase.prepare(
-          `DELETE FROM run_projection_history
+          `DELETE FROM provider_attempt_history
             WHERE event_sequence IN (
               SELECT sequence
                 FROM public_events
-               WHERE entity_type IN ('ActivationAttempt', 'ProviderAttempt')
+               WHERE entity_type = 'ProviderAttempt'
+            )`,
+        ).run();
+        historyDatabase.prepare(
+          `UPDATE activation_attempts
+              SET created_event_sequence = NULL
+            WHERE created_event_sequence IN (
+              SELECT sequence
+                FROM public_events
+               WHERE entity_type = 'ActivationAttempt'
+            )`,
+        ).run();
+        historyDatabase.prepare(
+          `UPDATE provider_attempts
+              SET created_event_sequence = NULL
+            WHERE created_event_sequence IN (
+              SELECT sequence
+                FROM public_events
+               WHERE entity_type = 'ProviderAttempt'
             )`,
         ).run();
         historyDatabase.prepare(

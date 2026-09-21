@@ -53,8 +53,8 @@ const publicEventQueryHookSymbol = Symbol.for(
 const projectionPageQueryHookSymbol = Symbol.for(
   "torsor.kernel.projection-page-query",
 );
-const projectionMaterializationQueryHookSymbol = Symbol.for(
-  "torsor.kernel.projection-materialization-query",
+const agentStatusQueryHookSymbol = Symbol.for(
+  "torsor.kernel.agent-status-query",
 );
 
 export function getBootstrap(kernel: db.KernelContext, projectId: string, attentionTargetAgentId?: string): BootstrapProjection {
@@ -69,7 +69,11 @@ export function getBootstrap(kernel: db.KernelContext, projectId: string, attent
            ON c.agent_id = a.id AND c.revision = a.current_config_revision
         WHERE a.project_id = ?
         ORDER BY a.name, a.id`, projectId).map(mapAgent);
-  const snapshot = invariants.resolveAttentionSnapshot(kernel, undefined);
+  const snapshot = invariants.resolvePublicSnapshot(
+    kernel,
+    projectId,
+    undefined,
+  );
   return {
     project: mapProject(project),
     channels,
@@ -122,163 +126,273 @@ export function getRunProjection(kernel: db.KernelContext, runId: string): RunPr
   };
 }
 
-export function recordProjectionHistories(
+export function getThreadProjectionAt(
   kernel: db.KernelContext,
-  correlationId: string,
-): void {
-  const boundarySql = `SELECT MAX(sequence) AS sequence
+  threadRootId: string,
+  snapshotEventSequence: number,
+): ThreadProjection {
+  const thread = invariants.requireThread(kernel, threadRootId);
+  const cursorRow = db.getRow(
+    kernel,
+    `SELECT thread_cursor
        FROM public_events
-      WHERE correlation_id = ?`;
-  recordQuery(
-    projectionMaterializationQueryHookSymbol,
-    boundarySql,
-    [correlationId],
+      WHERE thread_root_id = ?
+        AND sequence <= ?
+        AND thread_cursor IS NOT NULL
+      ORDER BY sequence DESC
+      LIMIT 1`,
+    threadRootId,
+    snapshotEventSequence,
   );
-  const boundary = db.getRow(
+  const messageRows = db.allRows(
     kernel,
-    boundarySql,
-    correlationId,
+    `SELECT message.*,
+            (
+              SELECT MAX(revision.revision)
+                FROM message_revisions AS revision
+               WHERE revision.message_id = message.id
+                 AND revision.created_event_sequence <= ?
+            ) AS latest_revision
+       FROM messages AS message INDEXED BY messages_thread_idx
+      WHERE message.thread_root_id = ?
+        AND message.created_event_sequence <= ?
+      ORDER BY message.thread_sequence`,
+    snapshotEventSequence,
+    threadRootId,
+    snapshotEventSequence,
   );
-  if (!boundary || boundary.sequence === null) {
-    return;
-  }
-  const eventSequence = integer(boundary.sequence);
-  const threadSql = `SELECT DISTINCT thread_root_id
-       FROM public_events AS event
-      WHERE event.correlation_id = ?
-        AND event.thread_root_id IS NOT NULL
-        AND (
-          event.type IN (
-            'MessagePublished',
-            'AttentionOpened',
-            'AttentionClaimed',
-            'AttentionResolved',
-            'AttentionIgnored',
-            'RunCreated',
-            'RunInputAdded',
-            'RunInputWithdrawn',
-            'ArtifactPublished',
-            'RunActivated',
-            'RunWaiting',
-            'RunCompleted',
-            'RunFailed',
-            'RunCancelled'
-          )
-          OR (
-            event.type = 'ActivationStarted'
-            AND EXISTS (
-              SELECT 1
-                FROM activation_attempts AS activation
-               WHERE activation.id = event.entity_id
-                 AND activation.run_id IS NOT NULL
-            )
-          )
-        )`;
-  recordQuery(
-    projectionMaterializationQueryHookSymbol,
-    threadSql,
-    [correlationId],
-  );
-  const threadRows = db.allRows(
-    kernel,
-    threadSql,
-    correlationId,
-  );
-  for (const row of threadRows) {
-    const threadRootId = text(row.thread_root_id);
-    db.run(
+  const messages = messageRows.map((message) => {
+    const revisions = db.allRows(
       kernel,
-      `UPDATE threads
-          SET created_event_sequence = COALESCE(created_event_sequence, ?)
-        WHERE root_message_id = ?`,
-      eventSequence,
-      threadRootId,
-    );
-    db.run(
+      `SELECT *
+         FROM message_revisions
+        WHERE message_id = ?
+          AND created_event_sequence <= ?
+        ORDER BY revision`,
+      text(message.id),
+      snapshotEventSequence,
+    ).map(mapMessageRevision);
+    const mentions = db.allRows(
       kernel,
-      `INSERT INTO thread_projection_history
-        (thread_root_id, event_sequence, projection_json)
-       VALUES (?, ?, ?)`,
+      `SELECT mention.target_agent_id
+         FROM mentions AS mention
+         JOIN message_revisions AS revision
+           ON revision.id = mention.message_revision_id
+        WHERE revision.message_id = ?
+          AND mention.created_event_sequence <= ?
+        ORDER BY mention.target_agent_id`,
+      text(message.id),
+      snapshotEventSequence,
+    ).map((row) => text(row.target_agent_id));
+    return mapMessage(message, revisions, mentions);
+  });
+  return {
+    projectId: text(thread.project_id),
+    channelId: text(thread.channel_id),
+    threadRootId,
+    cursor: cursorRow ? integer(cursorRow.thread_cursor) : 0,
+    messages,
+    attentions: db.allRows(
+      kernel,
+      `SELECT attention.sequence, attention.id, attention.project_id,
+              attention.channel_id, attention.thread_root_id,
+              attention.message_revision_id, attention.target_agent_id,
+              attention.trigger_kind, history.status, history.revision,
+              history.handler_lease_holder_principal_id,
+              history.handler_lease_expires_at, history.resolution_outcome,
+              history.resolved_run_id, attention.created_at,
+              history.resolved_at
+         FROM attentions AS attention
+         JOIN attention_history AS history
+           ON history.attention_id = attention.id
+          AND history.event_sequence = (
+            SELECT MAX(candidate.event_sequence)
+              FROM attention_history AS candidate
+             WHERE candidate.attention_id = attention.id
+               AND candidate.event_sequence <= ?
+          )
+        WHERE attention.thread_root_id = ?
+          AND attention.created_event_sequence <= ?
+        ORDER BY attention.created_at, attention.id`,
+      snapshotEventSequence,
       threadRootId,
-      eventSequence,
-      JSON.stringify(getThreadProjection(kernel, threadRootId)),
-    );
-  }
+      snapshotEventSequence,
+    ).map(mapAttention),
+    runs: db.allRows(
+      kernel,
+      `SELECT run.id, run.project_id, run.home_channel_id,
+              run.thread_root_id, run.owner_agent_id,
+              run.agent_config_revision, history.state, history.revision,
+              history.activation_generation, run.created_at,
+              history.updated_at, history.terminal_reason
+         FROM runs AS run
+         JOIN run_history AS history
+           ON history.run_id = run.id
+          AND history.event_sequence = (
+            SELECT MAX(candidate.event_sequence)
+              FROM run_history AS candidate
+             WHERE candidate.run_id = run.id
+               AND candidate.event_sequence <= ?
+          )
+        WHERE run.thread_root_id = ?
+          AND run.created_event_sequence <= ?
+        ORDER BY run.created_at, run.id`,
+      snapshotEventSequence,
+      threadRootId,
+      snapshotEventSequence,
+    ).map(mapRun),
+    artifacts: db.allRows(
+      kernel,
+      `SELECT artifact.*
+         FROM artifacts AS artifact
+         JOIN runs AS run ON run.id = artifact.producer_run_id
+        WHERE run.thread_root_id = ?
+          AND artifact.created_event_sequence <= ?
+        ORDER BY artifact.created_at, artifact.id`,
+      threadRootId,
+      snapshotEventSequence,
+    ).map(mapArtifact),
+  };
+}
 
-  const runSql = `SELECT event.entity_id AS run_id
-       FROM public_events AS event
-      WHERE event.correlation_id = ?
-        AND event.entity_type = 'Run'
-      UNION
-     SELECT input.run_id
-       FROM public_events AS event
-       JOIN run_inputs AS input ON input.id = event.entity_id
-      WHERE event.correlation_id = ?
-        AND event.entity_type = 'RunInput'
-      UNION
-     SELECT artifact.producer_run_id AS run_id
-       FROM public_events AS event
-       JOIN artifacts AS artifact ON artifact.id = event.entity_id
-      WHERE event.correlation_id = ?
-        AND event.entity_type = 'Artifact'
-      UNION
-     SELECT activation.run_id
-       FROM public_events AS event
-       JOIN activation_attempts AS activation ON activation.id = event.entity_id
-      WHERE event.correlation_id = ?
-        AND event.entity_type = 'ActivationAttempt'
-        AND activation.run_id IS NOT NULL
-      UNION
-     SELECT attempt.run_id
-       FROM public_events AS event
-       JOIN provider_attempts AS attempt ON attempt.id = event.entity_id
-      WHERE event.correlation_id = ?
-        AND event.entity_type = 'ProviderAttempt'
-        AND attempt.run_id IS NOT NULL
-      UNION
-     SELECT activity.run_id
-       FROM public_events AS event
-       JOIN run_activity_events AS activity ON activity.id = event.entity_id
-      WHERE event.correlation_id = ?
-         AND event.entity_type = 'RunActivityEvent'`;
-  const runParameters = [
-    correlationId,
-    correlationId,
-    correlationId,
-    correlationId,
-    correlationId,
-    correlationId,
-  ] satisfies SQLInputValue[];
-  recordQuery(
-    projectionMaterializationQueryHookSymbol,
-    runSql,
-    runParameters,
-  );
-  const runRows = db.allRows(
+export function getRunProjectionAt(
+  kernel: db.KernelContext,
+  runId: string,
+  snapshotEventSequence: number,
+): RunProjection {
+  const run = db.getRow(
     kernel,
-    runSql,
-    ...runParameters,
+    `SELECT current.id, current.project_id, current.home_channel_id,
+            current.thread_root_id, current.owner_agent_id,
+            current.agent_config_revision, history.state, history.revision,
+            history.activation_generation, current.created_at,
+            history.updated_at, history.terminal_reason
+       FROM runs AS current
+       JOIN run_history AS history
+         ON history.run_id = current.id
+        AND history.event_sequence = (
+          SELECT MAX(candidate.event_sequence)
+            FROM run_history AS candidate
+           WHERE candidate.run_id = current.id
+             AND candidate.event_sequence <= ?
+        )
+      WHERE current.id = ?
+        AND current.created_event_sequence <= ?`,
+    snapshotEventSequence,
+    runId,
+    snapshotEventSequence,
   );
-  for (const row of runRows) {
-    const runId = text(row.run_id);
-    db.run(
-      kernel,
-      `UPDATE runs
-          SET created_event_sequence = COALESCE(created_event_sequence, ?)
-        WHERE id = ?`,
-      eventSequence,
-      runId,
-    );
-    db.run(
-      kernel,
-      `INSERT INTO run_projection_history
-        (run_id, event_sequence, projection_json)
-       VALUES (?, ?, ?)`,
-      runId,
-      eventSequence,
-      JSON.stringify(getRunProjection(kernel, runId)),
+  if (!run) {
+    throw new KernelError(
+      "NotFound",
+      `Run ${runId} does not exist at the requested snapshot.`,
     );
   }
+  return {
+    run: mapRun(run),
+    inputs: db.allRows(
+      kernel,
+      `SELECT input.id, input.run_id, input.message_revision_id,
+              input.run_input_sequence, input.assigned_by_principal_id,
+              input.assigned_by_activation_id, input.source_attention_id,
+              input.created_at, history.disposition,
+              history.disposition_revision, history.disposition_reason,
+              history.superseded_by_run_input_id
+         FROM run_inputs AS input
+         JOIN run_input_history AS history
+           ON history.run_input_id = input.id
+          AND history.event_sequence = (
+            SELECT MAX(candidate.event_sequence)
+              FROM run_input_history AS candidate
+             WHERE candidate.run_input_id = input.id
+               AND candidate.event_sequence <= ?
+          )
+        WHERE input.run_id = ?
+          AND input.created_event_sequence <= ?
+        ORDER BY input.run_input_sequence`,
+      snapshotEventSequence,
+      runId,
+      snapshotEventSequence,
+    ).map(mapRunInput),
+    activations: db.allRows(
+      kernel,
+      `SELECT activation.id, activation.agent_id, activation.run_id,
+              activation.attention_id, activation.attention_lease_token,
+              activation.run_activation_generation, activation.cause,
+              activation.config_revision, activation.started_at,
+              activation.expires_at, history.revoked_at,
+              history.revocation_reason, history.finished_at,
+              history.outcome, history.detail
+         FROM activation_attempts AS activation
+         JOIN activation_history AS history
+           ON history.activation_id = activation.id
+          AND history.event_sequence = (
+            SELECT MAX(candidate.event_sequence)
+              FROM activation_history AS candidate
+             WHERE candidate.activation_id = activation.id
+               AND candidate.event_sequence <= ?
+          )
+        WHERE activation.run_id = ?
+          AND activation.created_event_sequence <= ?
+        ORDER BY activation.started_at, activation.id`,
+      snapshotEventSequence,
+      runId,
+      snapshotEventSequence,
+    ).map((activation) =>
+      mapActivation(
+        activation,
+        db.allRows(
+          kernel,
+          `SELECT run_input_id
+             FROM activation_run_inputs
+            WHERE activation_id = ?
+            ORDER BY run_input_sequence`,
+          text(activation.id),
+        ).map((row) => text(row.run_input_id)),
+      )
+    ),
+    providerAttempts: db.allRows(
+      kernel,
+      `SELECT attempt.id, attempt.activation_id, attempt.run_id,
+              attempt.adapter, attempt.adapter_version,
+              attempt.capability_snapshot_json,
+              attempt.run_input_ids_json,
+              attempt.request_idempotency_key,
+              attempt.diagnostic_session_id, history.status,
+              history.detail, attempt.started_at, history.finished_at
+         FROM provider_attempts AS attempt
+         JOIN provider_attempt_history AS history
+           ON history.provider_attempt_id = attempt.id
+          AND history.event_sequence = (
+            SELECT MAX(candidate.event_sequence)
+              FROM provider_attempt_history AS candidate
+             WHERE candidate.provider_attempt_id = attempt.id
+               AND candidate.event_sequence <= ?
+          )
+        WHERE attempt.run_id = ?
+          AND attempt.created_event_sequence <= ?
+        ORDER BY attempt.started_at, attempt.id`,
+      snapshotEventSequence,
+      runId,
+      snapshotEventSequence,
+    ).map(mapProviderAttempt),
+    activity: latestActivityWindowAt(
+      kernel,
+      runId,
+      snapshotEventSequence,
+      100,
+    ),
+    artifacts: db.allRows(
+      kernel,
+      `SELECT *
+         FROM artifacts
+        WHERE producer_run_id = ?
+          AND created_event_sequence <= ?
+        ORDER BY created_at, id`,
+      runId,
+      snapshotEventSequence,
+    ).map(mapArtifact),
+  };
 }
 
 export function listThreadProjections(
@@ -310,24 +424,15 @@ export function listThreadProjections(
     parameters.push(scope.threadRootId);
   }
   const queryParameters: SQLInputValue[] = [
-    snapshotEventSequence,
     ...parameters,
     limit + 1,
   ];
-  const sql = `SELECT thread.created_event_sequence,
-              created.event_id AS created_event_id,
-              history.projection_json
+  const sql = `SELECT thread.root_message_id,
+              thread.created_event_sequence,
+              created.event_id AS created_event_id
          FROM threads AS thread
          JOIN public_events AS created
            ON created.sequence = thread.created_event_sequence
-         JOIN thread_projection_history AS history
-           ON history.thread_root_id = thread.root_message_id
-          AND history.event_sequence = (
-            SELECT MAX(candidate.event_sequence)
-              FROM thread_projection_history AS candidate
-             WHERE candidate.thread_root_id = thread.root_message_id
-               AND candidate.event_sequence <= ?
-          )
         WHERE ${clauses.join(" AND ")}
         ORDER BY thread.created_event_sequence, thread.root_message_id
         LIMIT ?`;
@@ -337,7 +442,11 @@ export function listThreadProjections(
   const pageRows = rows.slice(0, limit);
   return {
     items: pageRows.map((row) =>
-      parseStoredProjection<ThreadProjection>(row.projection_json)
+      getThreadProjectionAt(
+        kernel,
+        text(row.root_message_id),
+        snapshotEventSequence,
+      )
     ),
     nextAfterEventId: hasMore
       ? optionalText(pageRows.at(-1)?.created_event_id)
@@ -378,24 +487,15 @@ export function listRunProjections(
     clauses.push("1 = 0");
   }
   const queryParameters: SQLInputValue[] = [
-    snapshotEventSequence,
     ...parameters,
     limit + 1,
   ];
-  const sql = `SELECT run.created_event_sequence,
-              created.event_id AS created_event_id,
-              history.projection_json
+  const sql = `SELECT run.id,
+              run.created_event_sequence,
+              created.event_id AS created_event_id
          FROM runs AS run
          JOIN public_events AS created
            ON created.sequence = run.created_event_sequence
-         JOIN run_projection_history AS history
-           ON history.run_id = run.id
-          AND history.event_sequence = (
-            SELECT MAX(candidate.event_sequence)
-              FROM run_projection_history AS candidate
-             WHERE candidate.run_id = run.id
-               AND candidate.event_sequence <= ?
-          )
         WHERE ${clauses.join(" AND ")}
         ORDER BY run.created_event_sequence, run.id
         LIMIT ?`;
@@ -405,7 +505,11 @@ export function listRunProjections(
   const pageRows = rows.slice(0, limit);
   return {
     items: pageRows.map((row) =>
-      parseStoredProjection<RunProjection>(row.projection_json)
+      getRunProjectionAt(
+        kernel,
+        text(row.id),
+        snapshotEventSequence,
+      )
     ),
     nextAfterEventId: hasMore
       ? optionalText(pageRows.at(-1)?.created_event_id)
@@ -464,12 +568,14 @@ export function getProjectAgentStatus(
     agentClauses.push("id = ?");
     agentParameters.push(agentId);
   }
-  const agents = db.allRows(
-    kernel,
-    `SELECT id
+  const agentsSql = `SELECT id
        FROM agents
       WHERE ${agentClauses.join(" AND ")}
-      ORDER BY name, id`,
+      ORDER BY name, id`;
+  recordQuery(agentStatusQueryHookSymbol, agentsSql, agentParameters);
+  const agents = db.allRows(
+    kernel,
+    agentsSql,
     ...agentParameters,
   );
   if (agentId && agents.length === 0) {
@@ -480,94 +586,85 @@ export function getProjectAgentStatus(
     throw new KernelError("Forbidden", "The Agent does not belong to the Project.");
   }
 
-  const nonterminalCounts = new Map(
-    db.allRows(
-      kernel,
-      `SELECT owner_agent_id, COUNT(*) AS count
-         FROM runs
+  const nonterminalParameters: SQLInputValue[] = [
+    projectId,
+    ...(agentId ? [agentId] : []),
+  ];
+  const nonterminalIndex = agentId
+    ? "runs_project_agent_state_idx"
+    : "runs_project_state_agent_idx";
+  const nonterminalSql = `SELECT owner_agent_id, COUNT(*) AS count
+         FROM runs INDEXED BY ${nonterminalIndex}
         WHERE project_id = ?
           AND state IN ('Active', 'Waiting')
           ${agentId ? "AND owner_agent_id = ?" : ""}
-        GROUP BY owner_agent_id`,
-      projectId,
-      ...(agentId ? [agentId] : []),
+        GROUP BY owner_agent_id`;
+  recordQuery(
+    agentStatusQueryHookSymbol,
+    nonterminalSql,
+    nonterminalParameters,
+  );
+  const nonterminalCounts = new Map(
+    db.allRows(
+      kernel,
+      nonterminalSql,
+      ...nonterminalParameters,
     ).map((row) => [text(row.owner_agent_id), integer(row.count)] as const),
   );
 
   const at = kernel.clock();
   const atIso = at.toISOString();
-  const activationRows = db.allRows(
-    kernel,
-    `SELECT activation.*,
-            run.state AS scope_run_state,
-            run.activation_generation AS scope_run_activation_generation,
-            run.owner_agent_id AS scope_agent_id,
-            NULL AS scope_attention_status,
-            NULL AS scope_attention_lease_token,
-            NULL AS scope_attention_lease_expires_at
-       FROM activation_attempts AS activation
+  const activationParameters: SQLInputValue[] = [
+    atIso,
+    projectId,
+    ...(agentId ? [agentId] : []),
+    atIso,
+    atIso,
+    projectId,
+    ...(agentId ? [agentId] : []),
+  ];
+  const runActivationIndex = agentId
+    ? "activation_live_run_agent_expiry_idx"
+    : "activation_live_run_expiry_idx";
+  const attentionActivationIndex = agentId
+    ? "activation_live_attention_agent_expiry_idx"
+    : "activation_live_attention_expiry_idx";
+  const activationSql = `SELECT live.agent_id, live.scope, COUNT(*) AS count
+       FROM (
+       SELECT activation.agent_id, 'Run' AS scope
+       FROM activation_attempts AS activation INDEXED BY ${runActivationIndex}
        JOIN runs AS run ON run.id = activation.run_id
-      WHERE run.project_id = ?
-        AND activation.cause = 'Run'
-        AND activation.finished_at IS NULL
-        AND activation.revoked_at IS NULL
-        AND activation.expires_at > ?
+      WHERE ${invariants.liveRunActivationPredicate("activation", "run")}
+        AND run.project_id = ?
         ${agentId ? "AND activation.agent_id = ?" : ""}
       UNION ALL
-     SELECT activation.*,
-            NULL AS scope_run_state,
-            NULL AS scope_run_activation_generation,
-            attention.target_agent_id AS scope_agent_id,
-            attention.status AS scope_attention_status,
-            attention.handler_lease_token AS scope_attention_lease_token,
-            attention.handler_lease_expires_at AS scope_attention_lease_expires_at
-       FROM activation_attempts AS activation
+     SELECT activation.agent_id, 'Attention' AS scope
+       FROM activation_attempts AS activation INDEXED BY ${attentionActivationIndex}
        JOIN attentions AS attention ON attention.id = activation.attention_id
-      WHERE attention.project_id = ?
-        AND activation.cause = 'Attention'
-        AND activation.finished_at IS NULL
-        AND activation.revoked_at IS NULL
-        AND activation.expires_at > ?
-        ${agentId ? "AND activation.agent_id = ?" : ""}`,
-    projectId,
-    atIso,
-    ...(agentId ? [agentId] : []),
-    projectId,
-    atIso,
-    ...(agentId ? [agentId] : []),
+      WHERE ${invariants.liveAttentionActivationPredicate("activation", "attention")}
+        AND attention.project_id = ?
+        ${agentId ? "AND activation.agent_id = ?" : ""}
+       ) AS live
+      GROUP BY live.agent_id, live.scope`;
+  recordQuery(
+    agentStatusQueryHookSymbol,
+    activationSql,
+    activationParameters,
+  );
+  const activationRows = db.allRows(
+    kernel,
+    activationSql,
+    ...activationParameters,
   );
   const liveRunCounts = new Map<string, number>();
   const liveAttentionCounts = new Map<string, number>();
   for (const activation of activationRows) {
-    if (
-      !invariants.isActivationLiveAt(
-        activation,
-        {
-          runState: optionalText(activation.scope_run_state),
-          runActivationGeneration:
-            activation.scope_run_activation_generation === null
-              ? null
-              : integer(activation.scope_run_activation_generation),
-          scopeAgentId: optionalText(activation.scope_agent_id),
-          attentionStatus: optionalText(activation.scope_attention_status),
-          attentionLeaseToken: optionalText(
-            activation.scope_attention_lease_token,
-          ),
-          attentionLeaseExpiresAt: optionalText(
-            activation.scope_attention_lease_expires_at,
-          ),
-        },
-        at,
-      )
-    ) {
-      continue;
-    }
     const counts =
-      text(activation.cause) === "Run"
+      text(activation.scope) === "Run"
         ? liveRunCounts
         : liveAttentionCounts;
     const activationAgentId = text(activation.agent_id);
-    counts.set(activationAgentId, (counts.get(activationAgentId) ?? 0) + 1);
+    counts.set(activationAgentId, integer(activation.count));
   }
 
   return {
@@ -615,6 +712,34 @@ export function latestActivityWindow(kernel: db.KernelContext, runId: string, li
         WHERE run_id = ?
         ORDER BY sequence DESC
         LIMIT ?`, runId, limit + 1);
+  const hasEarlier = rows.length > limit;
+  const items = rows.slice(0, limit).reverse().map(mapActivity);
+  return {
+    items,
+    hasEarlier,
+    earliestSequence: items[0]?.sequence ?? null,
+    latestSequence: items.at(-1)?.sequence ?? null,
+  };
+}
+
+export function latestActivityWindowAt(
+  kernel: db.KernelContext,
+  runId: string,
+  snapshotEventSequence: number,
+  limit: number,
+): ActivityWindow {
+  const rows = db.allRows(
+    kernel,
+    `SELECT *
+       FROM run_activity_events
+      WHERE run_id = ?
+        AND created_event_sequence <= ?
+      ORDER BY sequence DESC
+      LIMIT ?`,
+    runId,
+    snapshotEventSequence,
+    limit + 1,
+  );
   const hasEarlier = rows.length > limit;
   const items = rows.slice(0, limit).reverse().map(mapActivity);
   return {
@@ -816,10 +941,6 @@ export function listRecoverableAttentionExecutions(
     nextCursor: hasMore ? items.at(-1)?.cursor ?? null : null,
     hasMore,
   };
-}
-
-function parseStoredProjection<T>(value: unknown): T {
-  return JSON.parse(text(value)) as T;
 }
 
 function recordQuery(

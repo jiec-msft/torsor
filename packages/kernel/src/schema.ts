@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 7;
+export const CURRENT_SCHEMA_VERSION = 8;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS agents (
   name TEXT NOT NULL,
   current_config_revision INTEGER NOT NULL CHECK (current_config_revision > 0)
 ) STRICT;
+
+CREATE INDEX IF NOT EXISTS agents_project_name_idx
+  ON agents(project_id, name, id);
 
 CREATE TABLE IF NOT EXISTS agent_config_revisions (
   agent_id TEXT NOT NULL REFERENCES agents(id),
@@ -64,11 +67,15 @@ CREATE TABLE IF NOT EXISTS messages (
   caused_by_run_id TEXT REFERENCES runs(id),
   thread_sequence INTEGER NOT NULL CHECK (thread_sequence > 0),
   latest_revision INTEGER NOT NULL CHECK (latest_revision > 0),
+  created_event_sequence INTEGER REFERENCES public_events(sequence),
   created_at TEXT NOT NULL
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS messages_thread_idx
   ON messages(thread_root_id, thread_sequence);
+
+CREATE INDEX IF NOT EXISTS messages_thread_snapshot_idx
+  ON messages(thread_root_id, created_event_sequence, thread_sequence);
 
 CREATE TABLE IF NOT EXISTS message_revisions (
   id TEXT PRIMARY KEY,
@@ -76,6 +83,7 @@ CREATE TABLE IF NOT EXISTS message_revisions (
   revision INTEGER NOT NULL CHECK (revision > 0),
   body TEXT NOT NULL,
   tombstone INTEGER NOT NULL DEFAULT 0 CHECK (tombstone IN (0, 1)),
+  created_event_sequence INTEGER REFERENCES public_events(sequence),
   created_at TEXT NOT NULL,
   UNIQUE (message_id, revision)
 ) STRICT;
@@ -84,6 +92,7 @@ CREATE TABLE IF NOT EXISTS mentions (
   id TEXT PRIMARY KEY,
   message_revision_id TEXT NOT NULL REFERENCES message_revisions(id),
   target_agent_id TEXT NOT NULL REFERENCES agents(id),
+  created_event_sequence INTEGER REFERENCES public_events(sequence),
   created_at TEXT NOT NULL,
   UNIQUE (message_revision_id, target_agent_id)
 ) STRICT;
@@ -118,6 +127,9 @@ CREATE INDEX IF NOT EXISTS attentions_open_idx
 CREATE INDEX IF NOT EXISTS attentions_project_agent_status_idx
   ON attentions(project_id, target_agent_id, status, id);
 
+CREATE INDEX IF NOT EXISTS attentions_thread_snapshot_idx
+  ON attentions(thread_root_id, created_event_sequence, sequence);
+
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),
@@ -151,6 +163,9 @@ CREATE INDEX IF NOT EXISTS runs_project_channel_page_idx
 CREATE INDEX IF NOT EXISTS runs_project_agent_state_idx
   ON runs(project_id, owner_agent_id, state);
 
+CREATE INDEX IF NOT EXISTS runs_project_state_agent_idx
+  ON runs(project_id, state, owner_agent_id);
+
 CREATE TABLE IF NOT EXISTS run_inputs (
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES runs(id),
@@ -159,6 +174,7 @@ CREATE TABLE IF NOT EXISTS run_inputs (
   assigned_by_principal_id TEXT NOT NULL REFERENCES principals(id),
   assigned_by_activation_id TEXT REFERENCES activation_attempts(id),
   source_attention_id TEXT REFERENCES attentions(id),
+  created_event_sequence INTEGER REFERENCES public_events(sequence),
   created_at TEXT NOT NULL,
   disposition TEXT NOT NULL CHECK (disposition IN ('Pending', 'Incorporated', 'Declined', 'Superseded', 'Withdrawn', 'Abandoned')),
   disposition_revision INTEGER NOT NULL CHECK (disposition_revision > 0),
@@ -167,6 +183,13 @@ CREATE TABLE IF NOT EXISTS run_inputs (
   UNIQUE (run_id, message_revision_id),
   UNIQUE (run_id, run_input_sequence)
 ) STRICT;
+
+CREATE INDEX IF NOT EXISTS run_inputs_snapshot_idx
+  ON run_inputs(run_id, created_event_sequence, run_input_sequence);
+
+CREATE INDEX IF NOT EXISTS run_inputs_unmarked_idx
+  ON run_inputs(run_id, id)
+  WHERE created_event_sequence IS NULL;
 
 CREATE TABLE IF NOT EXISTS activation_attempts (
   id TEXT PRIMARY KEY,
@@ -177,6 +200,7 @@ CREATE TABLE IF NOT EXISTS activation_attempts (
   run_activation_generation INTEGER,
   cause TEXT NOT NULL CHECK (cause IN ('Run', 'Attention')),
   config_revision INTEGER NOT NULL,
+  created_event_sequence INTEGER REFERENCES public_events(sequence),
   started_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
   revoked_at TEXT,
@@ -194,6 +218,9 @@ CREATE TABLE IF NOT EXISTS activation_attempts (
   FOREIGN KEY (agent_id, config_revision)
     REFERENCES agent_config_revisions(agent_id, revision)
 ) STRICT;
+
+CREATE INDEX IF NOT EXISTS activation_run_snapshot_idx
+  ON activation_attempts(run_id, created_event_sequence, started_at, id);
 
 CREATE TABLE IF NOT EXISTS activation_run_inputs (
   activation_id TEXT NOT NULL REFERENCES activation_attempts(id),
@@ -215,6 +242,7 @@ CREATE TABLE IF NOT EXISTS provider_attempts (
   diagnostic_session_id TEXT,
   status TEXT NOT NULL CHECK (status IN ('Started', 'Acknowledged', 'Completed', 'Failed', 'Unknown')),
   detail TEXT,
+  created_event_sequence INTEGER REFERENCES public_events(sequence),
   started_at TEXT NOT NULL,
   finished_at TEXT,
   UNIQUE (activation_id, request_idempotency_key)
@@ -222,6 +250,9 @@ CREATE TABLE IF NOT EXISTS provider_attempts (
 
 CREATE INDEX IF NOT EXISTS provider_attempts_activation_status_idx
   ON provider_attempts(activation_id, status);
+
+CREATE INDEX IF NOT EXISTS provider_attempts_run_snapshot_idx
+  ON provider_attempts(run_id, created_event_sequence, started_at, id);
 
 CREATE INDEX IF NOT EXISTS provider_attempts_unsettled_activation_idx
   ON provider_attempts(status, activation_id)
@@ -231,12 +262,20 @@ CREATE INDEX IF NOT EXISTS activation_attention_expired_idx
   ON activation_attempts(expires_at, started_at, id)
   WHERE cause = 'Attention' AND finished_at IS NULL;
 
-CREATE INDEX IF NOT EXISTS activation_current_run_idx
-  ON activation_attempts(run_id, expires_at, run_activation_generation, agent_id)
+CREATE INDEX IF NOT EXISTS activation_live_run_expiry_idx
+  ON activation_attempts(expires_at, run_id, agent_id, run_activation_generation)
   WHERE cause = 'Run' AND finished_at IS NULL AND revoked_at IS NULL;
 
-CREATE INDEX IF NOT EXISTS activation_current_attention_idx
-  ON activation_attempts(attention_id, expires_at, agent_id)
+CREATE INDEX IF NOT EXISTS activation_live_run_agent_expiry_idx
+  ON activation_attempts(agent_id, expires_at, run_id, run_activation_generation)
+  WHERE cause = 'Run' AND finished_at IS NULL AND revoked_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS activation_live_attention_expiry_idx
+  ON activation_attempts(expires_at, attention_id, agent_id)
+  WHERE cause = 'Attention' AND finished_at IS NULL AND revoked_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS activation_live_attention_agent_expiry_idx
+  ON activation_attempts(agent_id, expires_at, attention_id)
   WHERE cause = 'Attention' AND finished_at IS NULL AND revoked_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS run_activity_events (
@@ -248,10 +287,15 @@ CREATE TABLE IF NOT EXISTS run_activity_events (
   kind TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   retention_class TEXT NOT NULL CHECK (retention_class IN ('durable', 'transient')),
+  created_event_sequence INTEGER REFERENCES public_events(sequence),
   created_at TEXT NOT NULL,
   UNIQUE (run_id, sequence),
   CHECK (activation_id IS NOT NULL OR provider_attempt_id IS NOT NULL)
 ) STRICT;
+
+CREATE INDEX IF NOT EXISTS run_activity_unmarked_idx
+  ON run_activity_events(run_id, id)
+  WHERE created_event_sequence IS NULL;
 
 CREATE TABLE IF NOT EXISTS artifacts (
   id TEXT PRIMARY KEY,
@@ -263,6 +307,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
   storage_location TEXT NOT NULL,
   visibility_channel_id TEXT NOT NULL REFERENCES channels(id),
   metadata_json TEXT,
+  created_event_sequence INTEGER REFERENCES public_events(sequence),
   created_at TEXT NOT NULL,
   UNIQUE (producer_run_id, content_digest)
 ) STRICT;
@@ -323,25 +368,64 @@ CREATE INDEX IF NOT EXISTS public_events_project_sequence_idx
 CREATE INDEX IF NOT EXISTS public_events_correlation_sequence_idx
   ON public_events(correlation_id, sequence);
 
-CREATE TABLE IF NOT EXISTS thread_projection_history (
-  thread_root_id TEXT NOT NULL REFERENCES threads(root_message_id),
-  event_sequence INTEGER NOT NULL REFERENCES public_events(sequence),
-  projection_json TEXT NOT NULL,
-  PRIMARY KEY (thread_root_id, event_sequence)
-) STRICT;
+CREATE INDEX IF NOT EXISTS public_events_project_correlation_sequence_idx
+  ON public_events(project_id, correlation_id, sequence);
 
-CREATE INDEX IF NOT EXISTS thread_projection_snapshot_idx
-  ON thread_projection_history(thread_root_id, event_sequence DESC);
+CREATE INDEX IF NOT EXISTS public_events_thread_sequence_idx
+  ON public_events(thread_root_id, sequence, thread_cursor);
 
-CREATE TABLE IF NOT EXISTS run_projection_history (
+CREATE TABLE IF NOT EXISTS run_history (
   run_id TEXT NOT NULL REFERENCES runs(id),
   event_sequence INTEGER NOT NULL REFERENCES public_events(sequence),
-  projection_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('Active', 'Waiting', 'Completed', 'Failed', 'Cancelled')),
+  revision INTEGER NOT NULL CHECK (revision > 0),
+  activation_generation INTEGER NOT NULL CHECK (activation_generation >= 0),
+  updated_at TEXT NOT NULL,
+  terminal_reason TEXT,
   PRIMARY KEY (run_id, event_sequence)
 ) STRICT;
 
-CREATE INDEX IF NOT EXISTS run_projection_snapshot_idx
-  ON run_projection_history(run_id, event_sequence DESC);
+CREATE INDEX IF NOT EXISTS run_history_snapshot_idx
+  ON run_history(run_id, event_sequence DESC);
+
+CREATE TABLE IF NOT EXISTS run_input_history (
+  run_input_id TEXT NOT NULL REFERENCES run_inputs(id),
+  event_sequence INTEGER NOT NULL REFERENCES public_events(sequence),
+  disposition TEXT NOT NULL CHECK (disposition IN ('Pending', 'Incorporated', 'Declined', 'Superseded', 'Withdrawn', 'Abandoned')),
+  disposition_revision INTEGER NOT NULL CHECK (disposition_revision > 0),
+  disposition_reason TEXT,
+  superseded_by_run_input_id TEXT REFERENCES run_inputs(id),
+  PRIMARY KEY (run_input_id, event_sequence)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS run_input_history_snapshot_idx
+  ON run_input_history(run_input_id, event_sequence DESC);
+
+CREATE TABLE IF NOT EXISTS activation_history (
+  activation_id TEXT NOT NULL REFERENCES activation_attempts(id),
+  event_sequence INTEGER NOT NULL REFERENCES public_events(sequence),
+  revoked_at TEXT,
+  revocation_reason TEXT,
+  finished_at TEXT,
+  outcome TEXT CHECK (outcome IS NULL OR outcome IN ('Completed', 'Failed', 'Cancelled', 'Expired')),
+  detail TEXT,
+  PRIMARY KEY (activation_id, event_sequence)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS activation_history_snapshot_idx
+  ON activation_history(activation_id, event_sequence DESC);
+
+CREATE TABLE IF NOT EXISTS provider_attempt_history (
+  provider_attempt_id TEXT NOT NULL REFERENCES provider_attempts(id),
+  event_sequence INTEGER NOT NULL REFERENCES public_events(sequence),
+  status TEXT NOT NULL CHECK (status IN ('Started', 'Acknowledged', 'Completed', 'Failed', 'Unknown')),
+  detail TEXT,
+  finished_at TEXT,
+  PRIMARY KEY (provider_attempt_id, event_sequence)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS provider_attempt_history_snapshot_idx
+  ON provider_attempt_history(provider_attempt_id, event_sequence DESC);
 
 CREATE TABLE IF NOT EXISTS attention_history (
   attention_id TEXT NOT NULL REFERENCES attentions(id),
@@ -350,6 +434,7 @@ CREATE TABLE IF NOT EXISTS attention_history (
   revision INTEGER NOT NULL CHECK (revision > 0),
   handler_lease_holder_principal_id TEXT REFERENCES principals(id),
   handler_lease_expires_at TEXT,
+  resolution_outcome TEXT,
   resolved_run_id TEXT REFERENCES runs(id),
   resolved_at TEXT,
   PRIMARY KEY (attention_id, event_sequence)
