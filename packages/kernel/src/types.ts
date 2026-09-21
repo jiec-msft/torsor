@@ -12,6 +12,10 @@ export type RunState =
   | "Failed"
   | "Cancelled";
 export type AttentionStatus = "Open" | "Resolved" | "Ignored";
+export type AttentionResolutionOutcome =
+  | "RunCreated"
+  | "ExistingRunContinued"
+  | "Ignored";
 export type RunInputDisposition =
   | "Pending"
   | "Incorporated"
@@ -131,6 +135,24 @@ export interface ResolveAttentionWithRunCommand extends IdempotentCommand {
   readonly attentionId: string;
   readonly expectedAttentionRevision: number;
   readonly handlerLeaseToken: string;
+}
+
+export interface IgnoreAttentionCommand extends IdempotentCommand {
+  readonly type: "IgnoreAttention";
+  readonly attentionId: string;
+  readonly expectedAttentionRevision: number;
+  readonly handlerLeaseToken: string;
+  readonly reason: string;
+}
+
+export interface ResolveAttentionWithExistingRunCommand
+  extends IdempotentCommand {
+  readonly type: "ResolveAttentionWithExistingRun";
+  readonly attentionId: string;
+  readonly expectedAttentionRevision: number;
+  readonly handlerLeaseToken: string;
+  readonly runId: string;
+  readonly expectedRunRevision: number;
 }
 
 export interface StartActivationCommand extends IdempotentCommand {
@@ -266,6 +288,8 @@ export type KernelCommand =
   | WithdrawRunInputCommand
   | ClaimAttentionCommand
   | ResolveAttentionWithRunCommand
+  | IgnoreAttentionCommand
+  | ResolveAttentionWithExistingRunCommand
   | StartActivationCommand
   | FinishActivationCommand
   | StartProviderAttemptCommand
@@ -352,6 +376,9 @@ export interface MessageView {
 export interface AttentionView {
   readonly cursor: number;
   readonly id: string;
+  readonly projectId: string;
+  readonly channelId: string;
+  readonly threadRootId: string;
   readonly messageRevisionId: string;
   readonly targetAgentId: string;
   readonly triggerKind: string;
@@ -359,6 +386,7 @@ export interface AttentionView {
   readonly revision: number;
   readonly handlerLeaseHolderPrincipalId: string | null;
   readonly handlerLeaseExpiresAt: string | null;
+  readonly resolutionOutcome: AttentionResolutionOutcome | null;
   readonly resolvedRunId: string | null;
   readonly createdAt: string;
   readonly resolvedAt: string | null;
