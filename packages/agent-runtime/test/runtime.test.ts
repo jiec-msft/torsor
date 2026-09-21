@@ -26,10 +26,16 @@ const bootstrap: KernelBootstrap = {
     { id: "principal-runtime", kind: "runtime", displayName: "Local Runtime" },
     { id: "principal-orbit", kind: "agent", displayName: "Orbit" },
     { id: "principal-keel", kind: "agent", displayName: "Keel" },
+    { id: "principal-lumen", kind: "agent", displayName: "Lumen" },
+    { id: "principal-rivet", kind: "agent", displayName: "Rivet" },
+    { id: "principal-sable", kind: "agent", displayName: "Sable" },
   ],
   projects: [
     { id: "project-sample", name: "Sample Project" },
     { id: "project-secondary", name: "Secondary Project" },
+    { id: "project-third", name: "Third Project" },
+    { id: "project-fourth", name: "Fourth Project" },
+    { id: "project-fifth", name: "Fifth Project" },
   ],
   channels: [
     {
@@ -40,6 +46,21 @@ const bootstrap: KernelBootstrap = {
     {
       id: "channel-secondary",
       projectId: "project-secondary",
+      name: "general",
+    },
+    {
+      id: "channel-third",
+      projectId: "project-third",
+      name: "general",
+    },
+    {
+      id: "channel-fourth",
+      projectId: "project-fourth",
+      name: "general",
+    },
+    {
+      id: "channel-fifth",
+      projectId: "project-fifth",
       name: "general",
     },
   ],
@@ -57,6 +78,30 @@ const bootstrap: KernelBootstrap = {
       principalId: "principal-keel",
       projectId: "project-secondary",
       name: "Keel",
+      configRevision: 1,
+      config: { provider: "deterministic-fake" },
+    },
+    {
+      id: "agent-lumen",
+      principalId: "principal-lumen",
+      projectId: "project-third",
+      name: "Lumen",
+      configRevision: 1,
+      config: { provider: "deterministic-fake" },
+    },
+    {
+      id: "agent-rivet",
+      principalId: "principal-rivet",
+      projectId: "project-fourth",
+      name: "Rivet",
+      configRevision: 1,
+      config: { provider: "deterministic-fake" },
+    },
+    {
+      id: "agent-sable",
+      principalId: "principal-sable",
+      projectId: "project-fifth",
+      name: "Sable",
       configRevision: 1,
       config: { provider: "deterministic-fake" },
     },
@@ -380,6 +425,138 @@ describe("AgentRuntime", () => {
       kernel.close();
     }
   }, 20_000);
+
+  it(
+    "gives a fifth Project a bounded turn after 400 earlier domains",
+    async () => {
+      const kernel = openKernel(":memory:");
+      const earlyProjects = [
+        {
+          projectId: "project-sample",
+          channelId: "channel-general",
+          agentId: "agent-orbit",
+        },
+        {
+          projectId: "project-secondary",
+          channelId: "channel-secondary",
+          agentId: "agent-keel",
+        },
+        {
+          projectId: "project-third",
+          channelId: "channel-third",
+          agentId: "agent-lumen",
+        },
+        {
+          projectId: "project-fourth",
+          channelId: "channel-fourth",
+          agentId: "agent-rivet",
+        },
+      ] as const;
+      let releaseEarly!: () => void;
+      let signalEarlyStarted!: () => void;
+      let signalFifthStarted!: () => void;
+      const release = new Promise<void>((resolve) => {
+        releaseEarly = resolve;
+      });
+      const earlyStarted = new Promise<void>((resolve) => {
+        signalEarlyStarted = resolve;
+      });
+      const fifthStarted = new Promise<void>((resolve) => {
+        signalFifthStarted = resolve;
+      });
+      const blockedProjects = new Set<string>();
+      const domainActive = new Map<string, number>();
+      let active = 0;
+      let maximumActive = 0;
+      let maximumDomainActive = 0;
+      let totalExecutions = 0;
+      let executionsWhenFifthStarted = Number.POSITIVE_INFINITY;
+      try {
+        for (const project of earlyProjects) {
+          for (let index = 0; index < 100; index += 1) {
+            await startProjectMention(
+              kernel,
+              project,
+              `cross-project-fairness:${project.projectId}:${index}`,
+              `${project.agentId}, handle cross-Project item ${index}.`,
+            );
+          }
+        }
+        await startProjectMention(
+          kernel,
+          {
+            projectId: "project-fifth",
+            channelId: "channel-fifth",
+            agentId: "agent-sable",
+          },
+          "cross-project-fairness:fifth",
+          "Sable, handle the fifth Project.",
+        );
+        const adapter = new DeterministicFakeAdapter(async (context) => {
+          if (context.cause.type !== "attention") {
+            throw new Error(
+              "The cross-Project fairness test must not create Run work.",
+            );
+          }
+          const { projectId, threadRootId } = context.cause.attention;
+          active += 1;
+          maximumActive = Math.max(maximumActive, active);
+          const nextDomainActive =
+            (domainActive.get(threadRootId) ?? 0) + 1;
+          domainActive.set(threadRootId, nextDomainActive);
+          maximumDomainActive = Math.max(
+            maximumDomainActive,
+            nextDomainActive,
+          );
+          totalExecutions += 1;
+          try {
+            if (
+              projectId !== "project-fifth" &&
+              !blockedProjects.has(projectId)
+            ) {
+              blockedProjects.add(projectId);
+              if (blockedProjects.size === earlyProjects.length) {
+                signalEarlyStarted();
+              }
+              await release;
+            }
+            if (projectId === "project-fifth") {
+              executionsWhenFifthStarted = totalExecutions;
+              signalFifthStarted();
+            }
+            await context.capabilities.ignoreAttention(
+              "Hierarchically scheduled synthetic Attention.",
+            );
+          } finally {
+            active -= 1;
+            domainActive.set(threadRootId, nextDomainActive - 1);
+          }
+        });
+        const runtime = createRuntime(kernel, adapter, {
+          projectIds: [
+            ...earlyProjects.map((project) => project.projectId),
+            "project-fifth",
+          ],
+          attentionConcurrency: 4,
+        });
+
+        const pass = runtime.runOnce();
+        await earlyStarted;
+        releaseEarly();
+        await fifthStarted;
+        const result = await pass;
+
+        expect(result.attentionsDispatched).toBe(401);
+        expect(executionsWhenFifthStarted).toBeLessThanOrEqual(9);
+        expect(maximumActive).toBe(4);
+        expect(maximumDomainActive).toBe(1);
+      } finally {
+        releaseEarly();
+        kernel.close();
+      }
+    },
+    60_000,
+  );
 
   it(
     "admits a fifth later domain before four early domains drain",
@@ -3053,60 +3230,6 @@ describe("AgentRuntime", () => {
     30_000,
   );
 
-  it("verifies recovery again after a clean-sweep mutation", async () => {
-    const kernel = openKernel(":memory:");
-    let pages = 0;
-    let transitioned = false;
-    try {
-      const execution = await prepareAttentionAttempt(
-        kernel,
-        "recovery-clean-sweep-mutation",
-        300_000,
-      );
-      await clearOutbox(kernel);
-      const runtime = createRuntime(
-        kernel,
-        new DeterministicFakeAdapter(),
-        {
-          hooks: {
-            afterAttentionRecoveryPage: async ({ itemCount }) => {
-              pages += 1;
-              if (pages !== 2 || itemCount !== 0) {
-                return;
-              }
-              transitioned = true;
-              await kernel.execute(
-                {
-                  type: "FinishActivation",
-                  idempotencyKey:
-                    "recovery-clean-sweep-mutation:finish",
-                  activationId: execution.activationId,
-                  outcome: "Completed",
-                },
-                runtimeContext,
-              );
-            },
-          },
-        },
-      );
-
-      await runtime.drainUntilIdle();
-
-      expect(transitioned).toBe(true);
-      expect(
-        await kernel.query(
-          {
-            type: "GetProviderAttempt",
-            providerAttemptId: execution.attemptId,
-          },
-          runtimeContext,
-        ),
-      ).toMatchObject({ status: "Unknown" });
-    } finally {
-      kernel.close();
-    }
-  });
-
   it("cancels provider execution when durable Run state is cancelled", async () => {
     const kernel = openKernel(":memory:");
     const attentionAdapter = new DeterministicFakeAdapter();
@@ -3217,6 +3340,29 @@ async function startMention(
       channelId: "channel-general",
       body,
       targetAgentIds: ["agent-orbit"],
+    },
+    humanContext,
+  );
+}
+
+async function startProjectMention(
+  kernel: TorsorKernel,
+  project: {
+    readonly projectId: string;
+    readonly channelId: string;
+    readonly agentId: string;
+  },
+  idempotencyKey: string,
+  body: string,
+) {
+  return kernel.execute(
+    {
+      type: "StartThread",
+      idempotencyKey,
+      projectId: project.projectId,
+      channelId: project.channelId,
+      body,
+      targetAgentIds: [project.agentId],
     },
     humanContext,
   );

@@ -10,9 +10,13 @@ The runtime provides:
 - Explicit Agent decisions to ignore an Attention, continue one eligible
   same-thread Run, or create a new Run.
 - Configurably bounded Attention concurrency across independent Agent/Thread
-  domains and Projects, with page-round-robin discovery, bounded per-domain
-  admission, in-pass reconsideration, and same-domain ordering preserved
-  across pages and claim races.
+  domains and Projects, with page-round-robin discovery, hierarchical
+  Project/domain dispatch, in-pass reconsideration, and same-domain ordering
+  preserved across pages and claim races. Each Project retains at most one
+  queued candidate beyond the global concurrency width; a newly ready Project
+  receives a turn after at most one candidate from each Project already in the
+  scheduler rotation. Later-page candidates replace queued candidates within
+  that same bounded Project reservoir rather than joining an unbounded FIFO.
 - Ordered, leased outbox consumption with idempotent command keys.
 - A provider-neutral adapter contract and deterministic fake adapter.
 - A GitHub Copilot CLI ACP stdio adapter using `copilot --acp --stdio`.
@@ -24,9 +28,11 @@ input from Kernel projections and never treats a provider session as
 authoritative state. Provider delivery failures park Runs through one atomic
 Kernel command, and expired Attention executions are discovered through
 bounded targeted projections rather than public-event history scans. Recovery
-restarts bounded keyset sweeps after settlements so an older Activation that
-becomes eligible behind an advanced cursor is still reconciled in the same
-drain.
+restarts bounded keyset sweeps after settlements, so an older Activation that
+becomes eligible behind an advanced cursor during a productive sweep is still
+reconciled in the same drain. Proving that an otherwise clean complete sweep
+was mutation-free still requires a Kernel recovery-set revision or snapshot
+token.
 
 The current Kernel contract does not expose lease renewal. The runtime
 therefore claims one outbox event at a time and requires Attention and outbox

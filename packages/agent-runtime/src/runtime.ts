@@ -88,6 +88,9 @@ interface RuntimePassExecution extends RuntimePassResult {
 
 type AttentionDispatchResult = "dispatched" | "blocked" | "retry";
 
+const ATTENTION_PAGE_SIZE = 100;
+const ATTENTION_PROJECT_QUEUE_RESERVE = 1;
+
 export class AgentRuntime {
   readonly #kernel: TorsorKernel;
   readonly #runtimeContext: { readonly principalId: string };
@@ -214,11 +217,16 @@ export class AgentRuntime {
   }> {
     let dispatched = 0;
     let deferred = 0;
-    for (let round = 0; round < 100; round += 1) {
+    for (
+      let round = 0;
+      round < this.#attentionConcurrency * ATTENTION_PAGE_SIZE;
+      round += 1
+    ) {
       const scheduler = new AttentionScheduler({
         concurrency: this.#attentionConcurrency,
-        bufferLimit: this.#attentionConcurrency * 100,
-        domainLimit: this.#attentionConcurrency,
+        bufferLimit: this.#attentionConcurrency * ATTENTION_PAGE_SIZE,
+        projectLimit:
+          this.#attentionConcurrency + ATTENTION_PROJECT_QUEUE_RESERVE,
         ...(this.#hooks.attentionBufferChanged
           ? { onBufferChanged: this.#hooks.attentionBufferChanged }
           : {}),
@@ -234,7 +242,7 @@ export class AgentRuntime {
       });
       const producerError = await this.#enqueueOpenAttentions(
         scheduler,
-        this.#attentionConcurrency * 100,
+        this.#attentionConcurrency * ATTENTION_PAGE_SIZE,
       );
       const result = await scheduler.drain();
       if (producerError !== undefined) {
@@ -290,7 +298,7 @@ export class AgentRuntime {
                 ...(state.snapshotEventId === undefined
                   ? {}
                   : { snapshotEventId: state.snapshotEventId }),
-                limit: 100,
+                limit: ATTENTION_PAGE_SIZE,
               },
               this.#runtimeContext,
             );
@@ -307,7 +315,7 @@ export class AgentRuntime {
         ): result is NonNullable<(typeof results)[number]> =>
           result !== undefined,
       );
-      for (let index = 0; index < 100; index += 1) {
+      for (let index = 0; index < ATTENTION_PAGE_SIZE; index += 1) {
         for (const { page } of pages) {
           const attention = page.items[index];
           if (attention === undefined) {
@@ -1125,8 +1133,6 @@ export class AgentRuntime {
 
   async #reconcileOrphanedAttentionExecutions(): Promise<number> {
     let recoveries = 0;
-    let cleanSweeps = 0;
-    let lastStalledHead: string | undefined;
     for (let sweep = 0; sweep < 100; sweep += 1) {
       let afterCursor:
         | {
@@ -1165,37 +1171,7 @@ export class AgentRuntime {
         afterCursor = page.nextCursor;
       }
       recoveries += sweepRecoveries;
-      if (sweepRecoveries > 0) {
-        cleanSweeps = 0;
-        lastStalledHead = undefined;
-        continue;
-      }
-      const verification = await this.#kernel.query(
-        {
-          type: "ListRecoverableAttentionExecutions",
-          limit: 1,
-        },
-        this.#runtimeContext,
-      );
-      const head = verification.items[0];
-      if (head) {
-        const headKey = JSON.stringify({
-          activationId: head.activation.id,
-          finishedAt: head.activation.finishedAt,
-          attempts: head.providerAttempts.map((attempt) => [
-            attempt.id,
-            attempt.status,
-          ]),
-        });
-        if (headKey === lastStalledHead) {
-          break;
-        }
-        lastStalledHead = headKey;
-        cleanSweeps = 0;
-        continue;
-      }
-      cleanSweeps += 1;
-      if (cleanSweeps >= 2) {
+      if (sweepRecoveries === 0) {
         break;
       }
     }
@@ -1262,7 +1238,7 @@ export class AgentRuntime {
 interface AttentionSchedulerOptions {
   readonly concurrency: number;
   readonly bufferLimit: number;
-  readonly domainLimit: number;
+  readonly projectLimit: number;
   readonly dispatch: (
     attention: AttentionView,
   ) => Promise<AttentionDispatchResult>;
@@ -1275,14 +1251,18 @@ interface AttentionSchedulerOptions {
 class AttentionScheduler {
   readonly #queues = new Map<
     string,
-    Array<{
+    {
       readonly attention: AttentionView;
-    }>
+      readonly projectId: string;
+    }
   >();
   readonly #activeDomains = new Set<string>();
   readonly #domainDeferred = new Map<string, number>();
-  readonly #readyDomains: string[] = [];
-  readonly #readyDomainSet = new Set<string>();
+  readonly #projectRetained = new Map<string, number>();
+  readonly #projectReadyDomains = new Map<string, string[]>();
+  readonly #projectReadyDomainSets = new Map<string, Set<string>>();
+  readonly #readyProjects: string[] = [];
+  readonly #readyProjectSet = new Set<string>();
   readonly #drainWaiters = new Set<() => void>();
   #buffered = 0;
   #dispatched = 0;
@@ -1293,12 +1273,7 @@ class AttentionScheduler {
 
   enqueue(attention: AttentionView): boolean {
     const key = attentionConflictDomain(attention);
-    const queue = this.#queues.get(key);
-    if (this.#buffered >= this.options.bufferLimit) {
-      this.#deferred += 1;
-      return false;
-    }
-    if ((queue?.length ?? 0) >= this.options.domainLimit) {
+    if (this.#queues.has(key) || this.#activeDomains.has(key)) {
       this.#deferred += 1;
       this.#domainDeferred.set(
         key,
@@ -1306,13 +1281,31 @@ class AttentionScheduler {
       );
       return false;
     }
-    if (queue) {
-      queue.push({ attention });
-    } else {
-      this.#queues.set(key, [{ attention }]);
+    const projectId = attention.projectId;
+    if (
+      (this.#projectRetained.get(projectId) ?? 0) >=
+      this.options.projectLimit
+    ) {
+      if (!this.#evictQueuedCandidate(projectId)) {
+        this.#deferred += 1;
+        return false;
+      }
+    } else if (this.#buffered >= this.options.bufferLimit) {
+      const projectRetained =
+        this.#projectRetained.get(projectId) ?? 0;
+      const madeRoom =
+        projectRetained === 0
+          ? this.#evictForNewProject(projectId)
+          : this.#evictQueuedCandidate(projectId);
+      if (!madeRoom) {
+        this.#deferred += 1;
+        return false;
+      }
     }
+    this.#queues.set(key, { attention, projectId });
     this.#buffered += 1;
-    this.#markReady(key);
+    this.#changeProjectRetained(projectId, 1);
+    this.#markReady(projectId, key);
     this.#pump();
     this.#notifyRetainedChanged();
     return true;
@@ -1336,25 +1329,53 @@ class AttentionScheduler {
     };
   }
 
-  #markReady(key: string): void {
+  #markReady(projectId: string, key: string): void {
+    if (this.#activeDomains.has(key)) {
+      return;
+    }
+    let readySet = this.#projectReadyDomainSets.get(projectId);
+    if (!readySet) {
+      readySet = new Set<string>();
+      this.#projectReadyDomainSets.set(projectId, readySet);
+    }
+    if (!readySet.has(key)) {
+      readySet.add(key);
+      let readyDomains = this.#projectReadyDomains.get(projectId);
+      if (!readyDomains) {
+        readyDomains = [];
+        this.#projectReadyDomains.set(projectId, readyDomains);
+      }
+      readyDomains.push(key);
+    }
+    this.#markProjectReady(projectId);
+  }
+
+  #markProjectReady(projectId: string): void {
     if (
-      this.#readyDomainSet.has(key) ||
-      this.#activeDomains.has(key)
+      this.#readyProjectSet.has(projectId) ||
+      (this.#projectReadyDomainSets.get(projectId)?.size ?? 0) === 0
     ) {
       return;
     }
-    this.#readyDomainSet.add(key);
-    this.#readyDomains.push(key);
+    this.#readyProjectSet.add(projectId);
+    this.#readyProjects.push(projectId);
   }
 
   #pump(): void {
     while (
       this.#activeDomains.size < this.options.concurrency &&
-      this.#readyDomains.length > 0
+      this.#readyProjects.length > 0
     ) {
-      const key = this.#readyDomains.shift()!;
-      this.#readyDomainSet.delete(key);
-      const queued = this.#queues.get(key)?.[0];
+      const projectId = this.#readyProjects.shift()!;
+      if (!this.#readyProjectSet.delete(projectId)) {
+        continue;
+      }
+      const key = this.#takeReadyDomain(projectId);
+      this.#markProjectReady(projectId);
+      if (key === undefined) {
+        continue;
+      }
+      const queued = this.#queues.get(key);
       if (queued === undefined) {
         continue;
       }
@@ -1367,6 +1388,7 @@ class AttentionScheduler {
     key: string,
     queued: {
       readonly attention: AttentionView;
+      readonly projectId: string;
     },
   ): Promise<void> {
     let result: AttentionDispatchResult | "error" = "error";
@@ -1380,16 +1402,10 @@ class AttentionScheduler {
     } finally {
       this.#activeDomains.delete(key);
       const queue = this.#queues.get(key);
-      if (result === "dispatched" && queue?.[0] === queued) {
-        queue.shift();
-        if (queue.length === 0) {
-          this.#queues.delete(key);
-          this.#domainDeferred.delete(key);
-        }
-        this.#buffered -= 1;
-      } else if (queue !== undefined) {
+      if (queue === queued) {
         this.#queues.delete(key);
-        this.#buffered -= queue.length;
+        this.#buffered -= 1;
+        this.#changeProjectRetained(queued.projectId, -1);
         const domainDeferred = this.#domainDeferred.get(key) ?? 0;
         if (result === "blocked") {
           this.#deferred -= domainDeferred;
@@ -1398,11 +1414,66 @@ class AttentionScheduler {
         }
         this.#domainDeferred.delete(key);
       }
-      if (this.#queues.has(key)) {
-        this.#markReady(key);
-      }
       this.#pump();
       this.#notifyRetainedChanged();
+    }
+  }
+
+  #takeReadyDomain(projectId: string): string | undefined {
+    const readyDomains = this.#projectReadyDomains.get(projectId);
+    const readySet = this.#projectReadyDomainSets.get(projectId);
+    while (readyDomains && readyDomains.length > 0) {
+      const key = readyDomains.shift()!;
+      if (!readySet?.delete(key)) {
+        continue;
+      }
+      return key;
+    }
+    if (readySet?.size === 0) {
+      this.#projectReadyDomainSets.delete(projectId);
+      this.#projectReadyDomains.delete(projectId);
+    }
+    return undefined;
+  }
+
+  #evictQueuedCandidate(projectId: string): boolean {
+    const key = this.#takeReadyDomain(projectId);
+    if (key === undefined) {
+      return false;
+    }
+    const queued = this.#queues.get(key);
+    if (!queued || this.#activeDomains.has(key)) {
+      return false;
+    }
+    this.#queues.delete(key);
+    this.#buffered -= 1;
+    this.#changeProjectRetained(projectId, -1);
+    this.#deferred += 1;
+    this.#domainDeferred.delete(key);
+    return true;
+  }
+
+  #evictForNewProject(projectId: string): boolean {
+    const candidates = [...this.#projectRetained.entries()]
+      .filter(
+        ([candidateProjectId, retained]) =>
+          candidateProjectId !== projectId && retained > 1,
+      )
+      .sort((left, right) => right[1] - left[1]);
+    for (const [candidateProjectId] of candidates) {
+      if (this.#evictQueuedCandidate(candidateProjectId)) {
+        return true;
+      }
+    }
+    return this.#evictQueuedCandidate(projectId);
+  }
+
+  #changeProjectRetained(projectId: string, delta: number): void {
+    const next = (this.#projectRetained.get(projectId) ?? 0) + delta;
+    if (next === 0) {
+      this.#projectRetained.delete(projectId);
+    } else {
+      this.#projectRetained.set(projectId, next);
     }
   }
 
