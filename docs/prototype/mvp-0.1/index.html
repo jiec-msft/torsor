@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Torsor MVP 0.1 · Desktop Workbench</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="desktop-shell" id="desktopShell">
+      <nav class="activity-rail" aria-label="Primary navigation">
+        <button class="brand-mark" data-view="workbench" aria-label="Torsor workbench">
+          <i></i><i></i><i></i>
+        </button>
+        <button class="rail-button active" data-view="workbench" title="Channels and Threads">
+          <span>#</span><small>Threads</small>
+        </button>
+        <button class="rail-button" data-view="activity" title="Activity across all Threads">
+          <span>◉</span><small>Activity</small><b>5</b>
+        </button>
+        <button class="rail-button" data-view="agents" title="Agent overview">
+          <span>⌁</span><small>Agents</small>
+        </button>
+        <div class="rail-spacer"></div>
+        <button class="rail-button" data-open-shortcuts title="Keyboard shortcuts">
+          <span>?</span><small>Help</small>
+        </button>
+        <button class="human-mark" title="Alex · Human full control">AC</button>
+      </nav>
+
+      <aside class="channel-panel" id="channelPanel"></aside>
+
+      <main class="main-shell">
+        <header class="topbar" id="topbar"></header>
+        <section class="main-view" id="mainView"></section>
+      </main>
+    </div>
+
+    <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+
+    <dialog class="shortcut-dialog" id="shortcutDialog">
+      <header><strong>Workbench shortcuts</strong><button id="closeShortcuts" aria-label="Close">×</button></header>
+      <dl>
+        <div><dt>Ctrl 1</dt><dd>Toggle Conversation</dd></div>
+        <div><dt>Ctrl 2</dt><dd>Toggle Workspaces</dd></div>
+        <div><dt>Ctrl 3</dt><dd>Focus Runs / restore context</dd></div>
+        <div><dt>Ctrl \</dt><dd>Split right</dd></div>
+        <div><dt>Ctrl Shift \</dt><dd>Split down</dd></div>
+      </dl>
+    </dialog>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

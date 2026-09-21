@@ -13,6 +13,16 @@ conversations, search local work, send deterministic messages and responses,
 create tasks and workstreams, inspect artifacts and authority, retry runs,
 review results, and reconcile uncertain external effects.
 
+## Current design baseline
+
+This React application records an earlier executable exploration. The accepted
+MVP 0.1 core, desktop interaction model, and dependency-free design prototype
+are documented in the
+[MVP 0.1 design baseline (Simplified Chinese)](../docs/prototype/001-overview.zh-cn.md).
+
+The next implementation slice should use that baseline when replacing or
+reusing behavior from this exploration.
+
 ## Run locally
 
 ```sh
