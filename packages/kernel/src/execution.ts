@@ -176,9 +176,14 @@ export function finishActivation(kernel: db.KernelContext, command: Extract<Kern
     throw new KernelError("Conflict", "The Activation is already finished.");
   }
   const now = db.now(kernel);
-  db.run(kernel, `UPDATE activation_attempts
+  const changed = db.allRows(kernel, `UPDATE activation_attempts
           SET finished_at = ?, outcome = ?, detail = ?
-        WHERE id = ?`, now, command.outcome, command.detail ?? null, command.activationId);
+        WHERE id = ?
+        RETURNING id`, now, command.outcome, command.detail ?? null, command.activationId);
+  invariants.markActivationChanges(
+    kernel,
+    changed.map((row) => text(row.id)),
+  );
   const scope = invariants.activationScope(kernel, activation);
   invariants.emitEvent(kernel, {
     type: "ActivationFinished",
