@@ -207,6 +207,16 @@ export interface FailProviderAttemptCommand extends IdempotentCommand {
   readonly error: string;
 }
 
+export interface ParkRunAfterProviderAttemptFailureCommand
+  extends IdempotentCommand {
+  readonly type: "ParkRunAfterProviderAttemptFailure";
+  readonly runId: string;
+  readonly providerAttemptId: string;
+  readonly expectedRunRevision: number;
+  readonly expectedActivationGeneration: number;
+  readonly reason: string;
+}
+
 export interface AppendRunActivityCommand extends IdempotentCommand {
   readonly type: "AppendRunActivity";
   readonly runId: string;
@@ -295,6 +305,7 @@ export type KernelCommand =
   | StartProviderAttemptCommand
   | FinishProviderAttemptCommand
   | FailProviderAttemptCommand
+  | ParkRunAfterProviderAttemptFailureCommand
   | ClaimOutboxEventsCommand
   | AcknowledgeOutboxEventsCommand
   | AppendRunActivityCommand
@@ -343,13 +354,31 @@ export interface ListOutboxEventsQuery {
   readonly includeAcknowledged?: boolean;
 }
 
+export interface GetProviderAttemptQuery {
+  readonly type: "GetProviderAttempt";
+  readonly providerAttemptId: string;
+}
+
+export interface RecoverableAttentionExecutionCursor {
+  readonly startedAt: string;
+  readonly activationId: string;
+}
+
+export interface ListRecoverableAttentionExecutionsQuery {
+  readonly type: "ListRecoverableAttentionExecutions";
+  readonly afterCursor?: RecoverableAttentionExecutionCursor;
+  readonly limit?: number;
+}
+
 export type KernelQuery =
   | GetBootstrapQuery
   | GetThreadProjectionQuery
   | GetRunProjectionQuery
   | ListActivityQuery
   | ListOpenAttentionsQuery
-  | ListOutboxEventsQuery;
+  | ListOutboxEventsQuery
+  | GetProviderAttemptQuery
+  | ListRecoverableAttentionExecutionsQuery;
 
 export interface MessageRevisionView {
   readonly id: string;
@@ -507,6 +536,19 @@ export interface OutboxPage {
   readonly hasMore: boolean;
 }
 
+export interface RecoverableAttentionExecutionView {
+  readonly cursor: RecoverableAttentionExecutionCursor;
+  readonly attention: AttentionView;
+  readonly activation: ActivationAttemptView;
+  readonly providerAttempts: readonly ProviderAttemptView[];
+}
+
+export interface RecoverableAttentionExecutionPage {
+  readonly items: readonly RecoverableAttentionExecutionView[];
+  readonly nextCursor: RecoverableAttentionExecutionCursor | null;
+  readonly hasMore: boolean;
+}
+
 export interface ArtifactView {
   readonly id: string;
   readonly contentDigest: string;
@@ -572,6 +614,8 @@ export interface QueryResultMap {
   readonly ListActivity: ActivityPage;
   readonly ListOpenAttentions: AttentionPage;
   readonly ListOutboxEvents: OutboxPage;
+  readonly GetProviderAttempt: ProviderAttemptView;
+  readonly ListRecoverableAttentionExecutions: RecoverableAttentionExecutionPage;
 }
 
 export type QueryResult<Q extends KernelQuery> = QueryResultMap[Q["type"]];

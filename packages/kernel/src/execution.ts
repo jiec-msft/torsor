@@ -10,6 +10,7 @@ import type {
 import {
   boundedDuration,
   integer,
+  isTerminalRunState,
   optionalText,
   requireNonEmpty,
   text,
@@ -267,6 +268,160 @@ export function failProviderAttempt(kernel: db.KernelContext, command: Extract<K
   type: "FailProviderAttempt";
 }>, principal: Row, context: PrincipalContext, correlationId: string): CommandResult {
   return setProviderAttemptStatus(kernel, command.providerAttemptId, "Failed", command.error, command.type, principal, context, correlationId);
+}
+
+export function parkRunAfterProviderAttemptFailure(kernel: db.KernelContext, command: Extract<KernelCommand, {
+  type: "ParkRunAfterProviderAttemptFailure";
+}>, principal: Row, correlationId: string): CommandResult {
+  invariants.requireKind(kernel, principal, "runtime");
+  requireNonEmpty(command.reason, "reason");
+  if (!Number.isInteger(command.expectedActivationGeneration) ||
+    command.expectedActivationGeneration < 1) {
+    throw new KernelError(
+      "InvalidCommand",
+      "expectedActivationGeneration must be a positive integer.",
+    );
+  }
+  const run = invariants.requireRun(kernel, command.runId);
+  invariants.checkRevision(
+    kernel,
+    integer(run.revision),
+    command.expectedRunRevision,
+    "Run",
+  );
+  if (text(run.state) !== "Active") {
+    throw new KernelError(
+      isTerminalRunState(text(run.state)) ? "TerminalRun" : "Conflict",
+      "Only an Active Run can be parked after ProviderAttempt failure.",
+      { state: text(run.state) },
+    );
+  }
+  if (integer(run.activation_generation) !==
+    command.expectedActivationGeneration) {
+    throw new KernelError(
+      "Conflict",
+      "The Run activation generation changed after the ProviderAttempt was observed.",
+      {
+        expectedActivationGeneration: command.expectedActivationGeneration,
+        actualActivationGeneration: integer(run.activation_generation),
+      },
+    );
+  }
+  const attempt = invariants.requireProviderAttempt(
+    kernel,
+    command.providerAttemptId,
+  );
+  if (optionalText(attempt.run_id) !== command.runId) {
+    throw new KernelError(
+      "Forbidden",
+      "The ProviderAttempt belongs to another Run.",
+    );
+  }
+  const activation = invariants.requireActivation(
+    kernel,
+    text(attempt.activation_id),
+  );
+  if (
+    optionalText(activation.run_id) !== command.runId ||
+    text(activation.agent_id) !== text(run.owner_agent_id)
+  ) {
+    throw new KernelError(
+      "Forbidden",
+      "The ProviderAttempt does not belong to the Run's owning Activation.",
+    );
+  }
+  if (
+    integer(activation.run_activation_generation) !==
+    command.expectedActivationGeneration
+  ) {
+    throw new KernelError(
+      "Conflict",
+      "The ProviderAttempt belongs to a stale Run activation generation.",
+    );
+  }
+  const providerStatus = text(attempt.status);
+  if (providerStatus !== "Failed" && providerStatus !== "Unknown") {
+    throw new KernelError(
+      "Conflict",
+      "Only a Failed or Unknown ProviderAttempt can park its Run.",
+      { status: providerStatus },
+    );
+  }
+  const now = db.now(kernel);
+  const revision = integer(run.revision) + 1;
+  const reason = command.reason.trim();
+  db.run(
+    kernel,
+    `UPDATE runs
+        SET state = 'Waiting',
+            revision = ?,
+            updated_at = ?
+      WHERE id = ?`,
+    revision,
+    now,
+    command.runId,
+  );
+  invariants.revokeRunActivations(
+    kernel,
+    command.runId,
+    "provider_attempt_failure_parked",
+    now,
+  );
+  const activity = insertActivity(
+    kernel,
+    command.runId,
+    text(activation.id),
+    command.providerAttemptId,
+    "provider_attempt_failure_parked",
+    {
+      providerAttemptStatus: providerStatus,
+      reason,
+      runRevision: revision,
+    },
+    "durable",
+  );
+  const cursor = invariants.emitThreadEvent(kernel, {
+    type: "RunWaiting",
+    projectId: text(run.project_id),
+    channelId: text(run.home_channel_id),
+    threadRootId: text(run.thread_root_id),
+    entityType: "Run",
+    entityId: command.runId,
+    actorPrincipalId: text(principal.id),
+    activationId: text(activation.id),
+    causationId: command.providerAttemptId,
+    correlationId,
+    payload: {
+      revision,
+      reason,
+      providerAttemptId: command.providerAttemptId,
+      providerAttemptStatus: providerStatus,
+      activityId: activity.id,
+    },
+  });
+  invariants.enqueueOutbox(
+    kernel,
+    "run.waiting",
+    "Run",
+    command.runId,
+    {
+      revision,
+      reason,
+      providerAttemptId: command.providerAttemptId,
+      providerAttemptStatus: providerStatus,
+    },
+  );
+  return {
+    commandType: command.type,
+    entityId: command.runId,
+    revision,
+    threadCursor: cursor,
+    relatedIds: {
+      activationId: text(activation.id),
+      providerAttemptId: command.providerAttemptId,
+      activityId: activity.id,
+    },
+  };
 }
 
 export function setProviderAttemptStatus(kernel: db.KernelContext, providerAttemptId: string, status: "Acknowledged" | "Completed" | "Failed" | "Unknown", detail: string | null, commandType: "FinishProviderAttempt" | "FailProviderAttempt", principal: Row, context: PrincipalContext, correlationId: string): CommandResult {

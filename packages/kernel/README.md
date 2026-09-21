@@ -49,6 +49,18 @@ Outbox consumers use `ClaimOutboxEvents`, `AcknowledgeOutboxEvents`, and
 `ListOutboxEvents`. Claims are ordered, leased, and recoverable after process
 restart or lease expiry.
 
+Runtime recovery can read one `ProviderAttempt` directly and page
+`ListRecoverableAttentionExecutions` in stable Activation start order without
+scanning public event history. The recovery page includes expired unfinished
+Attention Activations and finished Attention Activations that still own a
+`Started` or `Acknowledged` ProviderAttempt.
+
+`ParkRunAfterProviderAttemptFailure` is a Runtime-only atomic transition for a
+current `Failed` or `Unknown` ProviderAttempt. It revision- and
+generation-fences the Active Run, preserves Pending RunInputs, moves the Run to
+Waiting, revokes unfinished Run Activations, records durable activity, and
+does not create a replacement Activation or provider wake-up.
+
 Artifact publication stores an immutable descriptor only. The caller must
 finalize content in durable storage and verify its digest before
 `PublishArtifact`; the kernel does not upload blobs or turn a temporary upload

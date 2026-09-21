@@ -24,13 +24,23 @@ import type {
   AttentionPage,
   BootstrapProjection,
   OutboxPage,
+  PrincipalContext,
+  ProviderAttemptView,
+  RecoverableAttentionExecutionCursor,
+  RecoverableAttentionExecutionPage,
   RunProjection,
   ThreadProjection
 } from "./types.js";
 import {
   integer,
-  text
+  requireNonEmpty,
+  text,
+  type Row
 } from "./values.js";
+
+const recoverableAttentionQueryHookSymbol = Symbol.for(
+  "torsor.kernel.recoverable-attention-query",
+);
 
 export function getBootstrap(kernel: db.KernelContext, projectId: string, attentionTargetAgentId?: string): BootstrapProjection {
   const project = db.getRow(kernel, "SELECT * FROM projects WHERE id = ?", projectId);
@@ -185,6 +195,128 @@ export function listOutboxEvents(kernel: db.KernelContext, afterCursor: number, 
         LIMIT ?`, afterCursor, includeAcknowledged ? 1 : 0, limit + 1);
   const hasMore = rows.length > limit;
   const items = rows.slice(0, limit).map(mapOutboxEvent);
+  return {
+    items,
+    nextCursor: hasMore ? items.at(-1)?.cursor ?? null : null,
+    hasMore,
+  };
+}
+
+export function getProviderAttempt(
+  kernel: db.KernelContext,
+  providerAttemptId: string,
+  principal: Row,
+  context: PrincipalContext,
+): ProviderAttemptView {
+  const attempt = invariants.requireProviderAttempt(kernel, providerAttemptId);
+  const activation = invariants.requireActivation(
+    kernel,
+    text(attempt.activation_id),
+  );
+  if (text(principal.kind) === "runtime") {
+    return mapProviderAttempt(attempt);
+  }
+  if (text(principal.kind) !== "agent") {
+    throw new KernelError(
+      "Forbidden",
+      "ProviderAttempt queries require runtime or scoped Agent authority.",
+    );
+  }
+  invariants.authorizeActivationActor(
+    kernel,
+    principal,
+    context,
+    activation,
+  );
+  invariants.assertActivationScopeCurrent(kernel, activation);
+  return mapProviderAttempt(attempt);
+}
+
+export function listRecoverableAttentionExecutions(
+  kernel: db.KernelContext,
+  afterCursor: RecoverableAttentionExecutionCursor | undefined,
+  limit: number,
+): RecoverableAttentionExecutionPage {
+  const clauses = [
+    "activation.cause = 'Attention'",
+    `(
+      (activation.finished_at IS NULL AND activation.expires_at <= ?)
+      OR
+      (
+        activation.finished_at IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+            FROM provider_attempts AS unsettled
+           WHERE unsettled.activation_id = activation.id
+             AND unsettled.status IN ('Started', 'Acknowledged')
+        )
+      )
+    )`,
+  ];
+  const parameters: SQLInputValue[] = [db.now(kernel)];
+  if (afterCursor) {
+    requireNonEmpty(afterCursor.startedAt, "afterCursor.startedAt");
+    requireNonEmpty(afterCursor.activationId, "afterCursor.activationId");
+    clauses.push(
+      "(activation.started_at, activation.id) > (?, ?)",
+    );
+    parameters.push(
+      afterCursor.startedAt,
+      afterCursor.activationId,
+    );
+  }
+  parameters.push(limit + 1);
+  const sql = `SELECT activation.*
+       FROM activation_attempts AS activation
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY activation.started_at, activation.id
+      LIMIT ?`;
+  const queryHook = Reflect.get(
+    globalThis,
+    recoverableAttentionQueryHookSymbol,
+  );
+  if (typeof queryHook === "function") {
+    queryHook({ sql, parameters: [...parameters] });
+  }
+  const rows = db.allRows(
+    kernel,
+    sql,
+    ...parameters,
+  );
+  const hasMore = rows.length > limit;
+  const items = rows.slice(0, limit).map((activation) => {
+    const activationId = text(activation.id);
+    const attention = invariants.requireAttention(
+      kernel,
+      text(activation.attention_id),
+    );
+    return {
+      cursor: {
+        startedAt: text(activation.started_at),
+        activationId,
+      },
+      attention: mapAttention(attention),
+      activation: mapActivation(
+        activation,
+        db.allRows(
+          kernel,
+          `SELECT run_input_id
+             FROM activation_run_inputs
+            WHERE activation_id = ?
+            ORDER BY run_input_sequence`,
+          activationId,
+        ).map((row) => text(row.run_input_id)),
+      ),
+      providerAttempts: db.allRows(
+        kernel,
+        `SELECT *
+           FROM provider_attempts
+          WHERE activation_id = ?
+          ORDER BY started_at, id`,
+        activationId,
+      ).map(mapProviderAttempt),
+    };
+  });
   return {
     items,
     nextCursor: hasMore ? items.at(-1)?.cursor ?? null : null,
