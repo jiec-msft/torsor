@@ -74,6 +74,7 @@ export interface KernelOpenOptions {
   readonly bootstrap?: KernelBootstrap;
   readonly clock?: () => Date;
   readonly idFactory?: (prefix: string) => string;
+  readonly activationDurationMs?: number;
 }
 
 interface IdempotentCommand {
@@ -130,6 +131,7 @@ export interface StartActivationCommand extends IdempotentCommand {
   readonly attentionId?: string;
   readonly handlerLeaseToken?: string;
   readonly expectedRunRevision?: number;
+  readonly durationMs?: number;
 }
 
 export interface FinishActivationCommand extends IdempotentCommand {
@@ -155,6 +157,18 @@ export interface FinishProviderAttemptCommand extends IdempotentCommand {
   readonly providerAttemptId: string;
   readonly status: Exclude<ProviderAttemptStatus, "Started" | "Failed">;
   readonly detail?: string;
+}
+
+export interface ClaimOutboxEventsCommand extends IdempotentCommand {
+  readonly type: "ClaimOutboxEvents";
+  readonly limit?: number;
+  readonly leaseDurationMs: number;
+}
+
+export interface AcknowledgeOutboxEventsCommand extends IdempotentCommand {
+  readonly type: "AcknowledgeOutboxEvents";
+  readonly outboxEventIds: readonly string[];
+  readonly leaseToken: string;
 }
 
 export interface FailProviderAttemptCommand extends IdempotentCommand {
@@ -195,7 +209,10 @@ export interface PublishArtifactCommand extends IdempotentCommand {
 
 export interface CompletionException {
   readonly runInputId: string;
-  readonly disposition: Exclude<RunInputDisposition, "Pending" | "Incorporated">;
+  readonly disposition: Exclude<
+    RunInputDisposition,
+    "Pending" | "Incorporated" | "Withdrawn"
+  >;
   readonly reason: string;
   readonly supersededByRunInputId?: string;
 }
@@ -245,6 +262,8 @@ export type KernelCommand =
   | StartProviderAttemptCommand
   | FinishProviderAttemptCommand
   | FailProviderAttemptCommand
+  | ClaimOutboxEventsCommand
+  | AcknowledgeOutboxEventsCommand
   | AppendRunActivityCommand
   | PublishRunReplyCommand
   | PublishArtifactCommand
@@ -279,7 +298,15 @@ export interface ListOpenAttentionsQuery {
   readonly type: "ListOpenAttentions";
   readonly projectId?: string;
   readonly targetAgentId?: string;
+  readonly afterCursor?: number;
   readonly limit?: number;
+}
+
+export interface ListOutboxEventsQuery {
+  readonly type: "ListOutboxEvents";
+  readonly afterCursor?: number;
+  readonly limit?: number;
+  readonly includeAcknowledged?: boolean;
 }
 
 export type KernelQuery =
@@ -287,7 +314,8 @@ export type KernelQuery =
   | GetThreadProjectionQuery
   | GetRunProjectionQuery
   | ListActivityQuery
-  | ListOpenAttentionsQuery;
+  | ListOpenAttentionsQuery
+  | ListOutboxEventsQuery;
 
 export interface MessageRevisionView {
   readonly id: string;
@@ -312,6 +340,7 @@ export interface MessageView {
 }
 
 export interface AttentionView {
+  readonly cursor: number;
   readonly id: string;
   readonly messageRevisionId: string;
   readonly targetAgentId: string;
@@ -349,6 +378,7 @@ export interface RunView {
   readonly agentConfigRevision: number;
   readonly state: RunState;
   readonly revision: number;
+  readonly activationGeneration: number;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly terminalReason: string | null;
@@ -360,8 +390,12 @@ export interface ActivationAttemptView {
   readonly runId: string | null;
   readonly attentionId: string | null;
   readonly configRevision: number;
+  readonly runActivationGeneration: number | null;
   readonly runInputIds: readonly string[];
   readonly startedAt: string;
+  readonly expiresAt: string;
+  readonly revokedAt: string | null;
+  readonly revocationReason: string | null;
   readonly finishedAt: string | null;
   readonly outcome: ActivationOutcome | null;
   readonly detail: string | null;
@@ -393,6 +427,45 @@ export interface RunActivityEventView {
   readonly payload: JsonValue;
   readonly retentionClass: "durable" | "transient";
   readonly createdAt: string;
+}
+
+export interface AttentionPage {
+  readonly items: readonly AttentionView[];
+  readonly nextCursor: number | null;
+  readonly hasMore: boolean;
+}
+
+export interface ActivityPage {
+  readonly items: readonly RunActivityEventView[];
+  readonly nextCursor: number | null;
+  readonly hasMore: boolean;
+}
+
+export interface ActivityWindow {
+  readonly items: readonly RunActivityEventView[];
+  readonly hasEarlier: boolean;
+  readonly earliestSequence: number | null;
+  readonly latestSequence: number | null;
+}
+
+export interface OutboxEventView {
+  readonly cursor: number;
+  readonly id: string;
+  readonly topic: string;
+  readonly aggregateType: string;
+  readonly aggregateId: string;
+  readonly payload: JsonValue;
+  readonly deliveryAttempts: number;
+  readonly leaseHolderPrincipalId: string | null;
+  readonly leaseExpiresAt: string | null;
+  readonly acknowledgedAt: string | null;
+  readonly createdAt: string;
+}
+
+export interface OutboxPage {
+  readonly items: readonly OutboxEventView[];
+  readonly nextCursor: number | null;
+  readonly hasMore: boolean;
 }
 
 export interface ArtifactView {
@@ -429,7 +502,7 @@ export interface BootstrapProjection {
   readonly project: BootstrapProject;
   readonly channels: readonly BootstrapChannel[];
   readonly agents: readonly BootstrapAgent[];
-  readonly openAttentions: readonly AttentionView[];
+  readonly openAttentions: AttentionPage;
   readonly latestEventId: string | null;
 }
 
@@ -449,7 +522,7 @@ export interface RunProjection {
   readonly inputs: readonly RunInputView[];
   readonly activations: readonly ActivationAttemptView[];
   readonly providerAttempts: readonly ProviderAttemptView[];
-  readonly activity: readonly RunActivityEventView[];
+  readonly activity: ActivityWindow;
   readonly artifacts: readonly ArtifactView[];
 }
 
@@ -457,8 +530,9 @@ export interface QueryResultMap {
   readonly GetBootstrap: BootstrapProjection;
   readonly GetThreadProjection: ThreadProjection;
   readonly GetRunProjection: RunProjection;
-  readonly ListActivity: readonly RunActivityEventView[];
-  readonly ListOpenAttentions: readonly AttentionView[];
+  readonly ListActivity: ActivityPage;
+  readonly ListOpenAttentions: AttentionPage;
+  readonly ListOutboxEvents: OutboxPage;
 }
 
 export type QueryResult<Q extends KernelQuery> = QueryResultMap[Q["type"]];
@@ -469,4 +543,6 @@ export interface CommandResult {
   readonly revision?: number;
   readonly threadCursor?: number;
   readonly relatedIds?: Readonly<Record<string, string>>;
+  readonly leaseToken?: string;
+  readonly outboxEvents?: readonly OutboxEventView[];
 }

@@ -1,10 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 
-import { schemaSql } from "./schema.js";
+import { CURRENT_SCHEMA_VERSION, schemaSql } from "./schema.js";
 import type {
+  ActivityPage,
+  ActivityWindow,
   ActivationAttemptView,
   ArtifactView,
+  AttentionPage,
   AttentionView,
   BootstrapAgent,
   BootstrapChannel,
@@ -19,6 +22,8 @@ import type {
   KernelQuery,
   MessageRevisionView,
   MessageView,
+  OutboxEventView,
+  OutboxPage,
   PrincipalContext,
   ProviderAttemptView,
   PublicEventEnvelope,
@@ -81,19 +86,29 @@ export class TorsorKernel {
   readonly #database: DatabaseSync;
   readonly #clock: () => Date;
   readonly #idFactory: (prefix: string) => string;
+  readonly #activationDurationMs: number;
   #closed = false;
 
   private constructor(options: KernelOpenOptions) {
     this.#clock = options.clock ?? (() => new Date());
     this.#idFactory =
       options.idFactory ?? ((prefix) => `${prefix}_${randomUUID()}`);
+    this.#activationDurationMs = boundedDuration(
+      options.activationDurationMs ?? 300_000,
+      "activationDurationMs",
+    );
     this.#database = new DatabaseSync(options.databasePath);
-    this.#database.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
-    if (options.databasePath !== ":memory:") {
-      this.#database.exec("PRAGMA journal_mode = WAL;");
+    try {
+      this.#database.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+      if (options.databasePath !== ":memory:") {
+        this.#database.exec("PRAGMA journal_mode = WAL;");
+      }
+      this.#initializeSchema();
+      this.#applyBootstrap(options.bootstrap);
+    } catch (error) {
+      this.#database.close();
+      throw error;
     }
-    this.#database.exec(schemaSql);
-    this.#applyBootstrap(options.bootstrap);
   }
 
   static open(options: KernelOpenOptions): TorsorKernel {
@@ -113,6 +128,10 @@ export class TorsorKernel {
   ): Promise<CommandResult> {
     this.#assertOpen();
     const principal = this.#requirePrincipal(principalContext.principalId);
+    const effectiveContext =
+      text(principal.kind) === "human"
+        ? { principalId: principalContext.principalId }
+        : principalContext;
     const payloadHash = hashPayload(command);
     this.#database.exec("BEGIN IMMEDIATE");
     try {
@@ -132,14 +151,26 @@ export class TorsorKernel {
           );
         }
         const result = JSON.parse(text(cached.result_json)) as CommandResult;
-        this.#database.exec("COMMIT");
-        return result;
+        if (
+          command.type !== "ClaimOutboxEvents" ||
+          this.#isLiveOutboxClaim(result, principal)
+        ) {
+          this.#database.exec("COMMIT");
+          return result;
+        }
+        this.#run(
+          `DELETE FROM idempotency_records
+            WHERE principal_id = ? AND command_name = ? AND idempotency_key = ?`,
+          text(principal.id),
+          command.type,
+          command.idempotencyKey,
+        );
       }
 
       const correlationId = this.#idFactory("corr");
       const result = this.#dispatchCommand(
         command,
-        principalContext,
+        effectiveContext,
         principal,
         correlationId,
       );
@@ -247,6 +278,7 @@ export class TorsorKernel {
             result = this.#listOpenAttentions(
               text(agent.project_id),
               text(agent.id),
+              query.afterCursor ?? 0,
               boundedLimit(query.limit),
             );
             break;
@@ -257,7 +289,16 @@ export class TorsorKernel {
           result = this.#listOpenAttentions(
             query.projectId,
             query.targetAgentId,
+            query.afterCursor ?? 0,
             boundedLimit(query.limit),
+          );
+          break;
+        case "ListOutboxEvents":
+          this.#requireKind(principal, "runtime");
+          result = this.#listOutboxEvents(
+            query.afterCursor ?? 0,
+            boundedLimit(query.limit),
+            query.includeAcknowledged ?? false,
           );
           break;
         default:
@@ -271,6 +312,10 @@ export class TorsorKernel {
     }
   }
 
+  /**
+   * Trusted-internal event feed. Callers must apply transport authorization
+   * before exposing these envelopes outside the local server/runtime boundary.
+   */
   async readEvents(
     afterEventId: string | null,
     limit: number,
@@ -338,6 +383,10 @@ export class TorsorKernel {
           context,
           correlationId,
         );
+      case "ClaimOutboxEvents":
+        return this.#claimOutboxEvents(command, principal, correlationId);
+      case "AcknowledgeOutboxEvents":
+        return this.#acknowledgeOutboxEvents(command, principal, correlationId);
       case "AppendRunActivity":
         return this.#appendRunActivity(
           command,
@@ -389,7 +438,7 @@ export class TorsorKernel {
       projectId: command.projectId,
       channelId: command.channelId,
       author: principal,
-      context,
+      activationId: null,
       body: command.body,
       targetAgentIds: command.targetAgentIds,
       correlationId,
@@ -418,7 +467,7 @@ export class TorsorKernel {
       threadRootId: command.threadRootId,
       replyToMessageId: command.threadRootId,
       author: principal,
-      context,
+      activationId: null,
       body: command.body,
       targetAgentIds: command.targetAgentIds,
       correlationId,
@@ -455,7 +504,7 @@ export class TorsorKernel {
       threadRootId: text(run.thread_root_id),
       replyToMessageId: text(run.thread_root_id),
       author: principal,
-      context,
+      activationId: null,
       body: command.body,
       targetAgentIds: command.targetAgentIds,
       suppressedAttentionAgentIds: [text(run.owner_agent_id)],
@@ -526,7 +575,7 @@ export class TorsorKernel {
       "Cancelled",
       command.reason,
       principal,
-      context,
+      null,
       correlationId,
       command.type,
     );
@@ -573,6 +622,14 @@ export class TorsorKernel {
     const leaseToken = this.#idFactory("lease");
     const revision = integer(attention.revision) + 1;
     const expiresAt = new Date(now.getTime() + command.leaseDurationMs).toISOString();
+    this.#run(
+      `UPDATE activation_attempts
+          SET revoked_at = COALESCE(revoked_at, ?),
+              revocation_reason = COALESCE(revocation_reason, 'attention_lease_replaced')
+        WHERE attention_id = ? AND revoked_at IS NULL`,
+      now.toISOString(),
+      command.attentionId,
+    );
     this.#run(
       `UPDATE attentions
           SET revision = ?,
@@ -668,8 +725,16 @@ export class TorsorKernel {
       run,
       text(attention.message_revision_id),
       text(principal.id),
-      context.activationId ?? null,
+      text(attentionActivation.id),
       command.attentionId,
+    );
+    this.#run(
+      `UPDATE activation_attempts
+          SET revoked_at = COALESCE(revoked_at, ?),
+              revocation_reason = COALESCE(revocation_reason, 'attention_resolved')
+        WHERE id = ?`,
+      now,
+      text(attentionActivation.id),
     );
     this.#run(
       `UPDATE runs SET next_input_sequence = 2 WHERE id = ?`,
@@ -690,7 +755,7 @@ export class TorsorKernel {
         WHERE id = ?`,
       revision,
       text(principal.id),
-      context.activationId ?? null,
+      text(attentionActivation.id),
       runId,
       now,
       command.attentionId,
@@ -703,7 +768,7 @@ export class TorsorKernel {
       entityType: "Run",
       entityId: runId,
       actorPrincipalId: text(principal.id),
-      activationId: context.activationId ?? null,
+      activationId: text(attentionActivation.id),
       causationId: command.attentionId,
       correlationId,
       payload: { state: "Active", ownerAgentId: text(agent.id) },
@@ -717,7 +782,7 @@ export class TorsorKernel {
       entityType: "Attention",
       entityId: command.attentionId,
       actorPrincipalId: text(principal.id),
-      activationId: context.activationId ?? null,
+      activationId: text(attentionActivation.id),
       causationId: text(attention.message_revision_id),
       correlationId,
       payload: { outcome: "RunCreated", runId },
@@ -758,10 +823,18 @@ export class TorsorKernel {
     let runId: string | null = null;
     let attentionId: string | null = null;
     let attentionLeaseToken: string | null = null;
+    let runActivationGeneration: number | null = null;
+    let resultRunRevision: number | undefined;
     let configRevision: number;
     let projectId: string;
     let channelId: string;
     let threadRootId: string;
+    const durationMs = boundedDuration(
+      command.durationMs ?? this.#activationDurationMs,
+      "durationMs",
+    );
+    const now = this.#clock();
+    let expiresAt = new Date(now.getTime() + durationMs).toISOString();
     if (command.runId) {
       if (command.expectedRunRevision === undefined) {
         throw new KernelError(
@@ -779,14 +852,27 @@ export class TorsorKernel {
       projectId = text(run.project_id);
       channelId = text(run.home_channel_id);
       threadRootId = text(run.thread_root_id);
+      runActivationGeneration = integer(run.activation_generation) + 1;
+      this.#revokeRunActivations(
+        command.runId,
+        "superseded_activation",
+        now.toISOString(),
+      );
       if (text(run.state) === "Waiting") {
         const revision = integer(run.revision) + 1;
         this.#run(
-          "UPDATE runs SET state = 'Active', revision = ?, updated_at = ? WHERE id = ?",
+          `UPDATE runs
+              SET state = 'Active',
+                  revision = ?,
+                  activation_generation = ?,
+                  updated_at = ?
+            WHERE id = ?`,
           revision,
-          this.#now(),
+          runActivationGeneration,
+          now.toISOString(),
           command.runId,
         );
+        resultRunRevision = revision;
         this.#emitThreadEvent({
           type: "RunActivated",
           projectId,
@@ -806,6 +892,16 @@ export class TorsorKernel {
           command.runId,
           { revision },
         );
+      } else {
+        this.#run(
+          `UPDATE runs
+              SET activation_generation = ?, updated_at = ?
+            WHERE id = ?`,
+          runActivationGeneration,
+          now.toISOString(),
+          command.runId,
+        );
+        resultRunRevision = integer(run.revision);
       }
     } else {
       const attention = this.#requireAttention(command.attentionId!);
@@ -815,6 +911,36 @@ export class TorsorKernel {
       this.#assertAttentionLease(attention, command.handlerLeaseToken);
       attentionId = command.attentionId!;
       attentionLeaseToken = command.handlerLeaseToken!;
+      const leaseExpiry = new Date(text(attention.handler_lease_expires_at));
+      if (leaseExpiry.toISOString() < expiresAt) {
+        expiresAt = leaseExpiry.toISOString();
+      }
+      const existing = this.#getRow(
+        `SELECT id
+           FROM activation_attempts
+          WHERE attention_id = ? AND attention_lease_token = ?`,
+        attentionId,
+        attentionLeaseToken,
+      );
+      if (existing) {
+        if (text(principal.kind) === "agent") {
+          const principalAgent = this.#requireAgentForPrincipal(text(principal.id));
+          if (text(principalAgent.id) !== text(attention.target_agent_id)) {
+            throw new KernelError(
+              "Forbidden",
+              "An Agent may only start its own Activation.",
+            );
+          }
+        }
+        return {
+          commandType: command.type,
+          entityId: text(existing.id),
+          relatedIds: {
+            agentId: text(attention.target_agent_id),
+            attentionId,
+          },
+        };
+      }
       agent = this.#requireAgent(text(attention.target_agent_id));
       configRevision = integer(agent.current_config_revision);
       projectId = text(attention.project_id);
@@ -831,16 +957,19 @@ export class TorsorKernel {
     this.#run(
       `INSERT INTO activation_attempts
         (id, agent_id, run_id, attention_id, attention_lease_token,
-         cause, config_revision, started_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         run_activation_generation, cause, config_revision, started_at,
+         expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       activationId,
       text(agent.id),
       runId,
       attentionId,
       attentionLeaseToken,
+      runActivationGeneration,
       runId ? "Run" : "Attention",
       configRevision,
-      this.#now(),
+      now.toISOString(),
+      expiresAt,
     );
     if (runId) {
       const inputs = this.#allRows(
@@ -873,11 +1002,21 @@ export class TorsorKernel {
       activationId,
       causationId: runId ?? attentionId,
       correlationId,
-      payload: { runId, attentionId, agentId: text(agent.id), configRevision },
+      payload: {
+        runId,
+        attentionId,
+        agentId: text(agent.id),
+        configRevision,
+        runActivationGeneration,
+        expiresAt,
+      },
     });
     return {
       commandType: command.type,
       entityId: activationId,
+      ...(resultRunRevision === undefined
+        ? {}
+        : { revision: resultRunRevision }),
       relatedIds: {
         agentId: text(agent.id),
         ...(runId ? { runId } : { attentionId: attentionId! }),
@@ -893,6 +1032,9 @@ export class TorsorKernel {
   ): CommandResult {
     const activation = this.#requireActivation(command.activationId);
     this.#authorizeActivationActor(principal, context, activation);
+    if (text(principal.kind) === "agent") {
+      this.#assertActivationScopeCurrent(activation);
+    }
     if (activation.finished_at !== null) {
       throw new KernelError("Conflict", "The Activation is already finished.");
     }
@@ -1010,6 +1152,16 @@ export class TorsorKernel {
     context: PrincipalContext,
     correlationId: string,
   ): CommandResult {
+    if (
+      !["Acknowledged", "Completed", "Unknown"].includes(
+        command.status as string,
+      )
+    ) {
+      throw new KernelError(
+        "InvalidCommand",
+        "FinishProviderAttempt status must be Acknowledged, Completed, or Unknown.",
+      );
+    }
     return this.#setProviderAttemptStatus(
       command.providerAttemptId,
       command.status,
@@ -1065,6 +1217,9 @@ export class TorsorKernel {
     if (text(attempt.status) === "Acknowledged" && status === "Acknowledged") {
       throw new KernelError("Conflict", "The ProviderAttempt is already acknowledged.");
     }
+    if (status === "Unknown") {
+      requireNonEmpty(detail ?? "", "Unknown reason");
+    }
     const finishedAt = status === "Acknowledged" ? null : this.#now();
     this.#run(
       `UPDATE provider_attempts
@@ -1077,7 +1232,10 @@ export class TorsorKernel {
     );
     const scope = this.#activationScope(activation);
     this.#emitEvent({
-      type: "ProviderAttemptFinished",
+      type:
+        status === "Acknowledged"
+          ? "ProviderAttemptAcknowledged"
+          : "ProviderAttemptFinished",
       ...scope,
       threadCursor: null,
       entityType: "ProviderAttempt",
@@ -1139,6 +1297,155 @@ export class TorsorKernel {
     };
   }
 
+  #claimOutboxEvents(
+    command: Extract<KernelCommand, { type: "ClaimOutboxEvents" }>,
+    principal: Row,
+    _correlationId: string,
+  ): CommandResult {
+    this.#requireKind(principal, "runtime");
+    const limit = boundedLimit(command.limit);
+    const leaseDurationMs = boundedDuration(
+      command.leaseDurationMs,
+      "leaseDurationMs",
+    );
+    const now = this.#clock();
+    const leaseToken = this.#idFactory("outbox_lease");
+    const leaseExpiresAt = new Date(
+      now.getTime() + leaseDurationMs,
+    ).toISOString();
+    const candidates = this.#allRows(
+      `SELECT id
+         FROM outbox_events
+        WHERE acknowledged_at IS NULL
+          AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+        ORDER BY sequence
+        LIMIT ?`,
+      now.toISOString(),
+      limit,
+    );
+    for (const candidate of candidates) {
+      this.#run(
+        `UPDATE outbox_events
+            SET lease_holder_principal_id = ?,
+                lease_token = ?,
+                lease_expires_at = ?,
+                delivery_attempts = delivery_attempts + 1
+          WHERE id = ?`,
+        text(principal.id),
+        leaseToken,
+        leaseExpiresAt,
+        text(candidate.id),
+      );
+    }
+    const outboxEvents = candidates.map((candidate) =>
+      mapOutboxEvent(this.#requireOutboxEvent(text(candidate.id))),
+    );
+    return {
+      commandType: command.type,
+      entityId: leaseToken,
+      leaseToken,
+      outboxEvents,
+    };
+  }
+
+  #acknowledgeOutboxEvents(
+    command: Extract<KernelCommand, { type: "AcknowledgeOutboxEvents" }>,
+    principal: Row,
+    correlationId: string,
+  ): CommandResult {
+    this.#requireKind(principal, "runtime");
+    const ids = unique(command.outboxEventIds);
+    if (ids.length === 0) {
+      throw new KernelError(
+        "InvalidCommand",
+        "At least one OutboxEvent is required.",
+      );
+    }
+    requireNonEmpty(command.leaseToken, "leaseToken");
+    const now = this.#now();
+    const leasedRows = this.#allRows(
+      `SELECT id
+         FROM outbox_events
+        WHERE acknowledged_at IS NULL
+          AND lease_holder_principal_id = ?
+          AND lease_token = ?
+        ORDER BY sequence`,
+      text(principal.id),
+      command.leaseToken,
+    );
+    const leasedIds = leasedRows.map((row) => text(row.id));
+    if (
+      leasedIds.length !== ids.length ||
+      leasedIds.some((id) => !ids.includes(id))
+    ) {
+      throw new KernelError(
+        "InvalidCommand",
+        "Outbox acknowledgement must include the entire leased batch.",
+      );
+    }
+    for (const id of ids) {
+      const event = this.#requireOutboxEvent(id);
+      if (event.acknowledged_at !== null) {
+        throw new KernelError("Conflict", `OutboxEvent ${id} is already acknowledged.`);
+      }
+      if (
+        optionalText(event.lease_holder_principal_id) !== text(principal.id) ||
+        optionalText(event.lease_token) !== command.leaseToken ||
+        !optionalText(event.lease_expires_at) ||
+        new Date(text(event.lease_expires_at)) <= this.#clock()
+      ) {
+        throw new KernelError(
+          "Conflict",
+          `OutboxEvent ${id} is not held by the current live lease.`,
+        );
+      }
+      this.#run(
+        `UPDATE outbox_events
+            SET acknowledged_at = ?,
+                acknowledged_by_principal_id = ?,
+                lease_token = NULL,
+                lease_expires_at = NULL
+          WHERE id = ?`,
+        now,
+        text(principal.id),
+        id,
+      );
+    }
+    return {
+      commandType: command.type,
+      entityId: command.leaseToken,
+      relatedIds: {
+        acknowledgedCount: String(ids.length),
+        correlationId,
+      },
+    };
+  }
+
+  #isLiveOutboxClaim(result: CommandResult, principal: Row): boolean {
+    if (
+      !result.leaseToken ||
+      !result.outboxEvents ||
+      result.outboxEvents.length === 0
+    ) {
+      return false;
+    }
+    const now = this.#clock();
+    return result.outboxEvents.every((cachedEvent) => {
+      const event = this.#getRow(
+        "SELECT * FROM outbox_events WHERE id = ?",
+        cachedEvent.id,
+      );
+      return (
+        event !== undefined &&
+        event.acknowledged_at === null &&
+        optionalText(event.lease_holder_principal_id) === text(principal.id) &&
+        optionalText(event.lease_token) === result.leaseToken &&
+        optionalText(event.lease_expires_at) !== null &&
+        new Date(text(event.lease_expires_at)) > now
+      );
+    });
+  }
+
   #publishRunReply(
     command: Extract<KernelCommand, { type: "PublishRunReply" }>,
     principal: Row,
@@ -1158,7 +1465,7 @@ export class TorsorKernel {
       threadRootId: text(run.thread_root_id),
       replyToMessageId: text(run.thread_root_id),
       author: principal,
-      context,
+      activationId: text(activation.id),
       authorAgentId: text(run.owner_agent_id),
       causedByRunId: command.runId,
       body: command.body,
@@ -1401,7 +1708,7 @@ export class TorsorKernel {
         threadRootId: text(run.thread_root_id),
         replyToMessageId: text(run.thread_root_id),
         author: principal,
-        context,
+        activationId: text(activation.id),
         authorAgentId: text(run.owner_agent_id),
         causedByRunId: command.runId,
         body: command.finalReply.body,
@@ -1418,6 +1725,11 @@ export class TorsorKernel {
       revision,
       this.#now(),
       command.runId,
+    );
+    this.#revokeRunActivations(
+      command.runId,
+      "run_completed",
+      this.#now(),
     );
     const cursor = this.#emitThreadEvent({
       type: "RunCompleted",
@@ -1457,7 +1769,7 @@ export class TorsorKernel {
       command.runId,
       command.expectedRunRevision,
     );
-    this.#requireRunActivation(context, principal, run);
+    const activation = this.#requireRunActivation(context, principal, run);
     if (text(run.state) !== "Active") {
       throw new KernelError("Conflict", "Only an Active Run can enter Waiting.");
     }
@@ -1469,6 +1781,11 @@ export class TorsorKernel {
       this.#now(),
       command.runId,
     );
+    this.#revokeRunActivations(
+      command.runId,
+      "run_waiting",
+      this.#now(),
+    );
     const cursor = this.#emitThreadEvent({
       type: "RunWaiting",
       projectId: text(run.project_id),
@@ -1477,8 +1794,8 @@ export class TorsorKernel {
       entityType: "Run",
       entityId: command.runId,
       actorPrincipalId: text(principal.id),
-      activationId: context.activationId ?? null,
-      causationId: context.activationId ?? command.runId,
+      activationId: text(activation.id),
+      causationId: text(activation.id),
       correlationId,
       payload: { revision, reason: command.reason },
     });
@@ -1506,13 +1823,13 @@ export class TorsorKernel {
       command.runId,
       command.expectedRunRevision,
     );
-    this.#requireRunActivation(context, principal, run);
+    const activation = this.#requireRunActivation(context, principal, run);
     return this.#terminateRun(
       run,
       "Failed",
       command.reason,
       principal,
-      context,
+      text(activation.id),
       correlationId,
       command.type,
     );
@@ -1578,7 +1895,7 @@ export class TorsorKernel {
     state: "Failed" | "Cancelled",
     reason: string,
     principal: Row,
-    context: PrincipalContext,
+    activationId: string | null,
     correlationId: string,
     commandType: "FailRun" | "CancelRun",
   ): CommandResult {
@@ -1604,6 +1921,11 @@ export class TorsorKernel {
       reason,
       runId,
     );
+    this.#revokeRunActivations(
+      runId,
+      state === "Failed" ? "run_failed" : "run_cancelled",
+      this.#now(),
+    );
     const cursor = this.#emitThreadEvent({
       type: `Run${state}`,
       projectId: text(run.project_id),
@@ -1612,8 +1934,8 @@ export class TorsorKernel {
       entityType: "Run",
       entityId: runId,
       actorPrincipalId: text(principal.id),
-      activationId: context.activationId ?? null,
-      causationId: context.activationId ?? runId,
+      activationId,
+      causationId: activationId ?? runId,
       correlationId,
       payload: { revision, reason },
     });
@@ -1637,7 +1959,7 @@ export class TorsorKernel {
     threadRootId?: string;
     replyToMessageId?: string;
     author: Row;
-    context: PrincipalContext;
+    activationId: string | null;
     authorAgentId?: string;
     causedByAttentionId?: string;
     causedByRunId?: string;
@@ -1744,7 +2066,7 @@ export class TorsorKernel {
           entityType: "Attention",
           entityId: attentionId,
           actorPrincipalId: text(input.author.id),
-          activationId: input.context.activationId ?? null,
+          activationId: input.activationId,
           causationId: revisionId,
           correlationId: input.correlationId,
           payload: { targetAgentId, triggerKind: "Mention" },
@@ -1759,7 +2081,7 @@ export class TorsorKernel {
       entityType: "Message",
       entityId: messageId,
       actorPrincipalId: text(input.author.id),
-      activationId: input.context.activationId ?? null,
+      activationId: input.activationId,
       causationId: input.causedByRunId ?? input.causedByAttentionId ?? null,
       correlationId: input.correlationId,
       payload: {
@@ -1898,6 +2220,7 @@ export class TorsorKernel {
     if (text(agent.id) !== text(run.owner_agent_id)) {
       throw new KernelError("Forbidden", "The Agent does not own this Run.");
     }
+    this.#assertActivationScopeCurrent(activation);
     return activation;
   }
 
@@ -2072,6 +2395,7 @@ export class TorsorKernel {
       openAttentions: this.#listOpenAttentions(
         projectId,
         attentionTargetAgentId,
+        0,
         100,
       ),
       latestEventId: latest ? text(latest.event_id) : null,
@@ -2151,7 +2475,7 @@ export class TorsorKernel {
         "SELECT * FROM provider_attempts WHERE run_id = ? ORDER BY started_at, id",
         runId,
       ).map(mapProviderAttempt),
-      activity: this.#listActivity(runId, 0, 100),
+      activity: this.#latestActivityWindow(runId, 100),
       artifacts: this.#allRows(
         "SELECT * FROM artifacts WHERE producer_run_id = ? ORDER BY created_at, id",
         runId,
@@ -2163,25 +2487,52 @@ export class TorsorKernel {
     runId: string,
     afterSequence: number,
     limit: number,
-  ): readonly RunActivityEventView[] {
-    return this.#allRows(
+  ): ActivityPage {
+    const rows = this.#allRows(
       `SELECT * FROM run_activity_events
         WHERE run_id = ? AND sequence > ?
         ORDER BY sequence
         LIMIT ?`,
       runId,
       afterSequence,
-      limit,
-    ).map(mapActivity);
+      limit + 1,
+    );
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map(mapActivity);
+    return {
+      items,
+      nextCursor: hasMore ? items.at(-1)?.sequence ?? null : null,
+      hasMore,
+    };
+  }
+
+  #latestActivityWindow(runId: string, limit: number): ActivityWindow {
+    const rows = this.#allRows(
+      `SELECT * FROM run_activity_events
+        WHERE run_id = ?
+        ORDER BY sequence DESC
+        LIMIT ?`,
+      runId,
+      limit + 1,
+    );
+    const hasEarlier = rows.length > limit;
+    const items = rows.slice(0, limit).reverse().map(mapActivity);
+    return {
+      items,
+      hasEarlier,
+      earliestSequence: items[0]?.sequence ?? null,
+      latestSequence: items.at(-1)?.sequence ?? null,
+    };
   }
 
   #listOpenAttentions(
     projectId: string | undefined,
     targetAgentId: string | undefined,
+    afterCursor: number,
     limit: number,
-  ): readonly AttentionView[] {
-    const clauses = ["status = 'Open'"];
-    const parameters: SQLInputValue[] = [];
+  ): AttentionPage {
+    const clauses = ["status = 'Open'", "sequence > ?"];
+    const parameters: SQLInputValue[] = [afterCursor];
     if (projectId) {
       clauses.push("project_id = ?");
       parameters.push(projectId);
@@ -2190,14 +2541,85 @@ export class TorsorKernel {
       clauses.push("target_agent_id = ?");
       parameters.push(targetAgentId);
     }
-    parameters.push(limit);
-    return this.#allRows(
+    parameters.push(limit + 1);
+    const rows = this.#allRows(
       `SELECT * FROM attentions
         WHERE ${clauses.join(" AND ")}
-        ORDER BY created_at, id
+        ORDER BY sequence
         LIMIT ?`,
       ...parameters,
-    ).map(mapAttention);
+    );
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map(mapAttention);
+    return {
+      items,
+      nextCursor: hasMore ? items.at(-1)?.cursor ?? null : null,
+      hasMore,
+    };
+  }
+
+  #listOutboxEvents(
+    afterCursor: number,
+    limit: number,
+    includeAcknowledged: boolean,
+  ): OutboxPage {
+    const rows = this.#allRows(
+      `SELECT * FROM outbox_events
+        WHERE sequence > ?
+          AND (? = 1 OR acknowledged_at IS NULL)
+        ORDER BY sequence
+        LIMIT ?`,
+      afterCursor,
+      includeAcknowledged ? 1 : 0,
+      limit + 1,
+    );
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map(mapOutboxEvent);
+    return {
+      items,
+      nextCursor: hasMore ? items.at(-1)?.cursor ?? null : null,
+      hasMore,
+    };
+  }
+
+  #initializeSchema(): void {
+    const versionRow = this.#database.prepare("PRAGMA user_version").get() as
+      | Row
+      | undefined;
+    const version = versionRow ? integer(versionRow.user_version) : 0;
+    if (version === CURRENT_SCHEMA_VERSION) {
+      this.#database.exec(schemaSql);
+      return;
+    }
+    if (version !== 0) {
+      throw new KernelError(
+        "Conflict",
+        `Unsupported kernel schema version ${version}; expected ${CURRENT_SCHEMA_VERSION}.`,
+      );
+    }
+    const existing = this.#database
+      .prepare(
+        `SELECT name
+           FROM sqlite_master
+          WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+          LIMIT 1`,
+      )
+      .get() as Row | undefined;
+    if (existing) {
+      throw new KernelError(
+        "Conflict",
+        "The database contains an unversioned kernel schema and cannot be migrated safely.",
+      );
+    }
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      this.#database.exec(schemaSql);
+      this.#database.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
+      this.#database.exec("COMMIT");
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw this.#translateError(error);
+    }
   }
 
   #applyBootstrap(bootstrap?: KernelBootstrap): void {
@@ -2326,14 +2748,34 @@ export class TorsorKernel {
   }
 
   #assertActivationScopeCurrent(activation: Row): void {
+    if (activation.revoked_at !== null) {
+      throw new KernelError(
+        "Conflict",
+        `The Activation was revoked: ${optionalText(activation.revocation_reason) ?? "unspecified"}.`,
+      );
+    }
+    if (new Date(text(activation.expires_at)) <= this.#clock()) {
+      throw new KernelError("Conflict", "The Activation has expired.");
+    }
     const runId = optionalText(activation.run_id);
     if (runId) {
       const run = this.#requireRun(runId);
-      if (terminalRunStates.includes(text(run.state) as RunState)) {
+      if (text(run.state) !== "Active") {
         throw new KernelError(
-          "TerminalRun",
-          "The Activation scope ended when its Run became terminal.",
+          terminalRunStates.includes(text(run.state) as RunState)
+            ? "TerminalRun"
+            : "Conflict",
+          "Execution side effects require an Active Run.",
           { state: text(run.state) },
+        );
+      }
+      if (
+        integer(activation.run_activation_generation) !==
+        integer(run.activation_generation)
+      ) {
+        throw new KernelError(
+          "Conflict",
+          "The Activation was superseded by a newer Run activation generation.",
         );
       }
       return;
@@ -2356,6 +2798,22 @@ export class TorsorKernel {
         "The Activation scope ended when its Attention handler lease expired or changed.",
       );
     }
+  }
+
+  #revokeRunActivations(
+    runId: string,
+    reason: string,
+    revokedAt: string,
+  ): void {
+    this.#run(
+      `UPDATE activation_attempts
+          SET revoked_at = COALESCE(revoked_at, ?),
+              revocation_reason = COALESCE(revocation_reason, ?)
+        WHERE run_id = ? AND finished_at IS NULL AND revoked_at IS NULL`,
+      revokedAt,
+      reason,
+      runId,
+    );
   }
 
   #activationScope(activation: Row): {
@@ -2482,8 +2940,20 @@ export class TorsorKernel {
     return row;
   }
 
+  #requireOutboxEvent(id: string): Row {
+    const row = this.#getRow("SELECT * FROM outbox_events WHERE id = ?", id);
+    if (!row) {
+      throw new KernelError("NotFound", `OutboxEvent ${id} does not exist.`);
+    }
+    return row;
+  }
+
   #validateDisposition(disposition: RunInputDisposition, reason: string): void {
-    if (disposition === "Pending" || disposition === "Incorporated") {
+    if (
+      disposition === "Pending" ||
+      disposition === "Incorporated" ||
+      disposition === "Withdrawn"
+    ) {
       throw new KernelError("InvalidCommand", "The completion exception disposition is invalid.");
     }
     requireNonEmpty(reason, "exception reason");
@@ -2581,6 +3051,7 @@ function mapMessage(
 
 function mapAttention(row: Row): AttentionView {
   return {
+    cursor: integer(row.sequence),
     id: text(row.id),
     messageRevisionId: text(row.message_revision_id),
     targetAgentId: text(row.target_agent_id),
@@ -2607,6 +3078,7 @@ function mapRun(row: Row): RunView {
     agentConfigRevision: integer(row.agent_config_revision),
     state: text(row.state) as RunState,
     revision: integer(row.revision),
+    activationGeneration: integer(row.activation_generation),
     createdAt: text(row.created_at),
     updatedAt: text(row.updated_at),
     terminalReason: optionalText(row.terminal_reason),
@@ -2640,8 +3112,15 @@ function mapActivation(
     runId: optionalText(row.run_id),
     attentionId: optionalText(row.attention_id),
     configRevision: integer(row.config_revision),
+    runActivationGeneration:
+      row.run_activation_generation === null
+        ? null
+        : integer(row.run_activation_generation),
     runInputIds,
     startedAt: text(row.started_at),
+    expiresAt: text(row.expires_at),
+    revokedAt: optionalText(row.revoked_at),
+    revocationReason: optionalText(row.revocation_reason),
     finishedAt: optionalText(row.finished_at),
     outcome:
       row.outcome === null
@@ -2681,6 +3160,22 @@ function mapActivity(row: Row): RunActivityEventView {
     retentionClass: text(
       row.retention_class,
     ) as RunActivityEventView["retentionClass"],
+    createdAt: text(row.created_at),
+  };
+}
+
+function mapOutboxEvent(row: Row): OutboxEventView {
+  return {
+    cursor: integer(row.sequence),
+    id: text(row.id),
+    topic: text(row.topic),
+    aggregateType: text(row.aggregate_type),
+    aggregateId: text(row.aggregate_id),
+    payload: parseJson(row.payload_json),
+    deliveryAttempts: integer(row.delivery_attempts),
+    leaseHolderPrincipalId: optionalText(row.lease_holder_principal_id),
+    leaseExpiresAt: optionalText(row.lease_expires_at),
+    acknowledgedAt: optionalText(row.acknowledged_at),
     createdAt: text(row.created_at),
   };
 }
@@ -2783,6 +3278,20 @@ function boundedLimit(limit = 100): number {
     throw new KernelError("InvalidCommand", "Limit must be between 1 and 500.");
   }
   return limit;
+}
+
+function boundedDuration(durationMs: number, field: string): number {
+  if (
+    !Number.isInteger(durationMs) ||
+    durationMs < 1_000 ||
+    durationMs > 300_000
+  ) {
+    throw new KernelError(
+      "InvalidCommand",
+      `${field} must be between 1 and 300 seconds.`,
+    );
+  }
+  return durationMs;
 }
 
 function assertNever(value: never): never {

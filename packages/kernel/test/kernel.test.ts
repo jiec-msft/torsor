@@ -40,8 +40,8 @@ describe("TorsorKernel transactions and invariants", () => {
 
       expect(thread.messages).toHaveLength(1);
       expect(thread.messages[0]?.targetAgentIds).toEqual(["agent-orbit"]);
-      expect(attentions).toHaveLength(1);
-      expect(attentions[0]).toMatchObject({
+      expect(attentions.items).toHaveLength(1);
+      expect(attentions.items[0]).toMatchObject({
         messageRevisionId: thread.messages[0]?.revisions[0]?.id,
         targetAgentId: "agent-orbit",
         triggerKind: "Mention",
@@ -69,10 +69,12 @@ describe("TorsorKernel transactions and invariants", () => {
       ).rejects.toMatchObject({ code: "NotFound" });
 
       expect(
-        await kernel.query(
+        (
+          await kernel.query(
           { type: "ListOpenAttentions", projectId: "project-sample" },
           runtimeContext,
-        ),
+          )
+        ).items,
       ).toEqual([]);
       expect(await kernel.readEvents(null, 100)).toEqual([]);
     } finally {
@@ -94,10 +96,11 @@ describe("TorsorKernel transactions and invariants", () => {
         },
         humanContext,
       );
-      const [attention] = await kernel.query(
+      const attentionPage = await kernel.query(
         { type: "ListOpenAttentions", targetAgentId: "agent-orbit" },
         runtimeContext,
       );
+      const [attention] = attentionPage.items;
       const claim = await kernel.execute(
         {
           type: "ClaimAttention",
@@ -160,7 +163,6 @@ describe("TorsorKernel transactions and invariants", () => {
           },
         ),
       ).rejects.toMatchObject({ code: "Conflict" });
-
       const projection = await kernel.query(
         { type: "GetRunProjection", runId: run.entityId },
         humanContext,
@@ -237,8 +239,8 @@ describe("TorsorKernel transactions and invariants", () => {
       expect(new Set(projection.inputs.map((input) => input.messageRevisionId)).size).toBe(3);
       expect(thread.messages).toHaveLength(3);
       expect(projection.run.revision).toBe(3);
-      expect(orbitAttentions).toHaveLength(0);
-      expect(keelAttentions).toHaveLength(1);
+      expect(orbitAttentions.items).toHaveLength(0);
+      expect(keelAttentions.items).toHaveLength(1);
     } finally {
       kernel.close();
     }
@@ -307,7 +309,7 @@ describe("TorsorKernel transactions and invariants", () => {
         { type: "GetBootstrap", projectId: "project-sample" },
         { principalId: "principal-orbit" },
       );
-      expect(bootstrap.openAttentions).toEqual([]);
+      expect(bootstrap.openAttentions.items).toEqual([]);
 
       await expect(
         kernel.query(
@@ -626,7 +628,6 @@ describe("TorsorKernel transactions and invariants", () => {
           setup.agentContext,
         ),
       ).rejects.toMatchObject({ code: "Conflict" });
-
       const projection = await kernel.query(
         { type: "GetRunProjection", runId: setup.runId },
         humanContext,
@@ -698,7 +699,7 @@ describe("TorsorKernel transactions and invariants", () => {
           },
           setup.agentContext,
         ),
-      ).rejects.toMatchObject({ code: "TerminalRun" });
+      ).rejects.toMatchObject({ code: "Conflict" });
 
       await expect(
         kernel.execute(
@@ -714,7 +715,7 @@ describe("TorsorKernel transactions and invariants", () => {
           },
           runtimeContext,
         ),
-      ).rejects.toMatchObject({ code: "TerminalRun" });
+      ).rejects.toMatchObject({ code: "Conflict" });
       await expect(
         kernel.execute(
           {
@@ -728,7 +729,7 @@ describe("TorsorKernel transactions and invariants", () => {
           },
           runtimeContext,
         ),
-      ).rejects.toMatchObject({ code: "TerminalRun" });
+      ).rejects.toMatchObject({ code: "Conflict" });
 
       await kernel.execute(
         {
@@ -750,7 +751,7 @@ describe("TorsorKernel transactions and invariants", () => {
         disposition: "Abandoned",
         dispositionReason: "run_cancelled",
       });
-      expect(after.activity.at(-1)).toMatchObject({ kind: "late_output" });
+      expect(after.activity.items.at(-1)).toMatchObject({ kind: "late_output" });
     } finally {
       kernel.close();
     }
@@ -865,10 +866,11 @@ describe("TorsorKernel transactions and invariants", () => {
         },
         humanContext,
       );
-      const [attention] = await kernel.query(
+      const attentionPage = await kernel.query(
         { type: "ListOpenAttentions", targetAgentId: "agent-orbit" },
         runtimeContext,
       );
+      const [attention] = attentionPage.items;
       const claim = await kernel.execute(
         {
           type: "ClaimAttention",
@@ -915,6 +917,26 @@ describe("TorsorKernel transactions and invariants", () => {
           agentContext,
         ),
       ).rejects.toMatchObject({ code: "Conflict" });
+      await expect(
+        kernel.execute(
+          {
+            type: "FinishActivation",
+            idempotencyKey: "agent-finish-expired-attention",
+            activationId: activation.entityId,
+            outcome: "Completed",
+          },
+          agentContext,
+        ),
+      ).rejects.toMatchObject({ code: "Conflict" });
+      await kernel.execute(
+        {
+          type: "FinishActivation",
+          idempotencyKey: "runtime-finish-expired-attention",
+          activationId: activation.entityId,
+          outcome: "Expired",
+        },
+        runtimeContext,
+      );
     } finally {
       kernel.close();
     }
@@ -935,10 +957,11 @@ describe("TorsorKernel transactions and invariants", () => {
         },
         humanContext,
       );
-      const [attention] = await kernel.query(
+      const attentionPage = await kernel.query(
         { type: "ListOpenAttentions", targetAgentId: "agent-orbit" },
         runtimeContext,
       );
+      const [attention] = attentionPage.items;
       const firstClaim = await kernel.execute(
         {
           type: "ClaimAttention",
@@ -987,10 +1010,11 @@ describe("TorsorKernel transactions and invariants", () => {
         ),
       ).rejects.toMatchObject({ code: "Conflict" });
 
-      const [stillOpen] = await kernel.query(
+      const stillOpenPage = await kernel.query(
         { type: "ListOpenAttentions", targetAgentId: "agent-orbit" },
         runtimeContext,
       );
+      const [stillOpen] = stillOpenPage.items;
       expect(stillOpen?.revision).toBe(replacementClaim.revision);
     } finally {
       kernel.close();

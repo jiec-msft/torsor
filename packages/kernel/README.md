@@ -10,6 +10,10 @@ kernel.query(query, principalContext);
 kernel.readEvents(afterEventId, limit);
 ```
 
+`readEvents` is a trusted-internal synchronization feed for the local
+server/runtime boundary. A transport must apply its own authenticated
+Project/Channel authorization before exposing event envelopes to a client.
+
 Open a file-backed production database or the same adapter in memory:
 
 ```ts
@@ -33,3 +37,13 @@ Every command has a principal-scoped idempotency key. Runtime activity must
 carry durable Activation or ProviderAttempt provenance. Provider session IDs
 are diagnostic only; provider delivery never changes RunInput disposition or
 other semantic state.
+
+Outbox consumers use `ClaimOutboxEvents`, `AcknowledgeOutboxEvents`, and
+`ListOutboxEvents`. Claims are ordered, leased, and recoverable after process
+restart or lease expiry.
+
+Artifact publication stores an immutable descriptor only. The caller must
+finalize content in durable storage and verify its digest before
+`PublishArtifact`; the kernel does not upload blobs or turn a temporary upload
+location into a finalized Artifact. A failed or incomplete upload must not
+publish the descriptor.

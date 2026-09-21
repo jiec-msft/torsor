@@ -1,3 +1,5 @@
+export const CURRENT_SCHEMA_VERSION = 1;
+
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
 
@@ -49,8 +51,8 @@ CREATE TABLE IF NOT EXISTS messages (
   reply_to_message_id TEXT,
   author_principal_id TEXT NOT NULL REFERENCES principals(id),
   author_agent_id TEXT REFERENCES agents(id),
-  caused_by_attention_id TEXT,
-  caused_by_run_id TEXT,
+  caused_by_attention_id TEXT REFERENCES attentions(id),
+  caused_by_run_id TEXT REFERENCES runs(id),
   thread_sequence INTEGER NOT NULL CHECK (thread_sequence > 0),
   latest_revision INTEGER NOT NULL CHECK (latest_revision > 0),
   created_at TEXT NOT NULL
@@ -78,7 +80,8 @@ CREATE TABLE IF NOT EXISTS mentions (
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS attentions (
-  id TEXT PRIMARY KEY,
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
   project_id TEXT NOT NULL REFERENCES projects(id),
   channel_id TEXT NOT NULL REFERENCES channels(id),
   thread_root_id TEXT NOT NULL,
@@ -92,8 +95,8 @@ CREATE TABLE IF NOT EXISTS attentions (
   handler_lease_expires_at TEXT,
   resolution_outcome TEXT,
   resolved_by_principal_id TEXT REFERENCES principals(id),
-  resolved_activation_id TEXT,
-  resolved_run_id TEXT,
+  resolved_activation_id TEXT REFERENCES activation_attempts(id),
+  resolved_run_id TEXT REFERENCES runs(id),
   created_at TEXT NOT NULL,
   resolved_at TEXT,
   UNIQUE (message_revision_id, target_agent_id, trigger_kind)
@@ -111,6 +114,7 @@ CREATE TABLE IF NOT EXISTS runs (
   agent_config_revision INTEGER NOT NULL,
   state TEXT NOT NULL CHECK (state IN ('Active', 'Waiting', 'Completed', 'Failed', 'Cancelled')),
   revision INTEGER NOT NULL CHECK (revision > 0),
+  activation_generation INTEGER NOT NULL DEFAULT 0 CHECK (activation_generation >= 0),
   next_input_sequence INTEGER NOT NULL DEFAULT 1 CHECK (next_input_sequence > 0),
   next_activity_sequence INTEGER NOT NULL DEFAULT 1 CHECK (next_activity_sequence > 0),
   created_at TEXT NOT NULL,
@@ -128,7 +132,7 @@ CREATE TABLE IF NOT EXISTS run_inputs (
   message_revision_id TEXT NOT NULL REFERENCES message_revisions(id),
   run_input_sequence INTEGER NOT NULL CHECK (run_input_sequence > 0),
   assigned_by_principal_id TEXT NOT NULL REFERENCES principals(id),
-  assigned_by_activation_id TEXT,
+  assigned_by_activation_id TEXT REFERENCES activation_attempts(id),
   source_attention_id TEXT REFERENCES attentions(id),
   created_at TEXT NOT NULL,
   disposition TEXT NOT NULL CHECK (disposition IN ('Pending', 'Incorporated', 'Declined', 'Superseded', 'Withdrawn', 'Abandoned')),
@@ -145,13 +149,23 @@ CREATE TABLE IF NOT EXISTS activation_attempts (
   run_id TEXT REFERENCES runs(id),
   attention_id TEXT REFERENCES attentions(id),
   attention_lease_token TEXT,
+  run_activation_generation INTEGER,
   cause TEXT NOT NULL CHECK (cause IN ('Run', 'Attention')),
   config_revision INTEGER NOT NULL,
   started_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT,
+  revocation_reason TEXT,
   finished_at TEXT,
   outcome TEXT CHECK (outcome IS NULL OR outcome IN ('Completed', 'Failed', 'Cancelled', 'Expired')),
   detail TEXT,
   CHECK ((run_id IS NOT NULL) != (attention_id IS NOT NULL)),
+  CHECK (
+    (run_id IS NOT NULL AND run_activation_generation IS NOT NULL AND attention_lease_token IS NULL)
+    OR
+    (attention_id IS NOT NULL AND run_activation_generation IS NULL AND attention_lease_token IS NOT NULL)
+  ),
+  UNIQUE (attention_id, attention_lease_token),
   FOREIGN KEY (agent_id, config_revision)
     REFERENCES agent_config_revisions(agent_id, revision)
 ) STRICT;
@@ -220,14 +234,23 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS outbox_events (
-  id TEXT PRIMARY KEY,
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
   topic TEXT NOT NULL,
   aggregate_type TEXT NOT NULL,
   aggregate_id TEXT NOT NULL,
   payload_json TEXT NOT NULL,
+  delivery_attempts INTEGER NOT NULL DEFAULT 0 CHECK (delivery_attempts >= 0),
+  lease_holder_principal_id TEXT REFERENCES principals(id),
+  lease_token TEXT,
+  lease_expires_at TEXT,
   created_at TEXT NOT NULL,
-  published_at TEXT
+  acknowledged_at TEXT,
+  acknowledged_by_principal_id TEXT REFERENCES principals(id)
 ) STRICT;
+
+CREATE INDEX IF NOT EXISTS outbox_pending_idx
+  ON outbox_events(acknowledged_at, lease_expires_at, sequence);
 
 CREATE TABLE IF NOT EXISTS public_events (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -240,7 +263,7 @@ CREATE TABLE IF NOT EXISTS public_events (
   entity_type TEXT NOT NULL,
   entity_id TEXT NOT NULL,
   actor_principal_id TEXT NOT NULL REFERENCES principals(id),
-  activation_id TEXT,
+  activation_id TEXT REFERENCES activation_attempts(id),
   causation_id TEXT,
   correlation_id TEXT NOT NULL,
   payload_json TEXT NOT NULL,

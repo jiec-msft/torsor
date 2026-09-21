@@ -60,7 +60,7 @@ export async function createRun(kernel: TorsorKernel) {
     },
     humanContext,
   );
-  const [attention] = await kernel.query(
+  const attentionPage = await kernel.query(
     {
       type: "ListOpenAttentions",
       projectId: "project-sample",
@@ -68,6 +68,7 @@ export async function createRun(kernel: TorsorKernel) {
     },
     runtimeContext,
   );
+  const [attention] = attentionPage.items;
   if (!attention) {
     throw new Error("Expected an Attention.");
   }
