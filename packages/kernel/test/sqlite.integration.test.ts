@@ -18,69 +18,150 @@ interface SchemaInitializationOperation {
   readonly sql: string;
 }
 
-function legacyAcknowledgeOutboxEvents(
-  database: DatabaseSync,
-  eventIds: readonly string[],
-  leaseToken: string,
-  now: Date,
-): boolean {
-  database.exec("BEGIN IMMEDIATE");
-  try {
-    const leasedRows = database
-      .prepare(
-        `SELECT id
-           FROM outbox_events
-          WHERE acknowledged_at IS NULL
-            AND lease_holder_principal_id = ?
-            AND lease_token = ?
-          ORDER BY sequence`,
-      )
-      .all("principal-runtime", leaseToken) as ReadonlyArray<
-      Record<string, unknown>
-    >;
-    const leasedIds = leasedRows.map((row) => String(row.id));
-    if (
-      leasedIds.length !== eventIds.length ||
-      leasedIds.some((id) => !eventIds.includes(id))
-    ) {
-      database.exec("ROLLBACK");
-      return false;
-    }
-    const selectEvent = database.prepare(
-      `SELECT lease_holder_principal_id, lease_token, lease_expires_at
-         FROM outbox_events
-        WHERE id = ?`,
+function downgradeToSchemaVersionOne(database: DatabaseSync): void {
+  removeLeaseProtocolFence(database);
+  database.exec(`
+    DROP TABLE attention_history;
+    ALTER TABLE attentions DROP COLUMN created_event_sequence;
+    PRAGMA user_version = 1;
+  `);
+}
+
+function downgradeToSchemaVersionTwo(database: DatabaseSync): void {
+  removeLeaseProtocolFence(database);
+  database.exec("PRAGMA user_version = 2");
+}
+
+function removeLeaseProtocolFence(database: DatabaseSync): void {
+  database.exec(`
+    DROP TRIGGER IF EXISTS outbox_lease_protocol_fence;
+    DROP TRIGGER IF EXISTS outbox_ack_protocol_fence;
+  `);
+  const columns = database.prepare("PRAGMA table_info(outbox_events)").all() as
+    ReadonlyArray<Record<string, unknown>>;
+  if (
+    columns.some(
+      (column) => column.name === "lease_protocol_generation",
+    )
+  ) {
+    database.exec(
+      "ALTER TABLE outbox_events DROP COLUMN lease_protocol_generation",
     );
-    const acknowledge = database.prepare(
-      `UPDATE outbox_events
-          SET acknowledged_at = ?,
-              acknowledged_by_principal_id = 'principal-runtime',
-              lease_token = NULL,
-              lease_expires_at = NULL
-        WHERE id = ?`,
-    );
-    for (const eventId of eventIds) {
-      const event = selectEvent.get(eventId) as
-        | Record<string, unknown>
-        | undefined;
-      if (
-        !event ||
-        event.lease_holder_principal_id !== "principal-runtime" ||
-        event.lease_token !== leaseToken ||
-        typeof event.lease_expires_at !== "string" ||
-        new Date(event.lease_expires_at) <= now
-      ) {
-        database.exec("ROLLBACK");
-        return false;
-      }
-      acknowledge.run(now.toISOString(), eventId);
-    }
-    database.exec("COMMIT");
-    return true;
-  } catch (error) {
-    database.exec("ROLLBACK");
-    throw error;
   }
+}
+
+function prepareLegacyOutboxWorker(database: DatabaseSync): {
+  claim: (
+    limit: number,
+    leaseToken: string,
+    now: Date,
+    leaseExpiresAt: string,
+  ) => {
+    readonly candidateIds: readonly string[];
+    readonly rejected: boolean;
+  };
+  acknowledge: (
+    eventIds: readonly string[],
+    leaseToken: string,
+    now: Date,
+  ) => boolean;
+} {
+  const selectClaimable = database.prepare(
+    `SELECT id
+       FROM outbox_events
+      WHERE acknowledged_at IS NULL
+        AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+      ORDER BY sequence
+      LIMIT ?`,
+  );
+  const leaseEvent = database.prepare(
+    `UPDATE outbox_events
+        SET lease_holder_principal_id = 'principal-runtime',
+            lease_token = ?,
+            lease_expires_at = ?,
+            delivery_attempts = delivery_attempts + 1
+      WHERE id = ?`,
+  );
+  const selectLeased = database.prepare(
+    `SELECT id
+       FROM outbox_events
+      WHERE acknowledged_at IS NULL
+        AND lease_holder_principal_id = ?
+        AND lease_token = ?
+      ORDER BY sequence`,
+  );
+  const selectEvent = database.prepare(
+    `SELECT lease_holder_principal_id, lease_token, lease_expires_at
+       FROM outbox_events
+      WHERE id = ?`,
+  );
+  const acknowledgeEvent = database.prepare(
+    `UPDATE outbox_events
+        SET acknowledged_at = ?,
+            acknowledged_by_principal_id = 'principal-runtime',
+            lease_token = NULL,
+            lease_expires_at = NULL
+      WHERE id = ?`,
+  );
+  return {
+    claim: (limit, leaseToken, now, leaseExpiresAt) => {
+      database.exec("BEGIN IMMEDIATE");
+      let candidateIds: string[] = [];
+      try {
+        const candidates = selectClaimable.all(
+          now.toISOString(),
+          limit,
+        ) as ReadonlyArray<Record<string, unknown>>;
+        candidateIds = candidates.map((row) => String(row.id));
+        for (const eventId of candidateIds) {
+          leaseEvent.run(leaseToken, leaseExpiresAt, eventId);
+        }
+        database.exec("COMMIT");
+        return { candidateIds, rejected: false };
+      } catch {
+        database.exec("ROLLBACK");
+        return { candidateIds, rejected: true };
+      }
+    },
+    acknowledge: (eventIds, leaseToken, now) => {
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        const leasedRows = selectLeased.all(
+          "principal-runtime",
+          leaseToken,
+        ) as ReadonlyArray<Record<string, unknown>>;
+        const leasedIds = leasedRows.map((row) => String(row.id));
+        if (
+          leasedIds.length !== eventIds.length ||
+          leasedIds.some((id) => !eventIds.includes(id))
+        ) {
+          database.exec("ROLLBACK");
+          return false;
+        }
+        for (const eventId of eventIds) {
+          const event = selectEvent.get(eventId) as
+            | Record<string, unknown>
+            | undefined;
+          if (
+            !event ||
+            event.lease_holder_principal_id !== "principal-runtime" ||
+            event.lease_token !== leaseToken ||
+            typeof event.lease_expires_at !== "string" ||
+            new Date(event.lease_expires_at) <= now
+          ) {
+            database.exec("ROLLBACK");
+            return false;
+          }
+          acknowledgeEvent.run(now.toISOString(), eventId);
+        }
+        database.exec("COMMIT");
+        return true;
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
 }
 
 describe("SQLite persistence", () => {
@@ -392,11 +473,7 @@ describe("SQLite persistence", () => {
       first.close();
 
       const legacyWorker = new DatabaseSync(databasePath);
-      legacyWorker.exec(`
-        DROP TABLE attention_history;
-        ALTER TABLE attentions DROP COLUMN created_event_sequence;
-        PRAGMA user_version = 1;
-      `);
+      downgradeToSchemaVersionOne(legacyWorker);
       const setLease = legacyWorker.prepare(
         `UPDATE outbox_events
             SET lease_holder_principal_id = 'principal-runtime',
@@ -408,13 +485,13 @@ describe("SQLite persistence", () => {
       setLease.run("lease-c", beforeMigration.items[0]!.id);
       setLease.run("lease-b", beforeMigration.items[1]!.id);
       setLease.run("lease-c", beforeMigration.items[2]!.id);
+      const legacy = prepareLegacyOutboxWorker(legacyWorker);
 
       try {
         const migrated = TorsorKernel.open(options);
         try {
           expect(
-            legacyAcknowledgeOutboxEvents(
-              legacyWorker,
+            legacy.acknowledge(
               [
                 beforeMigration.items[0]!.id,
                 beforeMigration.items[2]!.id,
@@ -444,9 +521,19 @@ describe("SQLite persistence", () => {
             afterRejection.items.map((event) => event.deliveryAttempts),
           ).toEqual([1, 1, 1]);
 
-          setLease.run("lease-v2-c", beforeMigration.items[0]!.id);
-          setLease.run("lease-v2-b", beforeMigration.items[1]!.id);
-          setLease.run("lease-v2-c", beforeMigration.items[2]!.id);
+          const setCurrentLease = legacyWorker.prepare(
+            `UPDATE outbox_events
+                SET lease_holder_principal_id = 'principal-runtime',
+                    lease_token = ?,
+                    lease_expires_at = '2026-09-21T08:01:00.000Z',
+                    lease_protocol_generation =
+                      lease_protocol_generation + 1,
+                    delivery_attempts = delivery_attempts + 1
+              WHERE id = ?`,
+          );
+          setCurrentLease.run("lease-v2-c", beforeMigration.items[0]!.id);
+          setCurrentLease.run("lease-v2-b", beforeMigration.items[1]!.id);
+          setCurrentLease.run("lease-v2-c", beforeMigration.items[2]!.id);
           await expect(
             migrated.execute(
               {
@@ -498,12 +585,238 @@ describe("SQLite persistence", () => {
           );
           expect(
             recovered.outboxEvents?.map((event) => event.deliveryAttempts),
-          ).toEqual([2, 2, 2]);
+          ).toEqual([3, 3, 3]);
         } finally {
           migrated.close();
         }
       } finally {
         legacyWorker.close();
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("fences a prepared legacy claim after migration", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-outbox-fence-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    const now = new Date("2026-09-21T08:00:00.000Z");
+    const options = {
+      databasePath,
+      bootstrap,
+      clock: () => now,
+    };
+    try {
+      const initial = TorsorKernel.open(options);
+      for (let index = 1; index <= 2; index += 1) {
+        await initial.execute(
+          {
+            type: "StartThread",
+            idempotencyKey: `protocol-fence-initial-${index}`,
+            projectId: "project-sample",
+            channelId: "channel-general",
+            body: `Protocol fence event ${index}.`,
+          },
+          humanContext,
+        );
+      }
+      const initialOutbox = await initial.query(
+        {
+          type: "ListOutboxEvents",
+          includeAcknowledged: true,
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      initial.close();
+
+      const legacyConnection = new DatabaseSync(databasePath);
+      downgradeToSchemaVersionOne(legacyConnection);
+      const legacy = prepareLegacyOutboxWorker(legacyConnection);
+      try {
+        const migrated = TorsorKernel.open(options);
+        try {
+          const firstClaim = await migrated.execute(
+            {
+              type: "ClaimOutboxEvents",
+              idempotencyKey: "protocol-fence-v2-first",
+              limit: 1,
+              leaseDurationMs: 30_000,
+            },
+            runtimeContext,
+          );
+          expect(firstClaim.outboxEvents?.map((event) => event.id)).toEqual([
+            initialOutbox.items[0]!.id,
+          ]);
+          expect(() =>
+            legacy.acknowledge(
+              [initialOutbox.items[0]!.id],
+              firstClaim.leaseToken!,
+              now,
+            ),
+          ).toThrow(/outbox acknowledgement protocol generation mismatch/);
+          await migrated.execute(
+            {
+              type: "StartThread",
+              idempotencyKey: "protocol-fence-post-migration",
+              projectId: "project-sample",
+              channelId: "channel-general",
+              body: "Created after the lease protocol migration.",
+            },
+            humanContext,
+          );
+          const withPostMigrationEvent = await migrated.query(
+            {
+              type: "ListOutboxEvents",
+              includeAcknowledged: true,
+              limit: 10,
+            },
+            runtimeContext,
+          );
+          const postMigrationEvent = withPostMigrationEvent.items[2]!;
+
+          const legacySecondClaim = legacy.claim(
+            1,
+            "legacy-lease-second",
+            now,
+            "2026-09-21T08:01:00.000Z",
+          );
+          expect(legacySecondClaim).toEqual({
+            candidateIds: [initialOutbox.items[1]!.id],
+            rejected: true,
+          });
+          expect(
+            legacy.acknowledge(
+              [initialOutbox.items[1]!.id],
+              "legacy-lease-second",
+              now,
+            ),
+          ).toBe(false);
+
+          const afterLegacySecondClaim = await migrated.query(
+            {
+              type: "ListOutboxEvents",
+              includeAcknowledged: true,
+              limit: 10,
+            },
+            runtimeContext,
+          );
+          expect(
+            afterLegacySecondClaim.items.map((event) => ({
+              acknowledgedAt: event.acknowledgedAt,
+              deliveryAttempts: event.deliveryAttempts,
+              leaseHolderPrincipalId: event.leaseHolderPrincipalId,
+            })),
+          ).toEqual([
+            {
+              acknowledgedAt: null,
+              deliveryAttempts: 1,
+              leaseHolderPrincipalId: "principal-runtime",
+            },
+            {
+              acknowledgedAt: null,
+              deliveryAttempts: 0,
+              leaseHolderPrincipalId: null,
+            },
+            {
+              acknowledgedAt: null,
+              deliveryAttempts: 0,
+              leaseHolderPrincipalId: null,
+            },
+          ]);
+
+          await migrated.execute(
+            {
+              type: "AcknowledgeOutboxEvents",
+              idempotencyKey: "protocol-fence-v2-first-ack",
+              outboxEventIds: [initialOutbox.items[0]!.id],
+              leaseToken: firstClaim.leaseToken!,
+            },
+            runtimeContext,
+          );
+          const secondClaim = await migrated.execute(
+            {
+              type: "ClaimOutboxEvents",
+              idempotencyKey: "protocol-fence-v2-second",
+              limit: 1,
+              leaseDurationMs: 30_000,
+            },
+            runtimeContext,
+          );
+          expect(secondClaim.outboxEvents?.map((event) => event.id)).toEqual([
+            initialOutbox.items[1]!.id,
+          ]);
+
+          const legacyPostMigrationClaim = legacy.claim(
+            1,
+            "legacy-lease-post-migration",
+            now,
+            "2026-09-21T08:01:00.000Z",
+          );
+          expect(legacyPostMigrationClaim).toEqual({
+            candidateIds: [postMigrationEvent.id],
+            rejected: true,
+          });
+          expect(
+            legacy.acknowledge(
+              [postMigrationEvent.id],
+              "legacy-lease-post-migration",
+              now,
+            ),
+          ).toBe(false);
+          await migrated.execute(
+            {
+              type: "AcknowledgeOutboxEvents",
+              idempotencyKey: "protocol-fence-v2-second-ack",
+              outboxEventIds: [initialOutbox.items[1]!.id],
+              leaseToken: secondClaim.leaseToken!,
+            },
+            runtimeContext,
+          );
+        } finally {
+          migrated.close();
+        }
+      } finally {
+        legacyConnection.close();
+      }
+
+      const reopened = TorsorKernel.open(options);
+      try {
+        const recovered = await reopened.execute(
+          {
+            type: "ClaimOutboxEvents",
+            idempotencyKey: "protocol-fence-reopen-claim",
+            limit: 1,
+            leaseDurationMs: 30_000,
+          },
+          runtimeContext,
+        );
+        expect(recovered.outboxEvents).toHaveLength(1);
+        expect(recovered.outboxEvents![0]).toMatchObject({
+          deliveryAttempts: 1,
+        });
+        await reopened.execute(
+          {
+            type: "AcknowledgeOutboxEvents",
+            idempotencyKey: "protocol-fence-reopen-ack",
+            outboxEventIds: [recovered.outboxEvents![0]!.id],
+            leaseToken: recovered.leaseToken!,
+          },
+          runtimeContext,
+        );
+        const finalOutbox = await reopened.query(
+          {
+            type: "ListOutboxEvents",
+            includeAcknowledged: true,
+            limit: 10,
+          },
+          runtimeContext,
+        );
+        expect(
+          finalOutbox.items.every((event) => event.acknowledgedAt !== null),
+        ).toBe(true);
+      } finally {
+        reopened.close();
       }
     } finally {
       await rm(directory, { recursive: true, force: true });
@@ -687,6 +1000,96 @@ describe("SQLite persistence", () => {
     }
   });
 
+  it("migrates schema version 2 lease state to the fenced protocol", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-v2-protocol-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    const options = {
+      databasePath,
+      bootstrap,
+      clock: () => new Date("2026-09-21T08:00:00.000Z"),
+    };
+    try {
+      const initial = TorsorKernel.open(options);
+      await initial.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: "v2-protocol-event",
+          projectId: "project-sample",
+          channelId: "channel-general",
+          body: "Migrate this synthetic v2 lease.",
+        },
+        humanContext,
+      );
+      const outbox = await initial.query(
+        {
+          type: "ListOutboxEvents",
+          includeAcknowledged: true,
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      initial.close();
+
+      const versionTwo = new DatabaseSync(databasePath);
+      downgradeToSchemaVersionTwo(versionTwo);
+      versionTwo
+        .prepare(
+          `UPDATE outbox_events
+              SET lease_holder_principal_id = 'principal-runtime',
+                  lease_token = 'legacy-v2-token',
+                  lease_expires_at = '2026-09-21T08:01:00.000Z',
+                  delivery_attempts = 1
+            WHERE id = ?`,
+        )
+        .run(outbox.items[0]!.id);
+      versionTwo.close();
+
+      const migrated = TorsorKernel.open(options);
+      try {
+        const afterMigration = await migrated.query(
+          {
+            type: "ListOutboxEvents",
+            includeAcknowledged: true,
+            limit: 10,
+          },
+          runtimeContext,
+        );
+        expect(afterMigration.items[0]).toMatchObject({
+          acknowledgedAt: null,
+          deliveryAttempts: 1,
+          leaseHolderPrincipalId: null,
+          leaseExpiresAt: null,
+        });
+        const claimed = await migrated.execute(
+          {
+            type: "ClaimOutboxEvents",
+            idempotencyKey: "v2-protocol-reclaim",
+            limit: 1,
+            leaseDurationMs: 30_000,
+          },
+          runtimeContext,
+        );
+        expect(claimed.outboxEvents![0]).toMatchObject({
+          id: outbox.items[0]!.id,
+          deliveryAttempts: 2,
+        });
+        await migrated.execute(
+          {
+            type: "AcknowledgeOutboxEvents",
+            idempotencyKey: "v2-protocol-ack",
+            outboxEventIds: [outbox.items[0]!.id],
+            leaseToken: claimed.leaseToken!,
+          },
+          runtimeContext,
+        );
+      } finally {
+        migrated.close();
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("migrates complete Attention snapshot history from schema version 1", async () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-migration-"));
     const databasePath = join(directory, "kernel.sqlite");
@@ -707,11 +1110,7 @@ describe("SQLite persistence", () => {
       first.close();
 
       const versionOne = new DatabaseSync(databasePath);
-      versionOne.exec(`
-        DROP TABLE attention_history;
-        ALTER TABLE attentions DROP COLUMN created_event_sequence;
-        PRAGMA user_version = 1;
-      `);
+      downgradeToSchemaVersionOne(versionOne);
       versionOne.close();
 
       const migrated = TorsorKernel.open({ databasePath, bootstrap });
@@ -838,11 +1237,7 @@ describe("SQLite persistence", () => {
       const initial = TorsorKernel.open({ databasePath, bootstrap });
       initial.close();
       const versionOne = new DatabaseSync(databasePath);
-      versionOne.exec(`
-        DROP TABLE attention_history;
-        ALTER TABLE attentions DROP COLUMN created_event_sequence;
-        PRAGMA user_version = 1;
-      `);
+      downgradeToSchemaVersionOne(versionOne);
       versionOne.close();
 
       Reflect.set(
@@ -865,7 +1260,7 @@ describe("SQLite persistence", () => {
         try {
           expect(
             migrated.prepare("PRAGMA user_version").get(),
-          ).toMatchObject({ user_version: 2 });
+          ).toMatchObject({ user_version: 3 });
         } finally {
           migrated.close();
         }
