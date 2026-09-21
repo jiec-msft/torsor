@@ -648,7 +648,13 @@ export function getProjectAgentStatus(
      SELECT activation.agent_id, 'Attention' AS scope
        FROM activation_attempts AS activation INDEXED BY ${attentionActivationIndex}
        JOIN attentions AS attention ON attention.id = activation.attention_id
-      WHERE ${invariants.liveAttentionActivationPredicate("activation", "attention")}
+       JOIN attention_domain_fences AS attention_domain
+         ON attention_domain.attention_id = attention.id
+      WHERE ${invariants.liveAttentionActivationPredicate(
+        "activation",
+        "attention",
+        "attention_domain",
+      )}
         AND attention.project_id = ?
         ${agentId ? "AND activation.agent_id = ?" : ""}
        ) AS live

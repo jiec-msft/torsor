@@ -125,13 +125,38 @@ export function claimAttention(kernel: db.KernelContext, command: Extract<Kernel
   const leaseToken = kernel.idFactory("lease");
   const revision = integer(attention.revision) + 1;
   const expiresAt = new Date(now.getTime() + command.leaseDurationMs).toISOString();
-  invariants.claimAttentionDomain(
+  const superseded = invariants.claimAttentionDomain(
     kernel,
     attention,
     leaseToken,
     expiresAt,
     now,
   );
+  if (superseded) {
+    const supersededEventSequence = invariants.emitEvent(kernel, {
+      type: "AttentionHandlerLeaseSuperseded",
+      projectId: text(superseded.attention.project_id),
+      channelId: text(superseded.attention.channel_id),
+      threadRootId: text(superseded.attention.thread_root_id),
+      threadCursor: null,
+      entityType: "Attention",
+      entityId: text(superseded.attention.id),
+      actorPrincipalId: text(principal.id),
+      activationId: null,
+      causationId: command.attentionId,
+      correlationId,
+      payload: {
+        revision: superseded.revision,
+        supersededByAttentionId: command.attentionId,
+        revokedActivationIds: [...superseded.activationIds],
+      },
+    });
+    invariants.recordAttentionHistory(
+      kernel,
+      text(superseded.attention.id),
+      supersededEventSequence,
+    );
+  }
   const changedActivations = db.allRows(kernel, `UPDATE activation_attempts
           SET revoked_at = COALESCE(revoked_at, ?),
               revocation_reason = COALESCE(revocation_reason, 'attention_lease_replaced')
@@ -480,7 +505,12 @@ export function resolveCachedAttentionClaim(
       text(principal.id) ||
     optionalText(attention.handler_lease_token) !== leaseToken ||
     expiresAt === null ||
-    new Date(expiresAt) <= kernel.clock()
+    new Date(expiresAt) <= kernel.clock() ||
+    !invariants.isAttentionDomainLeaseCurrent(
+      kernel,
+      attention,
+      leaseToken,
+    )
   ) {
     throw new KernelError(
       "Conflict",

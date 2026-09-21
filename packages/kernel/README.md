@@ -157,6 +157,10 @@ that overlaps another live handler lease or an unsettled `Started` or
 `Acknowledged` Attention ProviderAttempt fails with `DomainBusy`. The fence
 survives Attention resolution and process restart until provider settlement;
 expired abandoned leases without unsettled provider work can be reclaimed.
+Reclaim by another Attention atomically clears the superseded handler lease
+and revokes its unfinished Activation. Cached claims, lease-authorized
+decisions, and Activation capabilities must still match the durable fence, so
+clock rollback cannot resurrect superseded authority.
 
 Runtime recovery can read one `ProviderAttempt` directly and page
 `ListRecoverableAttentionExecutions` in stable Activation start order without

@@ -38,7 +38,11 @@ type ThreadEventInput = Omit<EventInput, "threadRootId" | "threadCursor"> & {
 
 type ActivationScopeState =
   | Readonly<{ kind: "Run"; run: Row }>
-  | Readonly<{ kind: "Attention"; attention: Row }>;
+  | Readonly<{
+      kind: "Attention";
+      attention: Row;
+      domainFence: Row | undefined;
+    }>;
 
 export type PrincipalReadScope = Readonly<{
   projectId: string;
@@ -121,6 +125,49 @@ export function assertAttentionLease(kernel: db.KernelContext, attention: Row, l
   if (!expiresAt || new Date(expiresAt) <= kernel.clock()) {
     throw new KernelError("Conflict", "The Attention handler lease has expired.");
   }
+  if (!isAttentionDomainLeaseCurrent(kernel, attention, leaseToken)) {
+    throw new KernelError(
+      "Conflict",
+      "The Attention handler lease no longer owns its execution domain.",
+    );
+  }
+}
+
+export function isAttentionDomainLeaseCurrent(
+  kernel: db.KernelContext,
+  attention: Row,
+  leaseToken: string,
+): boolean {
+  const expiresAt = optionalText(attention.handler_lease_expires_at);
+  if (expiresAt === null) {
+    return false;
+  }
+  const fence = db.getRow(
+    kernel,
+    `SELECT *
+       FROM attention_domain_fences
+      WHERE attention_id = ?`,
+    text(attention.id),
+  );
+  return attentionDomainFenceMatches(attention, fence, leaseToken);
+}
+
+function attentionDomainFenceMatches(
+  attention: Row,
+  fence: Row | undefined,
+  leaseToken: string | null,
+): boolean {
+  return fence !== undefined &&
+    optionalText(attention.handler_lease_token) === leaseToken &&
+    optionalText(fence.agent_id) === optionalText(attention.target_agent_id) &&
+    optionalText(fence.project_id) === optionalText(attention.project_id) &&
+    optionalText(fence.channel_id) === optionalText(attention.channel_id) &&
+    optionalText(fence.thread_root_id) ===
+      optionalText(attention.thread_root_id) &&
+    optionalText(fence.lease_token) === leaseToken &&
+    optionalText(fence.lease_expires_at) ===
+      optionalText(attention.handler_lease_expires_at) &&
+    optionalText(fence.attention_id) === optionalText(attention.id);
 }
 
 export function claimAttentionDomain(
@@ -129,7 +176,11 @@ export function claimAttentionDomain(
   leaseToken: string,
   leaseExpiresAt: string,
   at: Date,
-): void {
+): Readonly<{
+  attention: Row;
+  revision: number;
+  activationIds: readonly string[];
+}> | null {
   const domain = {
     agentId: text(attention.target_agent_id),
     projectId: text(attention.project_id),
@@ -166,6 +217,55 @@ export function claimAttentionDomain(
         },
       );
     }
+    let superseded: Readonly<{
+      attention: Row;
+      revision: number;
+      activationIds: readonly string[];
+    }> | null = null;
+    if (text(existing.attention_id) !== text(attention.id)) {
+      const previous = requireAttention(kernel, text(existing.attention_id));
+      if (!attentionDomainFenceMatches(
+        previous,
+        existing,
+        optionalText(existing.lease_token),
+      )) {
+        throw new Error(
+          `Attention ${text(previous.id)} lease does not match its domain fence.`,
+        );
+      }
+      const previousRevision = integer(previous.revision) + 1;
+      db.run(
+        kernel,
+        `UPDATE attentions
+            SET revision = ?,
+                handler_lease_holder_principal_id = NULL,
+                handler_lease_token = NULL,
+                handler_lease_expires_at = NULL
+          WHERE id = ?`,
+        previousRevision,
+        text(previous.id),
+      );
+      const changedActivations = db.allRows(
+        kernel,
+        `UPDATE activation_attempts
+            SET revoked_at = COALESCE(revoked_at, ?),
+                revocation_reason =
+                  COALESCE(revocation_reason, 'attention_domain_superseded')
+          WHERE attention_id = ?
+            AND finished_at IS NULL
+            AND revoked_at IS NULL
+          RETURNING id`,
+        at.toISOString(),
+        text(previous.id),
+      );
+      const activationIds = changedActivations.map((row) => text(row.id));
+      markActivationChanges(kernel, activationIds);
+      superseded = {
+        attention: previous,
+        revision: previousRevision,
+        activationIds,
+      };
+    }
     db.run(
       kernel,
       `UPDATE attention_domain_fences
@@ -185,7 +285,7 @@ export function claimAttentionDomain(
       domain.channelId,
       domain.threadRootId,
     );
-    return;
+    return superseded;
   }
   db.run(
     kernel,
@@ -201,6 +301,7 @@ export function claimAttentionDomain(
     leaseToken,
     leaseExpiresAt,
   );
+  return null;
 }
 
 export function releaseAttentionDomainLease(
@@ -418,8 +519,16 @@ export function isActivationLiveAt(
     runActivationGeneration: number | null;
     scopeAgentId: string | null;
     attentionStatus: string | null;
+    attentionId: string | null;
     attentionLeaseToken: string | null;
     attentionLeaseExpiresAt: string | null;
+    attentionDomainId: string | null;
+    attentionDomainAgentId: string | null;
+    attentionDomainProjectId: string | null;
+    attentionDomainChannelId: string | null;
+    attentionDomainThreadRootId: string | null;
+    attentionDomainLeaseToken: string | null;
+    attentionDomainLeaseExpiresAt: string | null;
   }>,
   at: Date,
 ): boolean {
@@ -436,11 +545,27 @@ export function isActivationLiveAt(
       : {
           kind: "Attention",
           attention: {
+            id: scope.attentionId,
+            project_id: scope.attentionDomainProjectId,
+            channel_id: scope.attentionDomainChannelId,
+            thread_root_id: scope.attentionDomainThreadRootId,
             status: scope.attentionStatus,
             target_agent_id: scope.scopeAgentId,
             handler_lease_token: scope.attentionLeaseToken,
             handler_lease_expires_at: scope.attentionLeaseExpiresAt,
           },
+          domainFence:
+            scope.attentionDomainId === null
+              ? undefined
+              : {
+                  attention_id: scope.attentionDomainId,
+                  agent_id: scope.attentionDomainAgentId,
+                  project_id: scope.attentionDomainProjectId,
+                  channel_id: scope.attentionDomainChannelId,
+                  thread_root_id: scope.attentionDomainThreadRootId,
+                  lease_token: scope.attentionDomainLeaseToken,
+                  lease_expires_at: scope.attentionDomainLeaseExpiresAt,
+                },
         };
   return activationValidityAt(activation, activationScopeState, at).live;
 }
@@ -461,6 +586,7 @@ export function liveRunActivationPredicate(
 export function liveAttentionActivationPredicate(
   activationAlias: string,
   attentionAlias: string,
+  domainFenceAlias: string,
 ): string {
   return `${activationAlias}.cause = 'Attention'
         AND ${activationAlias}.finished_at IS NULL
@@ -470,7 +596,14 @@ export function liveAttentionActivationPredicate(
         AND ${attentionAlias}.handler_lease_token = ${activationAlias}.attention_lease_token
         AND ${attentionAlias}.handler_lease_expires_at IS NOT NULL
         AND ${attentionAlias}.handler_lease_expires_at > ?
-        AND ${activationAlias}.agent_id = ${attentionAlias}.target_agent_id`;
+        AND ${activationAlias}.agent_id = ${attentionAlias}.target_agent_id
+        AND ${domainFenceAlias}.attention_id = ${attentionAlias}.id
+        AND ${domainFenceAlias}.agent_id = ${attentionAlias}.target_agent_id
+        AND ${domainFenceAlias}.project_id = ${attentionAlias}.project_id
+        AND ${domainFenceAlias}.channel_id = ${attentionAlias}.channel_id
+        AND ${domainFenceAlias}.thread_root_id = ${attentionAlias}.thread_root_id
+        AND ${domainFenceAlias}.lease_token = ${attentionAlias}.handler_lease_token
+        AND ${domainFenceAlias}.lease_expires_at = ${attentionAlias}.handler_lease_expires_at`;
 }
 
 export function revokeRunActivations(kernel: db.KernelContext, runId: string, reason: string, revokedAt: string): void {
@@ -767,10 +900,23 @@ function loadActivationScopeState(
   const runId = optionalText(activation.run_id);
   return runId
     ? { kind: "Run", run: requireRun(kernel, runId) }
-    : {
-        kind: "Attention",
-        attention: requireAttention(kernel, text(activation.attention_id)),
-      };
+    : (() => {
+        const attention = requireAttention(
+          kernel,
+          text(activation.attention_id),
+        );
+        return {
+          kind: "Attention" as const,
+          attention,
+          domainFence: db.getRow(
+            kernel,
+            `SELECT *
+               FROM attention_domain_fences
+              WHERE attention_id = ?`,
+            text(attention.id),
+          ),
+        };
+      })();
 }
 
 function activationValidityAt(
@@ -813,11 +959,17 @@ function activationValidityAt(
   const leaseExpiresAt = optionalText(
     scope.attention.handler_lease_expires_at,
   );
+  const domainFence = scope.domainFence;
   if (
     optionalText(scope.attention.handler_lease_token) !==
       optionalText(activation.attention_lease_token) ||
     leaseExpiresAt === null ||
-    new Date(leaseExpiresAt) <= at
+    new Date(leaseExpiresAt) <= at ||
+    !attentionDomainFenceMatches(
+      scope.attention,
+      domainFence,
+      optionalText(scope.attention.handler_lease_token),
+    )
   ) {
     return { live: false, reason: "attention_lease_stale" };
   }
