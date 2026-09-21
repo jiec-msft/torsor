@@ -237,27 +237,25 @@ export function listRecoverableAttentionExecutions(
   afterCursor: RecoverableAttentionExecutionCursor | undefined,
   limit: number,
 ): RecoverableAttentionExecutionPage {
-  const clauses = [
+  const expiredClauses = [
+    "expired.cause = 'Attention'",
+    "expired.finished_at IS NULL",
+    "expired.expires_at <= ?",
+  ];
+  const unsettledClauses = [
     "activation.cause = 'Attention'",
-    `(
-      (activation.finished_at IS NULL AND activation.expires_at <= ?)
-      OR
-      (
-        activation.finished_at IS NOT NULL
-        AND EXISTS (
-          SELECT 1
-            FROM provider_attempts AS unsettled
-           WHERE unsettled.activation_id = activation.id
-             AND unsettled.status IN ('Started', 'Acknowledged')
-        )
-      )
-    )`,
+    "activation.finished_at IS NOT NULL",
   ];
   const parameters: SQLInputValue[] = [db.now(kernel)];
   if (afterCursor) {
     requireNonEmpty(afterCursor.startedAt, "afterCursor.startedAt");
     requireNonEmpty(afterCursor.activationId, "afterCursor.activationId");
-    clauses.push(
+    expiredClauses.push("(expired.started_at, expired.id) > (?, ?)");
+    parameters.push(
+      afterCursor.startedAt,
+      afterCursor.activationId,
+    );
+    unsettledClauses.push(
       "(activation.started_at, activation.id) > (?, ?)",
     );
     parameters.push(
@@ -266,10 +264,17 @@ export function listRecoverableAttentionExecutions(
     );
   }
   parameters.push(limit + 1);
-  const sql = `SELECT activation.*
-       FROM activation_attempts AS activation
-      WHERE ${clauses.join(" AND ")}
-      ORDER BY activation.started_at, activation.id
+  const sql = `SELECT expired.*
+       FROM activation_attempts AS expired
+      WHERE ${expiredClauses.join(" AND ")}
+      UNION ALL
+     SELECT DISTINCT activation.*
+       FROM provider_attempts AS unsettled
+       JOIN activation_attempts AS activation
+         ON activation.id = unsettled.activation_id
+      WHERE unsettled.status IN ('Started', 'Acknowledged')
+        AND ${unsettledClauses.join(" AND ")}
+      ORDER BY started_at, id
       LIMIT ?`;
   const queryHook = Reflect.get(
     globalThis,

@@ -51,9 +51,10 @@ restart or lease expiry.
 
 Runtime recovery can read one `ProviderAttempt` directly and page
 `ListRecoverableAttentionExecutions` in stable Activation start order without
-scanning public event history. The recovery page includes expired unfinished
+scanning public event history or settled Activation history. Expired unfinished
 Attention Activations and finished Attention Activations that still own a
-`Started` or `Acknowledged` ProviderAttempt.
+`Started` or `Acknowledged` ProviderAttempt are found through separate sparse
+indexes and merged into the stable page.
 
 `ParkRunAfterProviderAttemptFailure` is a Runtime-only atomic transition for a
 current `Failed` or `Unknown` ProviderAttempt. It revision- and
