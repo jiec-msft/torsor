@@ -21,3 +21,10 @@ Torsor is a greenfield, public open-source project for durable human and agent c
 - Preserve clear boundaries between collaboration state, execution state, local workspace state, and external systems.
 - Add tests when behavior is introduced or changed.
 - Keep dependencies minimal and verify that their licenses are compatible with Apache-2.0.
+
+## Pre-release compatibility
+
+- During the current pre-release development and verification stage, backward compatibility is not a goal unless the owner explicitly requests it.
+- Prefer breaking schema and API changes with clean replacement over migrations, compatibility layers, or preserving disposable development data.
+- When a breaking local schema change lands, stop old processes and recreate the local database. Fail clearly rather than silently migrating or deleting data.
+- Revisit this policy before the first release or real external adoption.
