@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 5;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -195,6 +195,13 @@ CREATE TABLE IF NOT EXISTS provider_attempts (
   finished_at TEXT,
   UNIQUE (activation_id, request_idempotency_key)
 ) STRICT;
+
+CREATE INDEX IF NOT EXISTS provider_attempts_activation_status_idx
+  ON provider_attempts(activation_id, status);
+
+CREATE INDEX IF NOT EXISTS activation_attention_recovery_idx
+  ON activation_attempts(started_at, id, expires_at, finished_at)
+  WHERE cause = 'Attention';
 
 CREATE TABLE IF NOT EXISTS run_activity_events (
   id TEXT PRIMARY KEY,
