@@ -218,7 +218,36 @@ finalize content in durable storage and verify its digest before
 location into a finalized Artifact. A failed or incomplete upload must not
 publish the descriptor.
 
-The current direct schema version is 12. Version 12 gives unfinished and
+Worktree mutation is fenced by a Runtime-only durable writer lease. Acquisition
+creates a new monotonically increasing generation and fencing token for the
+Worktree; renewal preserves both values, and release never makes the same
+authority current again. The lease is live only before its persisted expiry.
+At the exact expiry timestamp it is expired, cached idempotent acquisition or
+renewal results fail closed, and the next acquisition receives a higher
+generation and fencing token. An authority operation that first observes the
+expiry commits that transition before returning its error, so a backward clock
+adjustment cannot revive the old token. Runtime must include the exact generation,
+fencing token, and opaque lease token when renewing or releasing authority.
+The opaque token is returned only by successful acquisition or renewal,
+including a live idempotent retry after restart; state queries never disclose
+it to another process sharing the Runtime principal.
+
+Uncertain or invalid writer state can be moved to `Quarantined`.
+Quarantining an active lease requires its exact generation, fencing token, and
+opaque lease token; public state cannot authorize a stale process to fence the
+current writer. Quarantine clears live authority and advances the fencing token
+as a durable barrier, including when no prior lease exists. Acquisition remains
+blocked until `ResolveWorktreeWriterLeaseQuarantine` matches the current
+revision and barrier token and presents the opaque reconciliation token returned
+only by the quarantine command. `GetWorktreeWriterLease` materializes
+clock-derived expiry, and
+`ListWorktreeWriterLeaseEvents` exposes the durable acquisition, renewal,
+release, expiry, quarantine, and reconciliation ledger. These primitives do
+not perform filesystem mutation, process execution, or shell execution.
+
+The current direct schema version is 13. Version 13 adds durable Worktree
+writer lease state and its independent event ledger. It retains version 12's
+bounded Attention recovery expiry horizon. Version 12 gives unfinished and
 finished-unsettled Attention recovery one bounded expiry-horizon index, so
 Kernel-clock promotion and revision checks remain indexed after recovery
 membership moves fully into the Kernel. It retains version 11's non-revoked
@@ -227,4 +256,4 @@ normalized recovery state, ordered page indexes, count-only expiry promotion,
 recovery mutation revision, incremental provider/domain counters, and durable
 Agent/Project/Channel/Thread execution fences.
 This pre-release schema is intentionally breaking: stop old processes and
-recreate disposable databases rather than migrating version 8 through 11.
+recreate disposable databases rather than migrating version 8 through 12.
