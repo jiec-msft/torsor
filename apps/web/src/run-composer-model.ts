@@ -148,7 +148,8 @@ export class RunComposerModel {
         ["stale_revision", "terminal_run", "invalid_command"].includes(error.code);
       const initialRejection = !pending.uncertain && error instanceof ApiError &&
         error.requestId && error.status >= 400 && error.status < 500 &&
-        ["forbidden", "not_found", "invalid_request", "conflict"].includes(error.code);
+        (["forbidden", "not_found", "invalid_request", "conflict"].includes(error.code) ||
+          (error.status === 413 && error.code === "payload_too_large"));
       if (domainRejection || initialRejection) {
         this.#set(run.id, {
           ...pending, status: "rejected", request: null, uncertain: false,

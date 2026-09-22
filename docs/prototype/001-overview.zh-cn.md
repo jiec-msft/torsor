@@ -2088,8 +2088,8 @@ Also published in #torsor-core / current Thread
 
 1. Composer 显示目标 Agent 名称和 ID、完整 Run ID、观察到的 revision，以及公开 home Channel/Thread 的明确目的地与返回入口。
 2. 提交中显示 `Submitting`，禁止重复提交；未确认前不将乐观 Message 或 RunInput 插入已提交投影。成功显示两者已提交，刷新 Thread 与 RunInput 事实；读取失败只表示投影待刷新，不能撤销已确认的提交。
-3. 确定的事务拒绝显示原因及两者均未提交。revision conflict 保留草稿，要求刷新并由 Human 再次发送；终态拒绝不能退化为普通 Reply。
-4. 丢失响应或其他不确定结果显示 `Submission outcome unknown`，绝不显示 `Not submitted`。冻结原请求并提供 `Retry same submission`；此前结果未知时，即使重试遭遇认证/权限失败，也继续保留未知状态，直到同一身份的幂等重放确认结果。
+3. 确定的事务拒绝显示原因及两者均未提交。首次尝试在命令执行前收到带 `requestId` 的结构化 `413/payload_too_large`，且此前没有未知结果时，也属于明确拒绝：释放待恢复请求身份，保留可编辑草稿，允许 Human 缩短或替换正文后以新幂等键再次发送。revision conflict 保留草稿，要求刷新并由 Human 再次发送；终态拒绝不能退化为普通 Reply。
+4. 丢失响应或其他不确定结果显示 `Submission outcome unknown`，绝不显示 `Not submitted`。冻结原请求并提供 `Retry same submission`；此前结果未知时，即使重试遭遇认证/权限失败或 `413/payload_too_large`，也继续保留未知状态及原请求身份，直到同一身份的幂等重放确认结果。后续请求在命令执行前被拒绝，不能证明先前请求未提交。
 5. 草稿和待恢复身份按 Run 保留为当前 Client Window 的本地状态，跨 Panel 关闭、Run 切换、后台刷新和重新认证保留。旧 Run 的迟到结果只更新该 Run 的提交状态，不清空另一 Run 的草稿或切回旧 Run。此切片不承诺浏览器重载或进程退出后的草稿恢复。
 6. 已提交不代表 Provider 已收到、接受或纳入工作。没有公开交付证据时不得显示 `Delivered` 或 `Accepted`；RunInput disposition 独立展示。实时 Steer 能力未知时明确说明不保证即时投递，不阻止持久 RunInput 提交。
 7. 提供 label、可感知的 Pending/成功/错误状态、可见焦点、键盘提交和恢复。Enter 在多行正文中换行，Ctrl/Cmd+Enter 显式提交且不能干扰 IME；异步结果不得抢走其他 Run 或控件的焦点。窄视口中目的地、正文、状态和按钮必须可换行/滚动并可通过键盘访问。

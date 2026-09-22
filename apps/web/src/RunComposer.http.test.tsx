@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 import { TorsorApp } from "./App";
@@ -7,6 +7,84 @@ import { runComposerHttp } from "./test/run-composer-http";
 const fixtures: Awaited<ReturnType<typeof runComposerHttp>>[] = [];
 afterEach(async () => {
   for (const fixture of fixtures.splice(0)) await fixture.close();
+});
+
+describe("Run Composer oversized submission recovery (§44.2)", () => {
+  it("keeps an initial HTTP 413 draft editable and commits a shortened replacement with a new key", async () => {
+    const fixture = await runComposerHttp();
+    fixtures.push(fixture);
+    const { controller, browser, first } = fixture;
+    window.history.replaceState({}, "", `/?project=project-sample&channel=channel-general&thread=${first.threadId}&run=${first.id}&panel=run&panels=detail`);
+    const user = userEvent.setup();
+    render(<TorsorApp controller={controller} />);
+    const body = await screen.findByRole("textbox", { name: "Run input" });
+    fireEvent.change(body, { target: { value: "x".repeat(1_048_577) } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send to Run" })).toBeEnabled());
+    const revision = controller.getSnapshot().run!.run.revision;
+    await user.click(screen.getByRole("button", { name: "Send to Run" }));
+    await waitFor(() => expect(controller.runComposer.getSnapshot()[first.id]?.status).toBe("rejected"));
+    expect(controller.runComposer.getSnapshot()[first.id]).toMatchObject({
+      request: null, uncertain: false, rejectionCode: "payload_too_large",
+    });
+    expect(controller.runComposer.getSnapshot()[first.id]?.draft).toHaveLength(1_048_577);
+    expect(body).not.toHaveAttribute("readonly");
+    expect(screen.getByRole("alert")).toHaveTextContent("Neither Message nor RunInput committed");
+    expect(screen.getByRole("alert")).toHaveTextContent("The request body exceeds 1048576 bytes.");
+    await act(async () => { expect(await controller.refreshRunComposer(first.id)).toBe(true); });
+    expect(controller.getSnapshot().run?.run.revision).toBe(revision);
+    expect(controller.getSnapshot().thread?.messages).toHaveLength(1);
+    expect(controller.getSnapshot().run?.inputs).toHaveLength(1);
+
+    fireEvent.change(body, { target: { value: "A shorter Human instruction." } });
+    await user.click(screen.getByRole("button", { name: "Send to Run" }));
+    await waitFor(() => expect(controller.runComposer.getSnapshot()[first.id]?.status).toBe("submitted"));
+    await waitFor(() => {
+      expect(controller.getSnapshot().run?.inputs).toHaveLength(2);
+      expect(controller.getSnapshot().thread?.messages).toHaveLength(2);
+    });
+    expect(body).toHaveValue("");
+    const requests = browser.requests.filter((request) => request.path.endsWith("/send-to-run"));
+    expect(requests).toHaveLength(2);
+    const original = JSON.parse(requests[0]!.body!);
+    const replacement = JSON.parse(requests[1]!.body!);
+    expect(replacement).toMatchObject({
+      body: "A shorter Human instruction.", expectedRunRevision: revision, runId: first.id,
+    });
+    expect(replacement.idempotencyKey).not.toBe(original.idempotencyKey);
+  });
+
+  it("preserves an unknown outcome and the immutable request when a later retry receives HTTP 413", async () => {
+    const fixture = await runComposerHttp();
+    fixtures.push(fixture);
+    const { controller, browser, first } = fixture;
+    window.history.replaceState({}, "", `/?project=project-sample&channel=channel-general&thread=${first.threadId}&run=${first.id}&panel=run&panels=detail`);
+    const user = userEvent.setup();
+    render(<TorsorApp controller={controller} />);
+    const body = await screen.findByRole("textbox", { name: "Run input" });
+    fireEvent.change(body, { target: { value: "x".repeat(1_048_577) } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send to Run" })).toBeEnabled());
+    const lost = browser.hold("/api/v1/commands/send-to-run", "response-loss");
+    await user.click(screen.getByRole("button", { name: "Send to Run" }));
+    await lost.observed;
+    await act(async () => { lost.release(); });
+    await waitFor(() => expect(controller.runComposer.getSnapshot()[first.id]?.status).toBe("unknown"));
+    const original = controller.runComposer.getSnapshot()[first.id]!.request;
+    expect(original).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "Retry same submission" }));
+    await waitFor(() => expect(screen.getByText(/Submission outcome unknown/)).toHaveTextContent("The request body exceeds 1048576 bytes."));
+    await user.click(screen.getByRole("button", { name: "Refresh Run and Thread" }));
+    await waitFor(() => expect(controller.runComposer.getSnapshot()[first.id]?.projectionStatus).toBe("idle"));
+    const entry = controller.runComposer.getSnapshot()[first.id]!;
+    expect(entry.status).toBe("unknown");
+    expect(entry.uncertain).toBe(true);
+    expect(entry.request).toBe(original);
+    expect(entry.draft).toHaveLength(1_048_577);
+    expect(body).toHaveAttribute("readonly");
+    expect(screen.queryByText(/Neither Message nor RunInput committed|Not submitted/)).not.toBeInTheDocument();
+    const requests = browser.requests.filter((request) => request.path.endsWith("/send-to-run"));
+    expect(requests).toHaveLength(2);
+    expect(requests[1]!.body).toBe(requests[0]!.body);
+  });
 });
 
 describe("Run Composer committed refresh recovery in a narrow modal (§44.2)", () => {

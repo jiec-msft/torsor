@@ -17,7 +17,7 @@ interface Gate {
   readonly path: string;
   readonly observed: ReturnType<typeof deferred>;
   readonly released: ReturnType<typeof deferred>;
-  readonly fail: boolean;
+  readonly fail: boolean | "response-loss";
 }
 
 export class ControlledBrowser {
@@ -27,7 +27,7 @@ export class ControlledBrowser {
   readonly #releases: Array<() => void> = [];
   #cookie = "";
 
-  hold(path: string, fail = false) {
+  hold(path: string, fail: boolean | "response-loss" = false) {
     const gate: Gate = { path, observed: deferred(), released: deferred(), fail };
     this.#gates.push(gate);
     this.#releases.push(gate.released.resolve);
@@ -58,6 +58,7 @@ export class ControlledBrowser {
     if (gate) {
       gate.observed.resolve();
       await gate.released.promise;
+      if (gate.fail === "response-loss") throw new TypeError("Response lost after the HTTP request completed.");
       if (gate.fail) {
         return new Response(JSON.stringify({
           error: { code: "projection_unavailable", message: `Read failed: ${path}` },
