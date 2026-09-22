@@ -1,5 +1,6 @@
 
 import * as collaboration from "./collaboration.js";
+import { causalCapacity } from "./causal-limits.js";
 import * as db from "./database.js";
 import { KernelError } from "./errors.js";
 import * as execution from "./execution.js";
@@ -339,7 +340,7 @@ export function completeRun(kernel: db.KernelContext, command: Extract<KernelCom
     activationId: text(activation.id),
     causationId: text(activation.id),
     correlationId,
-    payload: { revision, finalMessageId },
+    payload: { revision, finalMessageId, ...causalCapacity(kernel, text(run.causal_root_id)) },
   });
   invariants.enqueueOutbox(kernel, "run.completed", "Run", command.runId, { revision, finalMessageId });
   return {
@@ -453,7 +454,7 @@ export function terminateRun(kernel: db.KernelContext, run: Row, state: "Failed"
     activationId,
     causationId: activationId ?? runId,
     correlationId,
-    payload: { revision, reason },
+    payload: { revision, reason, ...causalCapacity(kernel, text(run.causal_root_id)) },
   });
   invariants.enqueueOutbox(kernel, `run.${state.toLowerCase()}`, "Run", runId, { revision, reason });
   return {

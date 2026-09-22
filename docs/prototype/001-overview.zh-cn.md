@@ -1134,7 +1134,7 @@ Run仍可立即逻辑 Cancel：
 
 ### 25.1 因果链
 
-Agent生成的 Attention 和 Run 记录：
+首个持久因果限制切片使用以下不可变 Run 来源：
 
 ```text
 causal_root_id
@@ -1143,27 +1143,30 @@ parent_run_id
 delegation_depth
 ```
 
-Human 新请求开启新的 causal root。
+1. `causal_root_id` 是发起请求的 Human Message ID，而不是 Thread ID 或 Provider Session。Human 的 `StartThread`、`ReplyToThread` 和 `SendToRun` 所发布的新 Message 各自开启新 root；同一 Message 的多个 Mention 共享 root。
+2. 当前所有新 Run 都通过 `ResolveAttentionWithRun` 创建。Kernel 从已认证的 Attention Activation、Attention 的确切 Message revision 和该 Message 的服务端来源推导字段；`parent_attention_id` 是本次决议的 Attention ID。
+3. Human Message 直接触发的 Run 的 `parent_run_id = null`、`delegation_depth = 0`。Agent 的 `PublishRunReply` 或 `CompleteRun.finalReply` 触发的新 Run 使用 Message 的 `caused_by_run_id` 作为 parent，继承该 Run 的 root，并将 depth 加一。父 Run 已进入终态也不重置来源或深度。
+4. Attention 通过不可变 Message revision 和 Message 来源追溯因果链，不复制一套可漂移的预算字段。没有可信 Human 或 Run 来源时必须拒绝创建，不能退回到新 root。
+5. 将 Attention 接入已有 Run、Human Send-to-Run、Activation/Provider 重试均不重写已有 Run 来源，也不创建新的 Run 容量占用。已有 Run 后续发布的委派继续使用该 Run 的原始 root，而不是最新输入的 root。
+6. Agent/Provider payload 中的 root、parent、depth 或 limit 字段不能成为权威事实；Kernel 拒绝显式提交的这些服务端字段。当前切片不新增直接 Fork、Retry、Successor 或 Replacement 创建命令；未来创建路径必须复用同一准入边界。
 
 ### 25.2 预算 envelope
 
-1. 子 Run 和子 Attention 只能从调用方获得的预算中划分。
-2. Agent不能自行扩大总预算。
-3. 至少限制：
-   - Project/Agent 的并发非终态 Run
-   - 每个 causal root 的深度
-   - fan-out
-   - Provider 成本
-   - Attention 产生速率
-
-初始运行默认：
+首个切片只实施两个硬限制，已批准的初始默认值为：
 
 ```text
 delegation depth: 4
 max non-terminal Runs per causal root: 50
 ```
 
-数值配置化，不写死进领域模型。
+1. 最大 depth 为包含端点的 4（初始 Run 为 0）；同一 root 的非终态 Run 总数最多为 50，包含初始 Run，跨该 root 的所有 Agent 计数。
+2. 数值属于服务端 `KernelOpenOptions.causalLimits`，不是 Agent 配置或命令参数。创建新数据库时持久化默认值或显式配置；所有连接及重启从同一持久配置读取。重开时显式指定不同值必须明确失败。当前不提供在线改限额命令。
+3. Kernel 在同一 `BEGIN IMMEDIATE` 事务中推导来源、检查 depth、从持久 Run 状态计算占用、创建 Run/RunInput、决议 Attention、写入事件、Outbox 和幂等结果。多个 SQLite 连接竞争最后一个名额时最多一个成功。
+4. `Active` 和 `Waiting` 均占一个名额；Activation 数量、Provider 状态、Lease 过期和进程退出不释放名额。未来的 `Paused` 也属于非终态。
+5. 只有 `Completed`、`Failed`、`Cancelled` 的成功提交释放该 Run 的一个名额；不递归释放子 Run，也不表示 Provider 已停止。终态事件与容量证据原子提交。终态 parent 的待处理 Attention 仍可创建子 Run，但必须保留原 root/depth 并重新检查容量。
+6. 容量是当前非终态 Run 的计数，不是累计 Run 数或预付费余额。成功命令重放返回原幂等结果，不再次计数；新逻辑 Run 才占新名额。失败事务完整回滚，不留下 Run、输入、决议、事件、Outbox 或幂等结果。
+7. 超限返回 `CausalLimitExceeded`，包含 root、拟创建 depth、当前占用、有效限制和触发的维度。Attention 保持 Open，handler authority 不被该失败消费，Agent 可以显式 Ignore、继续已有 Run，或在条件改变后重试；不得静默丢弃或伪装成功。
+8. Project/Agent 并发配额、fan-out、Attention 速率、Provider 成本、预算划分和完整 policy language 均推迟；本切片不承诺这些维度已受限，也不增加 UI budgeting。
 
 ### 25.3 默认 Agent 策略
 
@@ -1222,6 +1225,8 @@ result
 - Run 终态延迟
 - 委派深度
 - 预算消耗
+
+本切片将后两项具体化为：Run 投影中的不可变 root、parent Attention/Run 和 depth；`RunCreated` 事件中的来源、有效限制及提交后非终态占用；`RunCompleted`、`RunFailed`、`RunCancelled` 事件中的 root 和释放后的占用；超限响应中的准入证据。占用以同一事务内的持久 Run 状态为准，可由创建/终态事件解释，不使用进程内计数器。拒绝创建不提交新的领域事件；重启保留已有来源、配置和事件。成本核算及其他预算指标仍推迟。
 
 ### 28.3 可解释性
 
@@ -1325,7 +1330,7 @@ GC 不得改变领域状态。
 6. **数据硬删除和保留期限**
    - 取决于部署和隐私承诺。
 7. **预算、深度和并发默认数值**
-   - 初始建议 depth 4、每个 causal root 50 个非终态 Run。
+   - 首个切片已批准最大 depth 4（root Run 为 0）、每个 causal root 最多 50 个非终态 Run；服务端持久配置及容量语义见 §25.1–25.2。成本、fan-out 和其他预算维度仍待后续设计。
 8. **Waiting、Paused、Failed、Cancelled Worktree 的物理保留期限**
    - 作为运行配置。
 9. **Human 是否需要直接 Send-to-Run**

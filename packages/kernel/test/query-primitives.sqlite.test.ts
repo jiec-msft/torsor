@@ -598,12 +598,15 @@ describe("Kernel server query primitives with SQLite", () => {
              (id, project_id, home_channel_id, thread_root_id, owner_agent_id,
               agent_config_revision, state, revision, activation_generation,
               next_input_sequence, next_activity_sequence, created_at,
-              updated_at, terminal_reason)
+              updated_at, terminal_reason, causal_root_id,
+              parent_attention_id, parent_run_id, delegation_depth)
            SELECT 'historical-run-' || value, 'project-sample',
                   'channel-general', 'historical-thread', 'agent-orbit',
                   3, 'Completed', 1, 0, 1, 1,
                   '2026-01-01T00:00:00.000Z',
-                  '2026-01-01T00:00:00.000Z', 'settled'
+                  '2026-01-01T00:00:00.000Z', 'settled',
+                  (SELECT causal_root_id FROM runs LIMIT 1),
+                  (SELECT parent_attention_id FROM runs LIMIT 1), NULL, 0
              FROM seed`,
         ).run();
         database.prepare(

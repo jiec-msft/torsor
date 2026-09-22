@@ -2,7 +2,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TorsorKernel, type KernelBootstrap } from "@torsor/kernel";
+import { TorsorKernel, type CausalLimits, type KernelBootstrap } from "@torsor/kernel";
 import { createTorsorHttpService } from "../../../server/src/index";
 import { WebController } from "../controller";
 import type { PublicEvent } from "../types";
@@ -188,9 +188,18 @@ async function seedRun(kernel: TorsorKernel, key: string) {
   return { id: result.entityId, threadId: root.entityId };
 }
 
-export async function runComposerHttp({ pauseEvents = false }: { readonly pauseEvents?: boolean } = {}) {
+export async function runComposerHttp({
+  pauseEvents = false,
+  causalLimits,
+}: {
+  readonly pauseEvents?: boolean;
+  readonly causalLimits?: CausalLimits;
+} = {}) {
   const directory = await mkdtemp(join(tmpdir(), "torsor-composer-races-"));
-  const kernel = TorsorKernel.open({ databasePath: join(directory, "state.sqlite"), bootstrap });
+  const kernel = TorsorKernel.open({
+    databasePath: join(directory, "state.sqlite"), bootstrap,
+    ...(causalLimits ? { causalLimits } : {}),
+  });
   const first = await seedRun(kernel, "first");
   const second = await seedRun(kernel, "second");
   const service = createTorsorHttpService({
@@ -227,7 +236,7 @@ export async function runComposerHttp({ pauseEvents = false }: { readonly pauseE
   let activityActivationId: string | null = null;
   let activitySequence = 0;
   return {
-    controller, browser, sources, first, second, origin,
+    kernel, controller, browser, sources, first, second, origin,
     async appendActivity(count: number) {
       const runtime = { principalId: "principal-runtime" };
       for (let index = 0; !activityActivationId; index += 1) {
