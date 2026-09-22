@@ -199,6 +199,24 @@ describe("TorsorApp", () => {
     expect(screen.getByText("Attention activation")).toBeInTheDocument();
   });
 
+  it("labels a clock-expired Activation as expired instead of live", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-22T06:00:00.000Z"));
+      window.history.replaceState(
+        {},
+        "",
+        "/?project=project-sample&channel=channel-general&thread=thread-1&run=run-1&panel=run&panels=detail",
+      );
+
+      render(<TorsorApp controller={stubController()} />);
+
+      expect(screen.getByText("Expired")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("collapses panels from the keyboard with explicit expanded state", async () => {
     const user = userEvent.setup();
     window.history.replaceState(
@@ -369,38 +387,61 @@ describe("TorsorApp", () => {
     expect(screen.getAllByText("Stale · reconnecting")).not.toHaveLength(0);
   });
 
-  it("moves focus into compact drawers, makes the workbench inert, and restores focus", async () => {
-    const user = userEvent.setup();
-    Object.defineProperty(window, "innerWidth", {
-      configurable: true,
-      value: 375,
-    });
-    window.history.replaceState(
-      {},
-      "",
-      "/?project=project-sample&channel=channel-general&thread=thread-1&panels=",
-    );
-    render(<TorsorApp controller={stubController()} />);
-    const openChannels = screen.getByRole("button", {
-      name: "Expand channels",
-    });
+  it.each([375, 768, 1024])(
+    "keeps reduced-motion compact drawer focus contained at %ipx",
+    async (width) => {
+      const user = userEvent.setup();
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        value: width,
+      });
+      Object.defineProperty(window, "matchMedia", {
+        configurable: true,
+        value: (query: string) => ({
+          matches:
+            query.includes("prefers-reduced-motion") ||
+            (query.includes("max-width: 1099px") && width <= 1099),
+          media: query,
+          onchange: null,
+          addListener: () => undefined,
+          removeListener: () => undefined,
+          addEventListener: () => undefined,
+          removeEventListener: () => undefined,
+          dispatchEvent: () => false,
+        }),
+      });
+      window.history.replaceState(
+        {},
+        "",
+        "/?project=project-sample&channel=channel-general&thread=thread-1&panels=",
+      );
+      render(<TorsorApp controller={stubController()} />);
+      const openChannels = screen.getByRole("button", {
+        name: "Expand channels",
+      });
 
-    await user.click(openChannels);
+      await user.click(openChannels);
 
-    const drawer = await screen.findByRole("dialog", {
-      name: "Channels and threads",
-    });
-    await waitFor(() => expect(drawer).toHaveFocus());
-    expect(document.getElementById("main-content")).toHaveAttribute("inert");
+      const drawer = await screen.findByRole("dialog", {
+        name: "Channels and threads",
+      });
+      await waitFor(() => expect(drawer).toHaveFocus());
+      expect(document.getElementById("main-content")).toHaveAttribute("inert");
+      expect(
+        screen.getByRole("button", { name: "Close open panels" }),
+      ).toHaveAttribute("tabindex", "-1");
 
-    await user.keyboard("{Shift>}{Tab}{/Shift}");
-    expect(drawer).toContainElement(document.activeElement as HTMLElement);
+      await user.keyboard("{Shift>}{Tab}{/Shift}");
+      expect(drawer).toContainElement(document.activeElement as HTMLElement);
+      await user.keyboard("{Tab}");
+      expect(drawer).toContainElement(document.activeElement as HTMLElement);
 
-    await user.keyboard("{Escape}");
+      await user.keyboard("{Escape}");
 
-    await waitFor(() => expect(openChannels).toHaveFocus());
-    expect(document.getElementById("main-content")).not.toHaveAttribute(
-      "inert",
-    );
-  });
+      await waitFor(() => expect(openChannels).toHaveFocus());
+      expect(document.getElementById("main-content")).not.toHaveAttribute(
+        "inert",
+      );
+    },
+  );
 });

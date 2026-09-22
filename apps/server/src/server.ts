@@ -338,9 +338,7 @@ class Service implements TorsorHttpService {
         currentSession &&
         sameContext(currentSession.context, context)
           ? ([currentSessionId, currentSession] as const)
-          : [...this.#sessions.entries()].find(([, session]) =>
-              sameContext(session.context, context)
-            );
+          : undefined;
       if (reusableEntry) {
         const [reusableSessionId, reusableSession] = reusableEntry;
         response.setHeader(

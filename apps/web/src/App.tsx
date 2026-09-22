@@ -41,6 +41,7 @@ import {
 } from "./routing";
 import {
   latestMessageBody,
+  type Activation,
   type AgentStatus,
   type Run,
   type RunProjection,
@@ -436,6 +437,7 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
         <button
           className="drawer-scrim"
           type="button"
+          tabIndex={-1}
           aria-label="Close open panels"
           onClick={() =>
             updateRoute(setRoute, {
@@ -1332,26 +1334,23 @@ function RunDetail({ state }: { readonly state: WebState }) {
       </DetailSection>
       <DetailSection title="Activations" count={projection.activations.length}>
         {projection.activations.length ? (
-          projection.activations.map((activation) => (
-            <div className="fact-card" key={activation.id}>
-              <div>
-                <strong>
-                  {activation.attentionId ? "Attention" : "Run"} activation
-                </strong>
-                <StatusPill
-                  label={
-                    activation.outcome ??
-                    (activation.revokedAt ? "Revoked" : "Live")
-                  }
-                  tone={
-                    activation.outcome || activation.revokedAt ? "idle" : "active"
-                  }
-                />
+          projection.activations.map((activation) => {
+            const status = activationStatus(activation);
+            return (
+              <div className="fact-card" key={activation.id}>
+                <div>
+                  <strong>
+                    {activation.attentionId ? "Attention" : "Run"} activation
+                  </strong>
+                  <StatusPill label={status.label} tone={status.tone} />
+                </div>
+                <small>{activation.id}</small>
+                <p>
+                  {formatTimeRange(activation.startedAt, activation.finishedAt)}
+                </p>
               </div>
-              <small>{activation.id}</small>
-              <p>{formatTimeRange(activation.startedAt, activation.finishedAt)}</p>
-            </div>
-          ))
+            );
+          })
         ) : (
           <p className="compact-empty">No Activations.</p>
         )}
@@ -1841,6 +1840,25 @@ function updateRoute(
 
 function agentName(agents: readonly AgentStatus[], agentId: string): string {
   return agents.find((agent) => agent.id === agentId)?.name ?? shortId(agentId);
+}
+
+function activationStatus(activation: Activation): {
+  readonly label: string;
+  readonly tone: "active" | "attention" | "idle";
+} {
+  if (activation.outcome) {
+    return { label: activation.outcome, tone: "idle" };
+  }
+  if (activation.revokedAt) {
+    return { label: "Revoked", tone: "idle" };
+  }
+  const expiresAt = Date.parse(activation.expiresAt);
+  if (!Number.isFinite(expiresAt)) {
+    return { label: "Unconfirmed", tone: "attention" };
+  }
+  return expiresAt > Date.now()
+    ? { label: "Live", tone: "active" }
+    : { label: "Expired", tone: "idle" };
 }
 
 function shortId(id: string): string {
