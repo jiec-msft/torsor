@@ -70,12 +70,19 @@ async function createRunFixture(kernel: TorsorKernel, key: string) {
       activationId: attentionActivation.entityId,
     },
   );
+  const outboxAuthority = await claimRunOutboxAuthority(
+    kernel,
+    run.entityId,
+    key,
+    run.relatedIds!.runInputId!,
+  );
   const activation = await kernel.execute(
     {
       type: "StartActivation",
       idempotencyKey: `${key}-run-activation`,
       runId: run.entityId,
       expectedRunRevision: 1,
+      ...outboxAuthority,
     },
     runtimeContext,
   );
@@ -87,6 +94,7 @@ async function createRunFixture(kernel: TorsorKernel, key: string) {
     } as const,
     runId: run.entityId,
     runInputId: run.relatedIds!.runInputId!,
+    ...outboxAuthority,
   };
 }
 
@@ -95,17 +103,13 @@ async function startProviderAttempt(
   fixture: Awaited<ReturnType<typeof createRunFixture>>,
   key: string,
 ) {
-  const outboxAuthority = await claimRunOutboxAuthority(
-    kernel,
-    fixture.runId,
-    key,
-  );
   const attempt = await kernel.execute(
     {
       type: "StartProviderAttempt",
       idempotencyKey: `${key}-provider`,
       activationId: fixture.activationId,
-      ...outboxAuthority,
+      outboxEventId: fixture.outboxEventId,
+      outboxLeaseToken: fixture.outboxLeaseToken,
       adapter: "deterministic-fake",
       adapterVersion: "1",
       capabilitySnapshot: { supportsIdempotentRequests: true },
@@ -118,8 +122,8 @@ async function startProviderAttempt(
     {
       type: "AcknowledgeOutboxEvents",
       idempotencyKey: `${key}-outbox-ack`,
-      outboxEventIds: [outboxAuthority.outboxEventId],
-      leaseToken: outboxAuthority.outboxLeaseToken,
+      outboxEventIds: [fixture.outboxEventId],
+      leaseToken: fixture.outboxLeaseToken,
     },
     runtimeContext,
   );
@@ -443,6 +447,15 @@ describe("Runtime provider recovery", () => {
           runtimeContext,
         ),
       ).rejects.toMatchObject({ code: "Forbidden" });
+      await kernel.execute(
+        {
+          type: "AcknowledgeOutboxEvents",
+          idempotencyKey: "guard-other-run-outbox-ack",
+          outboxEventIds: [other.outboxEventId],
+          leaseToken: other.outboxLeaseToken,
+        },
+        runtimeContext,
+      );
 
       const startedFixture = await createRunFixture(kernel, "guard-started");
       const started = await startProviderAttempt(
@@ -592,12 +605,29 @@ describe("Runtime provider recovery", () => {
         "guard-stale-activation",
         "Failed",
       );
+      const nextInput = await kernel.execute(
+        {
+          type: "SendToRun",
+          idempotencyKey: "guard-replacement-input",
+          runId: staleActivation.runId,
+          expectedRunRevision: 1,
+          body: "Create a new authoritative delivery generation.",
+        },
+        humanContext,
+      );
+      const replacementAuthority = await claimRunOutboxAuthority(
+        kernel,
+        staleActivation.runId,
+        "guard-replacement",
+        nextInput.relatedIds!.runInputId!,
+      );
       await kernel.execute(
         {
           type: "StartActivation",
           idempotencyKey: "guard-replacement-activation",
           runId: staleActivation.runId,
-          expectedRunRevision: 1,
+          expectedRunRevision: 2,
+          ...replacementAuthority,
         },
         runtimeContext,
       );
@@ -608,6 +638,7 @@ describe("Runtime provider recovery", () => {
             idempotencyKey: "guard-stale-attempt-park",
             runId: staleActivation.runId,
             providerAttemptId: staleAttempt.entityId,
+            expectedRunRevision: 2,
             expectedActivationGeneration: 2,
           },
           runtimeContext,

@@ -84,6 +84,7 @@ async function openAttention(
 async function createActiveRun(
   kernel: TorsorKernel,
   key: string,
+  keepOutboxAuthority = false,
 ) {
   const opened = await openAttention(kernel, key);
   const resolved = await kernel.execute(
@@ -96,20 +97,39 @@ async function createActiveRun(
     },
     opened.agentContext,
   );
+  const outboxAuthority = await claimRunOutboxAuthority(
+    kernel,
+    resolved.entityId,
+    key,
+    resolved.relatedIds!.runInputId!,
+  );
   const activation = await kernel.execute(
     {
       type: "StartActivation",
       idempotencyKey: `${key}-run-activation`,
       runId: resolved.entityId,
       expectedRunRevision: 1,
+      ...outboxAuthority,
     },
     runtimeContext,
   );
+  if (!keepOutboxAuthority) {
+    await kernel.execute(
+      {
+        type: "AcknowledgeOutboxEvents",
+        idempotencyKey: `${key}-run-outbox-ack`,
+        outboxEventIds: [outboxAuthority.outboxEventId],
+        leaseToken: outboxAuthority.outboxLeaseToken,
+      },
+      runtimeContext,
+    );
+  }
   return {
     ...opened,
     runId: resolved.entityId,
     runInputId: resolved.relatedIds!.runInputId!,
     runActivationId: activation.entityId,
+    ...outboxAuthority,
     runContext: {
       principalId: "principal-orbit",
       activationId: activation.entityId,
@@ -363,12 +383,18 @@ describe("Kernel server query primitives", () => {
         },
         opened.agentContext,
       );
+      const outboxAuthority = await claimRunOutboxAuthority(
+        kernel,
+        resolved.entityId,
+        "component-history",
+      );
       const activation = await kernel.execute(
         {
           type: "StartActivation",
           idempotencyKey: "component-history-run-activation",
           runId: resolved.entityId,
           expectedRunRevision: 1,
+          ...outboxAuthority,
         },
         runtimeContext,
       );
@@ -376,11 +402,6 @@ describe("Kernel server query primitives", () => {
         principalId: "principal-orbit",
         activationId: activation.entityId,
       } as const;
-      const outboxAuthority = await claimRunOutboxAuthority(
-        kernel,
-        resolved.entityId,
-        "component-history",
-      );
       const provider = await kernel.execute(
         {
           type: "StartProviderAttempt",
@@ -431,6 +452,7 @@ describe("Kernel server query primitives", () => {
           idempotencyKey: "component-history-replacement-activation",
           runId: resolved.entityId,
           expectedRunRevision: 2,
+          ...outboxAuthority,
         },
         runtimeContext,
       );
@@ -681,12 +703,15 @@ describe("Kernel server query primitives", () => {
   it("includes internally appended parked-run activity in temporal projections", async () => {
     const kernel = openMemoryKernel();
     try {
-      const setup = await createActiveRun(kernel, "parked-activity");
-      const outboxAuthority = await claimRunOutboxAuthority(
+      const setup = await createActiveRun(
         kernel,
-        setup.runId,
         "parked-activity",
+        true,
       );
+      const outboxAuthority = {
+        outboxEventId: setup.outboxEventId,
+        outboxLeaseToken: setup.outboxLeaseToken,
+      };
       const provider = await kernel.execute(
         {
           type: "StartProviderAttempt",
@@ -788,12 +813,19 @@ describe("Kernel server query primitives", () => {
         status: "waiting",
       });
 
+      const statusOutboxAuthority = await claimRunOutboxAuthority(
+        kernel,
+        resolved.entityId,
+        "status-run",
+        resolved.relatedIds!.runInputId!,
+      );
       const firstRunActivation = await kernel.execute(
         {
           type: "StartActivation",
           idempotencyKey: "status-run-activation",
           runId: resolved.entityId,
           expectedRunRevision: 1,
+          ...statusOutboxAuthority,
         },
         runtimeContext,
       );
@@ -844,6 +876,7 @@ describe("Kernel server query primitives", () => {
           idempotencyKey: "status-run-activation-two",
           runId: resolved.entityId,
           expectedRunRevision: 1,
+          ...statusOutboxAuthority,
         },
         runtimeContext,
       );
@@ -881,6 +914,7 @@ describe("Kernel server query primitives", () => {
           idempotencyKey: "status-terminal-activation",
           runId: resolved.entityId,
           expectedRunRevision: 2,
+          ...statusOutboxAuthority,
         },
         runtimeContext,
       );

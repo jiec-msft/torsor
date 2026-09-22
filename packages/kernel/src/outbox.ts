@@ -125,15 +125,78 @@ export function acknowledgeOutboxEvents(kernel: db.KernelContext, command: Extra
   };
 }
 
+type OutboxAuthorityCommand = Readonly<{
+  outboxEventId?: string;
+  outboxLeaseToken?: string;
+}>;
+
+export function requireOutboxActivationAuthority(
+  kernel: db.KernelContext,
+  command: OutboxAuthorityCommand,
+  principal: Row,
+  runId: string,
+): Readonly<{
+  leaseExpiresAt: string;
+  observedAt: string;
+}> {
+  const authority = requireOutboxDeliveryAuthority(
+    kernel,
+    command,
+    principal,
+    runId,
+  );
+  const runInput = db.getRow(
+    kernel,
+    "SELECT run_id, disposition FROM run_inputs WHERE id = ?",
+    authority.runInputId,
+  );
+  if (
+    !runInput ||
+    text(runInput.run_id) !== runId ||
+    text(runInput.disposition) !== "Pending"
+  ) {
+    throw new KernelError(
+      "Conflict",
+      "The Outbox event input is not a Pending input for this Run.",
+    );
+  }
+  return authority;
+}
+
 export function requireOutboxProviderAuthority(
   kernel: db.KernelContext,
-  command: Extract<KernelCommand, { type: "StartProviderAttempt" }>,
+  command: OutboxAuthorityCommand,
   principal: Row,
   runId: string,
   runInputIds: readonly string[],
 ): Readonly<{
   leaseExpiresAt: string;
   observedAt: string;
+}> {
+  const authority = requireOutboxDeliveryAuthority(
+    kernel,
+    command,
+    principal,
+    runId,
+  );
+  if (!runInputIds.includes(authority.runInputId)) {
+    throw new KernelError(
+      "Conflict",
+      "The Outbox event input is not included in this provider delivery.",
+    );
+  }
+  return authority;
+}
+
+function requireOutboxDeliveryAuthority(
+  kernel: db.KernelContext,
+  command: OutboxAuthorityCommand,
+  principal: Row,
+  runId: string,
+): Readonly<{
+  leaseExpiresAt: string;
+  observedAt: string;
+  runInputId: string;
 }> {
   invariants.requireKind(kernel, principal, "runtime");
   requireNonEmpty(command.outboxEventId ?? "", "outboxEventId");
@@ -186,7 +249,7 @@ export function requireOutboxProviderAuthority(
   ) {
     throw new KernelError(
       "Conflict",
-      "Provider admission requires exclusive authority over one Outbox event.",
+      "Delivery admission requires exclusive authority over one Outbox event.",
     );
   }
   const frontier = db.getRow(
@@ -214,15 +277,16 @@ export function requireOutboxProviderAuthority(
     typeof payloadRunInputId === "string"
       ? payloadRunInputId
       : null;
-  if (runInputId === null || !runInputIds.includes(runInputId)) {
+  if (runInputId === null) {
     throw new KernelError(
       "Conflict",
-      "The Outbox event input is not included in this provider delivery.",
+      "The Outbox event does not identify a Run input.",
     );
   }
   return {
     leaseExpiresAt,
     observedAt: observed.toISOString(),
+    runInputId,
   };
 }
 

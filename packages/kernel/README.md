@@ -136,13 +136,16 @@ batch that was acknowledged, superseded, moved outside the pending frontier,
 or acquired by another lease fails with `Conflict`; Kernel never returns its
 old token, expiry, or stale event views as delivery authority.
 
-Run `StartProviderAttempt` admission carries the exact Outbox event ID and
-lease token. In the same transaction that creates or returns the
-ProviderAttempt, the Kernel verifies the Runtime principal, live Kernel-clock
-lease, one-event ownership, oldest pending frontier, Run association, and
-delivered RunInput. Cached admission retries repeat those checks and return a
-fresh `authorityObservedAt`; acknowledgement, expiry, supersession, frontier
-loss, or an intervening lease fails closed before provider invocation.
+Run `StartActivation` and `StartProviderAttempt` admission carry the exact
+Outbox event ID and lease token. Before a Run Activation can advance the
+generation or revoke an existing owner, the Kernel transaction verifies the
+Runtime principal, live Kernel-clock lease, one-event ownership, oldest pending
+frontier, Run association, and Pending RunInput. ProviderAttempt admission
+revalidates the same authority and verifies that the event input is included in
+the delivery. Cached admission retries repeat those checks and return a fresh
+`authorityObservedAt`; acknowledgement, expiry, supersession, frontier loss,
+or an intervening lease fails closed before ownership changes or provider
+invocation.
 
 `ClaimAttention` also returns the exact persisted `leaseExpiresAt`. Runtime
 must derive provider execution time from that authority rather than request

@@ -251,17 +251,13 @@ describe("TorsorKernel transactions and invariants", () => {
     const kernel = openMemoryKernel();
     try {
       const setup = await createRun(kernel);
-      const outboxAuthority = await claimRunOutboxAuthority(
-        kernel,
-        setup.runId,
-        "provider-delivery",
-      );
       const provider = await kernel.execute(
         {
           type: "StartProviderAttempt",
           idempotencyKey: "provider-start",
           activationId: setup.activationId,
-          ...outboxAuthority,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
           adapter: "deterministic-fake",
           adapterVersion: "1",
           capabilitySnapshot: { acceptsInputWhileRunning: false },
@@ -357,17 +353,13 @@ describe("TorsorKernel transactions and invariants", () => {
     const kernel = openMemoryKernel();
     try {
       const setup = await createRun(kernel);
-      const outboxAuthority = await claimRunOutboxAuthority(
-        kernel,
-        setup.runId,
-        "async-provider",
-      );
       const provider = await kernel.execute(
         {
           type: "StartProviderAttempt",
           idempotencyKey: "async-provider-start",
           activationId: setup.activationId,
-          ...outboxAuthority,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
           adapter: "deterministic-fake",
           adapterVersion: "1",
           capabilitySnapshot: {},
@@ -420,6 +412,8 @@ describe("TorsorKernel transactions and invariants", () => {
           idempotencyKey: "wait-run",
           runId: setup.runId,
           expectedRunRevision: 1,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
           reason: "Waiting for a new public instruction.",
         },
         setup.agentContext,
@@ -443,6 +437,8 @@ describe("TorsorKernel transactions and invariants", () => {
           idempotencyKey: "fresh-reactivation",
           runId: setup.runId,
           expectedRunRevision: 2,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
         },
         runtimeContext,
       );
@@ -504,6 +500,8 @@ describe("TorsorKernel transactions and invariants", () => {
             idempotencyKey: "unseen-input-complete",
             runId: setup.runId,
             expectedRunRevision: 2,
+            outboxEventId: setup.outboxEventId,
+            outboxLeaseToken: setup.outboxLeaseToken,
             incorporatedThroughInputSequence: 2,
           },
           setup.agentContext,
@@ -516,6 +514,8 @@ describe("TorsorKernel transactions and invariants", () => {
           idempotencyKey: "refresh-input-snapshot",
           runId: setup.runId,
           expectedRunRevision: 2,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
         },
         runtimeContext,
       );
@@ -663,17 +663,13 @@ describe("TorsorKernel transactions and invariants", () => {
     const kernel = openMemoryKernel();
     try {
       const setup = await createRun(kernel);
-      const outboxAuthority = await claimRunOutboxAuthority(
-        kernel,
-        setup.runId,
-        "provider-before-terminal",
-      );
       const provider = await kernel.execute(
         {
           type: "StartProviderAttempt",
           idempotencyKey: "provider-before-terminal",
           activationId: setup.activationId,
-          ...outboxAuthority,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
           adapter: "deterministic-fake",
           adapterVersion: "1",
           capabilitySnapshot: {},
@@ -704,6 +700,8 @@ describe("TorsorKernel transactions and invariants", () => {
             idempotencyKey: "reactivate-terminal",
             runId: setup.runId,
             expectedRunRevision: 2,
+            outboxEventId: setup.outboxEventId,
+            outboxLeaseToken: setup.outboxLeaseToken,
           },
           runtimeContext,
         ),
@@ -832,6 +830,8 @@ describe("TorsorKernel transactions and invariants", () => {
           idempotencyKey: "cycle-activation",
           runId: setup.runId,
           expectedRunRevision: 2,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
         },
         runtimeContext,
       );

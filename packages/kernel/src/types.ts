@@ -161,6 +161,8 @@ export interface StartActivationCommand extends IdempotentCommand {
   readonly attentionId?: string;
   readonly handlerLeaseToken?: string;
   readonly expectedRunRevision?: number;
+  readonly outboxEventId?: string;
+  readonly outboxLeaseToken?: string;
   readonly durationMs?: number;
 }
 

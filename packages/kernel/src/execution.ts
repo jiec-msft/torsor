@@ -1,7 +1,10 @@
 import * as db from "./database.js";
 import { KernelError } from "./errors.js";
 import * as invariants from "./invariants.js";
-import { requireOutboxProviderAuthority } from "./outbox.js";
+import {
+  requireOutboxActivationAuthority,
+  requireOutboxProviderAuthority,
+} from "./outbox.js";
 import type {
   CommandResult,
   JsonValue,
@@ -36,6 +39,12 @@ export function startActivation(kernel: db.KernelContext, command: Extract<Kerne
   let projectId: string;
   let channelId: string;
   let threadRootId: string;
+  let runAuthority:
+    | Readonly<{
+        leaseExpiresAt: string;
+        observedAt: string;
+      }>
+    | undefined;
   const durationMs = boundedDuration(command.durationMs ?? kernel.activationDurationMs, "durationMs");
   const now = kernel.clock();
   let expiresAt = new Date(now.getTime() + durationMs).toISOString();
@@ -44,6 +53,12 @@ export function startActivation(kernel: db.KernelContext, command: Extract<Kerne
       throw new KernelError("InvalidCommand", "Run Activation requires an expected Run revision.");
     }
     const run = invariants.requireMutableRun(kernel, command.runId, command.expectedRunRevision);
+    runAuthority = requireOutboxActivationAuthority(
+      kernel,
+      command,
+      principal,
+      command.runId,
+    );
     runId = command.runId;
     agent = invariants.requireAgent(kernel, text(run.owner_agent_id));
     configRevision = integer(run.agent_config_revision);
@@ -155,6 +170,12 @@ export function startActivation(kernel: db.KernelContext, command: Extract<Kerne
   return {
     commandType: command.type,
     entityId: activationId,
+    ...(runAuthority
+      ? {
+          leaseExpiresAt: runAuthority.leaseExpiresAt,
+          authorityObservedAt: runAuthority.observedAt,
+        }
+      : {}),
     ...(resultRunRevision === undefined
       ? {}
       : { revision: resultRunRevision }),
@@ -162,6 +183,38 @@ export function startActivation(kernel: db.KernelContext, command: Extract<Kerne
       agentId: text(agent.id),
       ...(runId ? { runId } : { attentionId: attentionId! }),
     },
+  };
+}
+
+export function resolveCachedActivation(
+  kernel: db.KernelContext,
+  command: Extract<KernelCommand, { type: "StartActivation" }>,
+  result: CommandResult,
+  principal: Row,
+): CommandResult {
+  if (!command.runId) {
+    return result;
+  }
+  const activation = invariants.requireLiveActivation(
+    kernel,
+    result.entityId,
+  );
+  invariants.assertActivationScopeCurrent(kernel, activation);
+  if (optionalText(activation.run_id) !== command.runId) {
+    throw new Error(
+      `Cached Activation ${result.entityId} does not match its Run command.`,
+    );
+  }
+  const authority = requireOutboxActivationAuthority(
+    kernel,
+    command,
+    principal,
+    command.runId,
+  );
+  return {
+    ...result,
+    leaseExpiresAt: authority.leaseExpiresAt,
+    authorityObservedAt: authority.observedAt,
   };
 }
 

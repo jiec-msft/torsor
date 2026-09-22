@@ -10,16 +10,108 @@ import {
 } from "./helpers.js";
 
 describe("independent review regressions", () => {
+  it("revalidates cached Run activation authority before returning success", async () => {
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const kernel = openMemoryKernel(() => now);
+    try {
+      const setup = await createRun(kernel);
+      const originalCommand = {
+        type: "StartActivation",
+        idempotencyKey: "cached-run-activation-authority:start",
+        runId: setup.runId,
+        expectedRunRevision: 1,
+        outboxEventId: setup.outboxEventId,
+        outboxLeaseToken: setup.outboxLeaseToken,
+      } as const;
+
+      const original = await kernel.execute(
+        originalCommand,
+        runtimeContext,
+      );
+      now = new Date("2026-09-21T08:00:01.000Z");
+      const retry = await kernel.execute(originalCommand, runtimeContext);
+      expect(retry).toMatchObject({
+        entityId: original.entityId,
+        leaseExpiresAt: "2026-09-21T08:00:30.000Z",
+        authorityObservedAt: now.toISOString(),
+      });
+
+      now = new Date("2026-09-21T08:00:31.000Z");
+      await expect(
+        kernel.execute(originalCommand, runtimeContext),
+      ).rejects.toMatchObject({ code: "Conflict" });
+      const replacementClaim = await kernel.execute(
+        {
+          type: "ClaimOutboxEvents",
+          idempotencyKey:
+            "cached-run-activation-authority:replacement-claim",
+          limit: 1,
+          leaseDurationMs: 30_000,
+        },
+        runtimeContext,
+      );
+      const replacementCommand = {
+        ...originalCommand,
+        idempotencyKey:
+          "cached-run-activation-authority:replacement-activation",
+        outboxLeaseToken: replacementClaim.leaseToken!,
+      } as const;
+      const replacement = await kernel.execute(
+        replacementCommand,
+        runtimeContext,
+      );
+
+      await expect(
+        kernel.execute(originalCommand, runtimeContext),
+      ).rejects.toMatchObject({ code: "Conflict" });
+      let projection = await kernel.query(
+        { type: "GetRunProjection", runId: setup.runId },
+        runtimeContext,
+      );
+      expect(projection.run.activationGeneration).toBe(3);
+      expect(
+        projection.activations.find(
+          (activation) => activation.id === replacement.entityId,
+        ),
+      ).toMatchObject({ revokedAt: null });
+
+      await kernel.execute(
+        {
+          type: "AcknowledgeOutboxEvents",
+          idempotencyKey:
+            "cached-run-activation-authority:replacement-ack",
+          outboxEventIds: [setup.outboxEventId],
+          leaseToken: replacementClaim.leaseToken!,
+        },
+        runtimeContext,
+      );
+      await expect(
+        kernel.execute(replacementCommand, runtimeContext),
+      ).rejects.toMatchObject({ code: "Conflict" });
+      projection = await kernel.query(
+        { type: "GetRunProjection", runId: setup.runId },
+        runtimeContext,
+      );
+      expect(projection.run.activationGeneration).toBe(3);
+      expect(
+        projection.activations.find(
+          (activation) => activation.id === replacement.entityId,
+        ),
+      ).toMatchObject({ revokedAt: null });
+    } finally {
+      kernel.close();
+    }
+  });
+
   it("revalidates cached provider admission against the live Outbox frontier", async () => {
     let now = new Date("2026-09-21T08:00:00.000Z");
     const kernel = openMemoryKernel(() => now);
     try {
       const setup = await createRun(kernel);
-      const authority = await claimRunOutboxAuthority(
-        kernel,
-        setup.runId,
-        "cached-provider-authority",
-      );
+      const authority = {
+        outboxEventId: setup.outboxEventId,
+        outboxLeaseToken: setup.outboxLeaseToken,
+      };
       const command = {
         type: "StartProviderAttempt",
         idempotencyKey: "cached-provider-authority:start",
@@ -64,11 +156,10 @@ describe("independent review regressions", () => {
     const kernel = openMemoryKernel(() => now);
     try {
       const setup = await createRun(kernel);
-      const originalAuthority = await claimRunOutboxAuthority(
-        kernel,
-        setup.runId,
-        "intervening-provider-authority",
-      );
+      const originalAuthority = {
+        outboxEventId: setup.outboxEventId,
+        outboxLeaseToken: setup.outboxLeaseToken,
+      };
       const originalCommand = {
         type: "StartProviderAttempt",
         idempotencyKey: "intervening-provider-authority:original",
@@ -106,6 +197,8 @@ describe("independent review regressions", () => {
             "intervening-provider-authority:replacement-activation",
           runId: setup.runId,
           expectedRunRevision: 1,
+          outboxEventId: originalAuthority.outboxEventId,
+          outboxLeaseToken: replacementClaim.leaseToken!,
         },
         runtimeContext,
       );
@@ -156,6 +249,8 @@ describe("independent review regressions", () => {
           idempotencyKey: "review-wait",
           runId: setup.runId,
           expectedRunRevision: 1,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
           reason: "Waiting for another durable input.",
         },
         setup.agentContext,
@@ -183,6 +278,8 @@ describe("independent review regressions", () => {
           idempotencyKey: "review-reactivate",
           runId: setup.runId,
           expectedRunRevision: 2,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
         },
         runtimeContext,
       );
@@ -280,6 +377,8 @@ describe("independent review regressions", () => {
           idempotencyKey: "runtime-replacement-activation",
           runId: setup.runId,
           expectedRunRevision: 1,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
         },
         runtimeContext,
       );
@@ -401,6 +500,8 @@ describe("independent review regressions", () => {
           idempotencyKey: "runtime-next-replacement",
           runId: setup.runId,
           expectedRunRevision: 1,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
         },
         runtimeContext,
       );
@@ -410,6 +511,8 @@ describe("independent review regressions", () => {
           idempotencyKey: "runtime-next-replacement",
           runId: setup.runId,
           expectedRunRevision: 1,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
         },
         runtimeContext,
       );
@@ -583,12 +686,12 @@ describe("independent review regressions", () => {
         humanContext,
       );
       const runInputId = sent.relatedIds!.runInputId!;
-      const activation = await kernel.execute(
+      await kernel.execute(
         {
-          type: "StartActivation",
-          idempotencyKey: "provider-withdrawal-activation",
-          runId: setup.runId,
-          expectedRunRevision: 2,
+          type: "AcknowledgeOutboxEvents",
+          idempotencyKey: "provider-withdrawal-initial-ack",
+          outboxEventIds: [setup.outboxEventId],
+          leaseToken: setup.outboxLeaseToken,
         },
         runtimeContext,
       );
@@ -597,6 +700,16 @@ describe("independent review regressions", () => {
         setup.runId,
         "provider-withdrawal",
         runInputId,
+      );
+      const activation = await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "provider-withdrawal-activation",
+          runId: setup.runId,
+          expectedRunRevision: 2,
+          ...outboxAuthority,
+        },
+        runtimeContext,
       );
       const alreadyStarted = await kernel.execute(
         {
@@ -874,6 +987,8 @@ describe("independent review regressions", () => {
           idempotencyKey: "superseding-active-generation",
           runId: setup.runId,
           expectedRunRevision: 1,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
         },
         runtimeContext,
       );
@@ -922,17 +1037,13 @@ describe("independent review regressions", () => {
     const kernel = openMemoryKernel();
     try {
       const setup = await createRun(kernel);
-      const outboxAuthority = await claimRunOutboxAuthority(
-        kernel,
-        setup.runId,
-        "provider-status",
-      );
       const provider = await kernel.execute(
         {
           type: "StartProviderAttempt",
           idempotencyKey: "provider-status-start",
           activationId: setup.activationId,
-          ...outboxAuthority,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
           adapter: "deterministic-fake",
           adapterVersion: "1",
           capabilitySnapshot: {},

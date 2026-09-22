@@ -787,12 +787,18 @@ describe("Torsor HTTP and SSE service", () => {
     });
     let runActivationId: string;
     try {
+      const outboxAuthority = await claimRunOutboxAuthority(
+        activationKernel,
+        runId,
+        "agent-status-run-activation",
+      );
       const activation = await activationKernel.execute(
         {
           type: "StartActivation",
           idempotencyKey: "agent-status-run-activation",
           runId,
           expectedRunRevision: 1,
+          ...outboxAuthority,
         },
         runtimeContext,
       );
@@ -874,12 +880,18 @@ describe("Torsor HTTP and SSE service", () => {
         { type: "GetRunProjection", runId: seeded.runId },
         humanContext,
       );
+      const outboxAuthority = await claimRunOutboxAuthority(
+        kernel,
+        seeded.runId,
+        "agent-event-scope",
+      );
       const activation = await kernel.execute(
         {
           type: "StartActivation",
           idempotencyKey: "agent-event-scope",
           runId: seeded.runId,
           expectedRunRevision: run.run.revision,
+          ...outboxAuthority,
         },
         runtimeContext,
       );
@@ -1208,6 +1220,53 @@ async function seedRun(
   } finally {
     kernel.close();
   }
+}
+
+async function claimRunOutboxAuthority(
+  kernel: TorsorKernel,
+  runId: string,
+  key: string,
+): Promise<{
+  readonly outboxEventId: string;
+  readonly outboxLeaseToken: string;
+}> {
+  for (let index = 0; index < 100; index += 1) {
+    const claim = await kernel.execute(
+      {
+        type: "ClaimOutboxEvents",
+        idempotencyKey: `${key}-outbox-claim-${index}`,
+        limit: 1,
+        leaseDurationMs: 30_000,
+      },
+      runtimeContext,
+    );
+    const event = claim.outboxEvents?.[0];
+    if (!event || !claim.leaseToken) {
+      throw new Error(`Expected an Outbox event for Run ${runId}.`);
+    }
+    if (
+      event.aggregateId === runId &&
+      (
+        event.topic === "run.activation-requested" ||
+        event.topic === "run-input.available"
+      )
+    ) {
+      return {
+        outboxEventId: event.id,
+        outboxLeaseToken: claim.leaseToken,
+      };
+    }
+    await kernel.execute(
+      {
+        type: "AcknowledgeOutboxEvents",
+        idempotencyKey: `${key}-outbox-ack-${index}`,
+        outboxEventIds: [event.id],
+        leaseToken: claim.leaseToken,
+      },
+      runtimeContext,
+    );
+  }
+  throw new Error(`Outbox authority for Run ${runId} was not found.`);
 }
 
 async function seedAttentionActivation(

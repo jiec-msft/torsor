@@ -2795,6 +2795,29 @@ describe("AgentRuntime", () => {
   it("rejects stale Activation capabilities after replacement", async () => {
     const kernel = openKernel(":memory:");
     let replacementStarted = false;
+    let outboxAuthority:
+      | {
+          outboxEventId: string;
+          outboxLeaseToken: string;
+        }
+      | undefined;
+    const originalExecute = kernel.execute.bind(kernel);
+    vi.spyOn(kernel, "execute").mockImplementation(
+      async (command, context) => {
+        const result = await originalExecute(command, context);
+        if (
+          command.type === "ClaimOutboxEvents" &&
+          result.outboxEvents?.length &&
+          result.leaseToken
+        ) {
+          outboxAuthority = {
+            outboxEventId: result.outboxEvents[0]!.id,
+            outboxLeaseToken: result.leaseToken,
+          };
+        }
+        return result;
+      },
+    );
     const adapter = new DeterministicFakeAdapter(async (context) => {
       if (context.cause.type === "attention") {
         await context.capabilities.createRunFromAttention();
@@ -2808,6 +2831,7 @@ describe("AgentRuntime", () => {
             idempotencyKey: "test-replacement-activation",
             runId: context.cause.run.run.id,
             expectedRunRevision: context.cause.run.run.revision,
+            ...outboxAuthority!,
           },
           runtimeContext,
         );
@@ -2830,12 +2854,36 @@ describe("AgentRuntime", () => {
       expect(run.providerAttempts.at(-1)?.status).toBe("Failed");
       expect(run.run.activationGeneration).toBe(2);
     } finally {
+      vi.restoreAllMocks();
       kernel.close();
     }
   });
 
   it("cancels a provider when its Run Activation is superseded", async () => {
     const kernel = openKernel(":memory:");
+    let outboxAuthority:
+      | {
+          outboxEventId: string;
+          outboxLeaseToken: string;
+        }
+      | undefined;
+    const originalExecute = kernel.execute.bind(kernel);
+    vi.spyOn(kernel, "execute").mockImplementation(
+      async (command, context) => {
+        const result = await originalExecute(command, context);
+        if (
+          command.type === "ClaimOutboxEvents" &&
+          result.outboxEvents?.length &&
+          result.leaseToken
+        ) {
+          outboxAuthority = {
+            outboxEventId: result.outboxEvents[0]!.id,
+            outboxLeaseToken: result.leaseToken,
+          };
+        }
+        return result;
+      },
+    );
     const adapter = new DeterministicFakeAdapter(async (context) => {
       if (context.cause.type === "attention") {
         await context.capabilities.createRunFromAttention();
@@ -2847,6 +2895,7 @@ describe("AgentRuntime", () => {
           idempotencyKey: "supersede-running-provider",
           runId: context.cause.run.run.id,
           expectedRunRevision: context.cause.run.run.revision,
+          ...outboxAuthority!,
         },
         runtimeContext,
       );
@@ -2876,6 +2925,7 @@ describe("AgentRuntime", () => {
       expect(run.run.activationGeneration).toBe(2);
       expect(run.providerAttempts.at(-1)?.status).toBe("Unknown");
     } finally {
+      vi.restoreAllMocks();
       kernel.close();
     }
   });
@@ -3208,6 +3258,129 @@ describe("AgentRuntime", () => {
         "Completed",
       ]);
     } finally {
+      kernel.close();
+    }
+  });
+
+  it("prevents a stale Outbox claimant from superseding the current Run activation", async () => {
+    let kernelNow = new Date("2026-09-21T08:00:00.000Z");
+    let staleRuntimeNow = kernelNow;
+    const kernel = openKernel(":memory:", () => kernelNow);
+    let staleRunDeliveries = 0;
+    let replacementRunDeliveries = 0;
+    let releaseStaleActivation!: () => void;
+    let reportStaleActivationPaused!: () => void;
+    let releaseReplacementProvider!: () => void;
+    let reportReplacementProviderStarted!: () => void;
+    const staleActivationPaused = new Promise<void>((resolve) => {
+      reportStaleActivationPaused = resolve;
+    });
+    const staleActivationGate = new Promise<void>((resolve) => {
+      releaseStaleActivation = resolve;
+    });
+    const replacementProviderStarted = new Promise<void>((resolve) => {
+      reportReplacementProviderStarted = resolve;
+    });
+    const replacementProviderGate = new Promise<void>((resolve) => {
+      releaseReplacementProvider = resolve;
+    });
+    const staleAdapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+        return;
+      }
+      staleRunDeliveries += 1;
+      await context.capabilities.complete();
+    });
+    const replacementAdapter = new DeterministicFakeAdapter(
+      async (context) => {
+        if (context.cause.type !== "run") {
+          throw new Error(
+            "The replacement Runtime must only deliver Run work.",
+          );
+        }
+        replacementRunDeliveries += 1;
+        reportReplacementProviderStarted();
+        await replacementProviderGate;
+        await context.capabilities.complete();
+      },
+    );
+    try {
+      await mentionAgent(kernel, "outbox-pre-activation-takeover");
+      await createRuntime(kernel, staleAdapter, {
+        attentionLeaseMs: 6_000,
+        outboxLeaseMs: 6_000,
+        providerTimeoutMs: 5_000,
+        leaseSafetyMs: 1_000,
+        clock: () => staleRuntimeNow,
+      }).runOnce();
+
+      const stalePass = createRuntime(kernel, staleAdapter, {
+        attentionLeaseMs: 6_000,
+        outboxLeaseMs: 6_000,
+        providerTimeoutMs: 5_000,
+        leaseSafetyMs: 1_000,
+        clock: () => staleRuntimeNow,
+        hooks: {
+          beforeRunActivationStarted: async () => {
+            reportStaleActivationPaused();
+            await staleActivationGate;
+          },
+        },
+      }).runOnce();
+      await staleActivationPaused;
+
+      kernelNow = new Date(kernelNow.getTime() + 6_001);
+      staleRuntimeNow = new Date(kernelNow.getTime() - 60_000);
+      const replacementPass = createRuntime(
+        kernel,
+        replacementAdapter,
+        {
+          projectIds: ["project-secondary"],
+          attentionLeaseMs: 6_000,
+          outboxLeaseMs: 6_000,
+          providerTimeoutMs: 5_000,
+          leaseSafetyMs: 1_000,
+          clock: () => kernelNow,
+        },
+      ).runOnce();
+      await replacementProviderStarted;
+
+      let run = await getOnlyRun(kernel);
+      const currentActivation = run.activations.at(-1)!;
+      expect(run.run.activationGeneration).toBe(1);
+      expect(currentActivation.revokedAt).toBeNull();
+      expect(run.providerAttempts).toHaveLength(1);
+      expect(run.providerAttempts[0]?.status).toBe("Started");
+
+      releaseStaleActivation();
+      await expect(stalePass).rejects.toMatchObject({ code: "Conflict" });
+
+      run = await getOnlyRun(kernel);
+      expect(run.run.activationGeneration).toBe(1);
+      expect(run.activations).toHaveLength(1);
+      expect(run.activations[0]).toMatchObject({
+        id: currentActivation.id,
+        revokedAt: null,
+      });
+      expect(run.providerAttempts).toHaveLength(1);
+      expect(run.inputs[0]?.disposition).toBe("Pending");
+      expect(staleRunDeliveries).toBe(0);
+
+      releaseReplacementProvider();
+      const replacementResult = await replacementPass;
+      expect(replacementResult.outboxEventsProcessed).toBe(1);
+      expect(replacementRunDeliveries).toBe(1);
+
+      run = await getOnlyRun(kernel);
+      expect(run.run.state).toBe("Completed");
+      expect(run.activations).toHaveLength(1);
+      expect(run.providerAttempts).toHaveLength(1);
+      expect(run.providerAttempts[0]?.status).toBe("Completed");
+      expect(run.inputs[0]?.disposition).toBe("Incorporated");
+    } finally {
+      releaseStaleActivation?.();
+      releaseReplacementProvider?.();
       kernel.close();
     }
   });

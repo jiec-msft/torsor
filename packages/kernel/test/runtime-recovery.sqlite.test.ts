@@ -15,7 +15,6 @@ import {
 } from "../src/index.js";
 import {
   bootstrap,
-  claimRunOutboxAuthority,
   createRun,
   humanContext,
   runtimeContext,
@@ -97,11 +96,10 @@ async function failRunProvider(
   setup: Awaited<ReturnType<typeof createRun>>,
   key: string,
 ) {
-  const outboxAuthority = await claimRunOutboxAuthority(
-    kernel,
-    setup.runId,
-    key,
-  );
+  const outboxAuthority = {
+    outboxEventId: setup.outboxEventId,
+    outboxLeaseToken: setup.outboxLeaseToken,
+  };
   const attempt = await kernel.execute(
     {
       type: "StartProviderAttempt",

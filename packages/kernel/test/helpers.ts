@@ -162,12 +162,19 @@ export async function createRun(kernel: TorsorKernel) {
       activationId: attentionActivation.entityId,
     },
   );
+  const outboxAuthority = await claimRunOutboxAuthority(
+    kernel,
+    resolved.entityId,
+    "start-run",
+    resolved.relatedIds!.runInputId!,
+  );
   const activation = await kernel.execute(
     {
       type: "StartActivation",
       idempotencyKey: "start-run-activation",
       runId: resolved.entityId,
       expectedRunRevision: 1,
+      ...outboxAuthority,
     },
     runtimeContext,
   );
@@ -178,6 +185,7 @@ export async function createRun(kernel: TorsorKernel) {
     runId: resolved.entityId,
     runInputId: resolved.relatedIds!.runInputId!,
     activationId: activation.entityId,
+    ...outboxAuthority,
     agentContext: {
       principalId: "principal-orbit",
       activationId: activation.entityId,

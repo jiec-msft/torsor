@@ -981,6 +981,8 @@ describe("SQLite persistence", () => {
           idempotencyKey: "replacement-run-activation",
           runId: setup.runId,
           expectedRunRevision: 1,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
         },
         runtimeContext,
       );
@@ -1218,6 +1220,8 @@ describe("SQLite persistence", () => {
           idempotencyKey: "query-snapshot-resume",
           runId: setup.runId,
           expectedRunRevision: 2,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
         },
       );
       const whileUncommitted = await kernel.query(

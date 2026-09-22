@@ -54,12 +54,13 @@ decision commits and before the provider returns.
 
 The current Kernel contract does not expose lease renewal. The runtime
 therefore claims one outbox event at a time. Attention and non-empty outbox
-claims return their persisted lease expiry. Run ProviderAttempt admission
-atomically validates the exact Outbox event, lease token and principal, live
-Kernel-clock expiry, oldest pending frontier, and delivered RunInput. The same
-idempotent admission is revalidated immediately before adapter invocation, so
+claims return their persisted lease expiry. Run Activation creation atomically
+validates the exact Outbox event, lease token and principal, live Kernel-clock
+expiry, oldest pending frontier, and Pending RunInput before it can advance the
+generation or revoke another owner. ProviderAttempt admission revalidates that
+authority and the delivered RunInput immediately before adapter invocation, so
 an acknowledged, expired, superseded, or reclaimed event cannot reuse a cached
-ProviderAttempt as fresh authority.
+Activation or ProviderAttempt as fresh authority.
 
 Immediately before provider work, the runtime limits execution to the smaller
 of the configured provider timeout, local remaining lease time, and the

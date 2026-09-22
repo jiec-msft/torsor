@@ -32,6 +32,10 @@ export interface AgentRuntimeHooks {
     readonly providerAttemptId: string;
     readonly causeType: ProviderCause["type"];
   }) => Promise<void>;
+  readonly beforeRunActivationStarted?: (input: {
+    readonly runId: string;
+    readonly outboxEventId: string;
+  }) => Promise<void>;
   readonly beforeFailureParking?: (input: {
     readonly runId: string;
     readonly providerAttemptId: string;
@@ -753,12 +757,18 @@ export class AgentRuntime {
         await this.#reconcileRunProjection(currentProjection);
         return true;
       }
+      await this.#hooks.beforeRunActivationStarted?.({
+        runId: currentProjection.run.id,
+        outboxEventId: event.id,
+      });
       const activation = await this.#kernel.execute(
         {
           type: "StartActivation",
           idempotencyKey: `outbox:${event.id}:activation:${authorityLeaseToken}:${currentProjection.run.revision}`,
           runId: currentProjection.run.id,
           expectedRunRevision: currentProjection.run.revision,
+          outboxEventId: event.id,
+          outboxLeaseToken: authorityLeaseToken,
           durationMs: Math.max(
             this.#activationDurationMs ?? 0,
             DEFAULT_ACTIVATION_DURATION_MS,
