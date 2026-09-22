@@ -1,10 +1,12 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { DeterministicFakeAdapter } from "@torsor/agent-runtime";
 import type { AgentRuntimeHooks } from "@torsor/agent-runtime";
 import {
+  LocalArtifactStorage,
   TorsorKernel,
   type KernelBootstrap,
   type ThreadProjection,
@@ -20,6 +22,7 @@ import {
 
 import {
   createLocalRuntimeHost,
+  createTorsorHttpService,
   type LocalRuntimeHost,
 } from "../src/index.js";
 
@@ -58,6 +61,107 @@ afterEach(async () => {
 });
 
 describe("Local runtime host", () => {
+  it("finalizes Runtime reports, downloads authorized real bytes and restores SQLite/HTTP after restart", async () => {
+    const directory = await temporaryDirectory();
+    const databasePath = join(directory, "reports.sqlite");
+    const root = join(directory, "content");
+    const storage = await LocalArtifactStorage.open(root);
+    const report = "Synthetic Host report.\n";
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+      } else {
+        const input = { idempotencyKey: "report", text: report };
+        const id = await context.capabilities.publishReport(input);
+        expect(await context.capabilities.publishReport(input)).toBe(id);
+        await context.capabilities.complete({ finalReply: { body: `Report Artifact: ${id}` } });
+      }
+    });
+    const host = createLocalRuntimeHost({
+      databasePath, bootstrap, artifactStorage: storage, adapter, port: 0,
+      credentials: [{ token: "human-token", principalContext: { principalId: "principal-human" } }],
+      runtimePrincipalId: "principal-runtime", projectIds: ["project-sample"],
+      runtimePollIntervalMs: 5,
+    });
+    cleanup.push(() => host.close());
+    const origin = await host.start();
+    const response = await fetch(`${origin}/api/v1/commands/start-thread`, {
+      method: "POST", headers: { ...authorization(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        idempotencyKey: "report-thread", projectId: "project-sample", channelId: "channel-general",
+        body: "Produce a synthetic report.", targetAgentIds: ["agent-orbit"],
+      }),
+    });
+    expect(response.status).toBe(200);
+    const { result } = await response.json() as { result: { entityId: string } };
+    const thread = await waitForCompletedThread(origin, result.entityId);
+    expect(thread.artifacts).toHaveLength(1);
+    const artifact = thread.artifacts[0]!;
+    const digest = createHash("sha256").update(report).digest("hex");
+    expect(artifact.contentDigest).toBe(`sha256:${digest}`);
+    expect(artifact.producerThreadRootId).toBe(thread.threadRootId);
+    const contentPath = `/api/v1/artifacts/${artifact.id}/content`;
+    expect((await fetch(`${origin}${contentPath}`)).status).toBe(401);
+    const download = await fetch(`${origin}${contentPath}`, { headers: authorization() });
+    expect(download.status).toBe(200);
+    expect(download.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(download.headers.get("content-disposition")).toBe('attachment; filename="report.txt"');
+    expect(download.headers.get("cache-control")).toBe("no-store");
+    expect(download.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(await download.text()).toBe(report);
+    await host.close();
+
+    const reopenedStorage = await LocalArtifactStorage.open(root);
+    let onRead: (() => Promise<void>) | undefined;
+    const kernel = TorsorKernel.open({
+      databasePath,
+      artifactStorage: {
+        put: reopenedStorage.put.bind(reopenedStorage),
+        async read(digest, size) {
+          const content = await reopenedStorage.read(digest, size);
+          await onRead?.();
+          return content;
+        },
+      },
+    });
+    cleanup.push(async () => kernel.close());
+    const service = createTorsorHttpService({
+      kernel, port: 0,
+      credentials: [
+        { token: "human-token", principalContext: { principalId: "principal-human" } },
+        { token: "expired-agent", principalContext: { principalId: "principal-orbit", activationId: artifact.producerActivationId } },
+      ],
+    });
+    cleanup.push(() => service.close());
+    const restarted = await service.listen();
+    const descriptor = await fetch(`${restarted}/api/v1/artifacts/${artifact.id}`, { headers: authorization() });
+    expect(await descriptor.json()).toEqual({ artifact });
+    expect(JSON.stringify(artifact)).not.toContain(root);
+    expect(artifact).not.toHaveProperty("storageLocation");
+    expect((await fetch(`${restarted}${contentPath}`, { headers: { Authorization: "Bearer expired-agent" } })).status).toBe(409);
+    expect(await (await fetch(`${restarted}${contentPath}`, { headers: authorization() })).text()).toBe(report);
+    const session = await fetch(`${restarted}/api/v1/session`, { method: "POST", headers: authorization() });
+    const cookie = session.headers.get("set-cookie")!.split(";")[0]!;
+    await session.json();
+    onRead = async () => {
+      const logout = await fetch(`${restarted}/api/v1/session`, { method: "DELETE", headers: { Cookie: cookie } });
+      expect(logout.status).toBe(204);
+    };
+    const revoked = await fetch(`${restarted}${contentPath}`, { headers: { Cookie: cookie } });
+    expect(revoked.status).toBe(401);
+    onRead = undefined;
+    expect((await fetch(`${restarted}/api/v1/commands/publish-artifact`, {
+      method: "POST", headers: { ...authorization(), "Content-Type": "application/json" },
+      body: JSON.stringify({ contentDigest: `sha256:${digest}`, storageLocation: "file:///private" }),
+    })).status).toBe(404);
+    const blob = join(root, "sha256", digest);
+    await chmod(blob, 0o600);
+    await writeFile(blob, "tampered");
+    const failed = await fetch(`${restarted}${contentPath}`, { headers: authorization() });
+    expect(failed.status).toBe(500);
+    expect(await failed.text()).not.toContain(root);
+  });
+
   it("runs an HTTP request through the production host composition", async () => {
     const directory = await temporaryDirectory();
     const databasePath = join(directory, "torsor.sqlite");

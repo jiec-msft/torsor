@@ -129,6 +129,18 @@ function handlePrompt() {
         { type: "complete" },
       ]);
       return;
+    case "report":
+    case "forged-report":
+      sendActions([
+        {
+          type: "publish_report",
+          idempotencyKey: "investigation-report",
+          text: "Synthetic ACP report.\n",
+          ...(mode === "forged-report" ? { storageLocation: "file:///private/report" } : {}),
+        },
+        { type: "complete" },
+      ]);
+      return;
     case "malformed":
       process.stdout.write("{not-json}\n");
       return;

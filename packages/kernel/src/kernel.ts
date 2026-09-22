@@ -1,4 +1,16 @@
 import {
+  artifactDigest,
+  verifyArtifactContent,
+  type ArtifactStorage,
+} from "./artifact-storage.js";
+import {
+  authorizeReport,
+  collectReport,
+  getArtifact,
+  publishArtifact,
+  validateReportInput,
+} from "./artifacts.js";
+import {
   claimAttention,
   ignoreAttention,
   resolveCachedAttentionClaim,
@@ -68,7 +80,6 @@ import {
   cancelRun,
   completeRun,
   failRun,
-  publishArtifact,
   publishRunReply,
   recordLateOutput,
   sendToRun,
@@ -88,7 +99,9 @@ import {
   resolveWorktreeWriterLeaseQuarantine,
 } from "./worktree-writer-leases.js";
 import type {
+  ArtifactContent,
   CommandResult,
+  FinalizeReportInput,
   KernelCommand,
   KernelOpenOptions,
   KernelQuery,
@@ -119,10 +132,12 @@ export { KernelError } from "./errors.js";
 
 export class TorsorKernel {
   readonly #context: KernelContext;
+  readonly #artifactStorage: ArtifactStorage | undefined;
   #closed = false;
 
   private constructor(options: KernelOpenOptions) {
     this.#context = openKernelContext(options);
+    this.#artifactStorage = options.artifactStorage;
   }
 
   static open(options: KernelOpenOptions): TorsorKernel {
@@ -138,6 +153,69 @@ export class TorsorKernel {
 
   async execute<C extends KernelCommand>(
     command: C,
+    principalContext: PrincipalContext,
+  ): Promise<CommandResult> {
+    if (command.type === "PublishArtifact") {
+      throw new KernelError("Forbidden", "Artifact descriptors require trusted byte finalization.");
+    }
+    return this.#execute(command, principalContext);
+  }
+
+  get reportArtifactsEnabled(): boolean {
+    return this.#artifactStorage !== undefined;
+  }
+
+  async finalizeReport(
+    input: FinalizeReportInput,
+    context: PrincipalContext,
+  ): Promise<CommandResult> {
+    this.#assertOpen();
+    validateReportInput(input);
+    const storage = this.#requireArtifactStorage();
+    // Capture caller-owned context and fields before awaiting an untrusted stream.
+    const actor = { ...context };
+    const { runId, expectedRunRevision, idempotencyKey } = input;
+    authorizeReport(this.#context, runId, actor);
+    const content = await collectReport(input.content);
+    const contentDigest = artifactDigest(content);
+    await storage.put(contentDigest, content);
+    return this.#execute(
+      {
+        type: "PublishArtifact",
+        idempotencyKey: JSON.stringify([runId, idempotencyKey]),
+        runId,
+        expectedRunRevision,
+        contentDigest,
+        byteLength: content.byteLength,
+      },
+      actor,
+    );
+  }
+
+  async readArtifact(
+    artifactId: string,
+    context: PrincipalContext,
+  ): Promise<ArtifactContent> {
+    const actor = { ...context };
+    const artifact = await this.query({ type: "GetArtifact", artifactId }, actor);
+    const content = Buffer.from(await this.#requireArtifactStorage().read(
+      artifact.contentDigest,
+      artifact.byteLength,
+    ));
+    verifyArtifactContent(content, artifact.contentDigest, artifact.byteLength);
+    await this.query({ type: "GetArtifact", artifactId }, actor);
+    return { artifact, content };
+  }
+
+  #requireArtifactStorage(): ArtifactStorage {
+    if (!this.#artifactStorage) {
+      throw new KernelError("InvalidCommand", "Report Artifact storage is not configured.");
+    }
+    return this.#artifactStorage;
+  }
+
+  async #execute(
+    command: KernelCommand,
     principalContext: PrincipalContext,
   ): Promise<CommandResult> {
     this.#assertOpen();
@@ -169,6 +247,9 @@ export class TorsorKernel {
         command.idempotencyKey,
       );
       if (cached) {
+        if (command.type === "PublishArtifact") {
+          authorizeReport(this.#context, command.runId, effectiveContext);
+        }
         if (text(cached.payload_hash) !== payloadHash) {
           throw new KernelError(
             "Conflict",
@@ -176,6 +257,9 @@ export class TorsorKernel {
           );
         }
         const result = JSON.parse(text(cached.result_json)) as CommandResult;
+        if (command.type === "PublishArtifact") {
+          getArtifact(this.#context, result.entityId, effectiveContext);
+        }
         if (command.type === "ClaimAttention") {
           const current = resolveCachedAttentionClaim(
             this.#context,
@@ -370,6 +454,10 @@ export class TorsorKernel {
     try {
       let result: unknown;
       switch (query.type) {
+        case "GetArtifact": {
+          result = getArtifact(this.#context, query.artifactId, principalContext);
+          break;
+        }
         case "GetBootstrap": {
           assertProjectAccess(this.#context, principal, query.projectId);
           const agent =

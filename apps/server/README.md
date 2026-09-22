@@ -51,6 +51,16 @@ production composition path. `createTorsorHttpService` remains available for
 HTTP-only embedding; when passed a shared Kernel, the caller retains Kernel
 shutdown ownership.
 
+Report Artifacts are opt-in. Set `TORSOR_ARTIFACT_ROOT` to a private local
+directory with an existing trusted parent, outside Provider/Worktree write
+scope. Library callers supply `artifactStorage` to `createLocalRuntimeHost`
+or to the owned Kernel options of `createTorsorHttpService`; shared-Kernel
+embedding configures the adapter on that Kernel. The executable uses
+`LocalArtifactStorage`, whose storage/crash boundary is documented in the
+Kernel package and paired MVP sections 21/23. Never expose this directory as
+a static web root. Schema 14 is breaking: stop old processes and recreate the
+disposable database, without migration or silent deletion.
+
 Clients authenticate with `Authorization: Bearer <local-secret>`. Browsers can
 exchange that credential at `POST /api/v1/session` for an HttpOnly,
 SameSite-strict cookie that native `EventSource` sends automatically. The
@@ -71,6 +81,8 @@ revocation in one browser session does not revoke another.
 - `GET /api/v1/projects/:projectId/runs?after=...&snapshot=...&limit=...`
 - `GET /api/v1/runs/:runId`
 - `GET /api/v1/runs/:runId/activity?afterSequence=...&limit=...`
+- `GET /api/v1/artifacts/:artifactId`
+- `GET /api/v1/artifacts/:artifactId/content`
 - `GET /api/v1/projects/:projectId/agents`
 - `GET /api/v1/projects/:projectId/attentions`
 - `GET /api/v1/events?projectId=...&cursor=...&batchSize=...`
@@ -79,6 +91,12 @@ Command bodies contain Kernel command fields except `type`, which the route
 owns. Principal and author provenance are never accepted from the request
 body. The authenticated local credential supplies the complete
 `PrincipalContext`.
+
+Artifact routes recheck current Kernel visibility; content downloads also
+recheck browser-session validity after storage I/O. Download responses are
+uncached plain-text attachments with `nosniff` and a restrictive CSP. IDs and
+digests are not bearer credentials, internal paths never enter the contract,
+and there is no HTTP descriptor-upload/publish endpoint.
 
 The SSE stream emits `event: torsor`, uses the durable Kernel `eventId` as the
 SSE `id`, accepts either `Last-Event-ID` or `cursor`, and sends heartbeat

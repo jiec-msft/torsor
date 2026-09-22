@@ -92,9 +92,16 @@ The bridge then applies only server-bound Kernel capabilities; provider output
 cannot choose provenance, Agent identity, Activation identity, or
 ProviderAttempt identity.
 
-Artifact publication is intentionally unavailable to providers until the
-runtime has a trusted finalizer that persists bytes and computes the immutable
-digest and location. The Copilot process is also not an operating-system
+When the Host configures Artifact storage, a Run bridge offers
+`publishReport({ idempotencyKey, text })`. ACP exposes only the bounded
+`publish_report` action with those fields. The bridge binds Run/revision and
+Activation, and Kernel finalization computes the digest and persists real bytes
+before publication. Stable report keys are Run-scoped, not ProviderAttempt
+sequence numbers. Extra descriptor/provenance fields fail before actions apply;
+`publish_artifact` remains forbidden. Without storage the capability fails closed
+and is not advertised. Report publication does not complete the Run.
+
+The Copilot process is also not an operating-system
 sandbox; this slice relies on the CLI tool-availability boundary and sanitized
 environment and does not provide Worktree, Git, terminal, or multi-host
 execution.

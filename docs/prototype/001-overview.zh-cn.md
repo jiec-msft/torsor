@@ -976,6 +976,11 @@ Activation 是运行记录，不是主要用户对象。
 
 外部 Worker 可以重复消费 Outbox。
 
+首个可信 Artifact 切片只固化不可变报告字节。Torsor 必须先接收有界字节或字节流、
+自行计算 SHA-256、确认内容已持久落盘，再在现有 Kernel 事务中原子写入
+descriptor、`ArtifactPublished`、`artifact.published` Outbox 和完整幂等结果。
+存储失败不得发布 descriptor；Outbox 不是“将来再上传”却已可下载的承诺。
+
 ### 21.4 过期 Activation
 
 1. 所有 Run 变更要求 expected revision。
@@ -995,6 +1000,18 @@ Runtime 定期恢复：
 - 未完成 Artifact 固化
 
 所有恢复操作继续使用幂等键。
+
+报告固化以 `(principal_id, run_id, idempotency_key)` 标识一次请求。相同请求的
+字节、expected Run revision 必须相同，否则冲突。提交响应丢失后，重试返回原
+Artifact 和原始 provenance，不重复发布事件。新 Activation 只有在当前授权允许
+读取该 Run 时才可重试；重试不是重新使用旧 Activation 权限的途径。
+
+首片采用调用方重试恢复，不后台重放 Provider 输出：临时写入期间崩溃只留下不可见
+临时文件；内容已发布但数据库未提交只留下不可见的内容寻址 blob；数据库提交后
+响应丢失可通过持久幂等结果和 Run/Thread 投影恢复。重试复用并核对既有 blob，
+在事务中再次检查当前权限、Activation 和 Run revision。权限撤销或 Run 终态
+阻止新 descriptor；已提交 descriptor 仍由当前获授权的 Human/Runtime 查询。
+首片不自动删除 orphan 或 staging 文件，避免与并发固化竞争；清理留给停机维护。
 
 Runtime Host 调度恢复 pass 时，连续执行的 pass 数量必须有界，并在继续前让出事件循环并重新检查关闭请求。积压处理不得饿死 HTTP、timer、signal 或关闭处理。空闲轮询等待必须可被关闭请求中断；无论等待还是关闭先完成，都必须移除对应 listener 并取消不再需要的 timer。
 
@@ -1067,15 +1084,41 @@ producer_run_id
 producer_activation_id
 base_revision
 media_type
-storage_location
+byte_length
+producer_thread_root_id
 visibility_scope
 ```
+
+首片报告使用 `sha256:<lowercase hex>`，固定 `text/plain; charset=utf-8`，
+`base_revision` 为 Torsor 生成的 `run:<id>@<expected revision>`，不声称是 Git
+commit。来源 Run、Activation、Thread 和 home Channel 从可信上下文推导。
+Provider 提供的 digest、descriptor、文件路径或 `file://` URL 均不具有权威性。
+普通 `PublishArtifact` 命令必须拒绝；只有接收字节的可信 finalizer 可进入发布事务。
+
+报告上限为 1 MiB；流还限制为最多 4096 个 chunk。finalizer 复制输入字节后计算
+digest，存储适配器不接收 Provider 路径。窄接口只有不可变写入与按 digest/长度读取；
+适配器由可信 Host 静态配置，不向 Provider 暴露。相同 Run/digest 保留一个
+descriptor；其他 key 重复发布同一内容返回冲突，不改写 provenance。
+
+开发/测试本地布局为私有 root 下 `sha256/<64 hex>` 和 `staging/<random>.tmp`。
+先独占创建临时文件、写入并 flush，再用不覆盖目标的原子 hard-link 发布；同名目标
+必须核对长度、digest 和全部字节，不得覆盖。读取同样核对长度和 digest。
+拒绝非法 digest、路径穿越、符号链接/目录联接和非普通文件。root 及其祖先必须由
+可信 Host 控制，不可放在 Provider/Worktree 可写范围；此适配器不是对同一 OS 用户
+恶意并发改写的沙箱。POSIX 同时 flush 目录；Windows 支持进程崩溃/重启恢复，但不
+承诺 portable Node API 无法提供的目录 flush/断电持久性。生产远端存储另行实现接口。
 
 ### 23.2 权限
 
 1. Artifact 默认继承 Run 的 home Channel 可见性。
-2. 下载时再次授权。
-3. 存储 URL 使用短期签名。
+2. 每次 descriptor 查询和下载重新检查当前 Principal、Project、home Channel、
+   Run/Activation scope；读取异步存储之后、返回字节之前再次检查。
+3. 首片公开契约只有 Artifact ID 和 descriptor，不暴露内部路径或直接存储 URL。
+   HTTP 使用 `GET /api/v1/artifacts/:id` 和 `GET /api/v1/artifacts/:id/content`；
+   持有 ID/digest 不是授权。响应禁用缓存，内容按 attachment/plain text 返回。
+4. 当前本地权限模型中 Human/Runtime 拥有全局读取权，Agent 受实时 Activation
+   的 Project/Channel/Thread/Run scope 限制；不在本片新增 ACL 管理系统。
+   如后续使用短期签名 URL，它不能绕过当前权限复核。
 
 ### 23.3 集成
 
@@ -1094,6 +1137,11 @@ visibility_scope
 MVP 不新增 `ArtifactInput`。
 
 Artifact 通过 Thread 中的 Message 或卡片引用，再将该 Message revision 分配为 RunInput。
+
+引用只使用已固化 Artifact ID；引用、报告文本和 Provider 输出都不自动授予读取权、
+创建 RunInput 或完成 Run。Runtime 的可选 `publish_report` capability 只接受稳定
+请求 key 和报告文本，不接受 digest/location/provenance；任意 ACP
+`publish_artifact` 仍禁用。
 
 ## 24. Provider 取消、暂停和 Resume
 
@@ -1424,6 +1472,12 @@ Activity      - Run、ProviderAttempt、Lease 和状态时间线
 ```
 
 这些 Tab 是 Client view state，不是领域对象。
+
+首片通过既有 Run/Thread 的 Artifact 投影提供已固化报告的 digest、长度、media
+type 和 Run/Thread 来源，并通过授权 HTTP 接口下载。尚未固化的 Provider 文本、
+临时文件和 orphan blob 不得显示为已发布 Artifact。存储缺失、篡改、权限变化或
+下载失败必须显式失败，不能显示空白成功。新增 Artifacts UI、GitHub 状态机、
+Worktree 执行、通用插件市场和 ArtifactInput 均不属于本片。
 
 `Live` 不应是静态 Run Dashboard。推荐按时间顺序投影：
 

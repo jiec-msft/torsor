@@ -2,12 +2,14 @@
 
 `@torsor/kernel` is the durable local state boundary for the first Torsor
 implementation slice. It stores collaboration and execution facts in SQLite
-while keeping SQL and provider details behind three consumer operations:
+while keeping SQL and provider details behind consumer operations:
 
 ```ts
 kernel.execute(command, principalContext);
 kernel.query(query, principalContext);
 kernel.readEvents(afterEventId, limit);
+kernel.finalizeReport({ runId, expectedRunRevision, idempotencyKey, content }, principalContext);
+kernel.readArtifact(artifactId, principalContext);
 ```
 
 `readEvents` is a trusted-internal synchronization feed for the local
@@ -212,11 +214,39 @@ generation-fences the Active Run, preserves Pending RunInputs, moves the Run to
 Waiting, revokes unfinished Run Activations, records durable activity, and
 does not create a replacement Activation or provider wake-up.
 
-Artifact publication stores an immutable descriptor only. The caller must
-finalize content in durable storage and verify its digest before
-`PublishArtifact`; the kernel does not upload blobs or turn a temporary upload
-location into a finalized Artifact. A failed or incomplete upload must not
-publish the descriptor.
+Configure `KernelOpenOptions.artifactStorage` with a trusted `ArtifactStorage`
+adapter. `LocalArtifactStorage.open(absolutePrivateRoot)` implements immutable
+local storage. `finalizeReport` accepts bytes or an async byte stream from a
+live Run Activation, copies at most 1 MiB / 4096 chunks, computes SHA-256,
+awaits durable storage, and only then atomically publishes descriptor, public
+event, Outbox and idempotency result. Direct `execute(PublishArtifact)` is
+forbidden, including for an otherwise authorized Agent. Report provenance is
+Kernel-derived; no caller-supplied digest, file URL, path, or descriptor is
+accepted. Reports have fixed plain-text media type and a `run:<id>@<revision>`
+base reference, not a fabricated Git commit.
+
+The private storage layout is `sha256/<64 lowercase hex>` plus
+`staging/<random>.tmp`. Exclusive staging, file flush, no-replace hard-link
+publication and full collision verification precede descriptor publication.
+Reads reject invalid keys, links/junctions, non-regular files, size mismatches
+and digest mismatches. Keep the root/ancestors Host-controlled, outside any
+Provider-writable directory. This is not an OS sandbox. POSIX flushes directory
+entries too; portable Node on Windows provides process-crash/restart recovery,
+not a directory-flush/power-loss guarantee.
+
+Retry uses the same principal, Run, key, bytes and expected revision. A new
+currently authorized Activation may recover the same committed result and
+original provenance. Revoked Activations cannot replay cached results. Before
+commit, crashes leave invisible staging/orphan content; after commit, projections
+and durable idempotency records recover lost responses. There is no background
+Provider-output replay or online GC. Offline cleanup must preserve referenced
+blobs. One descriptor per Run/digest remains enforced.
+
+`GetArtifact` and `readArtifact` reauthorize the current principal and Run scope;
+the latter repeats authorization after storage I/O and verifies returned bytes.
+Descriptors expose `byteLength` and `producerThreadRootId`, never storage paths.
+The local model retains global Human/Runtime reads and scoped Agent reads.
+See paired MVP sections 21.3/21.5, 23.1/23.2/23.4 and 35.3 for requirements.
 
 Worktree mutation is fenced by a Runtime-only durable writer lease. Acquisition
 creates a new monotonically increasing generation and fencing token for the
@@ -245,7 +275,9 @@ clock-derived expiry, and
 release, expiry, quarantine, and reconciliation ledger. These primitives do
 not perform filesystem mutation, process execution, or shell execution.
 
-The current direct schema version is 13. Version 13 adds durable Worktree
+The current direct schema version is 14. Version 14 replaces caller-provided
+Artifact storage locations with bounded byte length and source Thread provenance.
+Version 13 adds durable Worktree
 writer lease state and its independent event ledger. It retains version 12's
 bounded Attention recovery expiry horizon. Version 12 gives unfinished and
 finished-unsettled Attention recovery one bounded expiry-horizon index, so
@@ -256,4 +288,4 @@ normalized recovery state, ordered page indexes, count-only expiry promotion,
 recovery mutation revision, incremental provider/domain counters, and durable
 Agent/Project/Channel/Thread execution fences.
 This pre-release schema is intentionally breaking: stop old processes and
-recreate disposable databases rather than migrating version 8 through 12.
+recreate disposable databases rather than migrating earlier versions.

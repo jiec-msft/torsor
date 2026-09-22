@@ -106,11 +106,11 @@ export async function claimRunOutboxAuthority(
   throw new Error(`Outbox authority for Run ${runId} was not found.`);
 }
 
-export async function createRun(kernel: TorsorKernel) {
+export async function createRun(kernel: TorsorKernel, keySuffix = "") {
   const thread = await kernel.execute(
     {
       type: "StartThread",
-      idempotencyKey: "start-thread",
+      idempotencyKey: `start-thread${keySuffix}`,
       projectId: "project-sample",
       channelId: "channel-general",
       body: "Please inspect the public sample and report the findings.",
@@ -133,7 +133,7 @@ export async function createRun(kernel: TorsorKernel) {
   const claim = await kernel.execute(
     {
       type: "ClaimAttention",
-      idempotencyKey: "claim-attention",
+      idempotencyKey: `claim-attention${keySuffix}`,
       attentionId: attention.id,
       expectedAttentionRevision: attention.revision,
       leaseDurationMs: 30_000,
@@ -143,7 +143,7 @@ export async function createRun(kernel: TorsorKernel) {
   const attentionActivation = await kernel.execute(
     {
       type: "StartActivation",
-      idempotencyKey: "start-attention-activation",
+      idempotencyKey: `start-attention-activation${keySuffix}`,
       attentionId: attention.id,
       handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
     },
@@ -152,7 +152,7 @@ export async function createRun(kernel: TorsorKernel) {
   const resolved = await kernel.execute(
     {
       type: "ResolveAttentionWithRun",
-      idempotencyKey: "resolve-attention",
+      idempotencyKey: `resolve-attention${keySuffix}`,
       attentionId: attention.id,
       expectedAttentionRevision: claim.revision!,
       handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
@@ -165,13 +165,13 @@ export async function createRun(kernel: TorsorKernel) {
   const outboxAuthority = await claimRunOutboxAuthority(
     kernel,
     resolved.entityId,
-    "start-run",
+    `start-run${keySuffix}`,
     resolved.relatedIds!.runInputId!,
   );
   const activation = await kernel.execute(
     {
       type: "StartActivation",
-      idempotencyKey: "start-run-activation",
+      idempotencyKey: `start-run-activation${keySuffix}`,
       runId: resolved.entityId,
       expectedRunRevision: 1,
       ...outboxAuthority,

@@ -1,3 +1,4 @@
+import { MAX_REPORT_BYTES } from "@torsor/kernel";
 import type {
   AttentionView,
   BootstrapAgent,
@@ -61,6 +62,34 @@ export class KernelActivationCapabilityBridge
 
   get terminalAction(): "complete" | "fail" | "wait" | null {
     return this.#terminalAction;
+  }
+
+  get reportArtifactsEnabled(): boolean {
+    return this.causeType === "run" && this.options.kernel.reportArtifactsEnabled;
+  }
+
+  async publishReport(input: {
+    readonly idempotencyKey: string;
+    readonly text: string;
+  }): Promise<string> {
+    const run = this.#requireRun();
+    if (
+      Object.keys(input).some((key) => key !== "idempotencyKey" && key !== "text") ||
+      typeof input.text !== "string" ||
+      Buffer.byteLength(input.text, "utf8") > MAX_REPORT_BYTES
+    ) {
+      throw new Error("publish_report accepts only a stable key and bounded report text.");
+    }
+    const result = await this.options.kernel.finalizeReport(
+      {
+        runId: run.run.id,
+        expectedRunRevision: this.#requireRunRevision(),
+        idempotencyKey: input.idempotencyKey,
+        content: Buffer.from(input.text, "utf8"),
+      },
+      this.#agentContext(),
+    );
+    return result.entityId;
   }
 
   async createRunFromAttention(): Promise<string> {

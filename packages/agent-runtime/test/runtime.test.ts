@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   KernelError,
+  LocalArtifactStorage,
   TorsorKernel,
   type KernelBootstrap,
   type RecoverableAttentionExecutionPage,
@@ -3969,6 +3970,46 @@ describe("AgentRuntime", () => {
       );
       const run = await getOnlyRun(kernel);
       expect(run.run.state).toBe("Waiting");
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it.each(["report", "forged-report"] as const)("routes ACP %s only through the trusted report boundary", async (mode) => {
+    const directory = mkdtempSync(join(tmpdir(), "torsor-acp-report-"));
+    const kernel = TorsorKernel.open({
+      databasePath: join(directory, "kernel.sqlite"),
+      bootstrap,
+      artifactStorage: await LocalArtifactStorage.open(join(directory, "content")),
+    });
+    try {
+      await prepareAcpRun(kernel, `acp-${mode}`);
+      const runtime = createRuntime(kernel, createFixtureAcpAdapter(mode));
+      if (mode === "forged-report") {
+        await expect(runtime.runOnce()).rejects.toThrow("publish_report accepts only");
+        expect((await getOnlyRun(kernel)).artifacts).toEqual([]);
+      } else {
+        await runtime.drainUntilIdle();
+        const run = await getOnlyRun(kernel);
+        expect(run.run.state).toBe("Completed");
+        expect(run.artifacts).toHaveLength(1);
+        const read = await kernel.readArtifact(run.artifacts[0]!.id, humanContext);
+        expect(Buffer.from(read.content).toString("utf8")).toBe("Synthetic ACP report.\n");
+        expect(read.artifact.producerRunId).toBe(run.run.id);
+      }
+    } finally {
+      kernel.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects report actions when storage is not configured", async () => {
+    const kernel = openKernel(":memory:");
+    try {
+      await prepareAcpRun(kernel, "report-disabled");
+      await expect(createRuntime(kernel, createFixtureAcpAdapter("report")).runOnce())
+        .rejects.toThrow("Report Artifact storage is not configured");
+      expect((await getOnlyRun(kernel)).artifacts).toEqual([]);
     } finally {
       kernel.close();
     }
