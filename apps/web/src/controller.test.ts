@@ -99,7 +99,13 @@ function createHarness(
     expireThread?: boolean;
     csrfToken?: string;
     principalId?: string;
+    threadsResponse?: (
+      callNumber: number,
+      url: string,
+    ) => Promise<Response>;
     threadResponse?: (url: string) => Promise<Response>;
+    runsResponse?: (callNumber: number) => Promise<Response>;
+    runResponse?: (url: string) => Promise<Response>;
     commandResponse?: (
       callNumber: number,
       init?: RequestInit,
@@ -146,6 +152,9 @@ function createHarness(
     }
     if (url.includes("/channels/channel-general/threads")) {
       counts.threads += 1;
+      if (options.threadsResponse) {
+        return options.threadsResponse(counts.threads, url);
+      }
       return json({
         items: [thread],
         nextCursor: null,
@@ -168,6 +177,9 @@ function createHarness(
     }
     if (url.includes("/projects/project-sample/runs")) {
       counts.runs += 1;
+      if (options.runsResponse) {
+        return options.runsResponse(counts.runs);
+      }
       return json({
         items: [runProjection],
         nextCursor: null,
@@ -177,7 +189,22 @@ function createHarness(
     }
     if (url.endsWith("/runs/run-1")) {
       counts.run += 1;
+      if (options.runResponse) {
+        return options.runResponse(url);
+      }
       return json({ run: runProjection });
+    }
+    if (url.endsWith("/runs/run-2")) {
+      counts.run += 1;
+      if (options.runResponse) {
+        return options.runResponse(url);
+      }
+      return json({
+        run: {
+          ...runProjection,
+          run: { ...runProjection.run, id: "run-2" },
+        },
+      });
     }
     if (url.endsWith("/projects/project-sample/agents")) {
       counts.agents += 1;
@@ -408,6 +435,64 @@ describe("WebController", () => {
     expect(secondBody.idempotencyKey).toBe(firstBody.idempotencyKey);
   });
 
+  it("retains each unresolved start request across other starts and bootstrap", async () => {
+    const committedKeys = new Set<string>();
+    const durableThreads = new Map<string, number>();
+    const durableAttentions = new Map<string, number>();
+    const harness = createHarness({
+      commandResponse: (callNumber, init) => {
+        const request = JSON.parse(String(init?.body)) as {
+          idempotencyKey: string;
+          body: string;
+          targetAgentIds?: readonly string[];
+        };
+        if (!committedKeys.has(request.idempotencyKey)) {
+          committedKeys.add(request.idempotencyKey);
+          durableThreads.set(
+            request.body,
+            (durableThreads.get(request.body) ?? 0) + 1,
+          );
+          if (request.targetAgentIds?.length) {
+            durableAttentions.set(
+              request.body,
+              (durableAttentions.get(request.body) ?? 0) + 1,
+            );
+          }
+        }
+        return callNumber === 1
+          ? Promise.reject(new TypeError("The committed response was lost."))
+          : Promise.resolve(json({ result: { entityId: `thread-${callNumber}` } }));
+      },
+    });
+    await harness.controller.exchangeSession("local-secret", "project-sample");
+    const startA = {
+      channelId: "channel-general",
+      body: "Start durable operation A.",
+      targetAgentIds: ["agent-orbit"],
+    } as const;
+
+    await expect(harness.controller.startThread(startA)).rejects.toThrow(
+      "The committed response was lost.",
+    );
+    await harness.controller.startThread({
+      channelId: "channel-general",
+      body: "Start durable operation B.",
+    });
+    await harness.controller.resume("project-sample");
+    await harness.controller.startThread(startA);
+
+    const commands = harness.calls.filter((call) =>
+      call.url.includes("/commands/start-thread"),
+    );
+    expect(commands).toHaveLength(3);
+    expect(JSON.parse(String(commands[2]?.init?.body))).toEqual(
+      JSON.parse(String(commands[0]?.init?.body)),
+    );
+    expect(durableThreads.get(startA.body)).toBe(1);
+    expect(durableAttentions.get(startA.body)).toBe(1);
+    expect(durableThreads.get("Start durable operation B.")).toBe(1);
+  });
+
   it("reuses the complete reply request after a committed response is lost", async () => {
     const committedKeys = new Set<string>();
     let projectedThread = thread;
@@ -634,6 +719,91 @@ describe("WebController", () => {
     expect(harness.counts.thread).toBe(baseline + 3);
   });
 
+  it("cancels a queued Thread refresh after navigation changes selection", async () => {
+    let blockThreadA = false;
+    let resolveThreadA: ((response: Response) => void) | undefined;
+    const threadB = { ...thread, threadRootId: "thread-2" };
+    const harness = createHarness({
+      threadResponse: (url) => {
+        if (url.endsWith("/thread-2")) {
+          return Promise.resolve(json({ thread: threadB }));
+        }
+        if (blockThreadA) {
+          return new Promise((resolve) => {
+            resolveThreadA = resolve;
+          });
+        }
+        return Promise.resolve(json({ thread }));
+      },
+    });
+    await harness.controller.exchangeSession("local-secret", "project-sample");
+    await harness.controller.loadThread("thread-1");
+    const baseline = harness.counts.thread;
+    blockThreadA = true;
+
+    const events = FakeEventSource.instances[0]!;
+    events.emit(publicEvent({ eventId: "event-thread-a-1" }));
+    events.emit(publicEvent({ eventId: "event-thread-a-2" }));
+    await waitFor(() => expect(harness.counts.thread).toBe(baseline + 1));
+
+    await harness.controller.loadThread("thread-2");
+    resolveThreadA?.(json({ thread: { ...thread, cursor: 3 } }));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(harness.controller.getSnapshot().thread?.threadRootId).toBe(
+      "thread-2",
+    );
+    expect(harness.counts.thread).toBe(baseline + 2);
+  });
+
+  it("cancels a queued Run refresh after navigation changes selection", async () => {
+    let blockRunA = false;
+    let resolveRunA: ((response: Response) => void) | undefined;
+    const runB = {
+      ...runProjection,
+      run: { ...runProjection.run, id: "run-2" },
+    };
+    const harness = createHarness({
+      runResponse: (url) => {
+        if (url.endsWith("/run-2")) {
+          return Promise.resolve(json({ run: runB }));
+        }
+        if (blockRunA) {
+          return new Promise((resolve) => {
+            resolveRunA = resolve;
+          });
+        }
+        return Promise.resolve(json({ run: runProjection }));
+      },
+    });
+    await harness.controller.exchangeSession("local-secret", "project-sample");
+    await harness.controller.loadRun("run-1");
+    const baseline = harness.counts.run;
+    blockRunA = true;
+
+    const events = FakeEventSource.instances[0]!;
+    for (const eventId of ["event-run-a-1", "event-run-a-2"]) {
+      events.emit(
+        publicEvent({
+          eventId,
+          type: "ProviderAttemptAcknowledged",
+          entityType: "ProviderAttempt",
+          payload: { runId: "run-1" },
+        }),
+      );
+    }
+    await waitFor(() => expect(harness.counts.run).toBe(baseline + 1));
+
+    await harness.controller.loadRun("run-2");
+    resolveRunA?.(json({ run: runProjection }));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(harness.controller.getSnapshot().run?.run.id).toBe("run-2");
+    expect(harness.counts.run).toBe(baseline + 2);
+  });
+
   it("does not let liveness success hide a failed thread invalidation", async () => {
     vi.useFakeTimers();
     try {
@@ -733,6 +903,86 @@ describe("WebController", () => {
     );
     await Promise.resolve();
     expect(harness.counts.runs).toBe(baseline.runs + 2);
+  });
+
+  it("uses one projection retry timer for a failed activation replay", async () => {
+    vi.useFakeTimers();
+    try {
+      const convergedRun = {
+        ...runProjection,
+        run: {
+          ...runProjection.run,
+          state: "Completed" as const,
+          terminalReason: "Synthetic completion.",
+        },
+      };
+      const harness = createHarness({
+        reconnectProbeDelayMs: 20,
+        agentLivenessRefreshMs: 10_000,
+        runsResponse: (callNumber) =>
+          callNumber === 1 || callNumber >= 4
+            ? Promise.resolve(
+                json({
+                  items: [callNumber >= 4 ? convergedRun : runProjection],
+                  nextCursor: null,
+                  hasMore: false,
+                  snapshotEventId: "event-7",
+                }),
+              )
+            : Promise.resolve(
+                json(
+                  {
+                    error: {
+                      code: "projection_failed",
+                      message: "Run replay refresh failed.",
+                    },
+                  },
+                  500,
+                ),
+              ),
+      });
+      await harness.controller.exchangeSession(
+        "local-secret",
+        "project-sample",
+      );
+      const baselineRuns = harness.counts.runs;
+      const baselineTimers = vi.getTimerCount();
+      const events = FakeEventSource.instances[0]!;
+
+      for (let index = 0; index < 50; index += 1) {
+        events.emit(
+          publicEvent({
+            eventId: `event-failed-activation-${index}`,
+            type: "ActivationStarted",
+            entityType: "ActivationAttempt",
+            entityId: `activation-failed-${index}`,
+            payload: { runId: "run-1" },
+          }),
+        );
+      }
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(harness.counts.runs).toBe(baselineRuns + 2);
+      expect(vi.getTimerCount()).toBeLessThanOrEqual(baselineTimers + 1);
+
+      await vi.advanceTimersByTimeAsync(20);
+      expect(harness.counts.runs).toBe(baselineRuns + 3);
+      expect(harness.controller.getSnapshot().runs[0]?.run.state).toBe(
+        "Completed",
+      );
+
+      events.emit(
+        publicEvent({
+          eventId: "event-failed-activation-49",
+          entityType: "ActivationAttempt",
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.counts.runs).toBe(baselineRuns + 3);
+      harness.controller.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("refreshes selected and global Run facts for activation completion", async () => {
@@ -959,6 +1209,118 @@ describe("WebController", () => {
     expect(
       harness.controller.getSnapshot().thread?.messages[0]?.revisions[0]?.body,
     ).toBe("Newer projection response.");
+  });
+
+  it("retires abandoned selection errors and prioritizes the current Thread error", async () => {
+    let failThreadA = true;
+    let failThreadB = false;
+    const harness = createHarness({
+      reconnectProbeDelayMs: 10_000,
+      threadResponse: (url) => {
+        if (url.endsWith("/thread-1") && failThreadA) {
+          return Promise.reject(new Error("Thread A failed."));
+        }
+        if (url.endsWith("/thread-2") && failThreadB) {
+          return Promise.reject(new Error("Thread B failed."));
+        }
+        return Promise.resolve(
+          json({
+            thread: url.endsWith("/thread-2")
+              ? { ...thread, threadRootId: "thread-2" }
+              : thread,
+          }),
+        );
+      },
+      runsResponse: (callNumber) =>
+        callNumber === 1
+          ? Promise.resolve(
+              json({
+                items: [runProjection],
+                nextCursor: null,
+                hasMore: false,
+                snapshotEventId: "event-7",
+              }),
+            )
+          : Promise.resolve(
+              json(
+                {
+                  error: {
+                    code: "projection_failed",
+                    message: "Global Run refresh failed.",
+                  },
+                },
+                500,
+              ),
+            ),
+    });
+    await harness.controller.exchangeSession("local-secret", "project-sample");
+
+    await harness.controller.loadThread("thread-1");
+    expect(harness.controller.getSnapshot().queryError).toContain(
+      "Thread A failed",
+    );
+
+    failThreadA = false;
+    await harness.controller.loadThread("thread-2");
+    expect(harness.controller.getSnapshot().queryError).toBeNull();
+
+    FakeEventSource.instances[0]!.emit(
+      publicEvent({
+        eventId: "event-global-run-error",
+        entityType: "Run",
+        entityId: "run-1",
+        channelId: null,
+        threadRootId: null,
+      }),
+    );
+    await waitFor(() =>
+      expect(harness.controller.getSnapshot().queryError).toContain(
+        "Global Run refresh failed",
+      ),
+    );
+
+    failThreadB = true;
+    await harness.controller.loadThread("thread-2");
+    expect(harness.controller.getSnapshot().queryError).toContain(
+      "Thread B failed",
+    );
+  });
+
+  it("preserves a same-channel Thread list snapshot when refresh fails", async () => {
+    let rejectRefresh: ((error: Error) => void) | undefined;
+    const harness = createHarness({
+      threadsResponse: (callNumber) =>
+        callNumber === 1
+          ? Promise.resolve(
+              json({
+                items: [thread],
+                nextCursor: null,
+                hasMore: false,
+                snapshotEventId: "event-7",
+              }),
+            )
+          : new Promise((_, reject) => {
+              rejectRefresh = reject;
+            }),
+    });
+    await harness.controller.exchangeSession("local-secret", "project-sample");
+    await harness.controller.loadThreads("channel-general");
+
+    const refresh = harness.controller.loadThreads("channel-general");
+    expect(harness.controller.getSnapshot()).toMatchObject({
+      threads: [thread],
+      threadsChannelId: "channel-general",
+      loadingThreads: true,
+    });
+
+    rejectRefresh?.(new Error("Thread list refresh failed."));
+    await refresh;
+    expect(harness.controller.getSnapshot()).toMatchObject({
+      threads: [thread],
+      threadsChannelId: "channel-general",
+      loadingThreads: false,
+      queryError: "Thread list refresh failed.",
+    });
   });
 
   it("does not refresh an old thread after a pending command completes", async () => {

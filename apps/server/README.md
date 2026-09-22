@@ -24,9 +24,10 @@ exchange that credential at `POST /api/v1/session` for an HttpOnly,
 SameSite-strict cookie that native `EventSource` sends automatically. The
 session response also returns a CSRF token; cookie-authenticated command
 requests must send it in `X-Torsor-CSRF` with `Content-Type: application/json`.
-Repeated exchanges for the same principal reuse its live browser session so
-opening another same-origin window does not rotate the shared cookie away from
-the CSRF token held by existing windows.
+Session exchange reuses a live session only when the request supplies a valid
+cookie whose principal context matches the bearer credential. Independent
+cookie jars receive distinct session and CSRF identities, so logout or SSE
+revocation in one browser session does not revoke another.
 
 ## HTTP contract
 

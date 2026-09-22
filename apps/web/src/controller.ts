@@ -72,8 +72,24 @@ const principalStorageKey = "torsor.session.principal";
 
 interface PendingInvalidation {
   readonly event: PublicEvent;
+  readonly projectionKeys: Set<string>;
+}
+
+interface ProjectionInvalidation {
+  readonly eventIds: Set<string>;
+  refresh: () => Promise<boolean>;
   retryCount: number;
   timer: ReturnType<typeof setTimeout> | null;
+}
+
+interface PendingStartThread {
+  readonly request: {
+    readonly idempotencyKey: string;
+    readonly projectId: string;
+    readonly channelId: string;
+    readonly body: string;
+    readonly targetAgentIds?: readonly string[];
+  };
 }
 
 interface PendingReply {
@@ -139,13 +155,11 @@ export class WebController {
   #seenEventIds: string[] = [];
   #processingEventIds = new Set<string>();
   #pendingInvalidations = new Map<string, PendingInvalidation>();
+  #projectionInvalidations = new Map<string, ProjectionInvalidation>();
   #coalescedRefreshes = new Map<string, CoalescedRefresh>();
   #latestProjectionRequests = new Map<string, Promise<boolean>>();
   #projectionErrors = new Map<string, string>();
-  #pendingStartThread: {
-    readonly fingerprint: string;
-    readonly idempotencyKey: string;
-  } | null = null;
+  #pendingStartThreads = new Map<string, PendingStartThread>();
   #pendingReplies = new Map<string, PendingReply>();
   #sessionGeneration = 0;
   #threadsRequestGeneration = 0;
@@ -275,11 +289,21 @@ export class WebController {
     const sessionGeneration = this.#sessionGeneration;
     const requestGeneration = ++this.#threadsRequestGeneration;
     const projectionKey = `threads:${channelId}`;
+    const previousChannelId = this.#channelId;
+    const changedChannel = previousChannelId !== channelId;
+    if (changedChannel) {
+      if (previousChannelId) {
+        this.#abandonProjectionInvalidation(`threads:${previousChannelId}`);
+      }
+      this.#clearProjectionErrors(["threads:"]);
+    }
     this.#channelId = channelId;
     this.#setState({
-      threads: [],
-      threadsChannelId: null,
+      ...(changedChannel
+        ? { threads: [], threadsChannelId: null }
+        : {}),
       loadingThreads: true,
+      queryError: this.#currentProjectionError(),
     });
     let request!: Promise<boolean>;
     request = (async () => {
@@ -304,7 +328,8 @@ export class WebController {
       } catch (error) {
         if (
           this.#sessionGeneration === sessionGeneration &&
-          this.#threadsRequestGeneration === requestGeneration
+          this.#threadsRequestGeneration === requestGeneration &&
+          this.#channelId === channelId
         ) {
           this.#projectionFailed(projectionKey, error, {
             loadingThreads: false,
@@ -322,11 +347,19 @@ export class WebController {
     const sessionGeneration = this.#sessionGeneration;
     const requestGeneration = ++this.#threadRequestGeneration;
     const projectionKey = `thread:${threadId}`;
-    const changedThread = this.#threadId !== threadId;
+    const previousThreadId = this.#threadId;
+    const changedThread = previousThreadId !== threadId;
+    if (changedThread) {
+      if (previousThreadId) {
+        this.#abandonProjectionInvalidation(`thread:${previousThreadId}`);
+      }
+      this.#clearProjectionErrors(["thread:"]);
+    }
     this.#threadId = threadId;
     this.#setState({
       ...(changedThread ? { thread: null } : {}),
       loadingThread: true,
+      queryError: this.#currentProjectionError(),
     });
     let request!: Promise<boolean>;
     request = (async () => {
@@ -368,6 +401,12 @@ export class WebController {
   clearThread(): void {
     this.#threadRequestGeneration += 1;
     this.#runRequestGeneration += 1;
+    if (this.#threadId) {
+      this.#abandonProjectionInvalidation(`thread:${this.#threadId}`);
+    }
+    if (this.#runId) {
+      this.#abandonProjectionInvalidation(`run:${this.#runId}`);
+    }
     this.#threadId = null;
     this.#runId = null;
     this.#clearProjectionErrors(["thread:", "run:"]);
@@ -384,11 +423,19 @@ export class WebController {
     const sessionGeneration = this.#sessionGeneration;
     const requestGeneration = ++this.#runRequestGeneration;
     const projectionKey = `run:${runId}`;
-    const changedRun = this.#runId !== runId;
+    const previousRunId = this.#runId;
+    const changedRun = previousRunId !== runId;
+    if (changedRun) {
+      if (previousRunId) {
+        this.#abandonProjectionInvalidation(`run:${previousRunId}`);
+      }
+      this.#clearProjectionErrors(["run:"]);
+    }
     this.#runId = runId;
     this.#setState({
       ...(changedRun ? { run: null } : {}),
       loadingRun: true,
+      queryError: this.#currentProjectionError(),
     });
     let request!: Promise<boolean>;
     request = (async () => {
@@ -429,6 +476,9 @@ export class WebController {
 
   clearRun(): void {
     this.#runRequestGeneration += 1;
+    if (this.#runId) {
+      this.#abandonProjectionInvalidation(`run:${this.#runId}`);
+    }
     this.#runId = null;
     this.#clearProjectionErrors(["run:"]);
     this.#setState({
@@ -453,41 +503,40 @@ export class WebController {
       targetAgentIds: input.targetAgentIds ?? [],
     });
     const pending =
-      this.#pendingStartThread?.fingerprint === fingerprint
-        ? this.#pendingStartThread
-        : {
-            fingerprint,
-            idempotencyKey: crypto.randomUUID(),
-          };
-    this.#pendingStartThread = pending;
+      this.#pendingStartThreads.get(fingerprint) ??
+      ({
+        request: {
+          idempotencyKey: crypto.randomUUID(),
+          projectId: this.#projectId,
+          channelId: input.channelId,
+          body: input.body,
+          ...(input.targetAgentIds?.length
+            ? { targetAgentIds: [...input.targetAgentIds] }
+            : {}),
+        },
+      } satisfies PendingStartThread);
+    this.#pendingStartThreads.set(fingerprint, pending);
     const selectedChannelId = this.#channelId;
     try {
-      await this.#command("start-thread", {
-        idempotencyKey: pending.idempotencyKey,
-        projectId: this.#projectId,
-        channelId: input.channelId,
-        body: input.body,
-        ...(input.targetAgentIds?.length
-          ? { targetAgentIds: input.targetAgentIds }
-          : {}),
-      });
-      if (this.#pendingStartThread === pending) {
-        this.#pendingStartThread = null;
+      await this.#command("start-thread", pending.request);
+      if (this.#pendingStartThreads.get(fingerprint) === pending) {
+        this.#pendingStartThreads.delete(fingerprint);
       }
     } catch (error) {
       if (
-        this.#pendingStartThread === pending &&
+        this.#pendingStartThreads.get(fingerprint) === pending &&
         !isUncertainCommandError(error)
       ) {
-        this.#pendingStartThread = null;
+        this.#pendingStartThreads.delete(fingerprint);
       }
       throw error;
     }
     if (
-      selectedChannelId === input.channelId &&
-      this.#channelId === input.channelId
+      selectedChannelId === pending.request.channelId &&
+      this.#channelId === pending.request.channelId &&
+      this.#projectId === pending.request.projectId
     ) {
-      await this.loadThreads(input.channelId);
+      await this.loadThreads(pending.request.channelId);
     }
   }
 
@@ -559,7 +608,6 @@ export class WebController {
     this.#channelId = null;
     this.#threadId = null;
     this.#runId = null;
-    this.#pendingStartThread = null;
     this.#seenEventIds = [];
     this.#processingEventIds.clear();
     this.#latestProjectionRequests.clear();
@@ -830,54 +878,66 @@ export class WebController {
     }
     if (
       this.#seenEventIds.includes(event.eventId) ||
-      this.#processingEventIds.has(event.eventId)
+      this.#processingEventIds.has(event.eventId) ||
+      this.#pendingInvalidations.has(event.eventId)
     ) {
       return;
-    }
-    const pending = this.#pendingInvalidations.get(event.eventId);
-    if (pending?.timer) {
-      clearTimeout(pending.timer);
-      pending.timer = null;
     }
     this.#processingEventIds.add(event.eventId);
     this.#setState({
       lastEventId: event.eventId,
       ...(broadcast ? { connection: "live" as const } : {}),
     });
-    if (broadcast && !pending) {
+    if (broadcast) {
       this.#broadcastChannel?.postMessage({
         kind: "event",
         event,
       } satisfies WindowMessage);
     }
 
-    const work: Promise<boolean>[] = [];
+    const work: Array<{
+      readonly key: string;
+      readonly promise: Promise<boolean>;
+    }> = [];
+    const queue = (
+      key: string,
+      refresh: () => Promise<boolean>,
+    ): void => {
+      this.#registerProjectionInvalidation(event, key, refresh);
+      work.push({
+        key,
+        promise: this.#coalesceProjectionRefresh(key, refresh),
+      });
+    };
     if (event.channelId && event.channelId === this.#channelId) {
       const channelId = event.channelId;
-      work.push(
-        this.#coalesceProjectionRefresh(
-          `threads:${channelId}`,
-          () => this.loadThreads(channelId),
-        ),
+      queue(
+        `threads:${channelId}`,
+        () =>
+          this.#channelId === channelId
+            ? this.loadThreads(channelId)
+            : Promise.resolve(true),
       );
     }
     if (event.threadRootId && event.threadRootId === this.#threadId) {
       const threadRootId = event.threadRootId;
-      work.push(
-        this.#coalesceProjectionRefresh(
-          `thread:${threadRootId}`,
-          () => this.loadThread(threadRootId),
-        ),
+      queue(
+        `thread:${threadRootId}`,
+        () =>
+          this.#threadId === threadRootId
+            ? this.loadThread(threadRootId)
+            : Promise.resolve(true),
       );
     }
 
     const runId = eventRunId(event);
     if (runId && runId === this.#runId) {
-      work.push(
-        this.#coalesceProjectionRefresh(
-          `run:${runId}`,
-          () => this.loadRun(runId),
-        ),
+      queue(
+        `run:${runId}`,
+        () =>
+          this.#runId === runId
+            ? this.loadRun(runId)
+            : Promise.resolve(true),
       );
     } else if (
       affectsSelectedRunDetail(event) &&
@@ -885,47 +945,51 @@ export class WebController {
       this.#runId
     ) {
       const selectedRunId = this.#runId;
-      work.push(
-        this.#coalesceProjectionRefresh(
-          `run:${selectedRunId}`,
-          () => this.loadRun(selectedRunId),
-        ),
+      queue(
+        `run:${selectedRunId}`,
+        () =>
+          this.#runId === selectedRunId
+            ? this.loadRun(selectedRunId)
+            : Promise.resolve(true),
       );
     }
 
     if (affectsRuns(event)) {
-      work.push(
-        this.#coalesceProjectionRefresh("runs", () => this.#refreshRuns()),
-      );
+      queue("runs", () => this.#refreshRuns());
     }
     if (affectsAttentionOrAgents(event)) {
-      work.push(
-        this.#coalesceProjectionRefresh(
-          "attention-agents",
-          () => this.#refreshAttentionAndAgents(),
-        ),
+      queue(
+        "attention-agents",
+        () => this.#refreshAttentionAndAgents(),
       );
     }
     if (event.entityType === "Channel" || event.entityType === "Project") {
-      work.push(
-        this.#coalesceProjectionRefresh(
-          "bootstrap",
-          () => this.#refreshBootstrap(),
-        ),
-      );
+      queue("bootstrap", () => this.#refreshBootstrap());
     }
     try {
-      const results = await Promise.all(work);
-      if (results.every(Boolean)) {
-        this.#pendingInvalidations.delete(event.eventId);
+      if (work.length === 0) {
         this.#rememberEvent(event.eventId);
         this.#projectionSucceeded("events", {});
-      } else {
-        this.#scheduleInvalidationRetry(event);
+        return;
+      }
+      const results = await Promise.all(
+        work.map(async ({ key, promise }) => ({
+          key,
+          succeeded: await promise,
+        })),
+      );
+      for (const result of results) {
+        if (result.succeeded) {
+          this.#reconcileEventProjection(event.eventId, result.key);
+        } else {
+          this.#scheduleProjectionRetry(result.key);
+        }
       }
     } catch (error) {
       this.#projectionFailed("events", error, {});
-      this.#scheduleInvalidationRetry(event);
+      for (const item of work) {
+        this.#scheduleProjectionRetry(item.key);
+      }
     } finally {
       this.#processingEventIds.delete(event.eventId);
     }
@@ -1065,15 +1129,36 @@ export class WebController {
     }
   }
 
-  #scheduleInvalidationRetry(event: PublicEvent): void {
-    const existing = this.#pendingInvalidations.get(event.eventId);
-    const pending = existing ?? {
-      event,
-      retryCount: 0,
-      timer: null,
-    };
+  #registerProjectionInvalidation(
+    event: PublicEvent,
+    key: string,
+    refresh: () => Promise<boolean>,
+  ): void {
+    const pending =
+      this.#pendingInvalidations.get(event.eventId) ??
+      {
+        event,
+        projectionKeys: new Set<string>(),
+      };
+    pending.projectionKeys.add(key);
     this.#pendingInvalidations.set(event.eventId, pending);
-    if (pending.timer) {
+
+    const projection =
+      this.#projectionInvalidations.get(key) ??
+      {
+        eventIds: new Set<string>(),
+        refresh,
+        retryCount: 0,
+        timer: null,
+      };
+    projection.eventIds.add(event.eventId);
+    projection.refresh = refresh;
+    this.#projectionInvalidations.set(key, projection);
+  }
+
+  #scheduleProjectionRetry(key: string): void {
+    const pending = this.#projectionInvalidations.get(key);
+    if (!pending || pending.eventIds.size === 0 || pending.timer) {
       return;
     }
     const delay = Math.min(
@@ -1083,27 +1168,97 @@ export class WebController {
     pending.retryCount += 1;
     pending.timer = setTimeout(() => {
       pending.timer = null;
-      void this.#applyEvent(pending.event, false);
+      void this.#retryProjectionInvalidation(key, pending);
     }, delay);
   }
 
+  async #retryProjectionInvalidation(
+    key: string,
+    pending: ProjectionInvalidation,
+  ): Promise<void> {
+    if (
+      this.#projectionInvalidations.get(key) !== pending ||
+      pending.eventIds.size === 0
+    ) {
+      return;
+    }
+    const eventIds = [...pending.eventIds];
+    const succeeded = await this.#coalesceProjectionRefresh(
+      key,
+      pending.refresh,
+    );
+    if (this.#projectionInvalidations.get(key) !== pending) {
+      return;
+    }
+    if (succeeded) {
+      pending.retryCount = 0;
+      for (const eventId of eventIds) {
+        this.#reconcileEventProjection(eventId, key);
+      }
+    } else {
+      this.#scheduleProjectionRetry(key);
+    }
+  }
+
   #retryPendingInvalidations(): void {
-    for (const pending of this.#pendingInvalidations.values()) {
+    for (const [key, pending] of this.#projectionInvalidations) {
       if (pending.timer) {
         clearTimeout(pending.timer);
         pending.timer = null;
       }
-      void this.#applyEvent(pending.event, false);
+      void this.#retryProjectionInvalidation(key, pending);
+    }
+  }
+
+  #reconcileEventProjection(eventId: string, key: string): void {
+    const pending = this.#pendingInvalidations.get(eventId);
+    if (!pending) {
+      return;
+    }
+    pending.projectionKeys.delete(key);
+    const projection = this.#projectionInvalidations.get(key);
+    projection?.eventIds.delete(eventId);
+    if (projection?.eventIds.size === 0) {
+      if (projection.timer) {
+        clearTimeout(projection.timer);
+      }
+      this.#projectionInvalidations.delete(key);
+    }
+    if (pending.projectionKeys.size === 0) {
+      this.#pendingInvalidations.delete(eventId);
+      if (!this.#seenEventIds.includes(eventId)) {
+        this.#rememberEvent(eventId);
+      }
+      this.#projectionSucceeded("events", {});
+    }
+  }
+
+  #abandonProjectionInvalidation(key: string): void {
+    const pending = this.#projectionInvalidations.get(key);
+    if (pending?.timer) {
+      clearTimeout(pending.timer);
+    }
+    for (const eventId of [...(pending?.eventIds ?? [])]) {
+      this.#reconcileEventProjection(eventId, key);
+    }
+    this.#projectionInvalidations.delete(key);
+
+    const refresh = this.#coalescedRefreshes.get(key);
+    if (refresh?.followUp) {
+      const followUp = refresh.followUp;
+      refresh.followUp = null;
+      followUp.resolve(true);
     }
   }
 
   #clearPendingInvalidations(): void {
-    for (const pending of this.#pendingInvalidations.values()) {
+    for (const pending of this.#projectionInvalidations.values()) {
       if (pending.timer) {
         clearTimeout(pending.timer);
       }
     }
     this.#pendingInvalidations.clear();
+    this.#projectionInvalidations.clear();
     this.#processingEventIds.clear();
   }
 
@@ -1271,7 +1426,28 @@ export class WebController {
   }
 
   #currentProjectionError(): string | null {
-    return this.#projectionErrors.values().next().value ?? null;
+    const activeKeys = [
+      ...(this.#runId ? [`run:${this.#runId}`] : []),
+      ...(this.#threadId ? [`thread:${this.#threadId}`] : []),
+      ...(this.#channelId ? [`threads:${this.#channelId}`] : []),
+    ];
+    for (const key of activeKeys) {
+      const error = this.#projectionErrors.get(key);
+      if (error) {
+        return error;
+      }
+    }
+    for (const [key, error] of this.#projectionErrors) {
+      if (
+        key.startsWith("run:") ||
+        key.startsWith("thread:") ||
+        key.startsWith("threads:")
+      ) {
+        continue;
+      }
+      return error;
+    }
+    return null;
   }
 
   #clearSession(
@@ -1293,7 +1469,6 @@ export class WebController {
     this.#channelId = null;
     this.#threadId = null;
     this.#runId = null;
-    this.#pendingStartThread = null;
     this.#seenEventIds = [];
     this.#latestProjectionRequests.clear();
     this.#projectionErrors.clear();

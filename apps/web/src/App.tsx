@@ -689,7 +689,8 @@ function ChannelsPanel({
           <span>{state.threads.length}</span>
         </div>
         <div className="thread-list">
-          {state.loadingThreads ? (
+          {state.loadingThreads &&
+          state.threadsChannelId !== route.channelId ? (
             <LoadingRows label="Loading threads" />
           ) : state.threads.length === 0 ? (
             <p className="compact-empty">No threads in this channel.</p>
@@ -1334,23 +1335,9 @@ function RunDetail({ state }: { readonly state: WebState }) {
       </DetailSection>
       <DetailSection title="Activations" count={projection.activations.length}>
         {projection.activations.length ? (
-          projection.activations.map((activation) => {
-            const status = activationStatus(activation);
-            return (
-              <div className="fact-card" key={activation.id}>
-                <div>
-                  <strong>
-                    {activation.attentionId ? "Attention" : "Run"} activation
-                  </strong>
-                  <StatusPill label={status.label} tone={status.tone} />
-                </div>
-                <small>{activation.id}</small>
-                <p>
-                  {formatTimeRange(activation.startedAt, activation.finishedAt)}
-                </p>
-              </div>
-            );
-          })
+          projection.activations.map((activation) => (
+            <ActivationCard activation={activation} key={activation.id} />
+          ))
         ) : (
           <p className="compact-empty">No Activations.</p>
         )}
@@ -1842,7 +1829,62 @@ function agentName(agents: readonly AgentStatus[], agentId: string): string {
   return agents.find((agent) => agent.id === agentId)?.name ?? shortId(agentId);
 }
 
-function activationStatus(activation: Activation): {
+function ActivationCard({
+  activation,
+}: {
+  readonly activation: Activation;
+}) {
+  const now = useActivationClock(activation);
+  const status = activationStatus(activation, now);
+  return (
+    <div className="fact-card">
+      <div>
+        <strong>
+          {activation.attentionId ? "Attention" : "Run"} activation
+        </strong>
+        <StatusPill label={status.label} tone={status.tone} />
+      </div>
+      <small>{activation.id}</small>
+      <p>{formatActivationTimeRange(activation, status.label)}</p>
+    </div>
+  );
+}
+
+function useActivationClock(activation: Activation): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (
+      activation.outcome ||
+      activation.revokedAt ||
+      activation.finishedAt
+    ) {
+      return;
+    }
+    const expiresAt = Date.parse(activation.expiresAt);
+    if (!Number.isFinite(expiresAt)) {
+      return;
+    }
+    const remaining = expiresAt - Date.now();
+    if (remaining <= 0) {
+      return;
+    }
+    const timer = window.setTimeout(
+      () => setNow(Date.now()),
+      Math.min(remaining + 1, 2_147_483_647),
+    );
+    return () => window.clearTimeout(timer);
+  }, [
+    activation.expiresAt,
+    activation.finishedAt,
+    activation.id,
+    activation.outcome,
+    activation.revokedAt,
+    now,
+  ]);
+  return now;
+}
+
+function activationStatus(activation: Activation, now: number): {
   readonly label: string;
   readonly tone: "active" | "attention" | "idle";
 } {
@@ -1856,7 +1898,7 @@ function activationStatus(activation: Activation): {
   if (!Number.isFinite(expiresAt)) {
     return { label: "Unconfirmed", tone: "attention" };
   }
-  return expiresAt > Date.now()
+  return expiresAt > now
     ? { label: "Live", tone: "active" }
     : { label: "Expired", tone: "idle" };
 }
@@ -1882,8 +1924,19 @@ function formatTime(value: string): string {
   }).format(new Date(value));
 }
 
-function formatTimeRange(startedAt: string, finishedAt: string | null): string {
-  return `${formatTime(startedAt)} → ${finishedAt ? formatTime(finishedAt) : "live"}`;
+function formatActivationTimeRange(
+  activation: Activation,
+  status: string,
+): string {
+  const terminalAt = activation.finishedAt ?? activation.revokedAt;
+  const end = terminalAt
+    ? formatTime(terminalAt)
+    : status === "Live"
+      ? "live"
+      : status === "Expired"
+        ? `expired ${formatTime(activation.expiresAt)}`
+        : status.toLowerCase();
+  return `${formatTime(activation.startedAt)} → ${end}`;
 }
 
 function summarizePayload(payload: unknown): string {

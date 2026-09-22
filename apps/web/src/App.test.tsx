@@ -199,10 +199,10 @@ describe("TorsorApp", () => {
     expect(screen.getByText("Attention activation")).toBeInTheDocument();
   });
 
-  it("labels a clock-expired Activation as expired instead of live", () => {
+  it("expires a mounted Activation badge and time range from the clock", async () => {
     vi.useFakeTimers();
     try {
-      vi.setSystemTime(new Date("2026-09-22T06:00:00.000Z"));
+      vi.setSystemTime(new Date("2026-09-22T05:00:00.000Z"));
       window.history.replaceState(
         {},
         "",
@@ -211,7 +211,16 @@ describe("TorsorApp", () => {
 
       render(<TorsorApp controller={stubController()} />);
 
+      expect(screen.getByText("Live")).toBeInTheDocument();
+      expect(screen.getByText(/→ live$/)).toBeInTheDocument();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_001);
+      });
+
       expect(screen.getByText("Expired")).toBeInTheDocument();
+      expect(screen.queryByText(/→ live$/)).not.toBeInTheDocument();
+      expect(screen.getByText(/→ expired /)).toBeInTheDocument();
     } finally {
       vi.useRealTimers();
     }
@@ -274,6 +283,41 @@ describe("TorsorApp", () => {
     });
     expect(controller.loadThread).not.toHaveBeenCalled();
     expect(new URLSearchParams(window.location.search).get("thread")).toBeNull();
+  });
+
+  it("keeps a stale same-channel Thread list visible and navigable", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(
+      {},
+      "",
+      "/?project=project-sample&channel=channel-general&panels=channels,detail",
+    );
+    render(
+      <TorsorApp
+        controller={stubController(
+          readyState({
+            thread: null,
+            run: null,
+            loadingThreads: true,
+            queryError: "Thread list refresh failed.",
+          }),
+        )}
+      />,
+    );
+
+    const threadButton = screen.getByRole("button", {
+      name: /Inspect the synthetic release path/,
+    });
+    expect(threadButton).toBeInTheDocument();
+    expect(screen.queryByText("Loading threads")).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Thread list refresh failed",
+    );
+
+    await user.click(threadButton);
+    expect(new URLSearchParams(window.location.search).get("thread")).toBe(
+      "thread-1",
+    );
   });
 
   it("reloads URL-selected projections after reauthentication", async () => {
