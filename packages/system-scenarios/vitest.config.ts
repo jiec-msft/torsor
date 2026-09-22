@@ -7,7 +7,7 @@ export default defineConfig({
     isolate: false,
     maxWorkers: 1,
     setupFiles: ["./test/setup.ts"],
-    testTimeout: 10_000,
-    hookTimeout: 10_000,
+    testTimeout: 60_000,
+    hookTimeout: 30_000,
   },
 });

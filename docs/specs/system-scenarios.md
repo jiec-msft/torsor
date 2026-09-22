@@ -95,6 +95,10 @@ Unconsumed script errors, unhandled rejections, leftover timers/handles/children
 or generated state fail. Clean only explicitly owned paths/processes, never
 scan/terminate unrelated processes. Do not force successful exit to hide leaks;
 timeouts are failure watchdogs, not scheduling.
+Performance goals are not hosted-runner failure deadlines: use a 60-second
+per-test watchdog, 30 seconds for cleanup hooks, and a 120-second outer
+fresh-process watchdog. Slow disks still report actual timings and whether
+the target was met, without weakening domain assertions or SQLite durability.
 Vitest fake timers count application timers; `async_hooks` tracks native
 TCP/pipe/process/timer resources. The sole known exception is Node's
 process-global HTTP Date-header cache timer, which server.close cannot cancel;

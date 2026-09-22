@@ -29,7 +29,7 @@ for (let round = 1; round <= rounds; round += 1) {
       const child = spawn(process.execPath, [
         vitest, "run", "--reporter=default", "--reporter=json", `--outputFile=${outputFile}`,
       ], {
-        cwd: directory, shell: false, stdio: ["ignore", "pipe", "pipe"], timeout: 30_000,
+        cwd: directory, shell: false, stdio: ["ignore", "pipe", "pipe"], timeout: 120_000,
       });
       let stdout = "";
       let stderr = "";

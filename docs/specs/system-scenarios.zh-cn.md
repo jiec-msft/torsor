@@ -82,6 +82,9 @@ Provider gate、SQLite 与场景创建的临时目录。清理失败不能通过
 未消费的脚本错误、unhandled rejection、遗留 timer/handle/child 或生成状态
 均使测试失败。只清理本场景拥有的明确路径和进程，不扫描/终止其他进程。
 不采用强制成功退出掩盖泄漏；超时是失败 watchdog，不是调度机制。
+速度目标不作为 hosted runner 的失败 deadline：单测试 watchdog 为 60 秒，
+清理 hook 为 30 秒，fresh-process 外层 watchdog 为 120 秒。慢磁盘仍报告
+真实耗时和目标是否达到，不放宽任何领域断言或 SQLite durability。
 应用 timer 由 Vitest fake timers 计数；native TCP/pipe/process/timer 由
 `async_hooks` 追踪。唯一预知例外是 Node 自有、不可通过 server.close 取消的
 进程级 HTTP Date-header cache timer；该例外不包含应用 timer。
