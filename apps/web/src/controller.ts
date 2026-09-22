@@ -1,4 +1,5 @@
 import { ApiError, readApiResponse } from "./api";
+import { RunComposerModel } from "./run-composer-model";
 import type {
   AgentStatus,
   Attention,
@@ -118,6 +119,7 @@ interface CoalescedRefresh {
 }
 
 export class WebController {
+  readonly runComposer = new RunComposerModel();
   readonly #apiBase: string;
   readonly #fetch: Fetch;
   readonly #eventSourceFactory: EventSourceFactory;
@@ -659,6 +661,72 @@ export class WebController {
     }
   }
 
+  async sendToRun(runId: string): Promise<void> {
+    const run = this.#state.run?.run;
+    if (!run || run.id !== runId || this.#runId !== runId || !this.#principalId) {
+      throw new Error("Load the selected Run in an authenticated Human session before sending.");
+    }
+    const submitted = await this.runComposer.submit(
+      run,
+      this.#principalId,
+      (request) => this.#command("send-to-run", { ...request }),
+    );
+    if (submitted && this.#runId === runId && this.#state.session === "ready") {
+      await this.refreshRunComposer(runId);
+    }
+  }
+
+  async refreshRunComposer(runId: string): Promise<boolean> {
+    const selected = this.#state.run?.run;
+    if (!selected || selected.id !== runId || this.#runId !== runId) return false;
+    const sessionGeneration = this.#sessionGeneration;
+    const csrfRevision = this.#csrfRevision;
+    const runGeneration = ++this.#runRequestGeneration;
+    const threadId = selected.threadRootId;
+    const threadSelected = this.#threadId === threadId;
+    const threadGeneration = threadSelected
+      ? ++this.#threadRequestGeneration
+      : this.#threadRequestGeneration;
+    const stillCurrent = () =>
+      this.#sessionGeneration === sessionGeneration &&
+      this.#runId === runId &&
+      this.#runRequestGeneration === runGeneration &&
+      (!threadSelected || (this.#threadId === threadId && this.#threadRequestGeneration === threadGeneration));
+    try {
+      const [run, thread] = await Promise.all([
+        this.#request<{ readonly run: RunProjection }>(
+          `/api/v1/runs/${encodeURIComponent(runId)}`, {}, sessionGeneration, csrfRevision,
+        ),
+        this.#request<{ readonly thread: ThreadProjection }>(
+          `/api/v1/threads/${encodeURIComponent(threadId)}`, {}, sessionGeneration, csrfRevision,
+        ),
+      ]);
+      if (!stillCurrent()) return false;
+      this.#projectionErrors.delete(`run:${runId}`);
+      if (threadSelected) this.#projectionErrors.delete(`thread:${threadId}`);
+      this.#setState({
+        run: run.run,
+        runs: this.#state.runs.map((item) => item.run.id === runId ? run.run : item),
+        ...(threadSelected ? { thread: thread.thread, loadingThread: false } : {}),
+        threads: this.#state.threads.map((item) => item.threadRootId === threadId ? thread.thread : item),
+        loadingRun: false,
+        queryError: this.#currentProjectionError(),
+      });
+      return true;
+    } catch (error) {
+      if (!stillCurrent()) return false;
+      if (error instanceof ApiError && error.status === 401 &&
+          this.#csrfRevision !== csrfRevision && this.#csrfToken) {
+        return this.refreshRunComposer(runId);
+      }
+      this.#projectionFailed(`run:${runId}`, error, {
+        loadingRun: false,
+        ...(threadSelected ? { loadingThread: false } : {}),
+      });
+      return false;
+    }
+  }
+
   dispose(): void {
     this.#disposed = true;
     this.#clearLivenessRefresh();
@@ -766,9 +834,9 @@ export class WebController {
   }
 
   async #command(
-    slug: "start-thread" | "reply-to-thread",
+    slug: "start-thread" | "reply-to-thread" | "send-to-run",
     body: Readonly<Record<string, unknown>>,
-  ): Promise<void> {
+  ): Promise<unknown> {
     if (!this.#csrfToken) {
       this.#clearSession("expired");
       throw new ApiError(
@@ -783,8 +851,9 @@ export class WebController {
     const sessionGeneration = this.#sessionGeneration;
     const csrfRevision = this.#csrfRevision;
     const csrfToken = this.#csrfToken;
+    const principalId = this.#principalId;
     try {
-      await this.#sendCommand(
+      return await this.#sendCommand(
         slug,
         body,
         csrfToken,
@@ -792,6 +861,16 @@ export class WebController {
         csrfRevision,
       );
     } catch (error) {
+      if (
+        slug === "send-to-run" &&
+        error instanceof ApiError && error.status === 401 &&
+        this.#csrfRevision !== csrfRevision && this.#csrfToken &&
+        this.#principalId === principalId
+      ) {
+        return await this.#sendCommand(
+          slug, body, this.#csrfToken, this.#sessionGeneration, this.#csrfRevision,
+        );
+      }
       if (
         error instanceof ApiError &&
         error.status === 403 &&
@@ -806,14 +885,13 @@ export class WebController {
           const retryCsrfToken = this.#csrfToken;
           const retryCsrfRevision = this.#csrfRevision;
           try {
-            await this.#sendCommand(
+            return await this.#sendCommand(
               slug,
               body,
               retryCsrfToken,
               sessionGeneration,
               retryCsrfRevision,
             );
-            return;
           } catch (retryError) {
             if (
               retryError instanceof ApiError &&
@@ -842,13 +920,13 @@ export class WebController {
   }
 
   async #sendCommand(
-    slug: "start-thread" | "reply-to-thread",
+    slug: "start-thread" | "reply-to-thread" | "send-to-run",
     body: Readonly<Record<string, unknown>>,
     csrfToken: string,
     sessionGeneration: number,
     csrfRevision: number,
-  ): Promise<void> {
-    await this.#request(
+  ): Promise<unknown> {
+    return this.#request(
       `/api/v1/commands/${slug}`,
       {
         method: "POST",

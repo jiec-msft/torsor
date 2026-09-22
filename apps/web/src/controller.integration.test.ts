@@ -57,6 +57,206 @@ afterEach(async () => {
 });
 
 describe("WebController production HTTP path", () => {
+  it.each([false, true])("replaces an obsolete send 401 with the same request (replacement failure: %s)", async (replacementFails) => {
+    const { server, browser, broadcasts, controller, run } = await prepareRunComposer();
+    const second = createWindowController(server.origin, browser, broadcasts);
+    controller.runComposer.edit(run.id, "Use replacement credentials safely.");
+    await revokeBrowserSession(server.origin, browser);
+    const held = browser.holdNext((url) => url.includes("/commands/send-to-run"));
+    const send = controller.sendToRun(run.id);
+    await held.observed;
+    await second.controller.exchangeSession("human-token", "project-sample");
+    if (replacementFails) await revokeBrowserSession(server.origin, browser);
+    held.release();
+    await send;
+    expect(browser.commandRequests).toHaveLength(2);
+    expect(browser.commandRequests[1]).toEqual(browser.commandRequests[0]);
+    expect(controller.getSnapshot().session).toBe(replacementFails ? "expired" : "ready");
+    expect(second.controller.getSnapshot().session).toBe(replacementFails ? "expired" : "ready");
+    expect(controller.runComposer.getSnapshot()[run.id]?.status).toBe(
+      replacementFails ? "auth-required" : "submitted",
+    );
+    if (replacementFails) {
+      await controller.exchangeSession("human-token", "project-sample");
+      await controller.loadRun(run.id);
+      await controller.loadThread(run.threadRootId);
+      await controller.sendToRun(run.id);
+      expect(browser.commandRequests[2]).toEqual(browser.commandRequests[0]);
+    }
+    expect(controller.getSnapshot().run!.inputs).toHaveLength(2);
+    expect(controller.getSnapshot().thread!.messages).toHaveLength(2);
+  });
+
+  it("recovers a committed receipt even after the Run becomes terminal", async () => {
+    const { server, browser, controller, run } = await prepareRunComposer();
+    controller.runComposer.edit(run.id, "One instruction before cancellation.");
+    browser.loseNextCommandResponse();
+    await controller.sendToRun(run.id);
+    await controller.refreshRunComposer(run.id);
+    const revision = controller.getSnapshot().run!.run.revision;
+    const cancel = await fetch(`${server.origin}/api/v1/commands/cancel-run`, {
+      method: "POST",
+      headers: { Authorization: "Bearer human-token", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        idempotencyKey: "cancel-after-lost-response", runId: run.id,
+        expectedRunRevision: revision, reason: "Synthetic cancellation.",
+      }),
+    });
+    expect(cancel.status).toBe(200);
+    await controller.refreshRunComposer(run.id);
+    expect(controller.getSnapshot().run!.run.state).toBe("Cancelled");
+    await controller.sendToRun(run.id);
+    expect(browser.commandRequests[1]).toEqual(browser.commandRequests[0]);
+    expect(controller.runComposer.getSnapshot()[run.id]?.status).toBe("submitted");
+    expect(controller.getSnapshot().run!.inputs).toHaveLength(2);
+    expect(controller.getSnapshot().thread!.messages).toHaveLength(2);
+    expect(controller.getSnapshot().run!.inputs.at(-1)?.disposition).toBe("Abandoned");
+  });
+
+  it("rolls back both halves on a before-commit fault and safely retries the same identity", async () => {
+    const { browser, controller, run } = await prepareRunComposer();
+    const hook = Symbol.for("torsor.kernel.command-before-commit");
+    const previous = Reflect.get(globalThis, hook);
+    Reflect.set(globalThis, hook, ({ commandType }: { commandType: string }) => {
+      if (commandType === "SendToRun") throw new Error("Synthetic commit fault.");
+    });
+    controller.runComposer.edit(run.id, "Retry the rolled-back transaction.");
+    try {
+      await controller.sendToRun(run.id);
+    } finally {
+      if (previous === undefined) Reflect.deleteProperty(globalThis, hook);
+      else Reflect.set(globalThis, hook, previous);
+    }
+    expect(controller.runComposer.getSnapshot()[run.id]?.status).toBe("unknown");
+    await controller.refreshRunComposer(run.id);
+    expect(controller.getSnapshot().thread!.messages).toHaveLength(1);
+    expect(controller.getSnapshot().run!.inputs).toHaveLength(1);
+    expect(controller.getSnapshot().run!.run.revision).toBe(run.revision);
+    await controller.sendToRun(run.id);
+    expect(browser.commandRequests[1]).toEqual(browser.commandRequests[0]);
+    expect(controller.getSnapshot().thread!.messages).toHaveLength(2);
+    expect(controller.getSnapshot().run!.inputs).toHaveLength(2);
+  });
+
+  it("does not turn a committed submission into failure when projection refresh fails", async () => {
+    const { browser, controller, run } = await prepareRunComposer();
+    const snapshots: Array<[number, number]> = [];
+    const unsubscribe = controller.subscribe(() => {
+      const state = controller.getSnapshot();
+      snapshots.push([state.thread?.messages.length ?? 0, state.run?.inputs.length ?? 0]);
+    });
+    controller.runComposer.edit(run.id, "Commit despite a delayed read.");
+    browser.failNext((url) => url.includes(`/runs/${run.id}`), "Run projection unavailable.");
+    await controller.sendToRun(run.id);
+    expect(controller.runComposer.getSnapshot()[run.id]).toMatchObject({ status: "submitted", draft: "" });
+    expect(controller.getSnapshot().queryError).toBe("Run projection unavailable.");
+    expect(snapshots).not.toContainEqual([2, 1]);
+    expect(snapshots).not.toContainEqual([1, 2]);
+    await controller.refreshRunComposer(run.id);
+    unsubscribe();
+    expect(controller.getSnapshot().queryError).toBeNull();
+    expect(snapshots.at(-1)).toEqual([2, 2]);
+    expect(browser.commandRequests).toHaveLength(1);
+  });
+
+  it("atomically publishes a Human RunInput and recovers a lost response with the original identity after reauthentication", async () => {
+    const server = await startServer({ seedRun: true });
+    const browser = new BrowserTransport();
+    const { controller } = createWindowController(server.origin, browser);
+    await controller.exchangeSession("human-token", "project-sample");
+    await controller.loadRun(server.runId!);
+    const run = controller.getSnapshot().run!.run;
+    await controller.loadThread(run.threadRootId);
+    const before = controller.getSnapshot().thread!;
+    controller.runComposer.edit(run.id, "Preserve this public instruction.");
+    browser.loseNextCommandResponse();
+
+    await controller.sendToRun(run.id);
+
+    expect(controller.runComposer.getSnapshot()[run.id]).toMatchObject({
+      status: "unknown",
+      draft: "Preserve this public instruction.",
+      request: { runId: run.id, expectedRunRevision: run.revision },
+    });
+    await controller.loadThread(run.threadRootId);
+    await controller.loadRun(run.id);
+    const committed = controller.getSnapshot();
+    expect(committed.thread!.messages).toHaveLength(before.messages.length + 1);
+    const message = committed.thread!.messages.at(-1)!;
+    expect(committed.run!.inputs.at(-1)).toMatchObject({
+      messageRevisionId: message.revisions[0]!.id,
+      assignedByPrincipalId: "principal-human",
+      assignedByActivationId: null,
+      sourceAttentionId: null,
+      disposition: "Pending",
+    });
+    expect(committed.thread!.attentions).toHaveLength(before.attentions.length);
+
+    await revokeBrowserSession(server.origin, browser);
+    await controller.sendToRun(run.id);
+    expect(controller.getSnapshot().session).toBe("expired");
+    expect(controller.runComposer.getSnapshot()[run.id]?.status).toBe("unknown");
+    await controller.exchangeSession("human-token", "project-sample");
+    await controller.loadThread(run.threadRootId);
+    await controller.loadRun(run.id);
+    await controller.sendToRun(run.id);
+
+    expect(browser.commandRequests).toHaveLength(3);
+    expect(browser.commandRequests[1]).toEqual(browser.commandRequests[0]);
+    expect(browser.commandRequests[2]).toEqual(browser.commandRequests[0]);
+    expect(controller.runComposer.getSnapshot()[run.id]).toMatchObject({
+      status: "submitted", draft: "", request: null,
+    });
+    expect(controller.getSnapshot().thread!.messages).toHaveLength(before.messages.length + 1);
+    expect(controller.getSnapshot().run!.inputs).toHaveLength(committed.run!.inputs.length);
+  });
+
+  it("rejects stale revisions and terminal Runs without publishing either half", async () => {
+    const server = await startServer({ seedRun: true });
+    const browser = new BrowserTransport();
+    const { controller } = createWindowController(server.origin, browser);
+    await controller.exchangeSession("human-token", "project-sample");
+    await controller.loadRun(server.runId!);
+    const run = controller.getSnapshot().run!.run;
+    await controller.loadThread(run.threadRootId);
+    const before = controller.getSnapshot().thread!;
+    const advance = await fetch(`${server.origin}/api/v1/commands/send-to-run`, {
+      method: "POST",
+      headers: { Authorization: "Bearer human-token", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        idempotencyKey: "another-human-input", runId: run.id,
+        expectedRunRevision: run.revision, body: "A concurrent instruction.",
+      }),
+    });
+    expect(advance.status).toBe(200);
+    controller.runComposer.edit(run.id, "Keep my rejected draft.");
+    await controller.sendToRun(run.id);
+    expect(controller.runComposer.getSnapshot()[run.id]).toMatchObject({
+      status: "rejected", rejectionCode: "stale_revision",
+      draft: "Keep my rejected draft.", request: null,
+    });
+    await controller.refreshRunComposer(run.id);
+    const refreshed = controller.getSnapshot().run!;
+    expect(controller.getSnapshot().thread!.messages).toHaveLength(before.messages.length + 1);
+    const cancel = await fetch(`${server.origin}/api/v1/commands/cancel-run`, {
+      method: "POST",
+      headers: { Authorization: "Bearer human-token", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        idempotencyKey: "cancel-before-input", runId: run.id,
+        expectedRunRevision: refreshed.run.revision, reason: "Synthetic stop.",
+      }),
+    });
+    expect(cancel.status).toBe(200);
+    await controller.sendToRun(run.id);
+    expect(controller.runComposer.getSnapshot()[run.id]).toMatchObject({
+      status: "rejected", rejectionCode: "terminal_run",
+      draft: "Keep my rejected draft.",
+    });
+    await controller.refreshRunComposer(run.id);
+    expect(controller.getSnapshot().thread!.messages).toHaveLength(before.messages.length + 1);
+    expect(controller.getSnapshot().run!.inputs).toHaveLength(refreshed.inputs.length);
+  });
+
   it("deduplicates an acknowledged Start while its Thread list refresh is held", async () => {
     const server = await startServer();
     const browser = new BrowserTransport();
@@ -787,6 +987,7 @@ class BrowserTransport {
   readonly commandRequests: Array<Record<string, unknown>> = [];
   readonly requests: string[] = [];
   #cookie = "";
+  #loseCommandResponse = false;
   #failure:
     | {
         readonly predicate: (url: string) => boolean;
@@ -837,6 +1038,11 @@ class BrowserTransport {
       );
     }
     const response = await this.#nativeFetch(input, { ...init, headers });
+    if (url.includes("/api/v1/commands/") && this.#loseCommandResponse) {
+      this.#loseCommandResponse = false;
+      await response.arrayBuffer();
+      throw new TypeError("The committed response was lost.");
+    }
     const setCookie = response.headers.get("set-cookie");
     if (setCookie) {
       const pair = setCookie.split(";", 1)[0]!;
@@ -875,6 +1081,10 @@ class BrowserTransport {
       throw new Error("Only one failed browser response is supported.");
     }
     this.#failure = { predicate, message };
+  }
+
+  loseNextCommandResponse(): void {
+    this.#loseCommandResponse = true;
   }
 }
 
@@ -979,6 +1189,18 @@ async function startServer(
     await rm(directory, { recursive: true, force: true });
   });
   return { service, origin, ...(runId ? { runId } : {}) };
+}
+
+async function prepareRunComposer() {
+  const server = await startServer({ seedRun: true });
+  const browser = new BrowserTransport();
+  const broadcasts = new BroadcastHub();
+  const { controller } = createWindowController(server.origin, browser, broadcasts);
+  await controller.exchangeSession("human-token", "project-sample");
+  await controller.loadRun(server.runId!);
+  const run = controller.getSnapshot().run!.run;
+  await controller.loadThread(run.threadRootId);
+  return { server, browser, broadcasts, controller, run };
 }
 
 async function seedRun(databasePath: string): Promise<string> {

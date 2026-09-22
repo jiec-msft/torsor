@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TorsorApp } from "./App";
 import type { WebController, WebState } from "./controller";
+import { RunComposerModel } from "./run-composer-model";
 import {
   agent,
   attention,
@@ -38,6 +39,7 @@ function readyState(overrides: Partial<WebState> = {}): WebState {
 
 function stubController(state: WebState = readyState()) {
   const controller = {
+    runComposer: new RunComposerModel(),
     getSnapshot: () => state,
     subscribe: () => () => undefined,
     resume: vi.fn(async () => undefined),
@@ -67,6 +69,7 @@ function mutableController(initialState: WebState) {
   let state = initialState;
   const listeners = new Set<() => void>();
   const controller = {
+    runComposer: new RunComposerModel(),
     getSnapshot: () => state,
     subscribe: (listener: () => void) => {
       listeners.add(listener);
