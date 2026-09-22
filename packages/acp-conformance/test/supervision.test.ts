@@ -7,6 +7,16 @@ import { describe, expect, it } from "vitest";
 import { loadScenario, runScenario } from "@torsor/acp-conformance";
 
 describe("owned process lifetime (spec section 4)", () => {
+  it("uses a separately bounded startup budget before protocol steps", async () => {
+    const data = JSON.parse(await readFile(new URL("../examples/basic.json", import.meta.url), "utf8"));
+    const defaults = loadScenario(JSON.stringify(data), { format: "json" });
+    expect(defaults.limits).toMatchObject({ startupMs: 15000, stepMs: 5000 });
+    data.limits = { startupMs: 1 };
+    const result = await runScenario(loadScenario(JSON.stringify(data), { format: "json" }));
+    expect(result.status).toBe("failed");
+    expect(result.diagnostics[0]).toMatchObject({ code: "timeout", step: -1 });
+  });
+
   it("terminates a descendant after its provider parent exits", async () => {
     const directory = await mkdtemp(join(tmpdir(), "acp-descendant-test-"));
     const marker = join(directory, "synthetic.pid");

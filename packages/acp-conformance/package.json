@@ -15,7 +15,7 @@
   "bin": { "acp-conformance": "./bin/acp-conformance.mjs" },
   "files": ["bin", "dist", "examples", "README.md", "README.zh-cn.md"],
   "scripts": {
-    "test": "npm run build && vitest run --testTimeout=20000 --maxWorkers=2",
+    "test": "npm run build && vitest run --testTimeout=60000 --maxWorkers=2",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "build": "tsc -p tsconfig.json"
   },

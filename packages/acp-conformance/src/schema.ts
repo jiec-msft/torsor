@@ -52,6 +52,7 @@ const schema = z.strictObject({
     stdoutBytes: bounded(1_048_576, 8_388_608),
     stderrBytes: bounded(65_536, 1_048_576),
     events: bounded(2048, 16384),
+    startupMs: bounded(15_000, 120_000),
     stepMs: bounded(5000, 120_000),
     runMs: bounded(30_000, 300_000),
     shutdownMs: bounded(2000, 10_000),

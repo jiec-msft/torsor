@@ -51,7 +51,7 @@ npm exec -- acp-conformance mock packages\acp-conformance\examples\basic.json
 
 Diagnostic 包含稳定 `code`、从零开始的 `step`（启动阶段为 `-1`）和不包含原始值的说明。`expectFailure` 用于测试 Harness 的错误路径；匹配时保留 Diagnostic，清理失败永不视为成功。
 
-可覆盖 `limits.frameBytes`、`stdoutBytes`、`stderrBytes`、`events`、`stepMs`、`runMs`、`shutdownMs`。默认依次为 262144、1048576、65536、2048、5000、30000、2000。真实 Provider 通常需要显式提高 `stepMs` / `runMs`；失败不会自动重试。
+可覆盖 `limits.frameBytes`、`stdoutBytes`、`stderrBytes`、`events`、`startupMs`、`stepMs`、`runMs`、`shutdownMs`。默认依次为 262144、1048576、65536、2048、15000、5000、30000、2000。启动预算与协议步骤分离；真实 Provider 通常需要显式提高 `stepMs` / `runMs`；失败不会自动重试。
 
 JSONL 只记录白名单协议事实、稳定 ID 和顺序；逻辑 Timestamp 每事件增加 1 ms，不用于测量耗时。Prompt、生成内容、stderr、错误文本、环境、机器路径和未知负载全部被省略或脱敏。它适合结构 Diff，不是无损 Wire Capture，也没有本切片的 Replay API。
 

@@ -14,7 +14,7 @@ const basic = JSON.parse(await readFile(example, "utf8"));
 
 function invoke(args: string[]) {
   return new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
-    execFile(process.execPath, [cli, ...args], { timeout: 20_000, maxBuffer: 65_536 }, (error, stdout, stderr) => {
+    execFile(process.execPath, [cli, ...args], { timeout: 40_000, maxBuffer: 65_536 }, (error, stdout, stderr) => {
       resolve({ code: error ? Number(error.code) : 0, stdout, stderr });
     });
   });

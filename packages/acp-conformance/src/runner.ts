@@ -66,13 +66,13 @@ export async function runScenario(input: Scenario, options: RunOptions = {}): Pr
     }, workspace, scenario.limits, !options.provider);
     const processHandle = owned;
     timer = setTimeout(() => processHandle.fail("timeout", "Scenario exceeded its run deadline."), scenario.limits.runMs);
-    const guard = <T>(promise: Promise<T>) => deadline(
+    const guard = <T>(promise: Promise<T>, budget = scenario.limits.stepMs) => deadline(
       Promise.race([promise, processHandle.failure.then((error) => { throw error; })]),
-      scenario.limits.stepMs,
+      budget,
     );
     transcript.add("harness", "started");
     const wire = new Wire(owned, scenario.limits, transcript, workspace);
-    await guard(owned.started);
+    await guard(owned.started, scenario.limits.startupMs);
     const updates: Json[] = [];
     let updated = deferred<void>();
     connection = client()

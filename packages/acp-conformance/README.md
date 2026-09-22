@@ -51,7 +51,7 @@ This command exposes a standard ACP stdio peer that other clients can launch dir
 
 Diagnostics contain stable `code`, zero-based `step` (`-1` during startup), and descriptions without raw values. `expectFailure` exercises harness failure paths; a match retains its diagnostic, and cleanup failure never passes.
 
-Override `limits.frameBytes`, `stdoutBytes`, `stderrBytes`, `events`, `stepMs`, `runMs`, or `shutdownMs`. Defaults are respectively 262144, 1048576, 65536, 2048, 5000, 30000, and 2000. Real providers often need explicitly larger `stepMs` / `runMs`; failures never retry automatically.
+Override `limits.frameBytes`, `stdoutBytes`, `stderrBytes`, `events`, `startupMs`, `stepMs`, `runMs`, or `shutdownMs`. Defaults are respectively 262144, 1048576, 65536, 2048, 15000, 5000, 30000, and 2000. Startup has a separate budget from protocol steps. Real providers often need explicitly larger `stepMs` / `runMs`; failures never retry automatically.
 
 JSONL retains only allowlisted protocol facts, stable identities, and ordering. Logical timestamps advance 1 ms per event and do not measure elapsed time. Prompts, generated content, stderr, error prose, environment, machine paths, and unknown payloads are omitted or redacted. This is for structural diffing, not lossless wire capture, and this slice has no replay API.
 

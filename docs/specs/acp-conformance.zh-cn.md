@@ -73,7 +73,7 @@ CLI 退出码：`0` 全部通过；`1` 场景失败；`2` 配置、用法或 Art
 2. 初始化结果必须选择版本 1 并提供 Capability 对象；Session 必须先初始化，Prompt 必须先获得有效 Session ID。Prompt 结果必须有有效 `stopReason`。Capability 内容可用事实断言检查，不断言自然语言文本。
 3. 取消用 `session/cancel`；取消后的 Update 仍可被接收，直到 Prompt 结果。被取消的 Prompt 必须以 `cancelled` 完成。明确协调测试覆盖取消前后竞态；不把进程被杀等同于协议取消成功。
 4. 客户端仅声明版本 1 和空的可选 Capability 对象；场景不能启用 FS / Terminal，也不能为 Session 指定临时 Workspace 之外的 cwd、额外目录或 MCP Server。每个 `session/request_permission` 自动返回 `cancelled`；其他反向请求由 SDK 返回 Method Not Found，不执行本地工具。策略不可配置成允许。Tool Update 是可观察协议事实，不等同于本地执行授权，也不是通用 ACP 违规。
-5. 默认每帧 256 KiB、stdout 总量 1 MiB、stderr 总量 64 KiB、2048 个协议事件、步骤期限 5 s、场景期限 30 s、清理期限 2 s。所有设置必须为有上限的正整数。包括 SDK 之前的原始流和 JSON 深度限制，拒绝超限而非截断成成功。stderr 被消费和计数，但内容从不保留。
+5. 默认每帧 256 KiB、stdout 总量 1 MiB、stderr 总量 64 KiB、2048 个协议事件、启动期限 15 s（`startupMs`）、步骤期限 5 s、场景期限 30 s、清理期限 2 s。启动期限独立覆盖 OS 所有权建立和 Provider Spawn，不用放宽协议步骤期限来适配 Windows 冷启动。所有设置必须为有上限的正整数。包括 SDK 之前的原始流和 JSON 深度限制，拒绝超限而非截断成成功。stderr 被消费和计数，但内容从不保留。
 6. 无 Shell 插值；命令与参数分开，Windows `.cmd` / `.bat` 不隐式启动 Shell。命令只能是受信任的本地程序。默认环境只继承运行所需的 OS / PATH 值，HOME、配置、缓存和临时目录均重定向至本次合成 Workspace；凭据只可通过显式 Runtime 环境授权传递。
 7. 每次调用启动一个仍存活的 Node 进程所有权包装层，以便 Provider 提前退出时仍能终止其后代。Windows 在启动 Provider 前通过系统 PowerShell/.NET 建立 `KILL_ON_JOB_CLOSE` Job Object；精确 PID 的有界 `taskkill /T /F` 关闭所有权层时，Job 同时回收已孤立的成员。Job 设置失败时不启动 Provider。POSIX 使用该次创建的独立进程组。总是等待关闭并删除临时目录；失败明确报告。逃离进程组的恶意程序、OS Sandbox 和不受控外部副作用不在保证范围内。
 8. 无真实 Provider 命令时只运行 Mock，不访问模型、网络或凭据。外部命令在未显式 `allowReal` 时返回 skipped，不启动进程。环境中存在 Token 不能开启真实测试。

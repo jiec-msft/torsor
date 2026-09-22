@@ -30,7 +30,7 @@ describe("public conformance runner (spec sections 2-5)", () => {
         fileURLToPath(new URL("../bin/acp-conformance.mjs", import.meta.url)),
         "run", fileURLToPath(new URL("../examples/basic.json", import.meta.url)),
         "--out", directory,
-      ], { timeout: 15_000 });
+      ], { timeout: 40_000 });
       expect(stdout).toContain("PASSED basic");
       expect(JSON.parse(await readFile(join(directory, "basic.result.json"), "utf8")))
         .toMatchObject({ schemaVersion: 1, status: "passed" });
