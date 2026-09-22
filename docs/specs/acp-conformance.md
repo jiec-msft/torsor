@@ -65,7 +65,11 @@ The only parameter substitution is a whole object `{ "$ref": "workspace" }` or `
 
 `expectFailure` accepts stable failure codes only. Matching an expected fault can pass a scenario, but cleanup failure always fails. Diagnostics remain visible rather than disguising expected failures as fault-free runs.
 
+Execution or assertion failures in mock request, notification, and stdin EOF actions report fixed `mock_failed` through a dedicated acknowledged control channel, without raw exceptions or payloads. SDK notification logging, normal exit, omission of an `exit` step, or `expectFailure` cannot mask these failures. Only explicit `reply.errorCode` in a request handler is an intentional RPC error rather than a mock execution failure. Without the runner control channel, the standalone `mock` command emits a fixed error description and exits nonzero.
+
 `reply` selects exactly one of `result` or `errorCode`. `fault` embeds a named `fault.kind` object; `wire` can explicitly omit its newline to test partial frames. `mock.onStdinClose` executes the same action vocabulary after input EOF, deterministically testing output after the final response without delays. Ajv (MIT) validates the used method definitions directly from the SDK's published ACP JSON Schema, without maintaining duplicate protocol field schemas; invalid payloads are rejected before SDK notification-error logging.
+
+Fact assertions and `$ref` share RFC 6901 traversal. Arrays accept only `0` or positive integer literals without leading zeroes, and the index must be in range. Reject `length`, leading zeroes, negative numbers, exponent notation, `-`, and out-of-range indices rather than reading JavaScript array properties. JSON objects still use exact own-member lookup, including members named `length` or `01`. JSON/YAML outcomes and diagnostics must agree.
 
 ## 4. Wire, state, permissions, and budgets
 
@@ -88,6 +92,10 @@ Windows file-handle release can lag process exit. Temporary-directory removal us
 
 The ownership layer receives launch configuration only after an explicit readiness handshake, without relying on runtime compilation or console text encoding. Startup timeouts report fixed stage names only, never raw system output or machine paths.
 
+Outbound `session/` methods are limited to `session/new`, `session/prompt`, and `session/cancel`. Other session methods, including `session/load`, `session/resume`, and `session/fork`, fail with `protocol_state` before writing to provider stdin, whether sent as requests or notifications. Future extensions must first define equivalent workspace, MCP, additional-directory, and lifecycle validation. When present, `session/new`'s `additionalDirectories` must be an empty array.
+
+`session/new` and `session/prompt` must be requests; `session/cancel` must be a notification. Prompt and cancel sessions must already exist on this connection, with at most one outstanding prompt per session. Every provider `session/update` must reference a created session; `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, and `tool_call_update` additionally require an outstanding prompt for that session. A turn stays active after cancel until the prompt response or error. Reject those turn updates after terminal responses, including during draining, until another prompt begins. Session-level notifications such as commands, modes, configuration, session information, and usage do not require an active prompt.
+
 ## 5. Transcript and safety
 
 JSONL is the sole event artifact format. Each line has `schemaVersion: 1`, increasing `sequence`, `timestamp`, `direction`, `kind`, and safe facts. `timestamp` is **logical time**, starting at Unix epoch and advancing 1 ms per event, not latency measurement; `sequence` defines order.
@@ -95,6 +103,8 @@ JSONL is the sole event artifact format. Each line has `schemaVersion: 1`, incre
 Use allowlisted projection, not secret-pattern heuristics: retain only known protocol methods/enums, versions, boolean capabilities, normalized request/session/tool IDs, error codes, and lifecycle facts. Arbitrary text, prompts, error messages, stderr, raw tool input/output, unknown keys/methods, paths, environment, PIDs, provider metadata, and binary content never enter artifacts. Unknown values use fixed placeholders. Raw values exist only in bounded memory for correlation, references, and assertions. Diagnostics never contain actual values.
 
 The same deterministic mock scenario produces the same transcript. Real-provider update counts/order may vary; normalization does not make model output deterministic. Artifacts support stable diffs and future structural replay; **this slice has no lossless replay or API that reconstructs prompts from redacted content**.
+
+Tool projection retains only `toolCallId`, `kind`, and `status`. Raw tool IDs are correlated by `(sessionId, toolCallId)` and assigned first-seen aliases such as `tool-1`, shared across `tool_call`, `tool_call_update`, and `session/request_permission.toolCall`. Allowed `kind` values are `read`, `edit`, `delete`, `move`, `search`, `execute`, `think`, `fetch`, `switch_mode`, and `other`; allowed `status` values are `pending`, `in_progress`, `completed`, and `failed`. Tool titles, input, output, locations, content, and permission-option text are never retained; unknown enum values are never emitted verbatim. This completes version 1's promised tool correlation/state facts, not lossless recording.
 
 ## 6. Copilot compatibility evidence (not ACP law)
 

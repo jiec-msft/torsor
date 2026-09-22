@@ -41,11 +41,18 @@ export function pointer(value: unknown, path: string): unknown {
   let current = value;
   for (const token of path.slice(1).split("/")) {
     const key = token.replace(/~1/g, "/").replace(/~0/g, "~");
-    if (
-      (!record(current) && !Array.isArray(current)) ||
-      !Object.hasOwn(current, key)
-    ) fail("assertion_failed", "JSON Pointer does not identify a value.");
-    current = Reflect.get(current, key);
+    if (Array.isArray(current)) {
+      const index = Number(key);
+      if (!/^(0|[1-9][0-9]*)$/.test(key) || !Number.isSafeInteger(index) || index >= current.length) {
+        fail("assertion_failed", "JSON Pointer does not identify an array element.");
+      }
+      current = current[index];
+    } else {
+      if (!record(current) || !Object.hasOwn(current, key)) {
+        fail("assertion_failed", "JSON Pointer does not identify a value.");
+      }
+      current = current[key];
+    }
   }
   return current;
 }

@@ -7,6 +7,8 @@ import { Transcript } from "./transcript.js";
 import { validatePayload } from "./protocol.js";
 
 const stopReasons = new Set(["end_turn", "cancelled", "refusal", "max_tokens", "max_turn_requests"]);
+const clientSessionMethods = new Set(["session/new", "session/prompt", "session/cancel"]);
+const turnUpdates = new Set(["user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"]);
 
 export class Wire {
   readonly stream: Stream;
@@ -110,16 +112,13 @@ export class Wire {
       if (typeof message.method !== "string" || Object.hasOwn(message, "result") || Object.hasOwn(message, "error")) {
         fail("invalid_envelope", "Request or notification has an invalid envelope.");
       }
+      if (direction === "client" && message.method.startsWith("session/")) {
+        if (!clientSessionMethods.has(message.method) || (message.method === "session/cancel") === hasId) {
+          fail("protocol_state", "Session method or message kind is outside the supported lifecycle safety boundary.");
+        }
+      }
       if (Object.hasOwn(message, "params") && !record(message.params)) fail("invalid_envelope", "ACP params must be an object.");
       validatePayload(message.method, "params", message.params);
-      if (hasId) {
-        if (this.#pending.has(key)) fail("invalid_envelope", "Request ID is already active.");
-        this.#pending.set(key, {
-          method: message.method,
-          sessionId: record(message.params) ? message.params.sessionId : undefined,
-          cancelled: false,
-        });
-      }
       if (direction === "client" && message.method === "session/new" && !this.#initialized) {
         fail("protocol_state", "Initialize must complete before creating a session.");
       }
@@ -133,22 +132,51 @@ export class Wire {
       if (direction === "client" && message.method === "session/new") {
         const params = message.params;
         if (!record(params) || params.cwd !== this.workspace || !Array.isArray(params.mcpServers) ||
-          params.mcpServers.length !== 0 || (Array.isArray(params.additionalDirectories) && params.additionalDirectories.length !== 0)) {
+          params.mcpServers.length !== 0 || (Object.hasOwn(params, "additionalDirectories") &&
+            (!Array.isArray(params.additionalDirectories) || params.additionalDirectories.length !== 0))) {
           fail("protocol_state", "Sessions must use the synthetic workspace without MCP servers or additional directories.");
         }
       }
-      if (direction === "client" && message.method === "session/prompt") {
+      if (direction === "client" && (message.method === "session/prompt" || message.method === "session/cancel")) {
         if (!record(message.params) || typeof message.params.sessionId !== "string" || !this.#sessions.has(message.params.sessionId)) {
-          fail("protocol_state", "Prompt requires a session created on this connection.");
+          fail("protocol_state", "Prompt and cancel require a session created on this connection.");
+        }
+        if (message.method === "session/prompt" && this.activePrompt(message.params.sessionId)) {
+          fail("protocol_state", "A session cannot have overlapping prompts.");
+        }
+      }
+      if (direction === "provider" && message.method === "session/update") {
+        const params = message.params;
+        if (hasId || !record(params) || typeof params.sessionId !== "string" || !this.#sessions.has(params.sessionId)) {
+          fail("protocol_state", "Session updates must be notifications for a session created on this connection.");
+        }
+        if (record(params.update) && typeof params.update.sessionUpdate === "string" &&
+          turnUpdates.has(params.update.sessionUpdate) && !this.activePrompt(params.sessionId)) {
+          fail("protocol_state", "Content and tool updates require an outstanding prompt for their session.");
         }
       }
       if (direction === "client" && message.method === "session/cancel" && record(message.params)) {
-        for (const request of this.#pending.values()) {
-          if (request.method === "session/prompt" && request.sessionId === message.params.sessionId) request.cancelled = true;
+        for (const [pendingKey, request] of this.#pending) {
+          if (pendingKey.startsWith("client:") && request.method === "session/prompt" &&
+            request.sessionId === message.params.sessionId) request.cancelled = true;
         }
+      }
+      if (hasId) {
+        if (this.#pending.has(key)) fail("invalid_envelope", "Request ID is already active.");
+        this.#pending.set(key, {
+          method: message.method,
+          sessionId: record(message.params) ? message.params.sessionId : undefined,
+          cancelled: false,
+        });
       }
     }
     this.transcript.protocol(direction, message);
+  }
+
+  private activePrompt(sessionId: string): boolean {
+    return [...this.#pending].some(([key, request]) =>
+      key.startsWith("client:") && request.method === "session/prompt" && request.sessionId === sessionId,
+    );
   }
 
   private result(method: string, result: unknown): void {

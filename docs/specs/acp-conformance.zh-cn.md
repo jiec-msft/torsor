@@ -65,7 +65,11 @@ CLI 退出码：`0` 全部通过；`1` 场景失败；`2` 配置、用法或 Art
 
 `expectFailure` 仅接受稳定失败码；匹配预期故障时场景可通过，但清理失败永远失败。错误诊断保留，避免“预期失败”伪装成没有发生故障。
 
+Mock 请求、通知和 stdin EOF 动作中的执行或断言失败通过专用、带确认的控制通道报告固定 `mock_failed`，不传递原始异常或负载；失败不能被 SDK 通知日志、正常退出、缺少 `exit` 步骤或 `expectFailure` 掩盖。只有请求 Handler 中显式 `reply.errorCode` 是预期 RPC 错误，而不是 Mock 执行失败。独立 `mock` 命令没有 Runner 控制通道时只输出固定错误说明并以非零退出。
+
 `reply` 使用 `result` 或 `errorCode` 二选一。`fault` 内嵌具名 `fault.kind` 对象；`wire` 可显式关闭换行以测试半帧。`mock.onStdinClose` 可在输入 EOF 后执行同一动作词汇，确定性测试最终响应之后的输出，不依赖延时。Ajv（MIT）直接验证 SDK 发布的 ACP JSON Schema 中本切片使用的方法定义，不另行维护协议字段 Schema；在 SDK 通知错误日志路径之前拒绝无效负载。
+
+事实断言和 `$ref` 共用 RFC 6901 遍历规则。数组只接受 `0` 或无前导零的正整数字面量，并且索引必须在数组范围内；拒绝 `length`、前导零、负数、指数形式、`-` 及越界索引，不读取 JavaScript 数组属性。JSON 对象仍按自身成员名精确查找，包括名为 `length` 或 `01` 的成员。JSON/YAML 的结果及诊断必须一致。
 
 ## 4. Wire、状态、权限与预算
 
@@ -88,6 +92,10 @@ Windows 释放文件句柄可能晚于进程退出；临时目录删除使用 No
 
 所有权层通过显式 Ready 握手后才接收启动配置，不依赖运行时编译或控制台文本编码。启动超时只报告固定阶段名称，不披露原始系统输出或机器路径。
 
+向 Provider 发送的 `session/` 方法仅支持 `session/new`、`session/prompt` 和 `session/cancel`。包括 `session/load`、`session/resume`、`session/fork` 在内的其他 Session 方法，无论是请求还是通知，都在写入 Provider stdin 前以 `protocol_state` 拒绝；未来扩展必须先定义等效的 Workspace、MCP、额外目录及生命周期校验。`session/new` 的 `additionalDirectories` 若存在，必须为空数组。
+
+`session/new` 和 `session/prompt` 必须是请求，`session/cancel` 必须是通知；Prompt 和 Cancel 的 Session 必须已在本连接创建。同一 Session 最多一个未完成 Prompt。每个 Provider `session/update` 都必须引用已创建 Session；`user_message_chunk`、`agent_message_chunk`、`agent_thought_chunk`、`tool_call`、`tool_call_update` 还要求该 Session 有未完成 Prompt。发送 Cancel 后到 Prompt 的响应或错误之前仍是活动 Turn；终止响应之后（包括排空阶段）拒绝这些 Turn Update，直到新 Prompt 开始。命令、模式、配置、Session 信息和用量等 Session 级通知不要求活动 Prompt。
+
 ## 5. Transcript 与安全
 
 JSONL 为唯一事件 Artifact 格式，每行 `schemaVersion: 1`、递增 `sequence`、`timestamp`、`direction`、`kind` 和安全事实。`timestamp` 是从 Unix Epoch 开始、每事件推进 1 ms 的**逻辑时间**，不是延迟测量；排序以 `sequence` 为准。
@@ -95,6 +103,8 @@ JSONL 为唯一事件 Artifact 格式，每行 `schemaVersion: 1`、递增 `sequ
 采用白名单投影，而不是依赖 Secret 正则：只保留已知协议 Method/Enum、版本、布尔 Capability、规范化请求/Session/Tool ID、Error Code 和生命周期事实。任意文本、Prompt、错误消息、stderr、原始工具输入/输出、未知键/方法、路径、环境、PID、Provider 元信息和二进制内容不进入 Artifact。未知值表示为固定占位符。原始值只在有界内存中用于请求关联、引用和事实断言。Diagnostic 不包含实际值。
 
 相同确定性 Mock 场景产生相同 Transcript。真实 Provider 的 Update 数量和顺序可以不同；不把规范化伪称为确定性模型输出。Artifact 可用于稳定 Diff 和未来结构性回放；**本切片不提供无损回放或把已脱敏内容恢复成 Prompt 的 API**。
+
+Tool 投影只保留 `toolCallId`、`kind`、`status`。原始 Tool ID 按 `(sessionId, toolCallId)` 关联，并依首次出现分配 `tool-1` 等别名；`tool_call`、`tool_call_update` 和 `session/request_permission.toolCall` 共用别名。`kind` 白名单为 `read`、`edit`、`delete`、`move`、`search`、`execute`、`think`、`fetch`、`switch_mode`、`other`；`status` 白名单为 `pending`、`in_progress`、`completed`、`failed`。不保留 Tool 标题、输入、输出、位置、内容或 Permission Option 文本；未知枚举不原样输出。此投影补全版本 1 已承诺的 Tool 关联及状态事实，不是无损录制。
 
 ## 6. Copilot 兼容性证据（非 ACP 规范）
 

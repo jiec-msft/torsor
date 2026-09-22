@@ -15,6 +15,53 @@ const deny = {
 };
 
 describe("coordinated conversations (spec sections 3-4)", () => {
+  it.each([false, true])("fails notification assertions independently of explicit exit: %s", async (explicitExit) => {
+    const data = structuredClone(basic);
+    data.steps.splice(5, 0,
+      { type: "update", sessionUpdate: "agent_message_chunk" },
+      { type: "notification", method: "session/cancel", params: { sessionId: { $ref: "session#/sessionId" } } },
+    );
+    data.steps.at(-1).expect[0].equals = "cancelled";
+    if (explicitExit) data.steps.push({ type: "close-stdin" }, { type: "exit", code: 0 });
+    data.mock.handlers[2].actions = [
+      data.mock.handlers[2].actions[0],
+      { type: "wait", gate: "cancel" },
+      deny,
+      { type: "reply", result: { stopReason: "cancelled" } },
+    ];
+    data.mock.handlers.push({
+      kind: "notification", method: "session/cancel", actions: [
+        { type: "release", gate: "cancel" },
+        { ...deny, expect: [{ path: "/outcome/outcome", equals: "selected" }] },
+      ],
+    });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const result = await runScenario(loadScenario(JSON.stringify(data), { format: "json" }));
+      expect(result.status).toBe("failed");
+      expect(result.diagnostics[0]?.code).toBe("mock_failed");
+      expect(JSON.stringify(result)).not.toContain("Synthetic request");
+    }
+  });
+
+  it("reports EOF action failures without an exit assertion", async () => {
+    const data = structuredClone(basic);
+    data.mock.onStdinClose = [{ type: "reply", errorCode: -32123 }];
+    const result = await runScenario(loadScenario(JSON.stringify(data), { format: "json" }));
+    expect(result.status).toBe("failed");
+    expect(result.diagnostics[0]?.code).toBe("mock_failed");
+  });
+
+  it("reports request action assertion failures through the same sanitized channel", async () => {
+    const data = structuredClone(basic);
+    data.expectFailure = "rpc_error";
+    data.mock.handlers[2].actions.unshift({
+      ...deny, expect: [{ path: "/outcome/outcome", equals: "selected" }],
+    });
+    const result = await runScenario(loadScenario(JSON.stringify(data), { format: "json" }));
+    expect(result.status).toBe("failed");
+    expect(result.diagnostics[0]?.code).toBe("mock_failed");
+  });
+
   it("denies permissions before and after cancel and completes the original prompt", async () => {
     const data = structuredClone(basic);
     data.id = "cancel-permission";

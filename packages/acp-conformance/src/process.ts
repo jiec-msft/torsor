@@ -90,6 +90,9 @@ export class OwnedProcess {
           break;
         case "ownership-starting": this.startupStage = "process ownership setup"; break;
         case "ownership-ready": this.startupStage = "provider spawn"; break;
+        case "mock-failure":
+          if (mock) this.fail("mock_failed", "Mock action or assertion failed.");
+          break;
         case "started": this.#started.resolve(); break;
         case "spawn-error": this.fail("spawn_failed", "Could not start the configured provider command."); break;
         case "ownership-error": this.fail("cleanup_failed", "Could not establish process ownership; provider was not started."); break;
@@ -111,7 +114,7 @@ export class OwnedProcess {
   }
 
   fail(code: string, message: string): void {
-    if (!this.#failed) {
+    if (!this.#failed || code === "mock_failed") {
       this.#failed = new HarnessError(code, message);
       this.#failure.resolve(this.#failed);
     }

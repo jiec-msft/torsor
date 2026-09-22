@@ -56,6 +56,9 @@ process.once("message", async (configuration: {
       } else if ("type" in message && message.type === "stdin-close") {
         child.stdin!.destroy();
         send("stdin-error");
+      } else if ("type" in message && message.type === "mock-failure") {
+        send("mock-failure");
+        child.send({ type: "mock-failure-ack" }, (error) => { if (error) send("mock-failure"); });
       }
     });
   }

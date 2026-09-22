@@ -4,7 +4,9 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { loadScenario, type MockAction, type Scenario } from "./schema.js";
-import { assertFacts, deferred } from "./facts.js";
+import { assertFacts, deferred, record } from "./facts.js";
+
+class MockReplyError extends RequestError {}
 
 let stdoutBytes = 0;
 function write(stream: NodeJS.WritableStream, chunk: string | Uint8Array): Promise<void> {
@@ -22,6 +24,28 @@ function hold(): Promise<never> {
 export async function serveMock(scenario: Scenario): Promise<void> {
   if (!scenario.mock) throw new Error("Mock handlers are required.");
   const app = agent();
+  const failureAcknowledged = deferred<void>();
+  let failed = false;
+  const reportFailure = async (): Promise<never> => {
+    if (!failed) {
+      failed = true;
+      process.exitCode = 2;
+      if (!process.send) {
+        await write(process.stderr, "Mock action or assertion failed.\n");
+        process.exit(2);
+      }
+      const acknowledge = (message: unknown) => {
+        if (record(message) && message.type === "mock-failure-ack") {
+          process.off("message", acknowledge);
+          failureAcknowledged.resolve();
+        }
+      };
+      process.on("message", acknowledge);
+      process.send({ type: "mock-failure" }, (error) => { if (error) process.exit(2); });
+    }
+    await failureAcknowledged.promise;
+    process.exit(2);
+  };
   const gates = new Map<string, ReturnType<typeof deferred<void>>>();
   const gate = (name: string) => {
     let value = gates.get(name);
@@ -32,7 +56,7 @@ export async function serveMock(scenario: Scenario): Promise<void> {
     for (const action of actions) {
       switch (action.type) {
         case "reply":
-          if (action.errorCode !== undefined) throw new RequestError(action.errorCode, "Synthetic provider error.");
+          if (action.errorCode !== undefined) throw new MockReplyError(action.errorCode, "Synthetic provider error.");
           return action.result;
         case "notify": await context.notify(action.method, action.params); break;
         case "wait": await gate(action.gate).promise; break;
@@ -76,12 +100,19 @@ export async function serveMock(scenario: Scenario): Promise<void> {
     }
     return {};
   };
+  const runActions = async (actions: readonly MockAction[], context: AgentContext, request = false) => {
+    try { return await execute(actions, context); }
+    catch (error) {
+      if (request && error instanceof MockReplyError) throw error;
+      return reportFailure();
+    }
+  };
   for (const handler of scenario.mock.handlers) {
     const parse = (value: unknown) => value;
     if (handler.kind === "request") {
-      app.onRequest(handler.method, parse, (context) => execute(handler.actions, context.client));
+      app.onRequest(handler.method, parse, (context) => runActions(handler.actions, context.client, true));
     } else {
-      app.onNotification(handler.method, parse, async (context) => { await execute(handler.actions, context.client); });
+      app.onNotification(handler.method, parse, async (context) => { await runActions(handler.actions, context.client); });
     }
   }
   const eofActions = scenario.mock.onStdinClose;
@@ -91,10 +122,7 @@ export async function serveMock(scenario: Scenario): Promise<void> {
       start: (controller) => {
         process.stdin.on("data", (chunk: Buffer) => controller.enqueue(chunk));
         process.stdin.on("end", () => {
-          void execute(eofActions, connection.client).then(
-            () => controller.close(),
-            () => { process.exitCode = 2; controller.close(); },
-          );
+          void runActions(eofActions, connection.client).then(() => controller.close());
         });
       },
     }),

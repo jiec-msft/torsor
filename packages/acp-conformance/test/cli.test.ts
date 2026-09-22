@@ -12,15 +12,28 @@ const example = fileURLToPath(new URL("../examples/basic.json", import.meta.url)
 const cli = fileURLToPath(new URL("../bin/acp-conformance.mjs", import.meta.url));
 const basic = JSON.parse(await readFile(example, "utf8"));
 
-function invoke(args: string[]) {
+function invoke(args: string[], closeInput = false) {
   return new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
-    execFile(process.execPath, [cli, ...args], { timeout: 40_000, maxBuffer: 65_536 }, (error, stdout, stderr) => {
+    const child = execFile(process.execPath, [cli, ...args], { timeout: 40_000, maxBuffer: 65_536 }, (error, stdout, stderr) => {
       resolve({ code: error ? Number(error.code) : 0, stdout, stderr });
     });
+    if (closeInput) child.stdin?.end();
   });
 }
 
 describe("CLI and opt-in contract (spec sections 2 and 6)", () => {
+  it("fails standalone mock actions with a fixed diagnostic and nonzero exit", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "acp-cli-mock-failure-"));
+    try {
+      const path = join(directory, "failure.json");
+      const data = structuredClone(basic);
+      data.mock.onStdinClose = [{ type: "reply", errorCode: -32123 }];
+      await writeFile(path, JSON.stringify(data));
+      const result = await invoke(["mock", path], true);
+      expect(result).toEqual({ code: 2, stdout: "", stderr: "Mock action or assertion failed.\n" });
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
   it("does not launch an external command or profile without explicit opt-in", async () => {
     const command = await invoke(["run", example, "--", "nonexistent-synthetic-provider"]);
     expect(command.code).toBe(3);
