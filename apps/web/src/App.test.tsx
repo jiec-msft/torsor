@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -47,8 +47,16 @@ function stubController(state: WebState = readyState()) {
     clearThread: vi.fn(),
     loadRun: vi.fn(async () => undefined),
     clearRun: vi.fn(),
-    startThread: vi.fn(async () => undefined),
-    replyToThread: vi.fn(async () => undefined),
+    startThread: vi.fn(
+      (
+        _input: Parameters<WebController["startThread"]>[0],
+      ): Promise<void> => Promise.resolve(),
+    ),
+    replyToThread: vi.fn(
+      (
+        _input: Parameters<WebController["replyToThread"]>[0],
+      ): Promise<void> => Promise.resolve(),
+    ),
     dispose: vi.fn(),
   };
   return controller as unknown as WebController & typeof controller;
@@ -71,8 +79,16 @@ function mutableController(initialState: WebState) {
     clearThread: vi.fn(),
     loadRun: vi.fn(async () => undefined),
     clearRun: vi.fn(),
-    startThread: vi.fn(async () => undefined),
-    replyToThread: vi.fn(async () => undefined),
+    startThread: vi.fn(
+      (
+        _input: Parameters<WebController["startThread"]>[0],
+      ): Promise<void> => Promise.resolve(),
+    ),
+    replyToThread: vi.fn(
+      (
+        _input: Parameters<WebController["replyToThread"]>[0],
+      ): Promise<void> => Promise.resolve(),
+    ),
     dispose: vi.fn(),
     update(next: WebState) {
       state = next;
@@ -173,6 +189,209 @@ describe("TorsorApp", () => {
     expect(
       screen.queryByText("Loading atomic thread projection"),
     ).not.toBeInTheDocument();
+  });
+
+  it("recovers the original Start payload after lost response, 401, and reauthentication", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(
+      {},
+      "",
+      "/?project=project-sample&channel=channel-general&panels=channels,detail",
+    );
+    const controller = mutableController(readyState());
+    const calls: unknown[] = [];
+    const durableOperations = new Set<string>();
+    vi.mocked(controller.startThread).mockImplementation(async (input) => {
+      calls.push(input);
+      durableOperations.add(JSON.stringify(input));
+      if (calls.length === 1) {
+        throw new TypeError("The committed response was lost.");
+      }
+      if (calls.length === 2) {
+        controller.update(
+          readyState({
+            session: "expired",
+            connection: "offline",
+            bootstrap: null,
+            threads: [],
+            threadsChannelId: null,
+            thread: null,
+            runs: [],
+            run: null,
+            agents: [],
+            attentions: [],
+            lastEventId: null,
+          }),
+        );
+        throw new Error("Session expired.");
+      }
+    });
+    vi.mocked(controller.exchangeSession).mockImplementation(async () => {
+      controller.update(readyState({ thread: null, run: null }));
+    });
+    render(<TorsorApp controller={controller} />);
+
+    const composer = screen.getByLabelText("Start a thread");
+    const form = composer.closest("form")!;
+    await user.type(composer, "Preserve this exact Start payload.");
+    await user.selectOptions(within(form).getByLabelText("Notify"), "agent-orbit");
+    await user.click(within(form).getByRole("button", { name: "Start" }));
+    await screen.findByText("The committed response was lost.");
+
+    await user.click(within(form).getByRole("button", { name: "Start" }));
+    await screen.findByText(/The browser session expired or was revoked/);
+    await user.type(
+      screen.getByLabelText("Local bearer credential"),
+      "replacement-secret",
+    );
+    await user.click(screen.getByRole("button", { name: "Connect" }));
+
+    const recoveredComposer = await screen.findByLabelText("Start a thread");
+    const recoveredForm = recoveredComposer.closest("form")!;
+    expect(recoveredComposer).toHaveValue("Preserve this exact Start payload.");
+    expect(within(recoveredForm).getByLabelText("Notify")).toHaveValue(
+      "agent-orbit",
+    );
+    await user.click(
+      within(recoveredForm).getByRole("button", { name: "Start" }),
+    );
+
+    expect(calls).toHaveLength(3);
+    expect(calls[1]).toEqual(calls[0]);
+    expect(calls[2]).toEqual(calls[0]);
+    expect(durableOperations.size).toBe(1);
+  });
+
+  it("recovers the original Reply payload after lost response, 401, and reauthentication", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(
+      {},
+      "",
+      "/?project=project-sample&channel=channel-general&thread=thread-1&panels=channels,detail",
+    );
+    const controller = mutableController(readyState());
+    const calls: unknown[] = [];
+    const durableOperations = new Set<string>();
+    vi.mocked(controller.replyToThread).mockImplementation(async (input) => {
+      calls.push(input);
+      durableOperations.add(JSON.stringify(input));
+      if (calls.length === 1) {
+        throw new TypeError("The committed response was lost.");
+      }
+      if (calls.length === 2) {
+        controller.update(
+          readyState({
+            session: "expired",
+            connection: "offline",
+            bootstrap: null,
+            threads: [],
+            threadsChannelId: null,
+            thread: null,
+            runs: [],
+            run: null,
+            agents: [],
+            attentions: [],
+            lastEventId: null,
+          }),
+        );
+        throw new Error("Session expired.");
+      }
+    });
+    vi.mocked(controller.exchangeSession).mockImplementation(async () => {
+      controller.update(readyState());
+    });
+    render(<TorsorApp controller={controller} />);
+
+    const composer = screen.getByLabelText("Reply to thread");
+    const form = composer.closest("form")!;
+    await user.type(composer, "Preserve this exact Reply payload.");
+    await user.selectOptions(within(form).getByLabelText("Notify"), "agent-orbit");
+    await user.click(within(form).getByRole("button", { name: "Reply" }));
+    await screen.findByText("The committed response was lost.");
+
+    await user.click(within(form).getByRole("button", { name: "Reply" }));
+    await screen.findByText(/The browser session expired or was revoked/);
+    await user.type(
+      screen.getByLabelText("Local bearer credential"),
+      "replacement-secret",
+    );
+    await user.click(screen.getByRole("button", { name: "Connect" }));
+
+    const recoveredComposer = await screen.findByLabelText("Reply to thread");
+    const recoveredForm = recoveredComposer.closest("form")!;
+    expect(recoveredComposer).toHaveValue("Preserve this exact Reply payload.");
+    expect(within(recoveredForm).getByLabelText("Notify")).toHaveValue(
+      "agent-orbit",
+    );
+    await user.click(
+      within(recoveredForm).getByRole("button", { name: "Reply" }),
+    );
+
+    expect(calls).toHaveLength(3);
+    expect(calls[1]).toEqual(calls[0]);
+    expect(calls[2]).toEqual(calls[0]);
+    expect(durableOperations.size).toBe(1);
+  });
+
+  it.each([
+    {
+      name: "Start",
+      route:
+        "/?project=project-sample&channel=channel-general&panels=channels,detail",
+      label: "Start a thread",
+      button: "Start",
+      method: "startThread" as const,
+    },
+    {
+      name: "Reply",
+      route:
+        "/?project=project-sample&channel=channel-general&thread=thread-1&panels=channels,detail",
+      label: "Reply to thread",
+      button: "Reply",
+      method: "replyToThread" as const,
+    },
+  ])("preserves later $name composer edits when send succeeds", async ({
+    route,
+    label,
+    button,
+    method,
+  }) => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", route);
+    const controller = mutableController(readyState());
+    let resolveCommand!: () => void;
+    const command = new Promise<void>((resolve) => {
+      resolveCommand = resolve;
+    });
+    const holdCommand = async () => {
+      controller.update(readyState({ commandPending: true }));
+      await command;
+      controller.update(readyState());
+    };
+    if (method === "startThread") {
+      vi.mocked(controller.startThread).mockImplementationOnce(holdCommand);
+    } else {
+      vi.mocked(controller.replyToThread).mockImplementationOnce(holdCommand);
+    }
+    render(<TorsorApp controller={controller} />);
+
+    const composer = screen.getByLabelText(label);
+    const form = composer.closest("form")!;
+    const notify = within(form).getByLabelText("Notify");
+    await user.type(composer, "Submitted revision.");
+    await user.selectOptions(notify, "agent-orbit");
+    await user.click(within(form).getByRole("button", { name: button }));
+    expect(
+      within(form).getByRole("button", { name: button }),
+    ).toBeDisabled();
+
+    await user.clear(composer);
+    await user.type(composer, "A later unsent revision.");
+    await user.selectOptions(notify, "");
+    await act(async () => resolveCommand());
+
+    expect(composer).toHaveValue("A later unsent revision.");
+    expect(notify).toHaveValue("");
   });
 
   it("shows authoritative Attention-only Agent activity", async () => {

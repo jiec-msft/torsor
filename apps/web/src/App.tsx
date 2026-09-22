@@ -51,6 +51,15 @@ import {
 const defaultProjectId =
   import.meta.env.VITE_TORSOR_PROJECT_ID ?? "project-sample";
 
+interface ComposerValue {
+  readonly draft: string;
+  readonly agentId: string;
+}
+
+type ComposerValueUpdater = (current: ComposerValue) => ComposerValue;
+
+const emptyComposerValue: ComposerValue = { draft: "", agentId: "" };
+
 export function TorsorApp({ controller }: { readonly controller: WebController }) {
   const state = useSyncExternalStore(
     controller.subscribe,
@@ -67,9 +76,30 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
   const channelsToggleRef = useRef<HTMLButtonElement>(null);
   const detailToggleRef = useRef<HTMLButtonElement>(null);
   const previousDrawer = useRef<"channels" | "detail" | null>(null);
+  const [composerValues, setComposerValues] = useState<
+    Readonly<Record<string, ComposerValue>>
+  >({});
   const compactPanels = useMediaQuery("(max-width: 1099px)");
   const modalDrawerOpen =
     compactPanels && (route.channelsOpen || route.detailOpen);
+  const startComposerKey = `start:${route.projectId}:${route.channelId ?? ""}`;
+  const replyComposerKey = `reply:${route.projectId}:${route.threadId ?? ""}`;
+  const updateComposer = (
+    key: string,
+    update: ComposerValueUpdater,
+  ): void => {
+    setComposerValues((currentValues) => {
+      const current = currentValues[key] ?? emptyComposerValue;
+      const next = update(current);
+      if (
+        next.draft === current.draft &&
+        next.agentId === current.agentId
+      ) {
+        return currentValues;
+      }
+      return { ...currentValues, [key]: next };
+    });
+  };
 
   useEffect(() => {
     if (resumedProject.current === route.projectId) {
@@ -348,6 +378,10 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
         modal={compactPanels && route.channelsOpen}
         route={route}
         state={state}
+        composerValue={composerValues[startComposerKey] ?? emptyComposerValue}
+        onComposerChange={(update) =>
+          updateComposer(startComposerKey, update)
+        }
         onClose={() =>
           updateRoute(setRoute, { ...route, channelsOpen: false })
         }
@@ -408,6 +442,12 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
           <Conversation
             state={state}
             route={route}
+            composerValue={
+              composerValues[replyComposerKey] ?? emptyComposerValue
+            }
+            onComposerChange={(update) =>
+              updateComposer(replyComposerKey, update)
+            }
             onSelectRun={selectRun}
             onReply={(body, targetAgentIds) =>
               controller.replyToThread({
@@ -624,6 +664,8 @@ function ChannelsPanel({
   modal,
   route,
   state,
+  composerValue,
+  onComposerChange,
   onClose,
   onSelectChannel,
   onSelectThread,
@@ -633,6 +675,8 @@ function ChannelsPanel({
   readonly modal: boolean;
   readonly route: WindowRoute;
   readonly state: WebState;
+  readonly composerValue: ComposerValue;
+  readonly onComposerChange: (update: ComposerValueUpdater) => void;
   readonly onClose: () => void;
   readonly onSelectChannel: (channelId: string) => void;
   readonly onSelectThread: (threadId: string) => void;
@@ -736,6 +780,8 @@ function ChannelsPanel({
             buttonLabel="Start"
             agents={state.agents}
             pending={state.commandPending}
+            value={composerValue}
+            onChange={onComposerChange}
             onSend={onStartThread}
           />
         </div>
@@ -816,11 +862,15 @@ function WorkbenchHeader({
 function Conversation({
   state,
   route,
+  composerValue,
+  onComposerChange,
   onSelectRun,
   onReply,
 }: {
   readonly state: WebState;
   readonly route: WindowRoute;
+  readonly composerValue: ComposerValue;
+  readonly onComposerChange: (update: ComposerValueUpdater) => void;
   readonly onSelectRun: (runId: string, threadId: string, channelId: string) => void;
   readonly onReply: (
     body: string,
@@ -929,6 +979,8 @@ function Conversation({
           buttonLabel="Reply"
           agents={state.agents}
           pending={state.commandPending}
+          value={composerValue}
+          onChange={onComposerChange}
           onSend={onReply}
         />
       </div>
@@ -1403,6 +1455,8 @@ function CommandComposer({
   buttonLabel,
   agents,
   pending,
+  value,
+  onChange,
   onSend,
 }: {
   readonly id: string;
@@ -1411,27 +1465,34 @@ function CommandComposer({
   readonly buttonLabel: string;
   readonly agents: readonly AgentStatus[];
   readonly pending: boolean;
+  readonly value: ComposerValue;
+  readonly onChange: (update: ComposerValueUpdater) => void;
   readonly onSend: (
     body: string,
     targetAgentIds?: readonly string[],
   ) => Promise<void>;
 }) {
-  const [draft, setDraft] = useState("");
-  const [agentId, setAgentId] = useState("");
   const [error, setError] = useState<string | null>(null);
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    const body = draft.trim();
+    const body = value.draft.trim();
     if (!body) {
       textAreaRef.current?.focus();
       return;
     }
     setError(null);
+    const submittedDraft = value.draft;
+    const submittedAgentId = value.agentId;
     try {
-      await onSend(body, agentId ? [agentId] : undefined);
-      setDraft("");
+      await onSend(body, submittedAgentId ? [submittedAgentId] : undefined);
+      onChange((current) =>
+        current.draft === submittedDraft &&
+        current.agentId === submittedAgentId
+          ? { ...current, draft: "" }
+          : current,
+      );
     } catch (sendError) {
       setError(
         sendError instanceof Error
@@ -1448,8 +1509,11 @@ function CommandComposer({
       <textarea
         id={`${id}-body`}
         ref={textAreaRef}
-        value={draft}
-        onChange={(event) => setDraft(event.target.value)}
+        value={value.draft}
+        onChange={(event) => {
+          const draft = event.target.value;
+          onChange((current) => ({ ...current, draft }));
+        }}
         placeholder={placeholder}
         rows={3}
         aria-describedby={error ? `${id}-error` : undefined}
@@ -1463,8 +1527,11 @@ function CommandComposer({
         <label htmlFor={`${id}-agent`}>Notify</label>
         <select
           id={`${id}-agent`}
-          value={agentId}
-          onChange={(event) => setAgentId(event.target.value)}
+          value={value.agentId}
+          onChange={(event) => {
+            const agentId = event.target.value;
+            onChange((current) => ({ ...current, agentId }));
+          }}
         >
           <option value="">No Agent</option>
           {agents.map((agent) => (
@@ -1476,7 +1543,7 @@ function CommandComposer({
         <button
           className="send-button"
           type="submit"
-          disabled={pending || !draft.trim()}
+          disabled={pending || !value.draft.trim()}
         >
           {pending ? (
             <RefreshCw className="spin" aria-hidden="true" size={15} />

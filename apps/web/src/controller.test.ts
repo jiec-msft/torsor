@@ -114,6 +114,8 @@ function createHarness(
     agentResponse?: (callNumber: number) => Promise<Response>;
     reconnectProbeDelayMs?: number;
     agentLivenessRefreshMs?: number;
+    apiBase?: string;
+    useDefaultEventSource?: boolean;
   } = {},
 ) {
   FakeEventSource.instances = [];
@@ -235,10 +237,15 @@ function createHarness(
     throw new Error(`Unhandled fetch: ${url}`);
   });
   const controller = new WebController({
+    ...(options.apiBase ? { apiBase: options.apiBase } : {}),
     fetch: fetchMock as typeof fetch,
     sessionStorage: storage,
-    eventSourceFactory: (url) =>
-      new FakeEventSource(url) as unknown as EventSource,
+    ...(options.useDefaultEventSource
+      ? {}
+      : {
+          eventSourceFactory: (url: string) =>
+            new FakeEventSource(url) as unknown as EventSource,
+        }),
     broadcastChannelFactory: () => {
       const channel = new FakeBroadcastChannel();
       broadcasts.push(channel);
@@ -362,6 +369,42 @@ describe("WebController", () => {
     });
     expect(FakeEventSource.instances).toHaveLength(1);
     expect(FakeEventSource.instances[0]?.url).toContain("cursor=event-7");
+  });
+
+  it("uses credentials for the native EventSource with an absolute API base", async () => {
+    const creations: Array<{
+      url: string | URL;
+      options?: EventSourceInit;
+    }> = [];
+    class CredentialedEventSource extends FakeEventSource {
+      constructor(url: string | URL, options?: EventSourceInit) {
+        super(String(url));
+        creations.push({ url, ...(options ? { options } : {}) });
+      }
+    }
+    vi.stubGlobal("EventSource", CredentialedEventSource);
+    try {
+      const harness = createHarness({
+        apiBase: "https://api.example.test",
+        useDefaultEventSource: true,
+      });
+
+      await harness.controller.exchangeSession(
+        "local-secret",
+        "project-sample",
+      );
+
+      expect(creations).toEqual([
+        {
+          url:
+            "https://api.example.test/api/v1/events?projectId=project-sample&cursor=event-7",
+          options: { withCredentials: true },
+        },
+      ]);
+      harness.controller.dispose();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("clears expired session state and closes the event stream on a 401", async () => {
@@ -1269,6 +1312,119 @@ describe("WebController", () => {
     }
   });
 
+  it("backs off a failed Thread projection while an unrelated Runs refresh remains pending", async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveSlowRuns: ((response: Response) => void) | undefined;
+      let threadCalls = 0;
+      const convergedThread = { ...thread, cursor: 4 };
+      const harness = createHarness({
+        reconnectProbeDelayMs: 1_000,
+        agentLivenessRefreshMs: 10_000,
+        threadResponse: () => {
+          threadCalls += 1;
+          if (threadCalls === 1) {
+            return Promise.resolve(json({ thread }));
+          }
+          if (threadCalls === 2) {
+            return Promise.resolve(
+              json(
+                {
+                  error: {
+                    code: "projection_unavailable",
+                    message: "Thread projection is temporarily unavailable.",
+                  },
+                },
+                503,
+              ),
+            );
+          }
+          return Promise.resolve(json({ thread: convergedThread }));
+        },
+        runsResponse: (callNumber) =>
+          callNumber === 2
+            ? new Promise((resolve) => {
+                resolveSlowRuns = resolve;
+              })
+            : Promise.resolve(
+                json({
+                  items: [runProjection],
+                  nextCursor: null,
+                  hasMore: false,
+                  snapshotEventId: "event-7",
+                }),
+              ),
+      });
+      await harness.controller.exchangeSession(
+        "local-secret",
+        "project-sample",
+      );
+      await harness.controller.loadThreads("channel-general");
+      await harness.controller.loadThread("thread-1");
+      const baseline = { ...harness.counts };
+      const baselineTimers = vi.getTimerCount();
+      const events = FakeEventSource.instances[0]!;
+
+      events.emit(
+        publicEvent({
+          eventId: "event-slow-runs-0",
+          type: "RunInputAdded",
+          entityType: "RunInput",
+          entityId: "run-input-0",
+          payload: { runId: "run-1" },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      for (let index = 1; index < 20; index += 1) {
+        await vi.advanceTimersByTimeAsync(10);
+        events.emit(
+          publicEvent({
+            eventId: `event-slow-runs-${index}`,
+            type: "RunInputAdded",
+            entityType: "RunInput",
+            entityId: `run-input-${index}`,
+            payload: { runId: "run-1" },
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(0);
+      }
+
+      expect(harness.counts.thread).toBe(baseline.thread + 1);
+      expect(harness.counts.runs).toBe(baseline.runs + 1);
+      expect(vi.getTimerCount()).toBeLessThanOrEqual(baselineTimers + 1);
+
+      await vi.advanceTimersByTimeAsync(810);
+      expect(harness.counts.thread).toBe(baseline.thread + 2);
+      expect(harness.controller.getSnapshot().thread?.cursor).toBe(4);
+      expect(harness.counts.runs).toBe(baseline.runs + 1);
+
+      resolveSlowRuns?.(
+        json({
+          items: [runProjection],
+          nextCursor: null,
+          hasMore: false,
+          snapshotEventId: "event-7",
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.counts.runs).toBe(baseline.runs + 2);
+
+      const reconciledCounts = { ...harness.counts };
+      events.emit(
+        publicEvent({
+          eventId: "event-slow-runs-19",
+          entityType: "RunInput",
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.counts).toEqual(reconciledCounts);
+      harness.controller.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("refreshes selected and global Run facts for activation completion", async () => {
     const harness = createHarness();
     await harness.controller.exchangeSession("local-secret", "project-sample");
@@ -1454,6 +1610,55 @@ describe("WebController", () => {
       "X-Torsor-CSRF": "csrf-second",
     });
     expect(first.controller.getSnapshot().session).toBe("ready");
+  });
+
+  it("ignores an invalid-CSRF response from a superseded session", async () => {
+    let resolveOldCommand: ((response: Response) => void) | undefined;
+    const harness = createHarness({
+      commandResponse: () =>
+        new Promise((resolve) => {
+          resolveOldCommand = resolve;
+        }),
+    });
+    await harness.controller.exchangeSession(
+      "first-secret",
+      "project-sample",
+    );
+    const oldEvents = FakeEventSource.instances[0]!;
+    const oldCommand = harness.controller.replyToThread({
+      threadRootId: "thread-1",
+      expectedThreadCursor: 2,
+      body: "Do not expire the replacement session.",
+    });
+    await waitFor(() => expect(harness.counts.commands).toBe(1));
+
+    await harness.controller.signOut();
+    await harness.controller.exchangeSession(
+      "replacement-secret",
+      "project-sample",
+    );
+    const replacementEvents = FakeEventSource.instances[1]!;
+    replacementEvents.open();
+    resolveOldCommand?.(
+      json(
+        {
+          error: {
+            code: "invalid_csrf_token",
+            message: "The superseded browser session CSRF token is invalid.",
+          },
+        },
+        403,
+      ),
+    );
+
+    await expect(oldCommand).rejects.toMatchObject({
+      status: 403,
+      code: "invalid_csrf_token",
+    });
+    expect(harness.controller.getSnapshot().session).toBe("ready");
+    expect(harness.controller.getSnapshot().connection).toBe("live");
+    expect(oldEvents.closed).toBe(true);
+    expect(replacementEvents.closed).toBe(false);
   });
 
   it("discards an older same-projection response that arrives last", async () => {

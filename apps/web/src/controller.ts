@@ -176,7 +176,8 @@ export class WebController {
     this.#apiBase = options.apiBase ?? "";
     this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.#eventSourceFactory =
-      options.eventSourceFactory ?? ((url) => new EventSource(url));
+      options.eventSourceFactory ??
+      ((url) => new EventSource(url, { withCredentials: true }));
     this.#storage = options.sessionStorage ?? sessionStorage;
     this.#reconnectProbeDelayMs = options.reconnectProbeDelayMs ?? 1_500;
     this.#agentLivenessRefreshMs = options.agentLivenessRefreshMs ?? 30_000;
@@ -740,7 +741,8 @@ export class WebController {
             if (
               retryError instanceof ApiError &&
               retryError.status === 403 &&
-              retryError.code === "invalid_csrf_token"
+              retryError.code === "invalid_csrf_token" &&
+              this.#sessionGeneration === sessionGeneration
             ) {
               this.#clearSession("expired", false);
             } else if (this.#sessionGeneration === sessionGeneration) {
@@ -749,7 +751,9 @@ export class WebController {
             throw retryError;
           }
         }
-        this.#clearSession("expired", false);
+        if (this.#sessionGeneration === sessionGeneration) {
+          this.#clearSession("expired", false);
+        }
       } else if (this.#sessionGeneration === sessionGeneration) {
         this.#setState({ commandPending: false });
       }
@@ -990,24 +994,21 @@ export class WebController {
         this.#projectionSucceeded("events", {});
         return;
       }
-      const results = await Promise.all(
-        work.map(async ({ key, promise }) => ({
-          key,
-          succeeded: await promise,
-        })),
+      await Promise.all(
+        work.map(async ({ key, promise }) => {
+          try {
+            const succeeded = await promise;
+            if (succeeded === true) {
+              this.#reconcileEventProjection(event.eventId, key);
+            } else if (succeeded === false) {
+              this.#scheduleProjectionRetry(key);
+            }
+          } catch (error) {
+            this.#projectionFailed("events", error, {});
+            this.#scheduleProjectionRetry(key);
+          }
+        }),
       );
-      for (const result of results) {
-        if (result.succeeded === true) {
-          this.#reconcileEventProjection(event.eventId, result.key);
-        } else if (result.succeeded === false) {
-          this.#scheduleProjectionRetry(result.key);
-        }
-      }
-    } catch (error) {
-      this.#projectionFailed("events", error, {});
-      for (const item of work) {
-        this.#scheduleProjectionRetry(item.key);
-      }
     } finally {
       this.#processingEventIds.delete(event.eventId);
     }
