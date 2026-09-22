@@ -327,16 +327,44 @@ class Service implements TorsorHttpService {
           "The local bearer credential is invalid.",
         );
       }
+      const now = Date.now();
+      this.#pruneSessions(now);
+      const currentSessionId = cookieValue(request, "torsor_session");
+      const currentSession = currentSessionId
+        ? this.#sessions.get(currentSessionId)
+        : undefined;
+      const reusableEntry =
+        currentSessionId &&
+        currentSession &&
+        sameContext(currentSession.context, context)
+          ? ([currentSessionId, currentSession] as const)
+          : undefined;
+      if (reusableEntry) {
+        const [reusableSessionId, reusableSession] = reusableEntry;
+        response.setHeader(
+          "Set-Cookie",
+          `torsor_session=${reusableSessionId}; HttpOnly; SameSite=Strict; Path=${apiPrefix}; Max-Age=${Math.max(1, Math.ceil((reusableSession.expiresAt - now) / 1_000))}`,
+        );
+        sendJson(response, 201, {
+          authenticated: true,
+          principalId: context.principalId,
+          csrfToken: reusableSession.csrfToken,
+        });
+        return;
+      }
       const sessionId = randomUUID();
       const csrfToken = randomUUID();
-      const expiresAt = Date.now() + this.#sessionDurationMs;
-      this.#pruneSessions(Date.now());
+      const expiresAt = now + this.#sessionDurationMs;
       this.#sessions.set(sessionId, { context, expiresAt, csrfToken });
       response.setHeader(
         "Set-Cookie",
         `torsor_session=${sessionId}; HttpOnly; SameSite=Strict; Path=${apiPrefix}; Max-Age=${Math.max(1, Math.ceil(this.#sessionDurationMs / 1_000))}`,
       );
-      sendJson(response, 201, { authenticated: true, csrfToken });
+      sendJson(response, 201, {
+        authenticated: true,
+        principalId: context.principalId,
+        csrfToken,
+      });
       return;
     }
     if (request.method === "DELETE") {
