@@ -530,7 +530,7 @@ export class AgentRuntime {
         type: "GetThreadProjection",
         threadRootId: attention.threadRootId,
       },
-      this.#runtimeContext,
+      { principalId: agent.principalId, activationId: activation.entityId },
     );
     const triggeringMessage = thread.messages.find((message) =>
       message.revisions.some(
@@ -806,7 +806,7 @@ export class AgentRuntime {
         type: "GetThreadProjection",
         threadRootId: currentProjection.run.threadRootId,
       },
-      this.#runtimeContext,
+      { principalId: agent.principalId, activationId: activationView.id },
     );
     const cause = {
       type: "run",

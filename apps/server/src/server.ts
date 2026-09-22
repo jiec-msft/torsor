@@ -770,7 +770,34 @@ class Service implements TorsorHttpService {
         !controller.signal.aborted &&
         this.#authenticationIsCurrent(authenticated)
       ) {
+        const previousCursor = cursor;
         cursor = page.scannedThroughEventId;
+        for (const event of page.events) {
+          if (!this.#authenticationIsCurrent(authenticated)) {
+            controller.abort();
+            break;
+          }
+          await writeStreamChunk(
+            response,
+            encodeSseEvent(event),
+            controller.signal,
+          );
+          lastWriteAt = Date.now();
+          if (controller.signal.aborted) {
+            break;
+          }
+        }
+        if (controller.signal.aborted || !this.#authenticationIsCurrent(authenticated)) {
+          break;
+        }
+        if (cursor && cursor !== previousCursor && page.events.at(-1)?.eventId !== cursor) {
+          await writeStreamChunk(
+            response,
+            `id: ${cursor}\nevent: checkpoint\ndata: ${JSON.stringify({ cursor })}\n\n`,
+            controller.signal,
+          );
+          lastWriteAt = Date.now();
+        }
         if (page.events.length === 0 && !page.hasMore) {
           await delay(
             this.#authenticationDelay(
@@ -807,24 +834,6 @@ class Service implements TorsorHttpService {
             authenticated.context,
           );
           continue;
-        }
-        for (const event of page.events) {
-          if (!this.#authenticationIsCurrent(authenticated)) {
-            controller.abort();
-            break;
-          }
-          await writeStreamChunk(
-            response,
-            encodeSseEvent(event),
-            controller.signal,
-          );
-          lastWriteAt = Date.now();
-          if (controller.signal.aborted) {
-            break;
-          }
-        }
-        if (controller.signal.aborted) {
-          break;
         }
         if (page.hasMore) {
           await yieldToEventLoop();

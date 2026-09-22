@@ -1,4 +1,5 @@
 import { MAX_REPORT_BYTES, MAX_REPORT_CHUNKS } from "./artifact-storage.js";
+import { visibleArtifactRows } from "./artifact-visibility.js";
 import * as db from "./database.js";
 import { KernelError } from "./errors.js";
 import * as invariants from "./invariants.js";
@@ -93,17 +94,16 @@ export function getArtifact(
   context: PrincipalContext,
 ): ArtifactView {
   const principal = invariants.requirePrincipal(kernel, context.principalId);
-  const row = db.getRow(kernel, "SELECT * FROM artifacts WHERE id = ?", artifactId);
+  const scope = text(principal.kind) === "agent"
+    ? invariants.resolvePrincipalReadScope(
+      kernel, principal, context,
+      text(invariants.requireAgentForPrincipal(kernel, context.principalId).project_id),
+    )
+    : null;
+  requireNonEmpty(artifactId, "artifactId");
+  const [row] = visibleArtifactRows(kernel, scope, { id: artifactId });
   if (!row) {
-    throw new KernelError("NotFound", "The Artifact does not exist.");
-  }
-  const run = invariants.requireRun(kernel, text(row.producer_run_id));
-  authorizeRunRead(kernel, run, principal, context);
-  if (
-    text(row.visibility_channel_id) !== text(run.home_channel_id) ||
-    text(row.producer_thread_root_id) !== text(run.thread_root_id)
-  ) {
-    throw new KernelError("Forbidden", "The Artifact no longer matches its source visibility.");
+    throw new KernelError("NotFound", "The Artifact was not found.");
   }
   return mapArtifact(row);
 }

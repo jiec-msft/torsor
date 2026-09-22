@@ -265,6 +265,11 @@ blobs. One descriptor per Run/digest remains enforced.
 the latter repeats authorization after storage I/O and verifies returned bytes.
 Descriptors expose `byteLength` and `producerThreadRootId`, never storage paths.
 The local model retains global Human/Runtime reads and scoped Agent reads.
+An Agent sees descriptors/events only for its current Run, across current and
+historical projections, bounded event replay and conditional-command catch-up.
+An Attention scope sees no Artifacts. Scope validation precedes descriptor
+lookup; missing and inaccessible IDs return the same generic `NotFound` without
+reading storage. Filtered event scan cursors still advance.
 See paired MVP sections 21.3/21.5, 23.1/23.2/23.4 and 35.3 for requirements.
 
 Worktree mutation is fenced by a Runtime-only durable writer lease. Acquisition
@@ -317,3 +322,15 @@ This pre-release schema is intentionally breaking: stop old processes and
 explicitly recreate disposable databases rather than migrating earlier versions,
 including either schema 14 layout. Opening an older database fails without
 modifying its version, schema, or data.
+
+Version 15 alone is not compatibility proof. An existing file is checked with a
+read-only connection before any writable open, then rechecked under the schema
+initialization lock. A reference schema in isolated memory supplies a SHA-256
+fingerprint of SQLite object definitions, column/FK/index pragmas and STRICT
+metadata. SQL token comparison ignores formatting/comments but preserves
+quoted literals, operator boundaries, CHECK predicates and trigger bodies.
+Missing, altered or extra-incompatible objects fail unchanged, including files
+with an uncheckpointed WAL; no `CREATE IF NOT EXISTS` repairs are attempted.
+SQLite-owned statistics are excluded. Integrity and required durable config
+rows are checked too. Only an empty version-0 database runs DDL/config/bootstrap,
+atomically; a valid reopen never reapplies bootstrap.

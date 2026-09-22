@@ -271,9 +271,9 @@ describe("durable causal limits (MVP 25.1-25.2, 28.2, 32.7)", () => {
       ...report, runId: child.entityId, ...{ parentRunId: root.entityId },
     }, childContext)).rejects.toMatchObject({ code: "InvalidCommand" });
     await expect(kernel.readArtifact(rootReport.entityId, childContext))
-      .rejects.toMatchObject({ code: "Forbidden" });
+      .rejects.toMatchObject({ code: "NotFound" });
     await expect(kernel.readArtifact(childReport.entityId, rootContext))
-      .rejects.toMatchObject({ code: "Forbidden" });
+      .rejects.toMatchObject({ code: "NotFound" });
 
     const grandchildDecision = await delegate(kernel, child, childContext, "orbit", "artifact-grandchild");
     await expect(kernel.execute(grandchildDecision.command, grandchildDecision.context))

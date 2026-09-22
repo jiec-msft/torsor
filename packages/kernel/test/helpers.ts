@@ -50,7 +50,7 @@ export function openMemoryKernel(clock?: () => Date): TorsorKernel {
 }
 
 export async function claimRunOutboxAuthority(
-  kernel: TorsorKernel,
+  kernel: Pick<TorsorKernel, "execute">,
   runId: string,
   key: string,
   runInputId?: string,

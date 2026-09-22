@@ -145,7 +145,7 @@ export function publishRunReply(kernel: db.KernelContext, command: Extract<Kerne
   const run = invariants.requireMutableRun(kernel, command.runId, command.expectedRunRevision);
   const activation = invariants.requireRunActivation(kernel, context, principal, run);
   const thread = invariants.requireThread(kernel, text(run.thread_root_id));
-  invariants.checkThreadCursor(kernel, thread, command.expectedThreadCursor);
+  invariants.checkThreadCursor(kernel, thread, principal, context, command.expectedThreadCursor);
   const created = collaboration.createMessage(kernel, {
     projectId: text(run.project_id),
     channelId: text(run.home_channel_id),
@@ -266,7 +266,7 @@ export function completeRun(kernel: db.KernelContext, command: Extract<KernelCom
   let finalMessageId: string | null = null;
   if (command.finalReply) {
     const thread = invariants.requireThread(kernel, text(run.thread_root_id));
-    invariants.checkThreadCursor(kernel, thread, command.finalReply.expectedThreadCursor);
+    invariants.checkThreadCursor(kernel, thread, principal, context, command.finalReply.expectedThreadCursor);
     const created = collaboration.createMessage(kernel, {
       projectId: text(run.project_id),
       channelId: text(run.home_channel_id),

@@ -41,9 +41,11 @@ comma-separated list of Projects whose existing Attentions the Runtime scans
 at startup; Projects encountered through durable outbox work are loaded
 dynamically.
 
-The bootstrap file uses `KernelBootstrap` JSON. It is applied idempotently when
-the current-schema database opens. Incompatible development schemas fail
-clearly and must be recreated; the host does not migrate them.
+The bootstrap file uses `KernelBootstrap` JSON. It is applied with schema/config
+creation in one transaction only for an empty version-0 database, never reapplied
+on reopen. Existing schema 15 files undergo complete read-only schema-contract
+validation before a writable connection is opened. Incompatible or partial
+development schemas fail unchanged; the host does not repair or migrate them.
 
 Library callers can use `createLocalRuntimeHost` with any existing
 `ProviderAdapter`. Tests use the deterministic fake through this same
@@ -115,6 +117,14 @@ subscribe from `bootstrap.latestEventId` to avoid a snapshot/subscription gap.
 Replay uses the Kernel `ReadPublicEvents` query, so authorization and filtered
 cursor advancement remain project-scoped and bounded without rebuilding Thread
 projections for every event.
+An Agent sees Artifact metadata/events only for its current Run, including
+historical projections; Attention scopes see none. Filtered tails emit
+`event: checkpoint` with the opaque scan cursor as both `id` and `data.cursor`,
+without hidden Artifact metadata. Clients retain that cursor for replacement
+connections; native reconnects use `Last-Event-ID`. Descriptor/content reads
+validate live scope first and return the same generic 404 for absent and
+inaccessible IDs. Unauthenticated calls remain 401 and stale scope errors do
+not depend on Artifact existence.
 
 Thread and Run list routes use the Kernel's atomic as-of projection pages.
 `snapshot` from the first page is reused with `after` on later pages, excluding

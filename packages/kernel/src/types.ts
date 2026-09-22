@@ -95,6 +95,7 @@ export interface CausalLimits {
 export interface KernelOpenOptions {
   readonly databasePath: string;
   readonly artifactStorage?: ArtifactStorage;
+  /** Applied atomically only when initializing an empty version-0 database. */
   readonly bootstrap?: KernelBootstrap;
   readonly clock?: () => Date;
   readonly idFactory?: (prefix: string) => string;

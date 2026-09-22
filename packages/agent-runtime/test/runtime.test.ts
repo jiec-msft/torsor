@@ -11,6 +11,7 @@ import {
   type RecoverableAttentionExecutionPage,
 } from "@torsor/kernel";
 import { describe, expect, it, vi } from "vitest";
+import { seedArtifactScopes } from "../../kernel/test/artifact-scope-fixture.js";
 
 import {
   AgentRuntime,
@@ -115,6 +116,57 @@ const runtimeContext = { principalId: "principal-runtime" } as const;
 let kernelInstance = 0;
 
 describe("AgentRuntime", () => {
+  it("delivers only owning-Run Artifacts to Providers and none to Attention contexts", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "torsor-provider-artifact-scope-"));
+    const clock = () => new Date("2026-09-21T08:00:00.000Z");
+    const kernel = TorsorKernel.open({
+      databasePath: join(directory, "state.sqlite"), clock,
+      artifactStorage: await LocalArtifactStorage.open(join(directory, "content")),
+      bootstrap: {
+        ...bootstrap,
+        agents: bootstrap.agents!.map((agent) => agent.id === "agent-keel"
+          ? { ...agent, projectId: "project-sample" } : agent),
+      },
+    });
+    try {
+      const scopes = await seedArtifactScopes(kernel);
+      const artifacts = new Map<string, string>();
+      for (const run of [scopes.parent, scopes.sibling, scopes.child, scopes.unrelated]) {
+        const result = await kernel.finalizeReport({
+          runId: run.runId, expectedRunRevision: 1, idempotencyKey: "report",
+          content: Buffer.from(run === scopes.child ? "Child bytes." : "Shared bytes."),
+        }, run.context);
+        artifacts.set(run.runId, result.entityId);
+        await kernel.execute({
+          type: "SendToRun", idempotencyKey: `resume-${run.runId}`, runId: run.runId,
+          expectedRunRevision: 1, body: "Resume this synthetic report.",
+        }, humanContext);
+      }
+      await kernel.execute({
+        type: "ReplyToThread", idempotencyKey: "attention-context", threadRootId: scopes.threadId,
+        body: "Consider a follow-up.", targetAgentIds: ["agent-orbit"],
+      }, humanContext);
+      const observed: Array<{ runId: string | null; artifacts: readonly string[] }> = [];
+      const adapter = new DeterministicFakeAdapter(async (context) => {
+        const runId = context.cause.type === "run" ? context.cause.run.run.id : null;
+        observed.push({ runId, artifacts: context.cause.thread.artifacts.map((artifact) => artifact.id) });
+        if (context.cause.type === "attention") await context.capabilities.ignoreAttention("No further work.");
+        else await context.capabilities.complete();
+      });
+      await createRuntime(kernel, adapter).drainUntilIdle();
+      expect(observed).toHaveLength(5);
+      for (const item of observed) {
+        expect(item.artifacts).toEqual(item.runId ? [artifacts.get(item.runId)] : []);
+      }
+      const thread = await kernel.query({ type: "GetThreadProjection", threadRootId: scopes.threadId }, humanContext);
+      expect(thread.runs.every((run) => run.state === "Completed")).toBe(true);
+      expect(thread.artifacts).toHaveLength(4);
+    } finally {
+      kernel.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     { maxDepth: 0, maxNonTerminalRunsPerRoot: 50, dimension: "depth" },
     { maxDepth: 4, maxNonTerminalRunsPerRoot: 1, dimension: "nonTerminalRuns" },

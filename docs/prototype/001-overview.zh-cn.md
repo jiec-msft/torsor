@@ -1023,6 +1023,16 @@ descriptor。此前 causal-only schema 14 和独立开发的 Artifact-only schem
 开发数据库必须在应用 DDL/Bootstrap 前明确拒绝，不迁移、不改写版本、不删除数据。
 停止旧进程后由操作者显式重建可丢弃数据库。schema 15 重开仍校验持久 causal 配置。
 
+`user_version = 15` 不是布局证明。已有数据库必须在任何 DDL、Bootstrap 或配置写入
+之前，以只读方式对照由可信 DDL 在隔离内存库生成的完整 schema 指纹：对象集合、
+列/type/not-null/default/PK/FK、索引/唯一性/partial predicate、trigger、CHECK
+和 STRICT 等约束。比较 SQLite 解析后的 metadata 与保留 literal/operator 语义的
+SQL token；只忽略空白、注释和未引用 keyword/identifier 大小写，不删除字符串内空白。
+缺失、额外不兼容、部分、损坏、前驱形状或未来布局必须拒绝，保持原文件字节及逻辑
+状态不变，不用 `CREATE IF NOT EXISTS` 修补。SQLite 自有统计对象不属于应用布局。
+只有没有持久对象的 version 0 数据库可在同一事务内执行 DDL、初始配置及 Bootstrap；
+失败完整回滚。有效 schema 15 重开不重新应用 Bootstrap，也不修改持久 causal 配置。
+
 Runtime Host 调度恢复 pass 时，连续执行的 pass 数量必须有界，并在继续前让出事件循环并重新检查关闭请求。积压处理不得饿死 HTTP、timer、signal 或关闭处理。空闲轮询等待必须可被关闭请求中断；无论等待还是关闭先完成，都必须移除对应 listener 并取消不再需要的 timer。
 
 ## 22. Worktree 和 Writer Lease
@@ -1136,6 +1146,23 @@ Run/Thread 及分页投影必须同时保留 causal 字段和 Artifact 引用。
 4. 当前本地权限模型中 Human/Runtime 拥有全局读取权，Agent 受实时 Activation
    的 Project/Channel/Thread/Run scope 限制；不在本片新增 ACL 管理系统。
    如后续使用短期签名 URL，它不能绕过当前权限复核。
+5. Agent 只能读取 `producer_run_id = scope.runId` 的平台 Artifact metadata；
+   Attention scope 没有 Run，因此不含任何 Artifact。此规则同时适用于当前/历史
+   Thread 与 Run 投影、列表、分页、条件提交的 catch-up 错误、事件和 SSE，以及
+   Runtime 提供给 Provider 的上下文；同 Thread、亲属关系或相同内容不扩大授权。
+   不返回被过滤 Artifact 的列表项、数量、digest、来源或事件 payload。显式公开
+   Message 的正文仍是 Channel/Thread 沟通，不因此变成 descriptor 或读取授权。
+6. 查找 Artifact ID 前先校验 Principal 和当前 Activation/scope。已授权调用者的
+   不存在及不可见 ID 均返回相同的 `NotFound`（HTTP 404）、通用 message 和响应
+   headers，不附带存在性、存储或来源详情，不读取不可见 blob。未认证仍为 401；
+   stale/revoked scope 的确定性错误在查找前产生，与 ID 是否存在无关。
+7. 过滤不阻断有界扫描：`scannedThroughEventId` 继续推进，它是 opaque 高水位而非
+   隐藏报告的数量或身份。SSE 对过滤尾部发送只含 opaque `cursor` 的 `checkpoint`
+   事件并设置 `id`；Client 的原生重连及替换连接采用该高水位，不合成 Artifact
+   timeline 条目、不暴露过滤 payload，也不清空已加载历史或 Composer 状态。
+   条件提交的 catch-up 最多扫描 100 个事件，同时返回 `scannedThroughEventId`
+   和 `hasMore`，过滤发生在扫描之后。Artifact 事件不通过跨窗口 BroadcastChannel
+   转发或接收；每个窗口只消费自己的已认证流，旧连接不能覆盖新 scope 的游标。
 
 ### 23.3 集成
 
@@ -1500,6 +1527,10 @@ type 和 Run/Thread 来源，并通过授权 HTTP 接口下载。尚未固化的
 临时文件和 orphan blob 不得显示为已发布 Artifact。存储缺失、篡改、权限变化或
 下载失败必须显式失败，不能显示空白成功。新增 Artifacts UI、GitHub 状态机、
 Worktree 执行、通用插件市场和 ArtifactInput 均不属于本片。
+
+初始页面、历史回填和实时替换均遵循 §23.2 的当前 scope，不能把同 Thread 的
+其他 Run 报告混入 Agent 的列表或计数。过滤 checkpoint 只更新恢复游标，不构造
+报告条目或重置 Timeline/Composer；切换认证 scope 后不得保留前一 scope 的投影。
 
 `Live` 不应是静态 Run Dashboard。推荐按时间顺序投影：
 

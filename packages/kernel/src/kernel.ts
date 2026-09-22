@@ -476,14 +476,14 @@ export class TorsorKernel {
         case "GetThreadProjection": {
           const thread = requireThread(this.#context, query.threadRootId);
           assertProjectAccess(this.#context, principal, text(thread.project_id));
-          assertAgentQueryScope(
+          const scope = assertAgentQueryScope(
             this.#context,
             principal,
             principalContext,
             text(thread.project_id),
             query.threadRootId,
           );
-          result = getThreadProjection(this.#context, query.threadRootId);
+          result = getThreadProjection(this.#context, query.threadRootId, scope);
           break;
         }
         case "GetRunProjection": {

@@ -284,7 +284,7 @@ describe("trusted report finalization (MVP 21.3/21.5, 23, 35.3)", () => {
       db.exec("INSERT INTO channels (id, project_id, name) VALUES ('channel-other', 'project-sample', 'other')");
       db.prepare("UPDATE runs SET home_channel_id = 'channel-other' WHERE id = ?").run(f.setup.runId);
       await expect(f.kernel.query({ type: "GetArtifact", artifactId: small.entityId }, humanContext))
-        .rejects.toMatchObject({ code: "Forbidden" });
+        .rejects.toMatchObject({ code: "NotFound" });
     } finally {
       db.close();
     }
@@ -320,9 +320,9 @@ describe("trusted report finalization (MVP 21.3/21.5, 23, 35.3)", () => {
     }, runtimeContext);
     const other = await createRun(f.kernel, "-other");
     await expect(f.kernel.query({ type: "GetArtifact", artifactId: result.entityId }, other.agentContext))
-      .rejects.toMatchObject({ code: "Forbidden" });
+      .rejects.toMatchObject({ code: "NotFound" });
     await expect(f.kernel.readArtifact(result.entityId, other.agentContext))
-      .rejects.toMatchObject({ code: "Forbidden" });
+      .rejects.toMatchObject({ code: "NotFound" });
     await expect(f.kernel.finalizeReport(f.input, other.agentContext))
       .rejects.toMatchObject({ code: "Forbidden" });
     expect((await f.kernel.readArtifact(result.entityId, f.setup.agentContext)).content).toEqual(f.input.content);
