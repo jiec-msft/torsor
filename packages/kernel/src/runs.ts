@@ -1,5 +1,6 @@
 
 import * as collaboration from "./collaboration.js";
+import { causalCapacity } from "./causal-limits.js";
 import * as db from "./database.js";
 import { KernelError } from "./errors.js";
 import * as execution from "./execution.js";
@@ -144,7 +145,7 @@ export function publishRunReply(kernel: db.KernelContext, command: Extract<Kerne
   const run = invariants.requireMutableRun(kernel, command.runId, command.expectedRunRevision);
   const activation = invariants.requireRunActivation(kernel, context, principal, run);
   const thread = invariants.requireThread(kernel, text(run.thread_root_id));
-  invariants.checkThreadCursor(kernel, thread, command.expectedThreadCursor);
+  invariants.checkThreadCursor(kernel, thread, principal, context, command.expectedThreadCursor);
   const created = collaboration.createMessage(kernel, {
     projectId: text(run.project_id),
     channelId: text(run.home_channel_id),
@@ -167,48 +168,6 @@ export function publishRunReply(kernel: db.KernelContext, command: Extract<Kerne
       messageRevisionId: created.messageRevisionId,
       activationId: text(activation.id),
     },
-  };
-}
-
-export function publishArtifact(kernel: db.KernelContext, command: Extract<KernelCommand, {
-  type: "PublishArtifact";
-}>, principal: Row, context: PrincipalContext, correlationId: string): CommandResult {
-  const run = invariants.requireMutableRun(kernel, command.runId, command.expectedRunRevision);
-  const activation = invariants.requireRunActivation(kernel, context, principal, run);
-  requireNonEmpty(command.contentDigest, "contentDigest");
-  requireNonEmpty(command.baseRevision, "baseRevision");
-  requireNonEmpty(command.mediaType, "mediaType");
-  requireNonEmpty(command.storageLocation, "storageLocation");
-  const artifactId = kernel.idFactory("artifact");
-  db.run(kernel, `INSERT INTO artifacts
-        (id, content_digest, producer_run_id, producer_activation_id,
-         base_revision, media_type, storage_location, visibility_channel_id,
-         metadata_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, artifactId, command.contentDigest, command.runId, text(activation.id), command.baseRevision, command.mediaType, command.storageLocation, text(run.home_channel_id), command.metadata === undefined ? null : JSON.stringify(command.metadata), db.now(kernel));
-  const cursor = invariants.emitThreadEvent(kernel, {
-    type: "ArtifactPublished",
-    projectId: text(run.project_id),
-    channelId: text(run.home_channel_id),
-    threadRootId: text(run.thread_root_id),
-    entityType: "Artifact",
-    entityId: artifactId,
-    actorPrincipalId: text(principal.id),
-    activationId: text(activation.id),
-    causationId: command.runId,
-    correlationId,
-    payload: {
-      runId: command.runId,
-      contentDigest: command.contentDigest,
-      baseRevision: command.baseRevision,
-    },
-  });
-  invariants.enqueueOutbox(kernel, "artifact.published", "Artifact", artifactId, { runId: command.runId, contentDigest: command.contentDigest });
-  return {
-    commandType: command.type,
-    entityId: artifactId,
-    revision: integer(run.revision),
-    threadCursor: cursor,
-    relatedIds: { activationId: text(activation.id), runId: command.runId },
   };
 }
 
@@ -307,7 +266,7 @@ export function completeRun(kernel: db.KernelContext, command: Extract<KernelCom
   let finalMessageId: string | null = null;
   if (command.finalReply) {
     const thread = invariants.requireThread(kernel, text(run.thread_root_id));
-    invariants.checkThreadCursor(kernel, thread, command.finalReply.expectedThreadCursor);
+    invariants.checkThreadCursor(kernel, thread, principal, context, command.finalReply.expectedThreadCursor);
     const created = collaboration.createMessage(kernel, {
       projectId: text(run.project_id),
       channelId: text(run.home_channel_id),
@@ -339,7 +298,7 @@ export function completeRun(kernel: db.KernelContext, command: Extract<KernelCom
     activationId: text(activation.id),
     causationId: text(activation.id),
     correlationId,
-    payload: { revision, finalMessageId },
+    payload: { revision, finalMessageId, ...causalCapacity(kernel, text(run.causal_root_id)) },
   });
   invariants.enqueueOutbox(kernel, "run.completed", "Run", command.runId, { revision, finalMessageId });
   return {
@@ -453,7 +412,7 @@ export function terminateRun(kernel: db.KernelContext, run: Row, state: "Failed"
     activationId,
     causationId: activationId ?? runId,
     correlationId,
-    payload: { revision, reason },
+    payload: { revision, reason, ...causalCapacity(kernel, text(run.causal_root_id)) },
   });
   invariants.enqueueOutbox(kernel, `run.${state.toLowerCase()}`, "Run", runId, { revision, reason });
   return {

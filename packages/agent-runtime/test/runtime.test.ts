@@ -5,11 +5,13 @@ import { fileURLToPath } from "node:url";
 
 import {
   KernelError,
+  LocalArtifactStorage,
   TorsorKernel,
   type KernelBootstrap,
   type RecoverableAttentionExecutionPage,
 } from "@torsor/kernel";
 import { describe, expect, it, vi } from "vitest";
+import { seedArtifactScopes } from "../../kernel/test/artifact-scope-fixture.js";
 
 import {
   AgentRuntime,
@@ -114,6 +116,120 @@ const runtimeContext = { principalId: "principal-runtime" } as const;
 let kernelInstance = 0;
 
 describe("AgentRuntime", () => {
+  it("delivers only owning-Run Artifacts to Providers and none to Attention contexts", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "torsor-provider-artifact-scope-"));
+    const clock = () => new Date("2026-09-21T08:00:00.000Z");
+    const kernel = TorsorKernel.open({
+      databasePath: join(directory, "state.sqlite"), clock,
+      artifactStorage: await LocalArtifactStorage.open(join(directory, "content")),
+      bootstrap: {
+        ...bootstrap,
+        agents: bootstrap.agents!.map((agent) => agent.id === "agent-keel"
+          ? { ...agent, projectId: "project-sample" } : agent),
+      },
+    });
+    try {
+      const scopes = await seedArtifactScopes(kernel);
+      const artifacts = new Map<string, string>();
+      for (const run of [scopes.parent, scopes.sibling, scopes.child, scopes.unrelated]) {
+        const result = await kernel.finalizeReport({
+          runId: run.runId, expectedRunRevision: 1, idempotencyKey: "report",
+          content: Buffer.from(run === scopes.child ? "Child bytes." : "Shared bytes."),
+        }, run.context);
+        artifacts.set(run.runId, result.entityId);
+        await kernel.execute({
+          type: "SendToRun", idempotencyKey: `resume-${run.runId}`, runId: run.runId,
+          expectedRunRevision: 1, body: "Resume this synthetic report.",
+        }, humanContext);
+      }
+      await kernel.execute({
+        type: "ReplyToThread", idempotencyKey: "attention-context", threadRootId: scopes.threadId,
+        body: "Consider a follow-up.", targetAgentIds: ["agent-orbit"],
+      }, humanContext);
+      const observed: Array<{ runId: string | null; artifacts: readonly string[] }> = [];
+      const adapter = new DeterministicFakeAdapter(async (context) => {
+        const runId = context.cause.type === "run" ? context.cause.run.run.id : null;
+        observed.push({ runId, artifacts: context.cause.thread.artifacts.map((artifact) => artifact.id) });
+        if (context.cause.type === "attention") await context.capabilities.ignoreAttention("No further work.");
+        else await context.capabilities.complete();
+      });
+      await createRuntime(kernel, adapter).drainUntilIdle();
+      expect(observed).toHaveLength(5);
+      for (const item of observed) {
+        expect(item.artifacts).toEqual(item.runId ? [artifacts.get(item.runId)] : []);
+      }
+      const thread = await kernel.query({ type: "GetThreadProjection", threadRootId: scopes.threadId }, humanContext);
+      expect(thread.runs.every((run) => run.state === "Completed")).toBe(true);
+      expect(thread.artifacts).toHaveLength(4);
+    } finally {
+      kernel.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { maxDepth: 0, maxNonTerminalRunsPerRoot: 50, dimension: "depth" },
+    { maxDepth: 4, maxNonTerminalRunsPerRoot: 1, dimension: "nonTerminalRuns" },
+  ])("surfaces causal $dimension rejection through the production capability bridge", async (limits) => {
+    const directory = mkdtempSync(join(tmpdir(), "torsor-runtime-causal-"));
+    const kernel = TorsorKernel.open({
+      databasePath: join(directory, "kernel.sqlite"),
+      bootstrap: {
+        ...bootstrap,
+        agents: bootstrap.agents!.map((agent) => agent.id === "agent-keel"
+          ? { ...agent, projectId: "project-sample", config: {
+            provider: "deterministic-fake",
+            causalLimits: { maxDepth: 999, maxNonTerminalRunsPerRoot: 999 },
+          } }
+          : agent),
+      },
+      causalLimits: {
+        maxDepth: limits.maxDepth,
+        maxNonTerminalRunsPerRoot: limits.maxNonTerminalRunsPerRoot,
+      },
+      clock: () => new Date("2026-09-21T08:00:00.000Z"),
+    });
+    let refusals = 0;
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        if (context.cause.attention.targetAgentId === "agent-orbit") {
+          await context.capabilities.createRunFromAttention();
+        } else {
+          await expect(context.capabilities.createRunFromAttention())
+            .rejects.toMatchObject({
+              code: "CausalLimitExceeded", details: { dimension: limits.dimension },
+            });
+          refusals += 1;
+          await context.capabilities.ignoreAttention("Causal limit requires Human guidance.");
+        }
+        return;
+      }
+      expect(context.cause.run.run.delegationDepth).toBe(0);
+      await context.capabilities.publishReply({
+        body: "Ask Keel to inspect a separate component.",
+        targetAgentIds: ["agent-keel"],
+      });
+      await context.capabilities.wait("Await Human guidance.");
+    });
+    try {
+      const thread = await mentionAgent(kernel, "causal-bridge");
+      await createRuntime(kernel, adapter).drainUntilIdle();
+      expect(refusals).toBe(1);
+      const projection = await kernel.query({
+        type: "GetThreadProjection", threadRootId: thread.entityId,
+      }, humanContext);
+      expect(projection.runs).toHaveLength(1);
+      expect(projection.runs[0]).toMatchObject({
+        state: "Waiting", causalRootId: thread.entityId, delegationDepth: 0,
+      });
+      expect(projection.attentions.find((item) => item.targetAgentId === "agent-keel"))
+        .toMatchObject({ status: "Ignored" });
+    } finally {
+      kernel.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("drives Attention to durable Run result through a provider attempt", async () => {
     const kernel = openKernel(":memory:");
     const adapter = new DeterministicFakeAdapter();
@@ -3969,6 +4085,46 @@ describe("AgentRuntime", () => {
       );
       const run = await getOnlyRun(kernel);
       expect(run.run.state).toBe("Waiting");
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it.each(["report", "forged-report"] as const)("routes ACP %s only through the trusted report boundary", async (mode) => {
+    const directory = mkdtempSync(join(tmpdir(), "torsor-acp-report-"));
+    const kernel = TorsorKernel.open({
+      databasePath: join(directory, "kernel.sqlite"),
+      bootstrap,
+      artifactStorage: await LocalArtifactStorage.open(join(directory, "content")),
+    });
+    try {
+      await prepareAcpRun(kernel, `acp-${mode}`);
+      const runtime = createRuntime(kernel, createFixtureAcpAdapter(mode));
+      if (mode === "forged-report") {
+        await expect(runtime.runOnce()).rejects.toThrow("publish_report accepts only");
+        expect((await getOnlyRun(kernel)).artifacts).toEqual([]);
+      } else {
+        await runtime.drainUntilIdle();
+        const run = await getOnlyRun(kernel);
+        expect(run.run.state).toBe("Completed");
+        expect(run.artifacts).toHaveLength(1);
+        const read = await kernel.readArtifact(run.artifacts[0]!.id, humanContext);
+        expect(Buffer.from(read.content).toString("utf8")).toBe("Synthetic ACP report.\n");
+        expect(read.artifact.producerRunId).toBe(run.run.id);
+      }
+    } finally {
+      kernel.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects report actions when storage is not configured", async () => {
+    const kernel = openKernel(":memory:");
+    try {
+      await prepareAcpRun(kernel, "report-disabled");
+      await expect(createRuntime(kernel, createFixtureAcpAdapter("report")).runOnce())
+        .rejects.toThrow("Report Artifact storage is not configured");
+      expect((await getOnlyRun(kernel)).artifacts).toEqual([]);
     } finally {
       kernel.close();
     }

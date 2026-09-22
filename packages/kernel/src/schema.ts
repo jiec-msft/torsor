@@ -1,7 +1,13 @@
-export const CURRENT_SCHEMA_VERSION = 14;
+export const CURRENT_SCHEMA_VERSION = 16;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS causal_limits (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  max_depth INTEGER NOT NULL CHECK (max_depth >= 0),
+  max_non_terminal_runs_per_root INTEGER NOT NULL CHECK (max_non_terminal_runs_per_root > 0)
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS principals (
   id TEXT PRIMARY KEY,
@@ -137,6 +143,10 @@ CREATE TABLE IF NOT EXISTS runs (
   thread_root_id TEXT NOT NULL,
   owner_agent_id TEXT NOT NULL REFERENCES agents(id),
   agent_config_revision INTEGER NOT NULL,
+  causal_root_id TEXT NOT NULL REFERENCES messages(id),
+  parent_attention_id TEXT NOT NULL REFERENCES attentions(id),
+  parent_run_id TEXT REFERENCES runs(id),
+  delegation_depth INTEGER NOT NULL CHECK (delegation_depth >= 0),
   state TEXT NOT NULL CHECK (state IN ('Active', 'Waiting', 'Completed', 'Failed', 'Cancelled')),
   revision INTEGER NOT NULL CHECK (revision > 0),
   activation_generation INTEGER NOT NULL DEFAULT 0 CHECK (activation_generation >= 0),
@@ -146,11 +156,28 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   terminal_reason TEXT,
+  CHECK (
+    (parent_run_id IS NULL AND delegation_depth = 0)
+    OR (parent_run_id IS NOT NULL AND parent_run_id != id AND delegation_depth > 0)
+  ),
   FOREIGN KEY (owner_agent_id, agent_config_revision)
     REFERENCES agent_config_revisions(agent_id, revision)
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS runs_thread_idx ON runs(thread_root_id, created_at);
+
+CREATE INDEX IF NOT EXISTS runs_causal_nonterminal_idx ON runs(causal_root_id)
+  WHERE state NOT IN ('Completed', 'Failed', 'Cancelled');
+
+CREATE TRIGGER IF NOT EXISTS runs_causal_provenance_immutable
+BEFORE UPDATE OF causal_root_id, parent_attention_id, parent_run_id, delegation_depth ON runs
+WHEN OLD.causal_root_id IS NOT NEW.causal_root_id
+  OR OLD.parent_attention_id IS NOT NEW.parent_attention_id
+  OR OLD.parent_run_id IS NOT NEW.parent_run_id
+  OR OLD.delegation_depth IS NOT NEW.delegation_depth
+BEGIN
+  SELECT RAISE(ABORT, 'Run causal provenance is immutable.');
+END;
 
 CREATE INDEX IF NOT EXISTS runs_project_page_idx
   ON runs(project_id, created_event_sequence, id)
@@ -361,9 +388,10 @@ CREATE TABLE IF NOT EXISTS artifacts (
   content_digest TEXT NOT NULL,
   producer_run_id TEXT NOT NULL REFERENCES runs(id),
   producer_activation_id TEXT NOT NULL REFERENCES activation_attempts(id),
+  producer_thread_root_id TEXT NOT NULL REFERENCES threads(root_message_id),
   base_revision TEXT NOT NULL,
   media_type TEXT NOT NULL,
-  storage_location TEXT NOT NULL,
+  byte_length INTEGER NOT NULL CHECK (byte_length >= 0 AND byte_length <= 1048576),
   visibility_channel_id TEXT NOT NULL REFERENCES channels(id),
   metadata_json TEXT,
   created_event_sequence INTEGER REFERENCES public_events(sequence),
@@ -524,7 +552,10 @@ CREATE TABLE IF NOT EXISTS worktree_executions (
   state TEXT NOT NULL CHECK (state IN
     ('Starting', 'Running', 'StopRequested', 'StopConfirmed', 'ForceTerminated', 'Uncertain')),
   pid INTEGER CHECK (pid > 0),
-  created_at TEXT NOT NULL
+  authority_revoked_at TEXT,
+  authority_revocation_reason TEXT,
+  created_at TEXT NOT NULL,
+  CHECK ((authority_revoked_at IS NULL) = (authority_revocation_reason IS NULL))
 ) STRICT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS worktree_unsettled_execution_idx
@@ -533,6 +564,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS worktree_unsettled_execution_idx
 
 CREATE INDEX IF NOT EXISTS worktree_execution_history_idx
   ON worktree_executions(worktree_id, sequence);
+
+CREATE INDEX IF NOT EXISTS worktree_execution_activation_idx
+  ON worktree_executions(activation_id, sequence);
+
+CREATE TRIGGER IF NOT EXISTS worktree_publication_revocation_immutable
+BEFORE UPDATE OF authority_revoked_at, authority_revocation_reason ON worktree_executions
+WHEN OLD.authority_revoked_at IS NOT NULL AND (
+  NEW.authority_revoked_at IS NOT OLD.authority_revoked_at OR
+  NEW.authority_revocation_reason IS NOT OLD.authority_revocation_reason
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Worktree publication revocation is irreversible');
+END;
 
 CREATE TABLE IF NOT EXISTS worktree_execution_events (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,

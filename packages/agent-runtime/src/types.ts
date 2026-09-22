@@ -57,6 +57,7 @@ export interface ActivationCapabilityBridge {
   readonly causeType: ProviderCause["type"];
   readonly attentionDecision: AttentionDecision | null;
   readonly terminalAction: "complete" | "fail" | "wait" | null;
+  readonly reportArtifactsEnabled: boolean;
 
   createRunFromAttention(): Promise<string>;
   continueAttentionWithRun(runId: string): Promise<string>;
@@ -72,6 +73,7 @@ export interface ActivationCapabilityBridge {
     readonly expectedThreadCursor?: number;
   }): Promise<string>;
   reportStatus(status: string, detail?: string): Promise<string>;
+  publishReport(input: { readonly idempotencyKey: string; readonly text: string }): Promise<string>;
   complete(input?: CompleteRunInput): Promise<void>;
   fail(reason: string): Promise<void>;
   wait(reason: string): Promise<void>;

@@ -9,6 +9,7 @@ import {
   TorsorKernel,
   type KernelBootstrap,
   type KernelOpenOptions,
+  type ArtifactStorage,
 } from "@torsor/kernel";
 
 import {
@@ -19,6 +20,7 @@ import {
 
 export interface LocalRuntimeHostOptions {
   readonly databasePath: string;
+  readonly artifactStorage?: ArtifactStorage;
   readonly bootstrap?: KernelBootstrap;
   readonly credentials: readonly LocalCredential[];
   readonly runtimePrincipalId: string;
@@ -231,6 +233,7 @@ export function createLocalRuntimeHost(
   );
   const kernelOptions: KernelOpenOptions = {
     databasePath: options.databasePath,
+    ...(options.artifactStorage ? { artifactStorage: options.artifactStorage } : {}),
     ...(options.bootstrap ? { bootstrap: options.bootstrap } : {}),
     ...(options.clock ? { clock: options.clock } : {}),
     ...(options.idFactory ? { idFactory: options.idFactory } : {}),

@@ -1,4 +1,14 @@
 import { ApiError, readApiResponse } from "./api";
+import {
+  activityPath,
+  historyWindow,
+  mergeActivity,
+  mergeRunTimeline,
+  readActivityGap,
+  validateActivityPage,
+  type ActivityPage,
+} from "./timeline-history";
+import { RunComposerModel } from "./run-composer-model";
 import type {
   AgentStatus,
   Attention,
@@ -36,6 +46,9 @@ export interface WebState {
   readonly loadingThreads: boolean;
   readonly loadingThread: boolean;
   readonly loadingRun: boolean;
+  readonly loadingRunHistory: boolean;
+  readonly runHistoryError: string | null;
+  readonly runRefreshError: string | null;
   readonly commandPending: boolean;
   readonly queryError: string | null;
   readonly lastEventId: string | null;
@@ -117,7 +130,21 @@ interface CoalescedRefresh {
   refresh: () => Promise<boolean>;
 }
 
+interface ProjectionRefresh {
+  readonly key: string;
+  readonly completion: DeferredBoolean;
+  readonly inScope: () => boolean;
+  readonly current: () => boolean;
+  readonly settled: Partial<WebState>;
+  readonly read: () => Promise<() => Partial<WebState>>;
+}
+
+type ProjectionRead =
+  | { readonly ok: true; readonly state: () => Partial<WebState> }
+  | { readonly ok: false; readonly error: unknown };
+
 export class WebController {
+  readonly runComposer = new RunComposerModel();
   readonly #apiBase: string;
   readonly #fetch: Fetch;
   readonly #eventSourceFactory: EventSourceFactory;
@@ -141,6 +168,9 @@ export class WebController {
     loadingThreads: false,
     loadingThread: false,
     loadingRun: false,
+    loadingRunHistory: false,
+    runHistoryError: null,
+    runRefreshError: null,
     commandPending: false,
     queryError: null,
     lastEventId: null,
@@ -171,6 +201,7 @@ export class WebController {
   #threadsRequestGeneration = 0;
   #threadRequestGeneration = 0;
   #runRequestGeneration = 0;
+  #runSelectionGeneration = 0;
   #runsRefreshGeneration = 0;
   #attentionRefreshGeneration = 0;
   #bootstrapRefreshGeneration = 0;
@@ -204,7 +235,7 @@ export class WebController {
         message: MessageEvent<WindowMessage>,
       ) => {
         if (message.data?.kind === "event") {
-          if (this.#state.session === "ready") {
+          if (this.#state.session === "ready" && !isArtifactEvent(message.data.event)) {
             void this.#applyEvent(message.data.event, false);
           }
         } else if (message.data?.kind === "session") {
@@ -374,6 +405,8 @@ export class WebController {
       this.#clearProjectionErrors(["thread:"]);
     }
     this.#threadId = threadId;
+    const inScope = () =>
+      this.#sessionGeneration === sessionGeneration && this.#threadId === threadId;
     this.#setState({
       ...(changedThread ? { thread: null } : {}),
       loadingThread: true,
@@ -398,7 +431,7 @@ export class WebController {
           });
           return true;
         }
-        return this.#replacementResult(projectionKey, request);
+        return this.#replacementResult(projectionKey, request, inScope);
       } catch (error) {
         const stillCurrent =
           this.#sessionGeneration === sessionGeneration &&
@@ -419,7 +452,7 @@ export class WebController {
           });
           return false;
         }
-        return this.#replacementResult(projectionKey, request);
+        return this.#replacementResult(projectionKey, request, inScope);
       }
     })();
     this.#latestProjectionRequests.set(projectionKey, request);
@@ -429,6 +462,7 @@ export class WebController {
   clearThread(): void {
     this.#threadRequestGeneration += 1;
     this.#runRequestGeneration += 1;
+    this.#runSelectionGeneration += 1;
     if (this.#threadId) {
       this.#abandonProjectionInvalidation(`thread:${this.#threadId}`);
     }
@@ -443,6 +477,9 @@ export class WebController {
       run: null,
       loadingThread: false,
       loadingRun: false,
+      loadingRunHistory: false,
+      runHistoryError: null,
+      runRefreshError: null,
       queryError: this.#currentProjectionError(),
     });
   }
@@ -455,37 +492,43 @@ export class WebController {
     const previousRunId = this.#runId;
     const changedRun = previousRunId !== runId;
     if (changedRun) {
+      this.#runSelectionGeneration += 1;
       if (previousRunId) {
         this.#abandonProjectionInvalidation(`run:${previousRunId}`);
       }
       this.#clearProjectionErrors(["run:"]);
     }
     this.#runId = runId;
+    const inScope = () =>
+      this.#sessionGeneration === sessionGeneration && this.#runId === runId;
     this.#setState({
-      ...(changedRun ? { run: null } : {}),
+      ...(changedRun ? {
+        run: null,
+        loadingRunHistory: false,
+        runHistoryError: null,
+        runRefreshError: null,
+      } : {}),
       loadingRun: true,
       queryError: this.#currentProjectionError(),
     });
     let request!: Promise<boolean>;
     request = (async () => {
       try {
-        const body = await this.#request<{ readonly run: RunProjection }>(
-          `/api/v1/runs/${encodeURIComponent(runId)}`,
-          {},
-          sessionGeneration,
-        );
-        if (
+        const isCurrent = () =>
+          !this.#disposed &&
           this.#sessionGeneration === sessionGeneration &&
           this.#runRequestGeneration === requestGeneration &&
-          this.#runId === runId
-        ) {
+          this.#runId === runId;
+        const run = await this.#readRunWithHistory(runId, sessionGeneration, isCurrent);
+        if (isCurrent()) {
           this.#projectionSucceeded(projectionKey, {
-            run: body.run,
+            run: mergeRunTimeline(this.#state.run, run),
             loadingRun: false,
+            runRefreshError: null,
           });
           return true;
         }
-        return this.#replacementResult(projectionKey, request);
+        return this.#replacementResult(projectionKey, request, inScope);
       } catch (error) {
         const stillCurrent =
           this.#sessionGeneration === sessionGeneration &&
@@ -503,18 +546,45 @@ export class WebController {
         if (stillCurrent) {
           this.#projectionFailed(projectionKey, error, {
             loadingRun: false,
+            runRefreshError: error instanceof Error
+              ? error.message : "Live activity could not be refreshed.",
           });
           return false;
         }
-        return this.#replacementResult(projectionKey, request);
+        return this.#replacementResult(projectionKey, request, inScope);
       }
     })();
     this.#latestProjectionRequests.set(projectionKey, request);
     return request;
   }
 
+  async #readRunWithHistory(
+    runId: string,
+    sessionGeneration: number,
+    isCurrent: () => boolean,
+  ): Promise<RunProjection> {
+    const csrfRevision = this.#csrfRevision;
+    const { run } = await this.#request<{ readonly run: RunProjection }>(
+      `/api/v1/runs/${encodeURIComponent(runId)}`, {}, sessionGeneration, csrfRevision,
+    );
+    const previous = this.#state.run?.run.id === runId ? this.#state.run.activity : undefined;
+    const gap = await readActivityGap(
+      runId, previous, run.activity,
+      (path) => this.#request<ActivityPage>(path, {}, sessionGeneration, csrfRevision),
+      isCurrent,
+    );
+    return mergeRunTimeline(this.#state.run, {
+      ...run,
+      activity: mergeActivity(runId, [
+        historyWindow({ items: gap, hasMore: previous?.hasEarlier ?? false, nextCursor: null }),
+        run.activity,
+      ]),
+    });
+  }
+
   clearRun(): void {
     this.#runRequestGeneration += 1;
+    this.#runSelectionGeneration += 1;
     if (this.#runId) {
       this.#abandonProjectionInvalidation(`run:${this.#runId}`);
     }
@@ -523,8 +593,67 @@ export class WebController {
     this.#setState({
       run: null,
       loadingRun: false,
+      loadingRunHistory: false,
+      runHistoryError: null,
+      runRefreshError: null,
       queryError: this.#currentProjectionError(),
     });
+  }
+
+  async loadEarlierRunActivity(): Promise<boolean> {
+    const run = this.#state.run;
+    if (!run || !run.activity.hasEarlier || this.#state.loadingRunHistory) {
+      return false;
+    }
+    const runId = run.run.id;
+    const before = run.activity.earliestSequence;
+    if (before === null) {
+      throw new Error("Earlier activity requires a sequence boundary.");
+    }
+    const sessionGeneration = this.#sessionGeneration;
+    const selectionGeneration = this.#runSelectionGeneration;
+    const csrfRevision = this.#csrfRevision;
+    const isCurrent = () =>
+      !this.#disposed &&
+      this.#sessionGeneration === sessionGeneration &&
+      this.#runSelectionGeneration === selectionGeneration &&
+      this.#runId === runId;
+    this.#setState({ loadingRunHistory: true, runHistoryError: null });
+    try {
+      const page = await this.#request<ActivityPage>(
+        activityPath(runId, before), {}, sessionGeneration, csrfRevision,
+      );
+      if (!isCurrent()) {
+        return false;
+      }
+      validateActivityPage(page, runId, before);
+      const current = this.#state.run!;
+      this.#setState({
+        run: {
+          ...current,
+          activity: {
+            ...mergeActivity(runId, [historyWindow(page), current.activity]),
+            hasEarlier: page.hasMore,
+          },
+        },
+        loadingRunHistory: false,
+      });
+      return true;
+    } catch (error) {
+      if (!isCurrent()) {
+        return false;
+      }
+      if (error instanceof ApiError && error.status === 401 &&
+        this.#csrfRevision !== csrfRevision && this.#csrfToken) {
+        this.#setState({ loadingRunHistory: false });
+        return this.loadEarlierRunActivity();
+      }
+      this.#setState({
+        loadingRunHistory: false,
+        runHistoryError: error instanceof Error ? error.message : "Run history could not be loaded.",
+      });
+      return false;
+    }
   }
 
   async startThread(input: {
@@ -659,6 +788,151 @@ export class WebController {
     }
   }
 
+  async sendToRun(runId: string): Promise<void> {
+    const run = this.#state.run?.run;
+    if (!run || run.id !== runId || this.#runId !== runId || !this.#principalId) {
+      throw new Error("Load the selected Run in an authenticated Human session before sending.");
+    }
+    const submitted = await this.runComposer.submit(
+      run,
+      this.#principalId,
+      (request) => this.#command("send-to-run", { ...request }),
+    );
+    if (submitted && this.#runId === runId && this.#state.session === "ready") {
+      await this.refreshRunComposer(runId);
+    }
+  }
+
+  async refreshRunComposer(runId: string): Promise<boolean> {
+    const selected = this.#state.run?.run;
+    if (!selected || selected.id !== runId || this.#runId !== runId) return false;
+    const finishRefresh = this.runComposer.beginRefresh(runId);
+    const sessionGeneration = this.#sessionGeneration;
+    const projectId = this.#projectId;
+    const runGeneration = ++this.#runRequestGeneration;
+    const threadId = selected.threadRootId;
+    const selectedThreadId = this.#threadId;
+    const threadSelected = selectedThreadId === threadId;
+    const threadGeneration = threadSelected
+      ? ++this.#threadRequestGeneration
+      : this.#threadRequestGeneration;
+    const sessionCurrent = () =>
+      this.#sessionGeneration === sessionGeneration &&
+      this.#projectId === projectId;
+    const runRefresh: ProjectionRefresh = {
+      key: `run:${runId}`,
+      completion: deferredBoolean(),
+      inScope: () => sessionCurrent() && this.#runId === runId,
+      current: () => runRefresh.inScope() && this.#runRequestGeneration === runGeneration,
+      settled: { loadingRun: false },
+      read: async () => {
+        const run = await this.#readRunWithHistory(
+          runId, sessionGeneration, runRefresh.current,
+        );
+        return () => ({
+          run: mergeRunTimeline(this.#state.run, run),
+          runRefreshError: null,
+          runs: this.#state.runs.map((item) =>
+            item.run.id === runId && item.run.revision <= run.run.revision ? run : item),
+        });
+      },
+    };
+    const threadRefresh: ProjectionRefresh = {
+      key: `thread:${threadId}`,
+      completion: deferredBoolean(),
+      inScope: () => sessionCurrent() && this.#threadId === selectedThreadId &&
+        (threadSelected || this.#runId === runId),
+      current: () => threadRefresh.inScope() &&
+        (threadSelected
+          ? this.#threadRequestGeneration === threadGeneration
+          : this.#latestProjectionRequests.get(`thread:${threadId}`) === threadRefresh.completion.promise),
+      settled: threadSelected ? { loadingThread: false } : {},
+      read: async () => {
+        const { thread } = await this.#request<{ readonly thread: ThreadProjection }>(
+          `/api/v1/threads/${encodeURIComponent(threadId)}`, {}, sessionGeneration,
+        );
+        return () => ({
+          ...(threadSelected ? { thread } : {}),
+          threads: this.#state.threads.map((item) =>
+            item.threadRootId === threadId && item.cursor <= thread.cursor ? thread : item),
+        });
+      },
+    };
+    // Single reads and SSE invalidations must follow only their own replacement,
+    // never the combined promise (which could depend on the other projection).
+    for (const refresh of [runRefresh, threadRefresh]) {
+      this.#latestProjectionRequests.set(refresh.key, refresh.completion.promise);
+    }
+    this.#setState({
+      loadingRun: true,
+      ...(threadSelected ? { loadingThread: true } : {}),
+    });
+    const [run, thread] = await Promise.all([
+      this.#readComposerProjection(runRefresh),
+      this.#readComposerProjection(threadRefresh),
+    ]);
+    const bothCurrent = runRefresh.current() && threadRefresh.current();
+    if (bothCurrent && run.ok && thread.ok) {
+      this.#projectionErrors.delete(runRefresh.key);
+      this.#projectionErrors.delete(threadRefresh.key);
+      this.#setState({
+        ...run.state(), ...thread.state(),
+        ...runRefresh.settled, ...threadRefresh.settled,
+        queryError: this.#currentProjectionError(),
+      });
+      runRefresh.completion.resolve(true);
+      threadRefresh.completion.resolve(true);
+      finishRefresh(true);
+      return true;
+    }
+    const results = await Promise.all([
+      this.#settleComposerProjection(runRefresh, run, bothCurrent),
+      this.#settleComposerProjection(threadRefresh, thread, bothCurrent),
+    ]);
+    const refreshed = results.every(Boolean);
+    finishRefresh(refreshed);
+    return refreshed;
+  }
+
+  async #readComposerProjection(refresh: ProjectionRefresh): Promise<ProjectionRead> {
+    const csrfRevision = this.#csrfRevision;
+    try {
+      return { ok: true, state: await refresh.read() };
+    } catch (error) {
+      if (refresh.current() && error instanceof ApiError && error.status === 401 &&
+          this.#csrfRevision !== csrfRevision && this.#csrfToken) {
+        return this.#readComposerProjection(refresh);
+      }
+      return { ok: false, error };
+    }
+  }
+
+  async #settleComposerProjection(
+    refresh: ProjectionRefresh,
+    result: ProjectionRead,
+    preservePair: boolean,
+  ): Promise<boolean> {
+    let succeeded = false;
+    if (!refresh.inScope()) {
+      // Selection/session clearing owns its loading flags; do not touch them.
+    } else if (!refresh.current()) {
+      succeeded = await this.#replacementResult(
+        refresh.key, refresh.completion.promise, refresh.inScope,
+      );
+    } else if (!result.ok) {
+      this.#projectionFailed(refresh.key, result.error, refresh.settled);
+    } else if (preservePair) {
+      this.#setState(refresh.settled);
+    } else {
+      this.#projectionSucceeded(refresh.key, {
+        ...result.state(), ...refresh.settled,
+      });
+      succeeded = true;
+    }
+    refresh.completion.resolve(succeeded);
+    return succeeded;
+  }
+
   dispose(): void {
     this.#disposed = true;
     this.#clearLivenessRefresh();
@@ -704,6 +978,9 @@ export class WebController {
       loadingThreads: false,
       loadingThread: false,
       loadingRun: false,
+      loadingRunHistory: false,
+      runHistoryError: null,
+      runRefreshError: null,
       commandPending: false,
       lastEventId: null,
     });
@@ -766,9 +1043,9 @@ export class WebController {
   }
 
   async #command(
-    slug: "start-thread" | "reply-to-thread",
+    slug: "start-thread" | "reply-to-thread" | "send-to-run",
     body: Readonly<Record<string, unknown>>,
-  ): Promise<void> {
+  ): Promise<unknown> {
     if (!this.#csrfToken) {
       this.#clearSession("expired");
       throw new ApiError(
@@ -783,8 +1060,9 @@ export class WebController {
     const sessionGeneration = this.#sessionGeneration;
     const csrfRevision = this.#csrfRevision;
     const csrfToken = this.#csrfToken;
+    const principalId = this.#principalId;
     try {
-      await this.#sendCommand(
+      return await this.#sendCommand(
         slug,
         body,
         csrfToken,
@@ -792,6 +1070,16 @@ export class WebController {
         csrfRevision,
       );
     } catch (error) {
+      if (
+        slug === "send-to-run" &&
+        error instanceof ApiError && error.status === 401 &&
+        this.#csrfRevision !== csrfRevision && this.#csrfToken &&
+        this.#principalId === principalId
+      ) {
+        return await this.#sendCommand(
+          slug, body, this.#csrfToken, this.#sessionGeneration, this.#csrfRevision,
+        );
+      }
       if (
         error instanceof ApiError &&
         error.status === 403 &&
@@ -806,14 +1094,13 @@ export class WebController {
           const retryCsrfToken = this.#csrfToken;
           const retryCsrfRevision = this.#csrfRevision;
           try {
-            await this.#sendCommand(
+            return await this.#sendCommand(
               slug,
               body,
               retryCsrfToken,
               sessionGeneration,
               retryCsrfRevision,
             );
-            return;
           } catch (retryError) {
             if (
               retryError instanceof ApiError &&
@@ -842,13 +1129,13 @@ export class WebController {
   }
 
   async #sendCommand(
-    slug: "start-thread" | "reply-to-thread",
+    slug: "start-thread" | "reply-to-thread" | "send-to-run",
     body: Readonly<Record<string, unknown>>,
     csrfToken: string,
     sessionGeneration: number,
     csrfRevision: number,
-  ): Promise<void> {
-    await this.#request(
+  ): Promise<unknown> {
+    return this.#request(
       `/api/v1/commands/${slug}`,
       {
         method: "POST",
@@ -946,9 +1233,16 @@ export class WebController {
     this.#events = events;
     events.onopen = () => {
       if (this.#events === events) {
+        const reconnecting = this.#state.connection === "reconnecting";
         this.#clearProbe();
         this.#setState({ connection: "live" });
         this.#retryPendingInvalidations();
+        if (reconnecting && this.#runId) {
+          const runId = this.#runId;
+          void this.#coalesceProjectionRefresh(`run:${runId}`, () =>
+            this.#runId === runId ? this.loadRun(runId) : Promise.resolve(true),
+          );
+        }
       }
     };
     events.onerror = () => {
@@ -958,18 +1252,36 @@ export class WebController {
       }
     };
     events.addEventListener("torsor", (message) => {
+      if (this.#events !== events) return;
       const eventMessage = message as MessageEvent<string>;
       try {
         const event = JSON.parse(eventMessage.data) as PublicEvent;
         void this.#applyEvent(event, true);
       } catch {
-        this.#projectionErrors.set(
-          "events",
-          "A server event could not be read. Live updates may be stale.",
-        );
-        this.#setState({ queryError: this.#currentProjectionError() });
+        this.#eventReadFailed();
       }
     });
+    events.addEventListener("checkpoint", (message) => {
+      if (this.#events !== events) return;
+      try {
+        const checkpoint: unknown = JSON.parse((message as MessageEvent<string>).data);
+        if (
+          typeof checkpoint !== "object" || checkpoint === null ||
+          !("cursor" in checkpoint) || typeof checkpoint.cursor !== "string" || !checkpoint.cursor
+        ) throw new Error("Invalid event checkpoint.");
+        this.#setState({ lastEventId: checkpoint.cursor });
+      } catch {
+        this.#eventReadFailed();
+      }
+    });
+  }
+
+  #eventReadFailed(): void {
+    this.#projectionErrors.set(
+      "events",
+      "A server event could not be read. Live updates may be stale.",
+    );
+    this.#setState({ queryError: this.#currentProjectionError() });
   }
 
   async #applyEvent(event: PublicEvent, broadcast: boolean): Promise<void> {
@@ -988,7 +1300,9 @@ export class WebController {
       lastEventId: event.eventId,
       ...(broadcast ? { connection: "live" as const } : {}),
     });
-    if (broadcast) {
+    // Artifact facts are Run-scoped. Other windows must obtain them from their
+    // own authenticated stream rather than a shared-origin broadcast.
+    if (broadcast && !isArtifactEvent(event)) {
       this.#broadcastChannel?.postMessage({
         kind: "event",
         event,
@@ -1482,12 +1796,16 @@ export class WebController {
     }, this.#reconnectProbeDelayMs);
   }
 
-  #replacementResult(
+  async #replacementResult(
     projectionKey: string,
     request: Promise<boolean>,
-  ): Promise<boolean> | false {
+    inScope: () => boolean = () => true,
+  ): Promise<boolean> {
+    if (!inScope()) return false;
     const replacement = this.#latestProjectionRequests.get(projectionKey);
-    return replacement && replacement !== request ? replacement : false;
+    return replacement && replacement !== request
+      ? (await replacement) && inScope()
+      : false;
   }
 
   #projectionSucceeded(
@@ -1597,6 +1915,9 @@ export class WebController {
       loadingThreads: false,
       loadingThread: false,
       loadingRun: false,
+      loadingRunHistory: false,
+      runHistoryError: null,
+      runRefreshError: null,
       commandPending: false,
       queryError: null,
       lastEventId: null,
@@ -1720,6 +2041,10 @@ function deferredBoolean(): DeferredBoolean {
     resolve = complete;
   });
   return { promise, resolve };
+}
+
+function isArtifactEvent(event: PublicEvent): boolean {
+  return event.entityType === "Artifact" || event.type === "ArtifactPublished";
 }
 
 function isUncertainCommandError(error: unknown): boolean {

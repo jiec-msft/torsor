@@ -534,7 +534,7 @@ export class AgentRuntime {
         type: "GetThreadProjection",
         threadRootId: attention.threadRootId,
       },
-      this.#runtimeContext,
+      { principalId: agent.principalId, activationId: activation.entityId },
     );
     const triggeringMessage = thread.messages.find((message) =>
       message.revisions.some(
@@ -810,7 +810,7 @@ export class AgentRuntime {
         type: "GetThreadProjection",
         threadRootId: currentProjection.run.threadRootId,
       },
-      this.#runtimeContext,
+      { principalId: agent.principalId, activationId: activationView.id },
     );
     const cause = {
       type: "run",
@@ -1064,7 +1064,9 @@ export class AgentRuntime {
       const providerError =
         error instanceof ProviderExecutionError
           ? error
-          : new ProviderExecutionError(errorMessage(error), "Failed");
+          : error instanceof KernelError && error.code === "WriterAuthorityLost"
+            ? new ProviderExecutionError("Controlled Worktree publication authority was lost.", "Unknown")
+            : new ProviderExecutionError(errorMessage(error), "Failed");
       if (input.cause.type === "run" && bridge.terminalAction === null) {
         const latest = await this.#kernel.query(
           { type: "GetRunProjection", runId: input.cause.run.run.id },
@@ -1089,6 +1091,7 @@ export class AgentRuntime {
                 waitError instanceof KernelError &&
                 (waitError.code === "StaleRevision" ||
                   waitError.code === "Conflict" ||
+                  waitError.code === "WriterAuthorityLost" ||
                   waitError.code === "TerminalRun")
               )
             ) {

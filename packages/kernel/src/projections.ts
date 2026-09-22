@@ -1,5 +1,6 @@
 import type { SQLInputValue } from "node:sqlite";
 
+import { filterVisiblePublicEvents, visibleArtifactRows } from "./artifact-visibility.js";
 import * as db from "./database.js";
 import { KernelError } from "./errors.js";
 import * as invariants from "./invariants.js";
@@ -90,7 +91,11 @@ export function getBootstrap(kernel: db.KernelContext, projectId: string, attent
   };
 }
 
-export function getThreadProjection(kernel: db.KernelContext, threadRootId: string): ThreadProjection {
+export function getThreadProjection(
+  kernel: db.KernelContext,
+  threadRootId: string,
+  scope: invariants.PrincipalReadScope,
+): ThreadProjection {
   const thread = invariants.requireThread(kernel, threadRootId);
   const messageRows = db.allRows(kernel, "SELECT * FROM messages WHERE thread_root_id = ? ORDER BY thread_sequence", threadRootId);
   const messages = messageRows.map((message) => {
@@ -110,11 +115,7 @@ export function getThreadProjection(kernel: db.KernelContext, threadRootId: stri
     messages,
     attentions: db.allRows(kernel, "SELECT * FROM attentions WHERE thread_root_id = ? ORDER BY created_at, id", threadRootId).map(mapAttention),
     runs: db.allRows(kernel, "SELECT * FROM runs WHERE thread_root_id = ? ORDER BY created_at, id", threadRootId).map(mapRun),
-    artifacts: db.allRows(kernel, `SELECT ar.*
-           FROM artifacts ar
-           JOIN runs r ON r.id = ar.producer_run_id
-          WHERE r.thread_root_id = ?
-          ORDER BY ar.created_at, ar.id`, threadRootId).map(mapArtifact),
+    artifacts: visibleArtifactRows(kernel, scope, { threadRootId }).map(mapArtifact),
   };
 }
 
@@ -129,7 +130,7 @@ export function getRunProjection(kernel: db.KernelContext, runId: string): RunPr
               ORDER BY run_input_sequence`, text(activation.id)).map((row) => text(row.run_input_id)))),
     providerAttempts: db.allRows(kernel, "SELECT * FROM provider_attempts WHERE run_id = ? ORDER BY started_at, id", runId).map(mapProviderAttempt),
     activity: latestActivityWindow(kernel, runId, 100),
-    artifacts: db.allRows(kernel, "SELECT * FROM artifacts WHERE producer_run_id = ? ORDER BY created_at, id", runId).map(mapArtifact),
+    artifacts: visibleArtifactRows(kernel, null, { runId }).map(mapArtifact),
   };
 }
 
@@ -137,6 +138,7 @@ export function getThreadProjectionAt(
   kernel: db.KernelContext,
   threadRootId: string,
   snapshotEventSequence: number,
+  scope: invariants.PrincipalReadScope,
 ): ThreadProjection {
   const thread = invariants.requireThread(kernel, threadRootId);
   const cursorRow = db.getRow(
@@ -230,6 +232,8 @@ export function getThreadProjectionAt(
       `SELECT run.id, run.project_id, run.home_channel_id,
               run.thread_root_id, run.owner_agent_id,
               run.agent_config_revision, history.state, history.revision,
+              run.causal_root_id, run.parent_attention_id,
+              run.parent_run_id, run.delegation_depth,
               history.activation_generation, run.created_at,
               history.updated_at, history.terminal_reason
          FROM runs AS run
@@ -248,17 +252,9 @@ export function getThreadProjectionAt(
       threadRootId,
       snapshotEventSequence,
     ).map(mapRun),
-    artifacts: db.allRows(
-      kernel,
-      `SELECT artifact.*
-         FROM artifacts AS artifact
-         JOIN runs AS run ON run.id = artifact.producer_run_id
-        WHERE run.thread_root_id = ?
-          AND artifact.created_event_sequence <= ?
-        ORDER BY artifact.created_at, artifact.id`,
-      threadRootId,
-      snapshotEventSequence,
-    ).map(mapArtifact),
+    artifacts: visibleArtifactRows(kernel, scope, {
+      threadRootId, snapshotEventSequence,
+    }).map(mapArtifact),
   };
 }
 
@@ -272,6 +268,8 @@ export function getRunProjectionAt(
     `SELECT current.id, current.project_id, current.home_channel_id,
             current.thread_root_id, current.owner_agent_id,
             current.agent_config_revision, history.state, history.revision,
+            current.causal_root_id, current.parent_attention_id,
+            current.parent_run_id, current.delegation_depth,
             history.activation_generation, current.created_at,
             history.updated_at, history.terminal_reason
        FROM runs AS current
@@ -389,16 +387,7 @@ export function getRunProjectionAt(
       snapshotEventSequence,
       100,
     ),
-    artifacts: db.allRows(
-      kernel,
-      `SELECT *
-         FROM artifacts
-        WHERE producer_run_id = ?
-          AND created_event_sequence <= ?
-        ORDER BY created_at, id`,
-      runId,
-      snapshotEventSequence,
-    ).map(mapArtifact),
+    artifacts: visibleArtifactRows(kernel, null, { runId, snapshotEventSequence }).map(mapArtifact),
   };
 }
 
@@ -453,6 +442,7 @@ export function listThreadProjections(
         kernel,
         text(row.root_message_id),
         snapshotEventSequence,
+        scope,
       )
     ),
     nextAfterEventId: hasMore
@@ -549,13 +539,7 @@ export function readAuthorizedPublicEvents(
   const rows = db.allRows(kernel, sql, ...parameters);
   const hasMore = rows.length > limit;
   const scannedRows = rows.slice(0, limit);
-  const events = scannedRows
-    .filter((row) =>
-      scope.threadRootId === null ||
-      (optionalText(row.channel_id) === scope.channelId &&
-        optionalText(row.thread_root_id) === scope.threadRootId)
-    )
-    .map(mapPublicEvent);
+  const events = filterVisiblePublicEvents(kernel, scannedRows, scope).map(mapPublicEvent);
   return {
     events,
     scannedThroughEventId:
@@ -706,16 +690,43 @@ export function getProjectAgentStatus(
   };
 }
 
-export function listActivity(kernel: db.KernelContext, runId: string, afterSequence: number, limit: number): ActivityPage {
+export function listActivity(
+  kernel: db.KernelContext,
+  runId: string,
+  afterSequence: number | undefined,
+  limit: number,
+  beforeSequence?: number,
+): ActivityPage {
+  if (
+    (afterSequence !== undefined &&
+      (!Number.isSafeInteger(afterSequence) || afterSequence < 0)) ||
+    (beforeSequence !== undefined &&
+      (!Number.isSafeInteger(beforeSequence) || beforeSequence < 1)) ||
+    (afterSequence !== undefined && beforeSequence !== undefined &&
+      afterSequence >= beforeSequence)
+  ) {
+    throw new KernelError("InvalidCommand", "Activity sequence bounds must be ordered nonnegative safe integers; beforeSequence must be positive.");
+  }
+  const backwards = beforeSequence !== undefined && afterSequence === undefined;
+  const parameters: SQLInputValue[] = [runId, afterSequence ?? 0];
+  if (beforeSequence !== undefined) {
+    parameters.push(beforeSequence);
+  }
+  parameters.push(limit + 1);
   const rows = db.allRows(kernel, `SELECT * FROM run_activity_events
         WHERE run_id = ? AND sequence > ?
-        ORDER BY sequence
-        LIMIT ?`, runId, afterSequence, limit + 1);
+          ${beforeSequence === undefined ? "" : "AND sequence < ?"}
+        ORDER BY sequence ${backwards ? "DESC" : "ASC"}
+        LIMIT ?`, ...parameters);
   const hasMore = rows.length > limit;
   const items = rows.slice(0, limit).map(mapActivity);
+  const nextCursor = hasMore ? items.at(-1)?.sequence ?? null : null;
+  if (backwards) {
+    items.reverse();
+  }
   return {
     items,
-    nextCursor: hasMore ? items.at(-1)?.sequence ?? null : null,
+    nextCursor,
     hasMore,
   };
 }

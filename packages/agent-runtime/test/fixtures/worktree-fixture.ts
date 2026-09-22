@@ -99,7 +99,7 @@ export async function activeRun(kernel: TorsorKernel, key: string) {
         runId: run.entityId, activationId: id,
         async close() {
           await kernel.execute({
-            type: "FinishActivation", idempotencyKey: `${key}:finish`, activationId: id, outcome: "Completed",
+            type: "FinishActivation", idempotencyKey: `${key}:finish`, activationId: id, outcome: "Cancelled",
           }, runtimeContext);
         },
       };

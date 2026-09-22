@@ -34,8 +34,64 @@ At adoption, `docs/prototype/001-overview.zh-cn.md` was the only locale-suffixed
 | `apps/server/README.md` | Not required | Component implementation reference | English-only; route and authentication reference tied directly to English API syntax, not a product specification or owner onboarding entry point |
 | `apps/web/README.md` | Not required | Component implementation reference | English-only; build and client-state reference tied directly to implementation |
 | `packages/agent-runtime/README.md` | Not required | Package implementation reference | English-only; detailed runtime contract maintained with code rather than used as the human product baseline |
+| `docs/specs/acp-conformance.md` | `docs/specs/acp-conformance.zh-cn.md` | Independent ACP harness specification and public reuse research | Paired; normative |
+| `packages/acp-conformance/README.md` | `packages/acp-conformance/README.zh-cn.md` | Independent tool onboarding | Paired; owner-facing and external provider-author entry point |
 | `packages/kernel/README.md` | Not required | Package implementation reference | English-only; detailed API and schema reference maintained with code rather than used as the human product baseline |
 
 Generated assets, source files under documentation prototype directories, screenshots, the license text, and nonexistent changelog/vendor artifacts are not product specifications and are outside Markdown pairing scope.
 
 Revisit an exclusion when a file becomes normative, appears in top-level owner navigation, or becomes the primary entry point for a product area.
+
+## Executable pairing contract
+
+`npm run check:docs` is the deterministic local and CI command, requiring only the repository's Node.js version and Git. `npm run test:docs` tests this section through the public CLI and temporary Git repositories; `npm run ci` includes both commands.
+
+### Files and top navigation
+
+- Check Markdown files tracked by the current Git index (recognizing all case variants of `.md`), reading working-tree content, but require lowercase `.md` in valid filenames. Run `git add` for new files first; untracked and ignored files are outside scope. Staged and unstaged edits and deletions are included.
+- Except for the explicit paths below, every Markdown file requires a same-directory, case-exact English `.md` / Simplified Chinese `.zh-cn.md` counterpart. New documents require pairing by default; no directory or filename receives an implicit exemption.
+- Pairing must be one-to-one and reversible: a counterpart's counterpart must be the original file. An English filename must have a nonempty stem before `.md` that does not end in any case variant of `.zh-cn`; Chinese adds exactly one lowercase `.zh-cn` suffix to that English name. Repeated or mixed-case locale suffixes, empty stems, and non-lowercase extensions fail with `document-name`, even if listed as exclusions. Only trailing filename suffixes count, not directory names or interior `.zh-cn` text. Invalid old names may be deleted or renamed without inventing counterparts for them; valid old and new names still follow pairing and diff rules.
+- Files must be regular files, not symbolic links. The first nonblank line must be a `# ` level-one title; the next nonblank line must use the repository's one-line language navigation: `> English | [简体中文](name.zh-cn.md)` or `> [简体中文（主要版本）](name.zh-cn.md) | English` for English, and `> 简体中文（主要版本） | [English](name.md)` for Chinese.
+- The destination must be the exact sibling filename, optionally prefixed by one literal `./`. Remaining raw characters are limited to ASCII letters, digits, `-._~`, and `%HH` escapes; all other literal characters, including Chinese filename characters, require UTF-8 percent-encoding. A raw `&` fails with `navigation-encoding` and must be written as `%26`; Markdown entities are not interpreted. Decode exactly once, require an exact counterpart filename match, and reject decoded `/`, backslashes, or control characters. Do not further normalize directories, dot segments, or repeated encoding. Literal `#` and `?` cannot introduce fragments or queries; filenames containing those characters require `%23` and `%3F` respectively.
+- Documents may start with one BOM and use LF or CRLF. Links in body text, code blocks, comments, images, or other positions do not replace top navigation. External URLs, fragments, queries, and reference-style links are not accepted; this is not a general Markdown parser.
+
+### Explicit exclusions
+
+The JSON array between these markers is the current exclusion list. Its Chinese counterpart must list exactly the same paths, each with a nonempty reason in both versions. Only exact, normalized repository-relative English `.md` paths are allowed; globs, directories, and `.zh-cn.md` exclusions are not supported. Duplicate, invalid, deleted, or already-paired exclusions fail. Moving, deleting, or promoting an excluded file requires updating both policy lists. Nonexistent generated, vendor, license, or changelog documents receive no advance wildcard exemption.
+
+<!-- bilingual-exclusions:start -->
+```json
+[
+  {
+    "path": "apps/server/README.md",
+    "reason": "Component implementation reference: route and authentication syntax, not a product specification or owner onboarding entry point."
+  },
+  {
+    "path": "apps/web/README.md",
+    "reason": "Component implementation reference: build and client state, not the product baseline."
+  },
+  {
+    "path": "packages/agent-runtime/README.md",
+    "reason": "Package implementation reference: runtime contract maintained with code, not the human product baseline."
+  },
+  {
+    "path": "packages/kernel/README.md",
+    "reason": "Package implementation reference: API and schema maintained with code, not the human product baseline."
+  }
+]
+```
+<!-- bilingual-exclusions:end -->
+
+### Pull request diff checks
+
+`npm run check:docs -- --base <git-ref>` adds net-change checks from the unique merge base of `<git-ref>` and `HEAD` to the current working tree, alongside the full structural check. Committed, staged, and unstaged tracked changes are included; new files still need `git add`. CI fetches full history, checks out the event's immutable `pull_request.head.sha`, then invokes this mode with `pull_request.base.sha`, never running this diff check on GitHub's synthetic merge commit. A `push` / `main` event explicitly falls back to that event's `github.sha`, using the full structural check and ordinary `npm run ci` only; this workflow does not additionally validate the synthetic merged tree. Tests use a real forked history with independent bilingual edits and a synthetic merge fixture to demonstrate checked-out head and push fallback behavior. Invalid refs, missing history, multiple merge bases, or unresolved index conflicts fail explicitly rather than falling back to a non-diff check.
+
+Any net change to a file requiring pairing in either the base or current state, including formatting-only changes, requires a net change to its counterpart path. Exemptions apply only where explicitly listed in the corresponding state's policy; a newly added exclusion cannot retroactively exempt a normative base document. For bases predating this contract with no list markers in either policy file, no base-side exemptions are assumed.
+
+Renames are treated as deletions at old paths and additions at new paths, without similarity inference. Both old and new counterparts must therefore be handled: paired renames or deletions pass, while orphans and omitted counterpart changes fail. Changes fully reverted before comparison do not count. Formatting-only counterpart edits can satisfy the mechanical check but cannot replace faithful translation and human review.
+
+### Output and limits
+
+Exit codes are `0` for success, `1` for policy violations, and `2` for argument, Git, or read failures. Violations are sorted in fixed lexical order, each with a repository-relative `/` path and stable diagnostic code, without machine-absolute paths. `--help` prints usage.
+
+The check establishes only the structural contract for files, navigation, exclusion lists, and changed paths. It cannot prove semantic equivalence, translation quality, Chinese-first authoring or review, justification of exclusions, or validity of all body links. Human review must still determine whether both versions describe the same requirements. This layer touches only documentation, scripts, and CI, can be reverted independently, and does not change product runtime behavior.

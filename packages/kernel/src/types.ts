@@ -1,3 +1,5 @@
+import type { ArtifactStorage } from "./artifact-storage.js";
+
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue =
   | JsonPrimitive
@@ -85,12 +87,20 @@ export interface KernelBootstrap {
   readonly agents?: readonly BootstrapAgent[];
 }
 
+export interface CausalLimits {
+  readonly maxDepth: number;
+  readonly maxNonTerminalRunsPerRoot: number;
+}
+
 export interface KernelOpenOptions {
   readonly databasePath: string;
+  readonly artifactStorage?: ArtifactStorage;
+  /** Applied atomically only when initializing an empty version-0 database. */
   readonly bootstrap?: KernelBootstrap;
   readonly clock?: () => Date;
   readonly idFactory?: (prefix: string) => string;
   readonly activationDurationMs?: number;
+  readonly causalLimits?: CausalLimits;
 }
 
 interface IdempotentCommand {
@@ -257,10 +267,18 @@ export interface PublishArtifactCommand extends IdempotentCommand {
   readonly runId: string;
   readonly expectedRunRevision: number;
   readonly contentDigest: string;
-  readonly baseRevision: string;
-  readonly mediaType: string;
-  readonly storageLocation: string;
-  readonly metadata?: JsonValue;
+  readonly byteLength: number;
+}
+
+export interface FinalizeReportInput extends IdempotentCommand {
+  readonly runId: string;
+  readonly expectedRunRevision: number;
+  readonly content: Uint8Array | AsyncIterable<Uint8Array>;
+}
+
+export interface ArtifactContent {
+  readonly artifact: ArtifactView;
+  readonly content: Uint8Array;
 }
 
 export interface CompletionException {
@@ -358,6 +376,12 @@ export interface RecordWorktreeExecutionCommand extends IdempotentCommand, Workt
   readonly state: Exclude<WorktreeExecutionState, "Starting">;
   readonly pid?: number;
   readonly evidence: string;
+  readonly preservePublicationAuthority?: boolean;
+}
+
+export interface RevokeWorktreeExecutionAuthorityCommand extends IdempotentCommand, WorktreeExecutionReceipt {
+  readonly type: "RevokeWorktreeExecutionAuthority";
+  readonly reason: string;
 }
 
 export interface RecoverWorktreeExecutionCommand extends IdempotentCommand {
@@ -375,6 +399,8 @@ export interface WorktreeExecutionView {
   readonly fencingToken: number;
   readonly state: WorktreeExecutionState;
   readonly pid: number | null;
+  readonly authorityRevokedAt: string | null;
+  readonly authorityRevocationReason: string | null;
   readonly events: readonly {
     readonly state: WorktreeExecutionState;
     readonly evidence: string;
@@ -447,6 +473,7 @@ export type KernelCommand =
   | RegisterPhysicalWorktreeCommand
   | StartWorktreeExecutionCommand
   | RecordWorktreeExecutionCommand
+  | RevokeWorktreeExecutionAuthorityCommand
   | RecoverWorktreeExecutionCommand
   | AcquireWorktreeWriterLeaseCommand
   | RenewWorktreeWriterLeaseCommand
@@ -469,10 +496,16 @@ export interface GetRunProjectionQuery {
   readonly runId: string;
 }
 
+export interface GetArtifactQuery {
+  readonly type: "GetArtifact";
+  readonly artifactId: string;
+}
+
 export interface ListActivityQuery {
   readonly type: "ListActivity";
   readonly runId: string;
   readonly afterSequence?: number;
+  readonly beforeSequence?: number;
   readonly limit?: number;
 }
 
@@ -566,6 +599,7 @@ export type KernelQuery =
   | { readonly type: "GetWorktreeStorageIdentity" }
   | { readonly type: "ListPhysicalWorktrees"; readonly afterWorktreeId?: string; readonly limit?: number }
   | { readonly type: "GetPhysicalWorktree"; readonly worktreeId: string }
+  | GetArtifactQuery
   | GetBootstrapQuery
   | GetThreadProjectionQuery
   | GetRunProjectionQuery
@@ -645,6 +679,10 @@ export interface RunView {
   readonly threadRootId: string;
   readonly ownerAgentId: string;
   readonly agentConfigRevision: number;
+  readonly causalRootId: string;
+  readonly parentAttentionId: string;
+  readonly parentRunId: string | null;
+  readonly delegationDepth: number;
   readonly state: RunState;
   readonly revision: number;
   readonly activationGeneration: number;
@@ -757,9 +795,10 @@ export interface ArtifactView {
   readonly contentDigest: string;
   readonly producerRunId: string;
   readonly producerActivationId: string;
+  readonly producerThreadRootId: string;
   readonly baseRevision: string;
   readonly mediaType: string;
-  readonly storageLocation: string;
+  readonly byteLength: number;
   readonly visibilityChannelId: string;
   readonly metadata: JsonValue | null;
   readonly createdAt: string;
@@ -892,6 +931,7 @@ export interface QueryResultMap {
   readonly GetWorktreeStorageIdentity: { readonly identity: string };
   readonly ListPhysicalWorktrees: { readonly items: readonly PhysicalWorktreeView[]; readonly hasMore: boolean };
   readonly GetPhysicalWorktree: PhysicalWorktreeView;
+  readonly GetArtifact: ArtifactView;
   readonly GetBootstrap: BootstrapProjection;
   readonly GetThreadProjection: ThreadProjection;
   readonly GetRunProjection: RunProjection;

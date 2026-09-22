@@ -12,6 +12,87 @@ import { nodeProbeDriver, type ControlledProcessDriver, type ControlledChild } f
 import { activeRun, bootstrap, runtimeContext, syntheticRepository } from "./fixtures/worktree-fixture.js";
 
 describe("controlled Worktree executor (§22, §24, §38)", () => {
+  it.each(["expiry-during-close", "invalid-result", "abnormal-close", "private-start-error"] as const)(
+    "never returns Provider success or private diagnostics after %s",
+    async (failure) => {
+      const repo = syntheticRepository();
+      repo.addWorktree("first");
+      let now = new Date();
+      const kernel = TorsorKernel.open({ databasePath: repo.databasePath, bootstrap, clock: () => now });
+      const run = await activeRun(kernel, "publication-failure");
+      let actual: ControlledChild | undefined;
+      const executor = new LocalWorktreeExecutor({
+        kernel, runtimePrincipalId: "runtime", ...repo,
+        driver: { start: (input) => {
+          if (failure === "private-start-error") throw new Error(`Synthetic private diagnostic: ${repo.directory}`);
+          actual = nodeProbeDriver.start(input);
+          return {
+            ...actual,
+            result: failure === "invalid-result" ? Promise.resolve("Synthetic private output.") : actual.result,
+            closed: actual.closed.then((evidence) => {
+              if (failure === "expiry-during-close") now = new Date(now.getTime() + 31_000);
+              return failure === "abnormal-close" ? { ...evidence, code: 3 } : evidence;
+            }),
+          };
+        } },
+      });
+      try {
+        await executor.register({
+          worktreeId: "first", directoryName: "first", baseRevision: repo.baseRevision, runId: run.runId,
+        });
+        await expect(executor.probe({ worktreeId: "first", activationId: run.activationId }))
+          .rejects.toMatchObject({
+            outcome: "Unknown", message: "Controlled Worktree execution did not complete with current authority.",
+          });
+        const physical = await kernel.query({ type: "GetPhysicalWorktree", worktreeId: "first" }, runtimeContext);
+        expect(physical.latestExecution?.authorityRevokedAt).not.toBeNull();
+        expect(physical.state).toBe(failure === "private-start-error" ? "Quarantined" : "Ready");
+        expect(JSON.stringify(await kernel.readEvents(null, 500))).not.toContain(repo.directory);
+      } finally {
+        actual?.forceStop();
+        if (actual) await actual.closed;
+        await executor.close(); await run.close(); kernel.close(); repo.dispose();
+      }
+    },
+  );
+
+  it("retains the Writer through clean publication but restart revokes even a confirmed-stop execution", async () => {
+    const repo = syntheticRepository();
+    repo.addWorktree("first");
+    const kernel = TorsorKernel.open({ databasePath: repo.databasePath, bootstrap });
+    const run = await activeRun(kernel, "publication-restart");
+    const executor = new LocalWorktreeExecutor({ kernel, runtimePrincipalId: "runtime", ...repo });
+    const reopened = TorsorKernel.open({ databasePath: repo.databasePath });
+    const restarted = new LocalWorktreeExecutor({ kernel: reopened, runtimePrincipalId: "runtime", ...repo });
+    try {
+      await executor.register({
+        worktreeId: "first", directoryName: "first", baseRevision: repo.baseRevision, runId: run.runId,
+      });
+      expect(await executor.probe({ worktreeId: "first", activationId: run.activationId }))
+        .toMatchObject({ stop: "StopConfirmed" });
+      expect(await kernel.query({ type: "GetWorktreeWriterLease", worktreeId: "first" }, runtimeContext))
+        .toMatchObject({ status: "Active", generation: 1 });
+      const activity = {
+        type: "AppendRunActivity" as const, idempotencyKey: "before-restart", activationId: run.activationId,
+        runId: run.runId, kind: "worktree_probe", payload: "Synthetic summary.", retentionClass: "durable" as const,
+      };
+      await kernel.execute(activity, runtimeContext);
+      await expect(kernel.execute({
+        type: "AcquireWorktreeWriterLease", idempotencyKey: "competing-publication",
+        worktreeId: "first", leaseDurationMs: 30_000,
+      }, runtimeContext)).rejects.toThrow();
+      await restarted.recover();
+      expect(await reopened.query({ type: "GetPhysicalWorktree", worktreeId: "first" }, runtimeContext))
+        .toMatchObject({ state: "Ready", latestExecution: {
+          state: "StopConfirmed", authorityRevokedAt: expect.any(String),
+        } });
+      await expect(kernel.execute(activity, runtimeContext)).rejects.toMatchObject({ code: "WriterAuthorityLost" });
+    } finally {
+      await restarted.close(); reopened.close();
+      await executor.close(); await run.close(); kernel.close(); repo.dispose();
+    }
+  });
+
   it("writes a fixed file and runs a real exact-argument child through live Kernel authority", async () => {
     const repo = syntheticRepository();
     const path = repo.addWorktree("first");
@@ -279,6 +360,7 @@ describe("controlled Worktree executor (§22, §24, §38)", () => {
     const now = new Date();
     const kernel = TorsorKernel.open({ databasePath: repo.databasePath, bootstrap, clock: () => now });
     const run = await activeRun(kernel, "automatic-stop");
+    const nextRun = await activeRun(kernel, "automatic-deadline");
     let actual!: ControlledChild;
     const executor = new LocalWorktreeExecutor({
       kernel, runtimePrincipalId: "runtime", ...repo, leaseDurationMs: 1_000,
@@ -286,21 +368,24 @@ describe("controlled Worktree executor (§22, §24, §38)", () => {
     });
     try {
       for (const worktreeId of ["first", "second"]) {
-        await executor.register({ worktreeId, directoryName: worktreeId, baseRevision: repo.baseRevision, runId: run.runId });
+        await executor.register({
+          worktreeId, directoryName: worktreeId, baseRevision: repo.baseRevision,
+          runId: worktreeId === "first" ? run.runId : nextRun.runId,
+        });
       }
       const controller = new AbortController();
       const cancelled = await executor.start({ worktreeId: "first", activationId: run.activationId, signal: controller.signal });
       await cancelled.result;
       controller.abort();
       expect(await cancelled.stop("Cancellation observed.")).toBe("StopConfirmed");
-      const expired = await executor.start({ worktreeId: "second", activationId: run.activationId });
+      const expired = await executor.start({ worktreeId: "second", activationId: nextRun.activationId });
       await expired.result;
       await actual.closed;
       expect(await expired.stop("Deadline already observed.")).toBe("StopConfirmed");
       expect((await kernel.query({
         type: "GetPhysicalWorktree", worktreeId: "second",
       }, runtimeContext)).latestExecution?.state).toBe("StopConfirmed");
-    } finally { await executor.close(); await run.close(); kernel.close(); repo.dispose(); }
+    } finally { await executor.close(); await run.close(); await nextRun.close(); kernel.close(); repo.dispose(); }
   });
 
   it("quarantines a thrown spawn window instead of claiming that no child exists", async () => {

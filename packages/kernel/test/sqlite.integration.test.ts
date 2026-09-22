@@ -501,7 +501,7 @@ describe("SQLite persistence", () => {
       const metadata = new DatabaseSync(databasePath, { readOnly: true });
       try {
         expect(metadata.prepare("PRAGMA user_version").get()).toMatchObject({
-          user_version: 14,
+          user_version: 16,
         });
       } finally {
         metadata.close();
@@ -1449,6 +1449,7 @@ describe("SQLite persistence", () => {
     const supersededSchemaPath = join(directory, "schema-10.sqlite");
     const priorRuntimeSchemaPath = join(directory, "schema-11.sqlite");
     const priorRecoverySchemaPath = join(directory, "schema-12.sqlite");
+    const priorLeaseSchemaPath = join(directory, "schema-13.sqlite");
     const unversionedPath = join(directory, "unversioned.sqlite");
     try {
       const unsupported = new DatabaseSync(unsupportedPath);
@@ -1523,6 +1524,28 @@ describe("SQLite persistence", () => {
       ).toThrow(
         /Incompatible development database schema version 12.*recreate the disposable local database/,
       );
+
+      const priorLeaseSchema = new DatabaseSync(priorLeaseSchemaPath);
+      priorLeaseSchema.exec(
+        "CREATE TABLE preserved_schema_13_state (id TEXT PRIMARY KEY); INSERT INTO preserved_schema_13_state VALUES ('synthetic'); PRAGMA user_version = 13",
+      );
+      priorLeaseSchema.close();
+      expect(() =>
+        TorsorKernel.open({ databasePath: priorLeaseSchemaPath, bootstrap }),
+      ).toThrow(
+        /Incompatible development database schema version 13; expected 16.*Stop old Torsor processes.*recreate the disposable local database/,
+      );
+      const preservedLeaseSchema = new DatabaseSync(priorLeaseSchemaPath, { readOnly: true });
+      try {
+        expect(preservedLeaseSchema.prepare("PRAGMA user_version").get())
+          .toMatchObject({ user_version: 13 });
+        expect(preservedLeaseSchema.prepare("SELECT * FROM preserved_schema_13_state").all())
+          .toEqual([{ id: "synthetic" }]);
+        expect(preservedLeaseSchema.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all())
+          .toEqual([{ name: "preserved_schema_13_state" }]);
+      } finally {
+        preservedLeaseSchema.close();
+      }
 
       const unversioned = new DatabaseSync(unversionedPath);
       unversioned.exec("CREATE VIEW preserved_view AS SELECT 1 AS value");

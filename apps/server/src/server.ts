@@ -11,6 +11,7 @@ import {
   KernelError,
   TorsorKernel,
   type KernelBootstrap,
+  type ArtifactStorage,
   type KernelCommand,
   type PrincipalContext,
   type PublicEventEnvelope,
@@ -62,6 +63,7 @@ interface TorsorHttpServiceBaseOptions {
 interface OwnedKernelHttpServiceOptions {
   readonly kernel?: never;
   readonly databasePath: string;
+  readonly artifactStorage?: ArtifactStorage;
   readonly bootstrap?: KernelBootstrap;
   readonly clock?: () => Date;
   readonly idFactory?: (prefix: string) => string;
@@ -70,6 +72,7 @@ interface OwnedKernelHttpServiceOptions {
 interface SharedKernelHttpServiceOptions {
   readonly kernel: TorsorKernel;
   readonly databasePath?: never;
+  readonly artifactStorage?: never;
   readonly bootstrap?: never;
   readonly clock?: never;
   readonly idFactory?: never;
@@ -176,6 +179,7 @@ class Service implements TorsorHttpService {
     } else {
       this.#kernel = TorsorKernel.open({
         databasePath: options.databasePath,
+        ...(options.artifactStorage ? { artifactStorage: options.artifactStorage } : {}),
         ...(options.bootstrap ? { bootstrap: options.bootstrap } : {}),
         ...(options.clock ? { clock: options.clock } : {}),
         ...(options.idFactory ? { idFactory: options.idFactory } : {}),
@@ -623,6 +627,31 @@ class Service implements TorsorHttpService {
       return;
     }
 
+    if (segments[2] === "artifacts" && segments[3]) {
+      if (segments.length === 4) {
+        const artifact = await this.#kernel.query(
+          { type: "GetArtifact", artifactId: segments[3] }, authenticated.context,
+        );
+        this.#requireCurrentAuthentication(authenticated);
+        sendJson(response, 200, { artifact });
+        return;
+      }
+      if (segments[4] === "content" && segments.length === 5) {
+        const { artifact, content } = await this.#kernel.readArtifact(segments[3], authenticated.context);
+        this.#requireCurrentAuthentication(authenticated);
+        response.writeHead(200, {
+          "Content-Type": artifact.mediaType,
+          "Content-Length": content.byteLength,
+          "Content-Disposition": 'attachment; filename="report.txt"',
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
+          "Content-Security-Policy": "default-src 'none'; sandbox",
+        });
+        response.end(content);
+        return;
+      }
+    }
+
     if (segments[2] === "threads" && segments[3] && segments.length === 4) {
       const thread = await this.#kernel.query(
         { type: "GetThreadProjection", threadRootId: segments[3] },
@@ -647,6 +676,7 @@ class Service implements TorsorHttpService {
             type: "ListActivity",
             runId: segments[3],
             ...optionalNumber(url, "afterSequence"),
+            ...optionalNumber(url, "beforeSequence"),
             limit: pageSize(url),
           },
           authenticated.context,
@@ -740,7 +770,34 @@ class Service implements TorsorHttpService {
         !controller.signal.aborted &&
         this.#authenticationIsCurrent(authenticated)
       ) {
+        const previousCursor = cursor;
         cursor = page.scannedThroughEventId;
+        for (const event of page.events) {
+          if (!this.#authenticationIsCurrent(authenticated)) {
+            controller.abort();
+            break;
+          }
+          await writeStreamChunk(
+            response,
+            encodeSseEvent(event),
+            controller.signal,
+          );
+          lastWriteAt = Date.now();
+          if (controller.signal.aborted) {
+            break;
+          }
+        }
+        if (controller.signal.aborted || !this.#authenticationIsCurrent(authenticated)) {
+          break;
+        }
+        if (cursor && cursor !== previousCursor && page.events.at(-1)?.eventId !== cursor) {
+          await writeStreamChunk(
+            response,
+            `id: ${cursor}\nevent: checkpoint\ndata: ${JSON.stringify({ cursor })}\n\n`,
+            controller.signal,
+          );
+          lastWriteAt = Date.now();
+        }
         if (page.events.length === 0 && !page.hasMore) {
           await delay(
             this.#authenticationDelay(
@@ -777,24 +834,6 @@ class Service implements TorsorHttpService {
             authenticated.context,
           );
           continue;
-        }
-        for (const event of page.events) {
-          if (!this.#authenticationIsCurrent(authenticated)) {
-            controller.abort();
-            break;
-          }
-          await writeStreamChunk(
-            response,
-            encodeSseEvent(event),
-            controller.signal,
-          );
-          lastWriteAt = Date.now();
-          if (controller.signal.aborted) {
-            break;
-          }
-        }
-        if (controller.signal.aborted) {
-          break;
         }
         if (page.hasMore) {
           await yieldToEventLoop();
@@ -981,6 +1020,8 @@ function kernelStatus(code: KernelError["code"]): number {
       return 400;
     case "Conflict":
     case "DomainBusy":
+    case "WriterAuthorityLost":
+    case "CausalLimitExceeded":
     case "StaleRevision":
     case "ConditionalCheckFailed":
     case "TerminalRun":

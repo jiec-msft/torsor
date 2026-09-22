@@ -1,9 +1,9 @@
 # `@torsor/kernel`
 
-## Physical execution records (schema 14)
+## Physical execution records (schema 16)
 
 `RegisterPhysicalWorktree`, `StartWorktreeExecution`, `RecordWorktreeExecution`,
-and `RecoverWorktreeExecution` are trusted Runtime-only commands.
+`RevokeWorktreeExecutionAuthority`, and `RecoverWorktreeExecution` are trusted Runtime-only commands.
 `GetPhysicalWorktree`, `ListPhysicalWorktrees`, and `GetWorktreeStorageIdentity`
 are likewise local Runtime-only queries; their paths, process receipts, and
 storage identity are not public Thread events or HTTP resources.
@@ -24,19 +24,28 @@ transaction. A previously committed intent survives OS or transaction failure.
 Only the local executor checks paths and attests original-handle stop evidence;
 Kernel never interprets a PID or increasing generation as physical safety.
 
-Schema 13 databases intentionally fail to open. Stop old processes and recreate
+`checkWorktreePublication` additionally requires confirmed normal stop. Every Agent
+mutation (including replay), Runtime activity/success and trusted report finalization
+checks its Activation's durable Writer fence. Authority loss is irreversible and
+returns `WriterAuthorityLost`; late close cannot restore publication. Stop/failure/
+Unknown reconciliation remains available. A clean probe retains its lease through
+result publication, then scope cleanup releases it. Reads retain Artifact authorization.
+
+Earlier schemas, including versions 14 and 15, intentionally fail to open. Stop old processes and recreate
 the disposable database **and use a fresh managed root**; no migration or
 automatic deletion is performed. The normative contracts are MVP §§22, 24, 38,
 and 43.1 in both languages.
 
 `@torsor/kernel` is the durable local state boundary for the first Torsor
 implementation slice. It stores collaboration and execution facts in SQLite
-while keeping SQL and provider details behind three consumer operations:
+while keeping SQL and provider details behind consumer operations:
 
 ```ts
 kernel.execute(command, principalContext);
 kernel.query(query, principalContext);
 kernel.readEvents(afterEventId, limit);
+kernel.finalizeReport({ runId, expectedRunRevision, idempotencyKey, content }, principalContext);
+kernel.readArtifact(artifactId, principalContext);
 ```
 
 `readEvents` is a trusted-internal synchronization feed for the local
@@ -156,6 +165,25 @@ revision to an eligible same-Project, same-Channel, same-Thread Run with
 `ResolveAttentionWithRun`. All three decisions consume the Attention exactly
 once and end its handler Activation.
 
+New Runs pass one write-transaction causal admission boundary (sections 25.1-25.2,
+28.2, 32.7 of the paired MVP specification). Kernel derives immutable
+`causalRootId`, `parentAttentionId`, `parentRunId`, and `delegationDepth` from
+the triggering Message and authenticated Attention. Initial Runs start at
+depth 0; Agent replies inherit the parent Run's Human Message root and add one
+depth. Continuing a Run never resets its origin.
+
+`KernelOpenOptions.causalLimits` is trusted server configuration with defaults
+`{ maxDepth: 4, maxNonTerminalRunsPerRoot: 50 }`. New databases persist it;
+reopen without an override uses that configuration, and an explicit mismatch
+fails. Agent configuration and command payloads cannot raise these limits.
+Admission counts durable nonterminal Runs under `BEGIN IMMEDIATE`, including
+Waiting. Only a committed Completed/Failed/Cancelled transition releases a
+slot, independently of Provider stop. Creation and terminal events carry
+capacity evidence; `CausalLimitExceeded` includes the exceeded dimension,
+effective limits, root, proposed depth, and current occupancy. Rejection
+leaves the Attention decision open, and idempotent replay allocates no slot.
+Provider cost, fan-out, per-Project/Agent quotas, and UI budgeting are deferred.
+
 Outbox consumers use `ClaimOutboxEvents`, `AcknowledgeOutboxEvents`, and
 `ListOutboxEvents`. Claims are ordered, leased, and recoverable after process
 restart or lease expiry. Successful non-empty claims return `leaseExpiresAt`,
@@ -241,11 +269,44 @@ generation-fences the Active Run, preserves Pending RunInputs, moves the Run to
 Waiting, revokes unfinished Run Activations, records durable activity, and
 does not create a replacement Activation or provider wake-up.
 
-Artifact publication stores an immutable descriptor only. The caller must
-finalize content in durable storage and verify its digest before
-`PublishArtifact`; the kernel does not upload blobs or turn a temporary upload
-location into a finalized Artifact. A failed or incomplete upload must not
-publish the descriptor.
+Configure `KernelOpenOptions.artifactStorage` with a trusted `ArtifactStorage`
+adapter. `LocalArtifactStorage.open(absolutePrivateRoot)` implements immutable
+local storage. `finalizeReport` accepts bytes or an async byte stream from a
+live Run Activation, copies at most 1 MiB / 4096 chunks, computes SHA-256,
+awaits durable storage, and only then atomically publishes descriptor, public
+event, Outbox and idempotency result. Direct `execute(PublishArtifact)` is
+forbidden, including for an otherwise authorized Agent. Report provenance is
+Kernel-derived; no caller-supplied digest, file URL, path, or descriptor is
+accepted. Reports have fixed plain-text media type and a `run:<id>@<revision>`
+base reference, not a fabricated Git commit.
+
+The private storage layout is `sha256/<64 lowercase hex>` plus
+`staging/<random>.tmp`. Exclusive staging, file flush, no-replace hard-link
+publication and full collision verification precede descriptor publication.
+Reads reject invalid keys, links/junctions, non-regular files, size mismatches
+and digest mismatches. Keep the root/ancestors Host-controlled, outside any
+Provider-writable directory. This is not an OS sandbox. POSIX flushes directory
+entries too; portable Node on Windows provides process-crash/restart recovery,
+not a directory-flush/power-loss guarantee.
+
+Retry uses the same principal, Run, key, bytes and expected revision. A new
+currently authorized Activation may recover the same committed result and
+original provenance. Revoked Activations cannot replay cached results. Before
+commit, crashes leave invisible staging/orphan content; after commit, projections
+and durable idempotency records recover lost responses. There is no background
+Provider-output replay or online GC. Offline cleanup must preserve referenced
+blobs. One descriptor per Run/digest remains enforced.
+
+`GetArtifact` and `readArtifact` reauthorize the current principal and Run scope;
+the latter repeats authorization after storage I/O and verifies returned bytes.
+Descriptors expose `byteLength` and `producerThreadRootId`, never storage paths.
+The local model retains global Human/Runtime reads and scoped Agent reads.
+An Agent sees descriptors/events only for its current Run, across current and
+historical projections, bounded event replay and conditional-command catch-up.
+An Attention scope sees no Artifacts. Scope validation precedes descriptor
+lookup; missing and inaccessible IDs return the same generic `NotFound` without
+reading storage. Filtered event scan cursors still advance.
+See paired MVP sections 21.3/21.5, 23.1/23.2/23.4 and 35.3 for requirements.
 
 Worktree mutation is fenced by a Runtime-only durable writer lease. Acquisition
 creates a new monotonically increasing generation and fencing token for the
@@ -274,8 +335,17 @@ clock-derived expiry, and
 release, expiry, quarantine, and reconciliation ledger. These primitives do
 not perform filesystem mutation, process execution, or shell execution.
 
-The current direct schema version is 14. Version 14 adds the physical records
-described above. Version 13 added durable Worktree
+The current direct schema version is 16. It combines the physical records and
+irreversible Writer publication fences above with trusted Artifact byte
+length and source Thread provenance (replacing caller-provided storage
+locations) with durable server-owned causal limits, immutable Run root/parent/depth,
+and the root-scoped nonterminal admission index. Defaults remain inclusive depth
+4 and at most 50 nonterminal Runs per root. Earlier schema 14 layouts
+(causal-only, Artifact-only and Worktree-only) and schema 15 are rejected before
+DDL/bootstrap. There is no version-only compatibility shortcut or migration.
+Artifacts trace causality through their producer Run; equal content in parent
+and child Runs shares a blob, not descriptor identity, authorization or a Run slot.
+Version 13 adds durable Worktree
 writer lease state and its independent event ledger. It retains version 12's
 bounded Attention recovery expiry horizon. Version 12 gives unfinished and
 finished-unsettled Attention recovery one bounded expiry-horizon index, so
@@ -286,4 +356,18 @@ normalized recovery state, ordered page indexes, count-only expiry promotion,
 recovery mutation revision, incremental provider/domain counters, and durable
 Agent/Project/Channel/Thread execution fences.
 This pre-release schema is intentionally breaking: stop old processes and
-recreate disposable databases rather than migrating version 8 through 13.
+explicitly recreate disposable databases rather than migrating earlier versions,
+and use fresh managed roots. Opening an older database fails without
+modifying its version, schema, or data.
+
+Version 16 alone is not compatibility proof. An existing file is checked with a
+read-only connection before any writable open, then rechecked under the schema
+initialization lock. A reference schema in isolated memory supplies a SHA-256
+fingerprint of SQLite object definitions, column/FK/index pragmas and STRICT
+metadata. SQL token comparison ignores formatting/comments but preserves
+quoted literals, operator boundaries, CHECK predicates and trigger bodies.
+Missing, altered or extra-incompatible objects fail unchanged, including files
+with an uncheckpointed WAL; no `CREATE IF NOT EXISTS` repairs are attempted.
+SQLite-owned statistics are excluded. Integrity and required durable config
+rows and Worktree storage identity are checked too. Only an empty version-0 database runs DDL/config/bootstrap,
+atomically; a valid reopen never reapplies bootstrap.

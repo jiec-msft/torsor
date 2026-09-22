@@ -21,12 +21,10 @@ export interface ControlledProcessDriver {
 
 const probeSource = `
 const { createHash } = require("node:crypto");
-process.on("message", (message) => {
-  if (message.type === "probe") {
-    process.send({ digest: createHash("sha256").update(message.content).digest("hex") });
-  } else if (message.type === "stop") {
-    process.disconnect();
-  }
+const input = require("node:readline").createInterface({ input: process.stdin });
+input.once("line", (line) => {
+  const message = JSON.parse(line);
+  process.stdout.write(createHash("sha256").update(message.content).digest("hex") + "\\n");
 });
 `;
 
@@ -39,21 +37,40 @@ export const nodeProbeDriver: ControlledProcessDriver = {
       // No inherited NODE_OPTIONS, preload, PATH, credentials, or repository environment.
       env: process.platform === "win32" && process.env.SystemRoot
         ? { SystemRoot: process.env.SystemRoot } : {},
-      stdio: ["ignore", "ignore", "ignore", "ipc"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
     let resolveResult!: (value: string) => void;
     let rejectResult!: (error: Error) => void;
     const result = new Promise<string>((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
     void result.catch(() => undefined);
     let error: string | null = null;
-    child.on("error", (failure) => { error = failure.message; rejectResult(failure); });
-    child.on("message", (message: unknown) => {
-      if (message !== null && typeof message === "object" && "digest" in message &&
-          typeof message.digest === "string" && /^[a-f0-9]{64}$/.test(message.digest)) {
-        resolveResult(message.digest);
-      } else {
-        rejectResult(new Error("Invalid controlled child result."));
+    let output = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    const fail = (message: string) => {
+      rejectResult(new Error(message));
+      if (error === null) {
+        error = message;
+        child.kill("SIGKILL");
       }
+    };
+    child.on("error", () => fail("Controlled child process failed."));
+    child.stdin.on("error", () => fail("Controlled child input failed."));
+    child.stdout.on("error", () => fail("Controlled child output failed."));
+    child.stderr.on("error", () => fail("Controlled child diagnostics failed."));
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdoutBytes += chunk.byteLength;
+      if (stdoutBytes > 65) return fail("Controlled child exceeded its output limit.");
+      if (chunk.some((byte) => byte > 127)) return fail("Invalid controlled child result.");
+      output += chunk.toString("ascii");
+      if (output.length === 65) {
+        if (/^[a-f0-9]{64}\n$/.test(output)) resolveResult(output.slice(0, 64));
+        else fail("Invalid controlled child result.");
+      }
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderrBytes += chunk.byteLength;
+      if (stderrBytes > 1024) fail("Controlled child exceeded its diagnostic limit.");
     });
     const closed = new Promise<ChildCloseEvidence>((resolve) => {
       child.once("close", (code, signal) => {
@@ -61,17 +78,10 @@ export const nodeProbeDriver: ControlledProcessDriver = {
         resolve({ code, signal, error });
       });
     });
-    const send = (message: object) => {
-      if (child.connected) {
-        child.send(message, (failure) => {
-          if (failure) { error = failure.message; rejectResult(failure); }
-        });
-      }
-    };
-    child.once("spawn", () => send({ type: "probe", content: input.content }));
+    child.once("spawn", () => child.stdin.write(`${JSON.stringify({ content: input.content })}\n`));
     return {
       pid: child.pid, result, closed,
-      requestStop: () => send({ type: "stop" }),
+      requestStop: () => child.stdin.end(),
       forceStop: () => child.kill("SIGKILL"),
     };
   },

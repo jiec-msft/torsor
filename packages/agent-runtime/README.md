@@ -16,6 +16,16 @@ and `close` bound the lifecycle. Runtime gives explicitly enabled trusted
 adapters only `context.worktree.probe(worktreeId)`, never a path or executable.
 Attention contexts have no such capability.
 
+Clean `probe` requires the fixed digest, normal child close and a current Writer
+fence; it retains the lease until Activation publication/settlement ends. Kernel
+guards activity, report finalization, terminal effects and cached mutation results.
+Cancellation, uncertainty, expiry or restart irreversibly revokes publication,
+even if a late child close makes the directory physically reusable. Reports go
+through the existing authorized `publishReport` capability, never raw descriptors.
+The fixed stdout protocol is bounded to 65 bytes, stderr to 1024 discarded bytes;
+the child inherits no credentials or injection settings. Provider-facing failures
+are fixed `Unknown` diagnostics, not local paths or raw process output.
+
 Logical lease expiry is not process exit. An unsettled execution blocks lease
 release and reacquisition. Unconfirmed stop quarantines the directory; only
 original-handle close evidence permits local reconciliation. A restart that
@@ -125,9 +135,16 @@ The bridge then applies only server-bound Kernel capabilities; provider output
 cannot choose provenance, Agent identity, Activation identity, or
 ProviderAttempt identity.
 
-Artifact publication is intentionally unavailable to providers until the
-runtime has a trusted finalizer that persists bytes and computes the immutable
-digest and location. The Copilot process is also not an operating-system
+When the Host configures Artifact storage, a Run bridge offers
+`publishReport({ idempotencyKey, text })`. ACP exposes only the bounded
+`publish_report` action with those fields. The bridge binds Run/revision and
+Activation, and Kernel finalization computes the digest and persists real bytes
+before publication. Stable report keys are Run-scoped, not ProviderAttempt
+sequence numbers. Extra descriptor/provenance fields fail before actions apply;
+`publish_artifact` remains forbidden. Without storage the capability fails closed
+and is not advertised. Report publication does not complete the Run.
+
+The Copilot process is also not an operating-system
 sandbox; this slice relies on the CLI tool-availability boundary and sanitized
 environment and does not provide Worktree, Git, terminal, or multi-host
 execution.

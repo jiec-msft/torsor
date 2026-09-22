@@ -1,0 +1,29 @@
+name: ACP conformance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run public CLI smoke
+        run: npm run build --workspace @torsor/acp-conformance && npm exec -- acp-conformance run packages/acp-conformance/examples/basic.json
+      - run: npm run test:acp-conformance
+      - run: npm run typecheck --workspace @torsor/acp-conformance

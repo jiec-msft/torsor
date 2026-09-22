@@ -607,53 +607,26 @@ describe("TorsorKernel transactions and invariants", () => {
     }
   });
 
-  it("keeps Artifact digest and provenance immutable", async () => {
+  it("rejects descriptor publication without trusted byte finalization", async () => {
     const kernel = openMemoryKernel();
     try {
       const setup = await createRun(kernel);
-      const artifact = await kernel.execute(
+      await expect(kernel.execute(
         {
           type: "PublishArtifact",
           idempotencyKey: "artifact-one",
           runId: setup.runId,
           expectedRunRevision: 1,
           contentDigest: "sha256:synthetic-report",
-          baseRevision: "sample-base-1",
-          mediaType: "application/json",
-          storageLocation: "local://artifacts/synthetic-report",
-          metadata: { label: "Synthetic report" },
+          byteLength: 16,
         },
         setup.agentContext,
-      );
-
-      await expect(
-        kernel.execute(
-          {
-            type: "PublishArtifact",
-            idempotencyKey: "artifact-conflict",
-            runId: setup.runId,
-            expectedRunRevision: 1,
-            contentDigest: "sha256:synthetic-report",
-            baseRevision: "different-base",
-            mediaType: "application/json",
-            storageLocation: "local://artifacts/changed",
-          },
-          setup.agentContext,
-        ),
-      ).rejects.toMatchObject({ code: "Conflict" });
+      )).rejects.toMatchObject({ code: "Forbidden" });
       const projection = await kernel.query(
         { type: "GetRunProjection", runId: setup.runId },
         humanContext,
       );
-      expect(projection.artifacts).toEqual([
-        expect.objectContaining({
-          id: artifact.entityId,
-          contentDigest: "sha256:synthetic-report",
-          producerRunId: setup.runId,
-          producerActivationId: setup.activationId,
-          baseRevision: "sample-base-1",
-        }),
-      ]);
+      expect(projection.artifacts).toEqual([]);
     } finally {
       kernel.close();
     }

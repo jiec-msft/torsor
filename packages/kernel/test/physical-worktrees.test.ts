@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import { createRun, openMemoryKernel, runtimeContext, humanContext } from "./helpers.js";
-import type { WorktreeMutationAuthority } from "../src/index.js";
+import { bootstrap, createRun, runtimeContext, humanContext } from "./helpers.js";
+import { TorsorKernel, type ArtifactStorage, type WorktreeMutationAuthority } from "../src/index.js";
 
-async function setup() {
+async function setup(artifactStorage?: ArtifactStorage) {
   let now = new Date("2026-09-22T08:00:00Z");
-  const kernel = openMemoryKernel(() => now);
+  const kernel = TorsorKernel.open({
+    databasePath: ":memory:", bootstrap, clock: () => now,
+    ...(artifactStorage ? { artifactStorage } : {}),
+  });
   const run = await createRun(kernel);
   await kernel.execute({
     type: "RegisterPhysicalWorktree", idempotencyKey: "register",
@@ -33,10 +36,154 @@ async function setup() {
     kernel, run, authority, receipt,
     mutation: { ...authority, ...receipt } satisfies WorktreeMutationAuthority,
     expire: () => { now = new Date("2026-09-22T08:00:01Z"); },
+    rewind: () => { now = new Date("2026-09-22T08:00:00Z"); },
   };
 }
 
 describe("physical execution contracts (§22, §24, §38)", () => {
+  it("fences a stopped old generation while a replacement Activation recovers an authorized committed Artifact", async () => {
+    const content = Buffer.from("Synthetic controlled report.\n");
+    const f = await setup({ put: async () => {}, read: async () => content });
+    try {
+      for (const state of ["Running", "StopRequested", "StopConfirmed"] as const) {
+        await f.kernel.execute({
+          type: "RecordWorktreeExecution", idempotencyKey: state, ...f.receipt,
+          state, evidence: "Synthetic exact-handle evidence.", preservePublicationAuthority: true,
+        }, runtimeContext);
+      }
+      const input = { idempotencyKey: "controlled-report", runId: f.run.runId, expectedRunRevision: 1, content };
+      const artifact = await f.kernel.finalizeReport(input, f.run.agentContext);
+      await f.kernel.execute({
+        type: "ReleaseWorktreeWriterLease", idempotencyKey: "release", ...f.authority,
+      }, runtimeContext);
+      const lease = await f.kernel.execute({
+        type: "AcquireWorktreeWriterLease", idempotencyKey: "replacement-lease",
+        worktreeId: "tree", leaseDurationMs: 30_000,
+      }, runtimeContext);
+      expect(lease.leaseGeneration).toBe(2);
+      await expect(f.kernel.finalizeReport(input, f.run.agentContext))
+        .rejects.toMatchObject({ code: "WriterAuthorityLost" });
+      await expect(f.kernel.execute({
+        type: "StartWorktreeExecution", idempotencyKey: "old-activation-new-token",
+        worktreeId: "tree", activationId: f.run.activationId, executorId: "replacement-host",
+        leaseToken: lease.leaseToken!, generation: lease.leaseGeneration!, fencingToken: lease.fencingToken!,
+      }, runtimeContext)).rejects.toMatchObject({ code: "WriterAuthorityLost" });
+      const replacement = await f.kernel.execute({
+        type: "StartActivation", idempotencyKey: "replacement-activation", runId: f.run.runId,
+        expectedRunRevision: 1, outboxEventId: f.run.outboxEventId, outboxLeaseToken: f.run.outboxLeaseToken,
+      }, runtimeContext);
+      await f.kernel.execute({
+        type: "StartWorktreeExecution", idempotencyKey: "replacement-execution",
+        worktreeId: "tree", activationId: replacement.entityId, executorId: "replacement-host",
+        leaseToken: lease.leaseToken!, generation: lease.leaseGeneration!, fencingToken: lease.fencingToken!,
+      }, runtimeContext);
+      const actor = { principalId: f.run.agentContext.principalId, activationId: replacement.entityId };
+      expect(await f.kernel.finalizeReport(input, actor)).toEqual(artifact);
+      expect((await f.kernel.readArtifact(artifact.entityId, actor)).artifact)
+        .toMatchObject({ producerActivationId: f.run.activationId, producerRunId: f.run.runId });
+      expect(() => f.kernel.performWorktreeMutation(f.mutation, runtimeContext, () => {})).toThrow();
+    } finally { f.kernel.close(); }
+  });
+
+  it.each(["expiry", "quarantine", "recovery"] as const)(
+    "fences Agent effects, cached activities, reports and Runtime success after %s without publishing facts",
+    async (loss) => {
+      let writes = 0;
+      const f = await setup({
+        put: async () => { writes++; },
+        read: async () => { throw new Error("No Artifact should be readable."); },
+      });
+      try {
+        const activity = {
+          type: "AppendRunActivity" as const, idempotencyKey: "activity",
+          runId: f.run.runId, activationId: f.run.activationId,
+          kind: "agent_message", payload: { text: "Synthetic progress." }, retentionClass: "durable" as const,
+        };
+        await f.kernel.execute(activity, f.run.agentContext);
+        const attempt = await f.kernel.execute({
+          type: "StartProviderAttempt", idempotencyKey: "provider", activationId: f.run.activationId,
+          outboxEventId: f.run.outboxEventId, outboxLeaseToken: f.run.outboxLeaseToken,
+          adapter: "synthetic", adapterVersion: "1", capabilitySnapshot: {},
+          runInputIds: [f.run.runInputId], requestIdempotencyKey: "provider-request",
+        }, runtimeContext);
+        if (loss === "expiry") f.expire();
+        else if (loss === "quarantine") {
+          await f.kernel.execute({
+            type: "QuarantineWorktreeWriterLease", idempotencyKey: "publication-quarantine",
+            worktreeId: "tree", reason: "Synthetic authority revocation.",
+            expectedGeneration: f.authority.generation, expectedFencingToken: f.authority.fencingToken,
+            leaseToken: f.authority.leaseToken,
+          }, runtimeContext);
+        } else {
+          await f.kernel.execute({
+            type: "RecoverWorktreeExecution", idempotencyKey: "publication-recovery",
+            executionId: f.receipt.executionId, reason: "Original executor unavailable.",
+          }, runtimeContext);
+        }
+        const events = await f.kernel.readEvents(null, 500);
+        const before = await f.kernel.query({ type: "GetRunProjection", runId: f.run.runId }, humanContext);
+        for (const command of [
+          activity,
+          { ...activity, idempotencyKey: "late-activity" },
+          { type: "PublishRunReply", idempotencyKey: "late-reply", runId: f.run.runId, expectedRunRevision: 1, body: "Stale reply." },
+          { type: "CompleteRun", idempotencyKey: "late-complete", runId: f.run.runId, expectedRunRevision: 1, incorporatedThroughInputSequence: 1 },
+          { type: "RecordLateOutput", idempotencyKey: "late-output", runId: f.run.runId, activationId: f.run.activationId, payload: "Stale output." },
+        ] as const) {
+          await expect(f.kernel.execute(command, f.run.agentContext)).rejects.toMatchObject({ code: "WriterAuthorityLost" });
+        }
+        for (const command of [
+          { ...activity, idempotencyKey: "runtime-activity" },
+          { type: "FinishProviderAttempt", idempotencyKey: "runtime-success", providerAttemptId: attempt.entityId, status: "Completed" },
+          { type: "FinishActivation", idempotencyKey: "activation-success", activationId: f.run.activationId, outcome: "Completed" },
+        ] as const) {
+          await expect(f.kernel.execute(command, runtimeContext)).rejects.toMatchObject({ code: "WriterAuthorityLost" });
+        }
+        await expect(f.kernel.finalizeReport({
+          idempotencyKey: "late-report", runId: f.run.runId, expectedRunRevision: 1, content: Buffer.from("Synthetic report."),
+        }, f.run.agentContext)).rejects.toMatchObject({ code: "WriterAuthorityLost" });
+        expect(writes).toBe(0);
+        expect(await f.kernel.readEvents(null, 500)).toEqual(events);
+        expect(await f.kernel.query({ type: "GetRunProjection", runId: f.run.runId }, humanContext)).toEqual(before);
+        f.rewind();
+        await expect(f.kernel.execute({ ...activity, idempotencyKey: "clock-rollback" }, f.run.agentContext))
+          .rejects.toMatchObject({ code: "WriterAuthorityLost" });
+        await f.kernel.execute({
+          type: "FinishProviderAttempt", idempotencyKey: "runtime-unknown",
+          providerAttemptId: attempt.entityId, status: "Unknown", detail: "Controlled execution authority was lost.",
+        }, runtimeContext);
+        await f.kernel.execute({
+          type: "RecordWorktreeExecution", idempotencyKey: "safe-stop", ...f.receipt,
+          state: "StopConfirmed", evidence: "Original child close.",
+        }, runtimeContext);
+        await expect(f.kernel.execute({ ...activity, idempotencyKey: "late-close" }, f.run.agentContext))
+          .rejects.toMatchObject({ code: "WriterAuthorityLost" });
+      } finally { f.kernel.close(); }
+    },
+  );
+
+  it("rejects Artifact finalization when authority expires during trusted storage acknowledgement", async () => {
+    let writes = 0;
+    const f = await setup({
+      put: async () => { writes++; f.expire(); },
+      read: async () => { throw new Error("Unreferenced bytes are not a descriptor."); },
+    });
+    try {
+      const events = await f.kernel.readEvents(null, 500);
+      const before = await f.kernel.query({ type: "GetRunProjection", runId: f.run.runId }, humanContext);
+      await expect(f.kernel.finalizeReport({
+        idempotencyKey: "racing-report", runId: f.run.runId, expectedRunRevision: 1, content: Buffer.from("Synthetic bytes."),
+      }, f.run.agentContext)).rejects.toMatchObject({ code: "WriterAuthorityLost" });
+      expect(writes).toBe(1);
+      expect(await f.kernel.readEvents(null, 500)).toEqual(events);
+      expect(await f.kernel.query({ type: "GetRunProjection", runId: f.run.runId }, humanContext)).toEqual(before);
+      f.rewind();
+      await expect(f.kernel.finalizeReport({
+        idempotencyKey: "retry-report", runId: f.run.runId, expectedRunRevision: 1, content: Buffer.from("Synthetic bytes."),
+      }, f.run.agentContext)).rejects.toMatchObject({ code: "WriterAuthorityLost" });
+      expect(writes).toBe(1);
+    } finally { f.kernel.close(); }
+  });
+
   it("binds provenance, rejects stale mutations, and prevents lease release while intent is unsettled", async () => {
     const f = await setup();
     try {

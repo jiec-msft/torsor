@@ -14,6 +14,14 @@ are not Kernel objects and are not synchronized across windows. Server facts
 are refreshed from durable SSE events and broadcast as invalidations to other
 windows without copying view state.
 
+Run detail's Live Agent Timeline retains loaded `RunActivityEvent` history,
+loads older items in explicit 100-item pages, and fills reconnect gaps through
+the authenticated activity API. It follows output only while at the bottom;
+scrolling upward pauses following until `Back to latest`. RunInput, Provider
+execution, and authoritative Run state remain distinct from streamed output.
+Unknown activity kinds expose metadata only. See MVP sections
+[35.3, 37, and 44](../../docs/prototype/001-overview.md#37-streaming-output).
+
 ## Run locally
 
 Start `@torsor/server` on its default `http://127.0.0.1:4317`, then:

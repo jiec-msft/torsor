@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { closeSync, openSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
@@ -9,6 +9,7 @@ import {
 
 import { nodeProbeDriver, type ChildCloseEvidence, type ControlledChild, type ControlledProcessDriver } from "./controlled-process.js";
 import { canonicalDirectory, inspectWorktree, readPlainFile, type WorktreeRegistration } from "./worktree-paths.js";
+import { ProviderExecutionError } from "./types.js";
 
 export interface WorktreeProbeInput {
   readonly worktreeId: string;
@@ -87,7 +88,8 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
       for (const tree of page.items) {
         if (dirname(tree.directoryPath) !== this.#root.path) continue;
         const execution = tree.latestExecution;
-        if (execution && execution.executorId !== this.#executorId && !stoppedStates.has(execution.state)) {
+        if (execution && execution.executorId !== this.#executorId &&
+            (execution.authorityRevokedAt === null || !stoppedStates.has(execution.state))) {
           await this.#kernel.execute({
             type: "RecoverWorktreeExecution", idempotencyKey: `${this.#executorId}:recover:${execution.id}`,
             executionId: execution.id, reason: "Executor restarted without the original child handle; PID is not authority.",
@@ -127,6 +129,8 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
       type: "AcquireWorktreeWriterLease", idempotencyKey: `${requestId}:acquire`,
       worktreeId: input.worktreeId, leaseDurationMs: this.#leaseMs,
     }, this.#context);
+    const leaseDeadlineAt = performance.now() +
+      Date.parse(lease.leaseExpiresAt!) - Date.parse(lease.authorityObservedAt!);
     const leaseAuthority = {
       worktreeId: input.worktreeId, leaseToken: lease.leaseToken!,
       generation: lease.leaseGeneration!, fencingToken: lease.fencingToken!,
@@ -151,18 +155,20 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
     const handle = new ControlledWorktreeProcess({
       kernel: this.#kernel, principalId: this.#context.principalId, authority,
       activationId: input.activationId, stopMs: this.#stopMs, forceMs: this.#forceMs,
-      leaseBudgetMs: Math.max(1, Date.parse(lease.leaseExpiresAt!) - Date.parse(lease.authorityObservedAt!)),
+      leaseDeadlineAt,
       ...(input.signal ? { signal: input.signal } : {}),
     });
     this.#handles.set(started.entityId, handle);
     try {
       this.#kernel.performWorktreeMutation(authority, this.#context, () => {
+        handle.assertTimeBudget();
         input.signal?.throwIfAborted();
         this.#checkTree(tree);
         const fd = openSync(join(tree.directoryPath, "torsor-probe.txt"), "wx", 0o600);
         try { writeFileSync(fd, probeContent); } finally { closeSync(fd); }
       });
       this.#kernel.performWorktreeMutation(authority, this.#context, () => {
+        handle.assertTimeBudget();
         input.signal?.throwIfAborted();
         this.#checkTree(tree);
         handle.spawning();
@@ -177,14 +183,19 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
   }
 
   async probe(input: WorktreeProbeInput): Promise<{ digest: string; stop: WorktreeExecutionState }> {
-    const handle = await this.start(input);
+    let handle: ControlledWorktreeProcess | undefined;
     try {
+      handle = await this.start(input);
       const digest = await handle.result;
-      const stop = await handle.stop("Controlled probe completed.");
-      if (stop === "Uncertain") throw new Error("Controlled probe stop is uncertain; Worktree quarantined.");
+      if (digest !== createHash("sha256").update(probeContent).digest("hex")) {
+        throw new Error("Controlled probe returned an invalid digest.");
+      }
+      const stop = await handle.finish();
       return { digest, stop };
-    } finally {
-      await handle.stop("Controlled probe scope ended.");
+    } catch {
+      // This is the Provider boundary; local paths and raw child errors stay private.
+      await handle?.stop("Controlled probe failed.").catch(() => { throw controlledFailure(); });
+      throw controlledFailure();
     }
   }
 
@@ -229,7 +240,7 @@ interface ProcessOptions {
   readonly activationId: string;
   readonly stopMs: number;
   readonly forceMs: number;
-  readonly leaseBudgetMs: number;
+  readonly leaseDeadlineAt: number;
   readonly signal?: AbortSignal;
 }
 
@@ -238,6 +249,8 @@ export class ControlledWorktreeProcess {
   readonly #options: ProcessOptions;
   #child: ControlledChild | undefined;
   #stop: Promise<WorktreeExecutionState> | undefined;
+  #cancel: Promise<WorktreeExecutionState> | undefined;
+  #closeEvidence: ChildCloseEvidence | undefined;
   #state: WorktreeExecutionState = "Starting";
   #forced = false;
   #spawnAttempted = false;
@@ -264,6 +277,12 @@ export class ControlledWorktreeProcess {
       this.#child.result,
       this.#finished.then((state) => { throw new Error(`Controlled execution ended: ${state}.`); }),
     ]);
+  }
+
+  assertTimeBudget(): void {
+    if (performance.now() >= this.#options.leaseDeadlineAt) {
+      throw new Error("Writer lease wall-clock budget exhausted.");
+    }
   }
 
   spawning(): void {
@@ -304,32 +323,58 @@ export class ControlledWorktreeProcess {
     }, 25);
     this.#deadline = setTimeout(() => {
       void this.stop("Writer lease wall-clock budget exhausted.").catch(() => undefined);
-    }, this.#options.leaseBudgetMs);
+    }, Math.max(1, this.#options.leaseDeadlineAt - performance.now()));
   }
 
   stop(reason: string): Promise<WorktreeExecutionState> {
+    return this.#cancel ??= this.#stopAndRevoke(reason);
+  }
+
+  async #stopAndRevoke(reason: string): Promise<WorktreeExecutionState> {
+    clearTimeout(this.#deadline);
+    this.#removeAbort?.();
+    await this.#options.kernel.execute({
+      type: "RevokeWorktreeExecutionAuthority",
+      idempotencyKey: `${this.#options.authority.executionId}:revoke`,
+      ...this.#options.authority, reason,
+    }, this.#options);
+    const state = await this.#drain(reason, false);
+    if (stoppedStates.has(state)) await this.#release();
+    return state;
+  }
+
+  async finish(): Promise<WorktreeExecutionState> {
+    const state = await this.#drain("Controlled probe completed.", true);
+    if (state !== "StopConfirmed" || this.#closeEvidence?.code !== 0 ||
+        this.#closeEvidence.signal !== null || this.#closeEvidence.error !== null) {
+      throw new Error("Controlled child did not exit normally.");
+    }
+    this.#options.signal?.throwIfAborted();
+    this.assertTimeBudget();
+    this.#options.kernel.checkWorktreePublication(this.#options.authority, this.#options);
+    return state;
+  }
+
+  #drain(reason: string, preservePublicationAuthority: boolean): Promise<WorktreeExecutionState> {
     if (!this.#stop) {
-      this.#stop = this.#stopProcess(reason);
+      this.#stop = this.#stopProcess(reason, preservePublicationAuthority);
       void this.#stop.then(this.#resolveFinished, this.#rejectFinished);
     }
     return this.#stop;
   }
 
-  async #stopProcess(reason: string): Promise<WorktreeExecutionState> {
+  async #stopProcess(reason: string, preservePublicationAuthority: boolean): Promise<WorktreeExecutionState> {
     clearInterval(this.#monitor);
-    clearTimeout(this.#deadline);
-    this.#removeAbort?.();
     if (!this.#child) {
       await this.#record(this.#spawnAttempted ? "Uncertain" : "StopConfirmed",
         this.#spawnAttempted ? `${reason} Spawn was attempted but no handle returned.` : `${reason} No child was spawned.`);
-      if (!this.#spawnAttempted) await this.#release();
       return this.#state;
     }
     const tree = await this.#options.kernel.query({
       type: "GetPhysicalWorktree", worktreeId: this.#options.authority.worktreeId,
     }, this.#options);
     if (tree.latestExecution?.state !== "Uncertain") {
-      await this.#record("StopRequested", reason);
+      await this.#record("StopRequested", reason, preservePublicationAuthority);
     } else {
       this.#state = "Uncertain";
     }
@@ -351,19 +396,26 @@ export class ControlledWorktreeProcess {
     await this.stop("Reconciliation requested.");
     if (this.#state !== "Uncertain" || !this.#child) return this.#state;
     const evidence = await within(this.#child.closed, 0);
-    return evidence ? this.#confirm(evidence) : this.#state;
-  }
-
-  async #confirm(evidence: ChildCloseEvidence): Promise<WorktreeExecutionState> {
-    await this.#record(this.#forced ? "ForceTerminated" : "StopConfirmed", `Original child close: ${JSON.stringify(evidence)}`);
-    await this.#release();
+    if (evidence) {
+      await this.#confirm(evidence);
+      await this.#release();
+    }
     return this.#state;
   }
 
-  async #record(state: Exclude<WorktreeExecutionState, "Starting">, evidence: string): Promise<void> {
+  async #confirm(evidence: ChildCloseEvidence): Promise<WorktreeExecutionState> {
+    this.#closeEvidence = evidence;
+    await this.#record(this.#forced || evidence.signal !== null ? "ForceTerminated" : "StopConfirmed",
+      `Original child close: ${JSON.stringify(evidence)}`);
+    return this.#state;
+  }
+
+  async #record(
+    state: Exclude<WorktreeExecutionState, "Starting">, evidence: string, preservePublicationAuthority = false,
+  ): Promise<void> {
     await this.#options.kernel.execute({
       type: "RecordWorktreeExecution", idempotencyKey: `${this.#options.authority.executionId}:${state}`,
-      ...this.#options.authority, state, evidence,
+      ...this.#options.authority, state, evidence, preservePublicationAuthority,
       ...(this.#child?.pid ? { pid: this.#child.pid } : {}),
     }, this.#options);
     this.#state = state;
@@ -387,6 +439,10 @@ export class ControlledWorktreeProcess {
       if (current.status !== "Expired") throw error;
     }
   }
+}
+
+function controlledFailure(): ProviderExecutionError {
+  return new ProviderExecutionError("Controlled Worktree execution did not complete with current authority.", "Unknown");
 }
 
 function positive(value: number): number {
