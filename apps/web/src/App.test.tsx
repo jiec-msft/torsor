@@ -786,6 +786,96 @@ describe("TorsorApp", () => {
     expect(gate).toContainElement(connect);
   });
 
+  it("keeps Thread navigation and Start reachable in a short landscape drawer", async () => {
+    const user = userEvent.setup();
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 812,
+    });
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: 375,
+    });
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: (query: string) => ({
+        matches:
+          query.includes("max-width: 1099px") &&
+          !query.includes("prefers-reduced-motion"),
+        media: query,
+        onchange: null,
+        addListener: () => undefined,
+        removeListener: () => undefined,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        dispatchEvent: () => false,
+      }),
+    });
+    const controller = stubController(
+      readyState({
+        bootstrap: {
+          ...bootstrap,
+          channels: [
+            ...bootstrap.channels,
+            {
+              id: "channel-design",
+              projectId: "project-sample",
+              name: "design",
+            },
+            {
+              id: "channel-release",
+              projectId: "project-sample",
+              name: "release",
+            },
+          ],
+        },
+        thread: null,
+        run: null,
+      }),
+    );
+    window.history.replaceState(
+      {},
+      "",
+      "/?project=project-sample&channel=channel-general&panels=",
+    );
+    render(<TorsorApp controller={controller} />);
+
+    await user.click(
+      screen.getByRole("button", { name: "Expand channels" }),
+    );
+    const drawer = await screen.findByRole("dialog", {
+      name: "Channels and threads",
+    });
+    const threadButton = within(drawer).getByRole("button", {
+      name: /Inspect the synthetic release path/,
+    });
+    const start = within(drawer).getByLabelText("Start a thread");
+    expect(
+      threadButton.compareDocumentPosition(start) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+    expect(styles).toMatch(
+      /@media \(max-width: 1099px\) and \(max-height: 600px\)[\s\S]*?\.channels-panel \{[\s\S]*?overflow-y: auto;[\s\S]*?\.channels-panel \.thread-list \{[\s\S]*?overflow: visible;/,
+    );
+
+    await user.click(threadButton);
+    expect(new URLSearchParams(window.location.search).get("thread")).toBe(
+      "thread-1",
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Expand channels" }),
+    );
+    const reopenedDrawer = await screen.findByRole("dialog", {
+      name: "Channels and threads",
+    });
+    const reopenedStart = within(reopenedDrawer).getByLabelText(
+      "Start a thread",
+    );
+    await user.click(reopenedStart);
+    await user.type(reopenedStart, "Reachable after Thread navigation.");
+    expect(reopenedStart).toHaveValue("Reachable after Thread navigation.");
+  });
+
   it.each([375, 768, 1024])(
     "keeps reduced-motion compact drawer focus contained at %ipx",
     async (width) => {
