@@ -7,6 +7,7 @@ import {
   KernelError,
   TorsorKernel,
   type KernelBootstrap,
+  type RecoverableAttentionExecutionPage,
 } from "@torsor/kernel";
 import { describe, expect, it, vi } from "vitest";
 
@@ -226,6 +227,7 @@ describe("AgentRuntime", () => {
         active -= 1;
       }
     });
+
     try {
       for (let index = 0; index < 10; index += 1) {
         await mentionAgent(kernel, `concurrent-attention-${index}`);
@@ -241,6 +243,122 @@ describe("AgentRuntime", () => {
       expect(
         events.filter((event) => event.type === "AttentionIgnored"),
       ).toHaveLength(10);
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it.each([
+    {
+      boundary: "positive",
+      runtimeOffsetMs: 4_999,
+      expectedProviderStarts: 1,
+    },
+    {
+      boundary: "zero",
+      runtimeOffsetMs: 5_000,
+      expectedProviderStarts: 0,
+    },
+    {
+      boundary: "negative",
+      runtimeOffsetMs: 5_001,
+      expectedProviderStarts: 0,
+    },
+  ])(
+    "uses the authoritative Attention lease for a $boundary provider budget",
+    async ({ runtimeOffsetMs, expectedProviderStarts }) => {
+      const kernelNow = new Date("2026-09-21T08:00:00.000Z");
+      const kernel = openKernel(":memory:", () => kernelNow);
+      const adapter = new DeterministicFakeAdapter(async (context) => {
+        if (context.cause.type !== "attention") {
+          throw new Error("The lease boundary test must not create Run work.");
+        }
+        await context.capabilities.ignoreAttention(
+          "Authoritative lease budget remained positive.",
+        );
+      });
+      try {
+        await mentionAgent(kernel, `attention-budget-${runtimeOffsetMs}`);
+        const result = await createRuntime(kernel, adapter, {
+          attentionLeaseMs: 6_000,
+          outboxLeaseMs: 6_000,
+          providerTimeoutMs: 5_000,
+          leaseSafetyMs: 1_000,
+          clock: () =>
+            new Date(kernelNow.getTime() + runtimeOffsetMs),
+        }).runOnce();
+
+        expect(adapter.invocationCount).toBe(expectedProviderStarts);
+        expect(result.attentionsDispatched).toBe(expectedProviderStarts);
+        const events = await kernel.readEvents(null, 500);
+        expect(
+          events.filter((event) => event.type === "ProviderAttemptStarted"),
+        ).toHaveLength(expectedProviderStarts);
+      } finally {
+        kernel.close();
+      }
+    },
+  );
+
+  it("requests an Activation window that covers the authoritative lease", async () => {
+    const startedAt = new Date("2026-09-21T08:00:00.000Z");
+    let now = startedAt;
+    const kernel = openKernel(":memory:", () => now, bootstrap, 1_000);
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type !== "attention") {
+        throw new Error("The Activation window test must not create Run work.");
+      }
+      now = new Date(now.getTime() + 1_500);
+      await context.capabilities.ignoreAttention(
+        "Activation remained authoritative beyond the Kernel default.",
+      );
+    });
+    try {
+      const thread = await mentionAgent(
+        kernel,
+        "activation-window-authority",
+      );
+      await createRuntime(kernel, adapter, {
+        attentionLeaseMs: 6_000,
+        outboxLeaseMs: 6_000,
+        providerTimeoutMs: 5_000,
+        leaseSafetyMs: 1_000,
+        clock: () => now,
+      }).runOnce();
+
+      const projection = await kernel.query(
+        {
+          type: "GetThreadProjection",
+          threadRootId: thread.entityId,
+        },
+        runtimeContext,
+      );
+      expect(projection.attentions[0]?.status).toBe("Ignored");
+      const events = await kernel.readEvents(null, 500);
+      expect(
+        events.find((event) => event.type === "ActivationStarted")
+          ?.payload,
+      ).toMatchObject({
+        expiresAt: new Date(startedAt.getTime() + 6_000).toISOString(),
+      });
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("rejects duration settings that could invalidate lease budgets", () => {
+    const kernel = openKernel(":memory:");
+    try {
+      expect(() =>
+        createRuntime(kernel, new DeterministicFakeAdapter(), {
+          leaseSafetyMs: -1,
+        }),
+      ).toThrow("leaseSafetyMs must be an integer of at least 0.");
+      expect(() =>
+        createRuntime(kernel, new DeterministicFakeAdapter(), {
+          providerTimeoutMs: Number.NaN,
+        }),
+      ).toThrow("providerTimeoutMs must be an integer of at least 1.");
     } finally {
       kernel.close();
     }
@@ -1175,6 +1293,7 @@ describe("AgentRuntime", () => {
           releaseFirst();
         }
       });
+
       const firstHooks = {
         beforeAttentionClaim: async (attention: { readonly id: string }) => {
           if (attention.id === firstAttentionId) {
@@ -1237,6 +1356,132 @@ describe("AgentRuntime", () => {
       );
       expect(refreshedFirst.attentions[0]?.status).toBe("Ignored");
     } finally {
+      kernel.close();
+    }
+  });
+
+  it("skips a DomainBusy claim while unrelated work continues", async () => {
+    const kernel = openKernel(":memory:");
+    let signalDecisionCommitted!: () => void;
+    let releaseOwner!: () => void;
+    const decisionCommitted = new Promise<void>((resolve) => {
+      signalDecisionCommitted = resolve;
+    });
+    const ownerRelease = new Promise<void>((resolve) => {
+      releaseOwner = resolve;
+    });
+    let sameDomainActive = 0;
+    let maximumSameDomainActive = 0;
+    const handledBodies: string[] = [];
+    let ownerPass: Promise<{
+      readonly attentionsDispatched: number;
+      readonly outboxEventsProcessed: number;
+    }> | undefined;
+    try {
+      const sharedThread = await startMention(
+        kernel,
+        "domain-busy-shared-root",
+        "Orbit, handle the first fenced item.",
+      );
+      await kernel.execute(
+        {
+          type: "ReplyToThread",
+          idempotencyKey: "domain-busy-shared-follow-up",
+          threadRootId: sharedThread.entityId,
+          body: "Orbit, handle the second fenced item.",
+          targetAgentIds: ["agent-orbit"],
+        },
+        humanContext,
+      );
+      await startMention(
+        kernel,
+        "domain-busy-independent",
+        "Orbit, handle unrelated work.",
+      );
+      const ordered = (
+        await kernel.query(
+          {
+            type: "GetThreadProjection",
+            threadRootId: sharedThread.entityId,
+          },
+          runtimeContext,
+        )
+      ).attentions.toSorted((left, right) => left.cursor - right.cursor);
+      const firstAttentionId = ordered[0]!.id;
+      const secondAttentionId = ordered[1]!.id;
+      const adapter = new DeterministicFakeAdapter(async (context) => {
+        if (context.cause.type !== "attention") {
+          throw new Error("The DomainBusy test must not create Run work.");
+        }
+        const body = context.cause.triggeringRevision.body;
+        handledBodies.push(body);
+        if (context.cause.attention.threadRootId === sharedThread.entityId) {
+          sameDomainActive += 1;
+          maximumSameDomainActive = Math.max(
+            maximumSameDomainActive,
+            sameDomainActive,
+          );
+          try {
+            await context.capabilities.ignoreAttention(
+              "Handled under the durable domain fence.",
+            );
+            if (context.cause.attention.id === firstAttentionId) {
+              signalDecisionCommitted();
+              await ownerRelease;
+            }
+          } finally {
+            sameDomainActive -= 1;
+          }
+          return;
+        }
+        await context.capabilities.ignoreAttention(
+          "Unrelated domain continued.",
+        );
+      });
+      ownerPass = createRuntime(kernel, adapter, {
+        attentionConcurrency: 1,
+      }).runOnce();
+      await decisionCommitted;
+
+      const contender = createRuntime(kernel, adapter, {
+        attentionConcurrency: 2,
+      });
+      const contenderPass = await contender.runOnce();
+
+      expect(contenderPass.attentionsDispatched).toBe(1);
+      expect(handledBodies).toContain("Orbit, handle unrelated work.");
+      expect(handledBodies).not.toContain(
+        "Orbit, handle the second fenced item.",
+      );
+      expect(maximumSameDomainActive).toBe(1);
+
+      releaseOwner();
+      const ownerResult = await ownerPass;
+      const nextPass = await contender.runOnce();
+
+      expect(
+        ownerResult.attentionsDispatched +
+          nextPass.attentionsDispatched,
+      ).toBe(2);
+      expect(handledBodies).toContain(
+        "Orbit, handle the second fenced item.",
+      );
+      expect(maximumSameDomainActive).toBe(1);
+      const after = await kernel.query(
+        {
+          type: "GetThreadProjection",
+          threadRootId: sharedThread.entityId,
+        },
+        runtimeContext,
+      );
+      expect(
+        after.attentions.find(
+          (attention) => attention.id === secondAttentionId,
+        )?.status,
+      ).toBe("Ignored");
+    } finally {
+      releaseOwner();
+      await ownerPass?.catch(() => {});
       kernel.close();
     }
   });
@@ -1987,7 +2232,7 @@ describe("AgentRuntime", () => {
     }
   });
 
-  it("immediately reconciles a finished Attention with an unfinished ProviderAttempt", async () => {
+  it("waits for the Attention Activation horizon before recovery settlement", async () => {
     let now = new Date("2026-09-21T08:00:00.000Z");
     const kernel = openKernel(":memory:", () => now);
     try {
@@ -2068,7 +2313,23 @@ describe("AgentRuntime", () => {
         { clock: () => now },
       ).runOnce();
 
-      const events = await kernel.readEvents(null, 500);
+      let events = await kernel.readEvents(null, 500);
+      expect(
+        events.find(
+          (event) =>
+            event.type === "ProviderAttemptFinished" &&
+            event.entityId === attempt.entityId,
+        ),
+      ).toBeUndefined();
+
+      now = new Date(now.getTime() + 31_000);
+      await createRuntime(
+        kernel,
+        new DeterministicFakeAdapter(),
+        { clock: () => now },
+      ).runOnce();
+
+      events = await kernel.readEvents(null, 500);
       const finish = events.find(
         (event) =>
           event.type === "ProviderAttemptFinished" &&
@@ -2080,7 +2341,7 @@ describe("AgentRuntime", () => {
     }
   });
 
-  it("does not fail live Attention completion when recovery settles its attempt", async () => {
+  it("does not recover a provider still returning after its Attention decision", async () => {
     const kernel = openKernel(":memory:");
     let signalDecisionCommitted!: () => void;
     let releaseProvider!: () => void;
@@ -2118,7 +2379,7 @@ describe("AgentRuntime", () => {
       );
       expect(attemptFinishes).toHaveLength(1);
       expect(attemptFinishes[0]?.payload).toMatchObject({
-        status: "Unknown",
+        status: "Completed",
       });
     } finally {
       releaseProvider();
@@ -2127,7 +2388,8 @@ describe("AgentRuntime", () => {
   });
 
   it("does not fail Attention recovery when live completion settles first", async () => {
-    const kernel = openKernel(":memory:");
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const kernel = openKernel(":memory:", () => now);
     let signalDecisionCommitted!: () => void;
     let releaseProvider!: () => void;
     const decisionCommitted = new Promise<void>((resolve) => {
@@ -2148,13 +2410,18 @@ describe("AgentRuntime", () => {
     });
     try {
       await mentionAgent(kernel, "recovery-after-live-completion-race");
-      const ownerPass = createRuntime(kernel, adapter).runOnce();
+      const ownerPass = createRuntime(kernel, adapter, {
+        clock: () => now,
+      }).runOnce();
       await decisionCommitted;
+      now = new Date(now.getTime() + 31_000);
 
       const recoveryPass = createRuntime(
         kernel,
         new DeterministicFakeAdapter(),
         {
+          projectIds: ["project-secondary"],
+          clock: () => now,
           hooks: {
             beforeAttentionRecoverySettlement: async () => {
               releaseProvider();
@@ -2216,6 +2483,7 @@ describe("AgentRuntime", () => {
     try {
       await mentionAgent(kernel, "process-replacement");
       const firstRuntime = createRuntime(kernel, firstAdapter, {
+        activationDurationMs: 30_000,
         hooks: {
           afterProviderAttemptStarted: async ({ causeType }) => {
             if (causeType === "run") {
@@ -2233,7 +2501,9 @@ describe("AgentRuntime", () => {
       now = new Date(now.getTime() + 31_000);
       kernel = openKernel(databasePath, () => now);
       const replacementAdapter = new DeterministicFakeAdapter();
-      const replacementRuntime = createRuntime(kernel, replacementAdapter);
+      const replacementRuntime = createRuntime(kernel, replacementAdapter, {
+        activationDurationMs: 30_000,
+      });
       await replacementRuntime.drainUntilIdle();
 
       const events = await kernel.readEvents(null, 500);
@@ -2460,6 +2730,297 @@ describe("AgentRuntime", () => {
       expect(run.artifacts).toHaveLength(0);
       expect(run.run.state).toBe("Completed");
     } finally {
+      kernel.close();
+    }
+  });
+
+  it("does not deliver an Outbox event without authoritative lease budget", async () => {
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const kernel = openKernel(":memory:", () => now);
+    let runDeliveries = 0;
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+        return;
+      }
+      runDeliveries += 1;
+      await context.capabilities.complete();
+    });
+    try {
+      await mentionAgent(kernel, "outbox-authoritative-budget");
+      await createRuntime(kernel, adapter, {
+        attentionLeaseMs: 6_000,
+        outboxLeaseMs: 6_000,
+        providerTimeoutMs: 5_000,
+        leaseSafetyMs: 1_000,
+        clock: () => now,
+      }).runOnce();
+
+      const staleAuthorityPass = await createRuntime(kernel, adapter, {
+        attentionLeaseMs: 6_000,
+        outboxLeaseMs: 6_000,
+        providerTimeoutMs: 5_000,
+        leaseSafetyMs: 1_000,
+        clock: () => new Date(now.getTime() + 5_000),
+      }).runOnce();
+
+      expect(staleAuthorityPass.outboxEventsProcessed).toBe(0);
+      expect(runDeliveries).toBe(0);
+
+      now = new Date(now.getTime() + 6_001);
+      await createRuntime(kernel, adapter, {
+        attentionLeaseMs: 6_000,
+        outboxLeaseMs: 6_000,
+        providerTimeoutMs: 5_000,
+        leaseSafetyMs: 1_000,
+        clock: () => now,
+      }).drainUntilIdle();
+
+      expect(runDeliveries).toBe(1);
+      const run = await getOnlyRun(kernel);
+      expect(run.run.state).toBe("Completed");
+      expect(run.providerAttempts).toHaveLength(1);
+      expect(run.providerAttempts.at(-1)?.status).toBe("Completed");
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("parks a terminal Outbox attempt that races provider startup", async () => {
+    const kernel = openKernel(":memory:");
+    let runDeliveries = 0;
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+        return;
+      }
+      runDeliveries += 1;
+      await context.capabilities.complete();
+    });
+    try {
+      await mentionAgent(kernel, "terminal-outbox-startup-race");
+      await createRuntime(kernel, adapter).runOnce();
+
+      const result = await createRuntime(kernel, adapter, {
+        hooks: {
+          afterProviderAttemptStarted: async ({
+            causeType,
+            providerAttemptId,
+          }) => {
+            if (causeType !== "run") {
+              return;
+            }
+            await kernel.execute(
+              {
+                type: "FinishProviderAttempt",
+                idempotencyKey:
+                  "terminal-outbox-startup-race:settle-unknown",
+                providerAttemptId,
+                status: "Unknown",
+                detail:
+                  "Synthetic concurrent settlement before provider startup.",
+              },
+              runtimeContext,
+            );
+          },
+        },
+      }).runOnce();
+
+      expect(result.outboxEventsProcessed).toBe(1);
+      expect(runDeliveries).toBe(0);
+      const run = await getOnlyRun(kernel);
+      expect(run.run.state).toBe("Waiting");
+      expect(run.inputs[0]?.disposition).toBe("Pending");
+      expect(run.providerAttempts).toHaveLength(1);
+      expect(run.providerAttempts[0]?.status).toBe("Unknown");
+      expect(run.activations[0]?.finishedAt).not.toBeNull();
+      expect(run.activations[0]?.outcome).toBe("Expired");
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("uses a fresh Activation after setup exhausts an Outbox lease", async () => {
+    let kernelNow = new Date("2026-09-21T08:00:00.000Z");
+    let runtimeNow = kernelNow;
+    const kernel = openKernel(":memory:", () => kernelNow);
+    let runDeliveries = 0;
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+        return;
+      }
+      runDeliveries += 1;
+      await context.capabilities.complete();
+    });
+    try {
+      await mentionAgent(kernel, "outbox-setup-budget-retry");
+      await createRuntime(kernel, adapter, {
+        attentionLeaseMs: 6_000,
+        outboxLeaseMs: 6_000,
+        providerTimeoutMs: 5_000,
+        leaseSafetyMs: 1_000,
+        clock: () => runtimeNow,
+      }).runOnce();
+
+      let exhaustedDuringSetup = false;
+      const originalQuery = kernel.query.bind(kernel);
+      vi.spyOn(kernel, "query").mockImplementation(
+        async (query, context) => {
+          const result = await originalQuery(query, context);
+          if (
+            query.type === "GetThreadProjection" &&
+            !exhaustedDuringSetup
+          ) {
+            exhaustedDuringSetup = true;
+            runtimeNow = new Date(kernelNow.getTime() + 5_000);
+          }
+          return result;
+        },
+      );
+      const exhaustedPass = await createRuntime(kernel, adapter, {
+        attentionLeaseMs: 6_000,
+        outboxLeaseMs: 6_000,
+        providerTimeoutMs: 5_000,
+        leaseSafetyMs: 1_000,
+        clock: () => runtimeNow,
+      }).runOnce();
+      vi.restoreAllMocks();
+
+      expect(exhaustedDuringSetup).toBe(true);
+      expect(exhaustedPass.outboxEventsProcessed).toBe(0);
+      expect(runDeliveries).toBe(0);
+
+      kernelNow = new Date(kernelNow.getTime() + 6_001);
+      runtimeNow = kernelNow;
+      await createRuntime(kernel, adapter, {
+        attentionLeaseMs: 6_000,
+        outboxLeaseMs: 6_000,
+        providerTimeoutMs: 5_000,
+        leaseSafetyMs: 1_000,
+        clock: () => runtimeNow,
+      }).drainUntilIdle();
+
+      expect(runDeliveries).toBe(1);
+      const run = await getOnlyRun(kernel);
+      expect(run.run.state).toBe("Completed");
+      expect(run.activations).toHaveLength(2);
+      expect(run.activations[0]?.outcome).toBe("Expired");
+      expect(run.activations[1]?.outcome).toBe("Completed");
+      expect(run.providerAttempts).toHaveLength(1);
+    } finally {
+      vi.restoreAllMocks();
+      kernel.close();
+    }
+  });
+
+  it("retries when an Outbox lease expires after attempt creation", async () => {
+    let kernelNow = new Date("2026-09-21T08:00:00.000Z");
+    let runtimeNow = kernelNow;
+    const kernel = openKernel(":memory:", () => kernelNow);
+    let runDeliveries = 0;
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+        return;
+      }
+      runDeliveries += 1;
+      await context.capabilities.complete();
+    });
+    try {
+      await mentionAgent(kernel, "outbox-post-attempt-budget-retry");
+      await createRuntime(kernel, adapter, {
+        attentionLeaseMs: 6_000,
+        outboxLeaseMs: 6_000,
+        providerTimeoutMs: 5_000,
+        leaseSafetyMs: 1_000,
+        clock: () => runtimeNow,
+      }).runOnce();
+
+      let exhaustedAfterAttempt = false;
+      const exhaustedPass = await createRuntime(kernel, adapter, {
+        attentionLeaseMs: 6_000,
+        outboxLeaseMs: 6_000,
+        providerTimeoutMs: 5_000,
+        leaseSafetyMs: 1_000,
+        clock: () => runtimeNow,
+        hooks: {
+          afterProviderAttemptStarted: async ({ causeType }) => {
+            if (causeType !== "run" || exhaustedAfterAttempt) {
+              return;
+            }
+            exhaustedAfterAttempt = true;
+            runtimeNow = new Date(kernelNow.getTime() + 5_000);
+          },
+        },
+      }).runOnce();
+
+      expect(exhaustedAfterAttempt).toBe(true);
+      expect(exhaustedPass.outboxEventsProcessed).toBe(0);
+      expect(runDeliveries).toBe(0);
+
+      kernelNow = new Date(kernelNow.getTime() + 6_001);
+      runtimeNow = kernelNow;
+      await createRuntime(kernel, adapter, {
+        attentionLeaseMs: 6_000,
+        outboxLeaseMs: 6_000,
+        providerTimeoutMs: 5_000,
+        leaseSafetyMs: 1_000,
+        clock: () => runtimeNow,
+      }).drainUntilIdle();
+
+      expect(runDeliveries).toBe(1);
+      const run = await getOnlyRun(kernel);
+      expect(run.run.state).toBe("Completed");
+      expect(run.activations).toHaveLength(2);
+      expect(run.providerAttempts.map((attempt) => attempt.status)).toEqual([
+        "Failed",
+        "Completed",
+      ]);
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("fails closed when a cached Outbox claim loses authority", async () => {
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const kernel = openKernel(":memory:", () => now);
+    const adapter = new DeterministicFakeAdapter();
+    const originalExecute = kernel.execute.bind(kernel);
+    let replayed = false;
+    try {
+      await mentionAgent(kernel, "stale-cached-outbox-claim");
+      vi.spyOn(kernel, "execute").mockImplementation(
+        async (command, context) => {
+          if (command.type !== "ClaimOutboxEvents" || replayed) {
+            return originalExecute(command, context);
+          }
+          replayed = true;
+          const original = await originalExecute(command, context);
+          expect(original.outboxEvents).toHaveLength(1);
+          now = new Date(now.getTime() + 31_000);
+          await originalExecute(
+            {
+              ...command,
+              idempotencyKey: "stale-cached-outbox-claim:replacement",
+            },
+            context,
+          );
+          return originalExecute(command, context);
+        },
+      );
+
+      await expect(
+        createRuntime(kernel, adapter, {
+          projectIds: ["project-secondary"],
+          clock: () => now,
+        }).runOnce(),
+      ).rejects.toMatchObject({ code: "Conflict" });
+
+      expect(adapter.invocationCount).toBe(0);
+      expect(replayed).toBe(true);
+    } finally {
+      vi.restoreAllMocks();
       kernel.close();
     }
   });
@@ -3520,6 +4081,157 @@ describe("AgentRuntime", () => {
     }
   });
 
+  it("discards recovery work superseded after its page was read", async () => {
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const kernel = openKernel(":memory:", () => now);
+    let superseded = false;
+    try {
+      const thread = await mentionAgent(
+        kernel,
+        "recovery-superseded-after-page",
+      );
+      const projection = await kernel.query(
+        {
+          type: "GetThreadProjection",
+          threadRootId: thread.entityId,
+        },
+        runtimeContext,
+      );
+      const attention = projection.attentions[0]!;
+      const claim = await kernel.execute(
+        {
+          type: "ClaimAttention",
+          idempotencyKey: "recovery-superseded-after-page:claim",
+          attentionId: attention.id,
+          expectedAttentionRevision: attention.revision,
+          leaseDurationMs: 30_000,
+        },
+        runtimeContext,
+      );
+      const activation = await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "recovery-superseded-after-page:activation",
+          attentionId: attention.id,
+          handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
+        },
+        runtimeContext,
+      );
+      await clearOutbox(kernel);
+      now = new Date(now.getTime() + 31_000);
+      const originalQuery = kernel.query.bind(kernel);
+      vi.spyOn(kernel, "query").mockImplementation(
+        async (query, context) => {
+          const result = await originalQuery(query, context);
+          const recoveryPage =
+            result as RecoverableAttentionExecutionPage;
+          if (
+            query.type === "ListRecoverableAttentionExecutions" &&
+            !superseded &&
+            recoveryPage.items.length > 0
+          ) {
+            superseded = true;
+            await kernel.execute(
+              {
+                type: "ClaimAttention",
+                idempotencyKey:
+                  "recovery-superseded-after-page:replacement",
+                attentionId: attention.id,
+                expectedAttentionRevision: claim.revision!,
+                leaseDurationMs: 30_000,
+              },
+              runtimeContext,
+            );
+          }
+          return result;
+        },
+      );
+
+      await createRuntime(
+        kernel,
+        new DeterministicFakeAdapter(),
+        {
+          projectIds: ["project-secondary"],
+          clock: () => now,
+        },
+      ).runOnce();
+
+      expect(superseded).toBe(true);
+      const events = await kernel.readEvents(null, 500);
+      expect(
+        events.some(
+          (event) =>
+            event.type === "ActivationFinished" &&
+            event.entityId === activation.entityId,
+        ),
+      ).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+      kernel.close();
+    }
+  });
+
+  it("converges when another reconciler finishes the Activation first", async () => {
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const kernel = openKernel(":memory:", () => now);
+    let activationRaceWon = false;
+    try {
+      const execution = await prepareAttentionAttempt(
+        kernel,
+        "recovery-activation-finish-race",
+        30_000,
+      );
+      await clearOutbox(kernel);
+      now = new Date(now.getTime() + 31_000);
+      const originalExecute = kernel.execute.bind(kernel);
+      vi.spyOn(kernel, "execute").mockImplementation(
+        async (command, context) => {
+          if (
+            command.type === "FinishActivation" &&
+            command.idempotencyKey.includes("attention-reconciled") &&
+            !activationRaceWon
+          ) {
+            activationRaceWon = true;
+            await originalExecute(
+              {
+                type: "FinishActivation",
+                idempotencyKey:
+                  "recovery-activation-finish-race:competitor",
+                activationId: execution.activationId,
+                outcome: "Expired",
+              },
+              context,
+            );
+          }
+          return originalExecute(command, context);
+        },
+      );
+
+      await createRuntime(
+        kernel,
+        new DeterministicFakeAdapter(),
+        {
+          projectIds: ["project-secondary"],
+          clock: () => now,
+        },
+      ).runOnce();
+
+      expect(activationRaceWon).toBe(true);
+      expect(
+        await kernel.query(
+          {
+            type: "GetProviderAttempt",
+            providerAttemptId: execution.attemptId,
+          },
+          runtimeContext,
+        ),
+      ).toMatchObject({ status: "Unknown" });
+    } finally {
+      vi.restoreAllMocks();
+      kernel.close();
+    }
+  });
+
   it(
     "restarts recovery after an older Activation becomes recoverable behind the cursor",
     async () => {
@@ -3536,11 +4248,11 @@ describe("AgentRuntime", () => {
           "recovery-cursor-older",
           300_000,
         );
-        for (let index = 0; index < 100; index += 1) {
+        for (let index = 0; index < 101; index += 1) {
           const execution = await prepareAttentionAttempt(
             kernel,
             `recovery-cursor-newer-${index}`,
-            300_000,
+            150_000,
           );
           await kernel.execute(
             {
@@ -3554,6 +4266,8 @@ describe("AgentRuntime", () => {
           );
         }
         await clearOutbox(kernel);
+        now = new Date(now.getTime() + 151_000);
+        const querySpy = vi.spyOn(kernel, "query");
         const runtime = createRuntime(
           kernel,
           new DeterministicFakeAdapter(),
@@ -3567,7 +4281,6 @@ describe("AgentRuntime", () => {
                 recoveryPages += 1;
                 if (
                   transitioned ||
-                  itemCount !== 100 ||
                   hasMore
                 ) {
                   return;
@@ -3583,15 +4296,38 @@ describe("AgentRuntime", () => {
                   },
                   runtimeContext,
                 );
+                now = new Date(now.getTime() + 150_000);
               },
             },
           },
         );
 
-        await runtime.drainUntilIdle();
+        await runtime.runOnce();
 
         expect(transitioned).toBe(true);
-        expect(recoveryPages).toBeGreaterThanOrEqual(3);
+        expect(recoveryPages).toBeGreaterThanOrEqual(4);
+        const recoveryQueries = querySpy.mock.calls
+          .map(([query]) => query)
+          .filter(
+            (query) =>
+              query.type === "ListRecoverableAttentionExecutions",
+          );
+        expect(recoveryQueries.length).toBeGreaterThanOrEqual(3);
+        expect(
+          recoveryQueries.every(
+            (query) =>
+              "recoveryRevision" in query &&
+              typeof query.recoveryRevision === "number" &&
+              !("observedAt" in query) &&
+              !("nextExpiryAt" in query),
+          ),
+        ).toBe(true);
+        expect(
+          querySpy.mock.calls.filter(
+            ([query]) =>
+              query.type === "GetAttentionRecoverySnapshot",
+          ).length,
+        ).toBeGreaterThanOrEqual(4);
         expect(
           await kernel.query(
             {
@@ -3686,6 +4422,7 @@ function openKernel(
   databasePath: string,
   clock: () => Date = () => new Date("2026-09-21T08:00:00.000Z"),
   kernelBootstrap: KernelBootstrap = bootstrap,
+  activationDurationMs?: number,
 ): TorsorKernel {
   const instance = kernelInstance;
   kernelInstance += 1;
@@ -3694,6 +4431,9 @@ function openKernel(
     databasePath,
     bootstrap: kernelBootstrap,
     clock,
+    ...(activationDurationMs === undefined
+      ? {}
+      : { activationDurationMs }),
     idFactory: (prefix) => `${prefix}-${instance}-${++nextId}`,
   });
 }

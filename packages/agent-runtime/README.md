@@ -38,23 +38,29 @@ input from Kernel projections and never treats a provider session as
 authoritative state. Provider delivery failures park Runs through one atomic
 Kernel command, and expired Attention executions are discovered through
 bounded targeted projections rather than public-event history scans. Recovery
-restarts bounded keyset sweeps after settlements, so an older Activation that
-becomes eligible behind an advanced cursor during a productive sweep is still
-reconciled in the same drain. Proving that an otherwise clean complete sweep
-was mutation-free still requires a Kernel recovery-set revision or snapshot
-token.
+captures an authoritative recovery snapshot, supplies only its revision to
+every bounded keyset page, and restarts from a fresh snapshot on stale pages
+or a changed final revision. Finished Attention Activations are not reclaimed
+before their expiry horizon, so a provider that has committed its decision but
+is still returning retains the cross-runtime domain fence. Superseded recovery
+work is discarded rather than settled from a stale page.
 
-Cross-runtime same-Agent/Thread serialization still requires a Kernel claim
-domain fence. Runtime-local domain queues cannot prevent a second runtime from
-claiming the next Attention after the first decision commits but before its
-ProviderAttempt finishes.
+Runtime-local queues preserve bounded Project/domain fairness and serialize
+same-domain work within one process. Kernel Attention claims provide the
+cross-runtime Agent, Project, Channel, and Thread fence. `DomainBusy` skips the
+contended domain without failing unrelated work, and the fence remains held
+through ProviderAttempt settlement, including the interval after an Attention
+decision commits and before the provider returns.
 
 The current Kernel contract does not expose lease renewal. The runtime
-therefore claims one outbox event at a time and requires Attention and outbox
-leases to exceed the configured provider timeout by a safety margin.
-The current claim result contract does not return the authoritative Attention
-lease expiry, so provider execution cannot yet shrink its timeout to account
-for setup time already consumed after the claim.
+therefore claims one outbox event at a time. Attention and non-empty outbox
+claims return their persisted lease expiry. Immediately before provider work,
+the runtime limits execution to the smaller of the configured provider timeout
+and the authoritative remaining lease time minus a one-second default safety
+margin. Runtime-requested Activation windows cover the corresponding lease
+window, so a shorter Kernel default cannot truncate provider authority.
+Non-positive budgets never start provider work, and stale outbox claim
+authority is allowed to fail closed rather than being treated as refreshable.
 
 Because the Kernel outbox is globally ordered, runtime instances coordinate
 through the same leased stream. `projectIds` supplies the Projects whose

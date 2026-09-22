@@ -99,6 +99,10 @@ interface AttentionProjectDiscoveryContinuation {
 
 const ATTENTION_PAGE_SIZE = 100;
 const ATTENTION_PROJECT_QUEUE_RESERVE = 1;
+const ATTENTION_RECOVERY_SWEEP_LIMIT = 10_000;
+const DEFAULT_ACTIVATION_DURATION_MS = 300_000;
+const PROVIDER_NOT_STARTED_DETAIL =
+  "Runtime did not start provider execution because the authoritative lease budget was exhausted.";
 
 export class AgentRuntime {
   readonly #kernel: TorsorKernel;
@@ -140,6 +144,30 @@ export class AgentRuntime {
     this.#leaseSafetyMs = options.leaseSafetyMs ?? 1_000;
     this.#clock = options.clock ?? (() => new Date());
     this.#hooks = options.hooks ?? {};
+    requireIntegerAtLeast(
+      this.#attentionLeaseMs,
+      1,
+      "attentionLeaseMs",
+    );
+    requireIntegerAtLeast(this.#outboxLeaseMs, 1, "outboxLeaseMs");
+    requireIntegerAtLeast(
+      this.#providerTimeoutMs,
+      1,
+      "providerTimeoutMs",
+    );
+    requireIntegerAtLeast(
+      this.#cancellationPollMs,
+      1,
+      "cancellationPollMs",
+    );
+    requireIntegerAtLeast(this.#leaseSafetyMs, 0, "leaseSafetyMs");
+    if (this.#activationDurationMs !== undefined) {
+      requireIntegerAtLeast(
+        this.#activationDurationMs,
+        1,
+        "activationDurationMs",
+      );
+    }
     if (this.#outboxBatchSize !== 1) {
       throw new Error(
         "AgentRuntime currently requires outboxBatchSize=1 because the Kernel does not expose outbox lease renewal.",
@@ -442,6 +470,9 @@ export class AgentRuntime {
         this.#runtimeContext,
       );
     } catch (error) {
+      if (error instanceof KernelError && error.code === "DomainBusy") {
+        return "blocked";
+      }
       if (
         error instanceof KernelError &&
         (error.code === "Conflict" || error.code === "StaleRevision")
@@ -468,7 +499,12 @@ export class AgentRuntime {
       throw error;
     }
     const handlerLeaseToken = claim.relatedIds?.handlerLeaseToken;
-    if (!handlerLeaseToken || claim.revision === undefined) {
+    const leaseExpiresAt = claim.leaseExpiresAt;
+    if (
+      !handlerLeaseToken ||
+      claim.revision === undefined ||
+      leaseExpiresAt === undefined
+    ) {
       throw new Error(`Attention claim ${attention.id} returned no live lease.`);
     }
     const activation = await this.#kernel.execute(
@@ -477,9 +513,11 @@ export class AgentRuntime {
         idempotencyKey: `attention:${attention.id}:activation:${handlerLeaseToken}`,
         attentionId: attention.id,
         handlerLeaseToken,
-        ...(this.#activationDurationMs === undefined
-          ? {}
-          : { durationMs: this.#activationDurationMs }),
+        durationMs: Math.max(
+          this.#activationDurationMs ?? 0,
+          DEFAULT_ACTIVATION_DURATION_MS,
+          this.#attentionLeaseMs,
+        ),
       },
       this.#runtimeContext,
     );
@@ -519,16 +557,17 @@ export class AgentRuntime {
       triggeringRevision,
       eligibleRuns,
     } as const;
-    await this.#executeProvider({
+    const providerStarted = await this.#executeProvider({
       activationId: activation.entityId,
       agent,
       cause,
       attentionRevision: claim.revision,
       handlerLeaseToken,
+      authorityLeaseExpiresAt: leaseExpiresAt,
       runInputIds: [],
       requestIdempotencyKey: `attention:${attention.id}:${handlerLeaseToken}`,
     });
-    return "dispatched";
+    return providerStarted ? "dispatched" : "blocked";
   }
 
   async #hasEarlierOpenAttention(
@@ -563,23 +602,48 @@ export class AgentRuntime {
     if (events.length === 0) {
       return 0;
     }
+    const leaseToken = claim.leaseToken;
+    const leaseExpiresAt = claim.leaseExpiresAt;
+    if (!leaseToken || !leaseExpiresAt) {
+      throw new Error("Non-empty Outbox claim returned no live lease.");
+    }
+    if (this.#providerExecutionBudget(leaseExpiresAt) <= 0) {
+      return 0;
+    }
     for (const event of events) {
-      await this.#processOutboxEvent(event);
+      if (
+        !(
+          await this.#processOutboxEvent(
+            event,
+            leaseToken,
+            leaseExpiresAt,
+          )
+        )
+      ) {
+        return 0;
+      }
     }
     await this.#hooks.beforeOutboxAcknowledge?.(events);
+    if (this.#providerExecutionBudget(leaseExpiresAt) <= 0) {
+      return 0;
+    }
     await this.#kernel.execute(
       {
         type: "AcknowledgeOutboxEvents",
-        idempotencyKey: `outbox-ack:${claim.leaseToken}`,
+        idempotencyKey: `outbox-ack:${leaseToken}`,
         outboxEventIds: events.map((event) => event.id),
-        leaseToken: claim.leaseToken!,
+        leaseToken,
       },
       this.#runtimeContext,
     );
     return events.length;
   }
 
-  async #processOutboxEvent(event: OutboxEventView): Promise<void> {
+  async #processOutboxEvent(
+    event: OutboxEventView,
+    authorityLeaseToken: string,
+    authorityLeaseExpiresAt: string,
+  ): Promise<boolean> {
     if (event.topic === "message.published") {
       const threadRootId = requirePayloadString(event.payload, "threadRootId");
       const thread = await this.#kernel.query(
@@ -587,13 +651,13 @@ export class AgentRuntime {
         this.#runtimeContext,
       );
       await this.#loadProject(thread.projectId);
-      return;
+      return true;
     }
     if (
       event.topic !== "run.activation-requested" &&
       event.topic !== "run-input.available"
     ) {
-      return;
+      return true;
     }
     const projection = await this.#kernel.query(
       { type: "GetRunProjection", runId: event.aggregateId },
@@ -608,14 +672,17 @@ export class AgentRuntime {
           candidate.requestIdempotencyKey === requestIdempotencyKey,
       )
       .at(-1);
-    if (priorAttempt) {
+    const priorAttemptDidNotStart =
+      priorAttempt?.status === "Failed" &&
+      priorAttempt.detail === PROVIDER_NOT_STARTED_DETAIL;
+    if (priorAttempt && !priorAttemptDidNotStart) {
       activationView = requireActivation(
         currentProjection,
         priorAttempt.activationId,
       );
       if (priorAttempt.status === "Completed") {
         await this.#reconcileRunProjection(currentProjection);
-        return;
+        return true;
       }
       if (
         priorAttempt.status === "Failed" ||
@@ -631,10 +698,9 @@ export class AgentRuntime {
             event,
             priorAttempt.status,
           );
-        } else {
-          await this.#reconcileRunProjection(currentProjection);
         }
-        return;
+        await this.#reconcileRunProjection(currentProjection);
+        return true;
       }
       if (
         !isActivationUsable(
@@ -659,10 +725,11 @@ export class AgentRuntime {
             event,
             "Unknown",
           );
+          await this.#reconcileRunProjection(currentProjection);
         } else {
           await this.#reconcileRunProjection(currentProjection);
         }
-        return;
+        return true;
       }
     } else {
       if (
@@ -673,17 +740,19 @@ export class AgentRuntime {
         )
       ) {
         await this.#reconcileRunProjection(currentProjection);
-        return;
+        return true;
       }
       const activation = await this.#kernel.execute(
         {
           type: "StartActivation",
-          idempotencyKey: `outbox:${event.id}:activation:${currentProjection.run.revision}`,
+          idempotencyKey: `outbox:${event.id}:activation:${authorityLeaseToken}:${currentProjection.run.revision}`,
           runId: currentProjection.run.id,
           expectedRunRevision: currentProjection.run.revision,
-          ...(this.#activationDurationMs === undefined
-            ? {}
-            : { durationMs: this.#activationDurationMs }),
+          durationMs: Math.max(
+            this.#activationDurationMs ?? 0,
+            DEFAULT_ACTIVATION_DURATION_MS,
+            this.#outboxLeaseMs,
+          ),
         },
         this.#runtimeContext,
       );
@@ -737,12 +806,14 @@ export class AgentRuntime {
         },
         this.#runtimeContext,
       );
-      return;
+      return true;
     }
-    await this.#executeProvider({
+    return this.#executeProvider({
       activationId: activationView.id,
       agent,
       cause,
+      outboxEvent: event,
+      authorityLeaseExpiresAt,
       runInputIds: deliveryInputIds,
       requestIdempotencyKey,
     });
@@ -754,9 +825,15 @@ export class AgentRuntime {
     readonly cause: ProviderCause;
     readonly attentionRevision?: number;
     readonly handlerLeaseToken?: string;
+    readonly outboxEvent?: OutboxEventView;
+    readonly authorityLeaseExpiresAt: string;
     readonly runInputIds: readonly string[];
     readonly requestIdempotencyKey: string;
-  }): Promise<void> {
+  }): Promise<boolean> {
+    if (this.#providerExecutionBudget(input.authorityLeaseExpiresAt) <= 0) {
+      await this.#finishActivationBeforeProvider(input.activationId);
+      return false;
+    }
     const attempt = await this.#kernel.execute(
       {
         type: "StartProviderAttempt",
@@ -779,7 +856,52 @@ export class AgentRuntime {
       attempt.entityId,
     );
     if (existingStatus && isTerminalProviderStatus(existingStatus)) {
-      return;
+      if (input.cause.type === "attention") {
+        return false;
+      }
+      const latest = await this.#kernel.query(
+        {
+          type: "GetRunProjection",
+          runId: input.cause.run.run.id,
+        },
+        this.#runtimeContext,
+      );
+      if (existingStatus === "Completed") {
+        await this.#reconcileRunProjection(latest);
+        return true;
+      }
+      const terminalAttempt = latest.providerAttempts.find(
+        (candidate) => candidate.id === attempt.entityId,
+      );
+      if (!terminalAttempt) {
+        throw new Error(
+          `Run ${latest.run.id} does not contain ProviderAttempt ${attempt.entityId}.`,
+        );
+      }
+      const activation = requireActivation(
+        latest,
+        terminalAttempt.activationId,
+      );
+      if (
+        latest.run.state === "Active" &&
+        activation.runActivationGeneration ===
+          latest.run.activationGeneration
+      ) {
+        if (!input.outboxEvent) {
+          throw new Error(
+            `Run ProviderAttempt ${attempt.entityId} has no OutboxEvent authority.`,
+          );
+        }
+        await this.#parkRunAfterDeliveryFailure(
+          latest,
+          input.outboxEvent,
+          existingStatus,
+        );
+        await this.#reconcileRunProjection(latest);
+      } else {
+        await this.#reconcileRunProjection(latest);
+      }
+      return true;
     }
     const bridge =
       input.cause.type === "attention"
@@ -802,10 +924,24 @@ export class AgentRuntime {
             causeType: "run",
             projection: input.cause.run,
           });
+    const executionBudgetMs = this.#providerExecutionBudget(
+      input.authorityLeaseExpiresAt,
+    );
+    if (executionBudgetMs <= 0) {
+      await this.#settleProviderAttempt({
+        providerAttemptId: attempt.entityId,
+        idempotencyKey: `${attempt.entityId}:lease-budget-exhausted`,
+        status: "Failed",
+        detail: PROVIDER_NOT_STARTED_DETAIL,
+      });
+      await this.#finishActivationBeforeProvider(input.activationId);
+      return false;
+    }
     const controller = new AbortController();
     const stopMonitor = this.#monitorExecution(
       input.cause,
       input.activationId,
+      executionBudgetMs,
       controller,
       () => bridge.terminalAction !== null,
     );
@@ -854,6 +990,7 @@ export class AgentRuntime {
           this.#runtimeContext,
         );
       }
+      return true;
     } catch (error) {
       const providerError =
         error instanceof ProviderExecutionError
@@ -927,17 +1064,18 @@ export class AgentRuntime {
   #monitorExecution(
     cause: ProviderCause,
     activationId: string,
+    executionBudgetMs: number,
     controller: AbortController,
     hasProviderTerminalAction: () => boolean,
   ): () => void {
     const timeout = setTimeout(() => {
       controller.abort(
         new ProviderExecutionError(
-          `Provider execution exceeded ${this.#providerTimeoutMs}ms.`,
+          `Provider execution exceeded its ${executionBudgetMs}ms lease budget.`,
           "Unknown",
         ),
       );
-    }, this.#providerTimeoutMs);
+    }, executionBudgetMs);
     let stopped = false;
     let poll: NodeJS.Timeout | undefined;
     const check = async () => {
@@ -1003,6 +1141,33 @@ export class AgentRuntime {
         clearTimeout(poll);
       }
     };
+  }
+
+  #providerExecutionBudget(leaseExpiresAt: string): number {
+    const leaseExpiryMs = Date.parse(leaseExpiresAt);
+    if (!Number.isFinite(leaseExpiryMs)) {
+      throw new Error(`Invalid authoritative lease expiry ${leaseExpiresAt}.`);
+    }
+    return Math.min(
+      this.#providerTimeoutMs,
+      leaseExpiryMs - this.#leaseSafetyMs - this.#clock().getTime(),
+    );
+  }
+
+  async #finishActivationBeforeProvider(
+    activationId: string,
+  ): Promise<void> {
+    await this.#kernel.execute(
+      {
+        type: "FinishActivation",
+        idempotencyKey: `${activationId}:lease-budget-exhausted`,
+        activationId,
+        outcome: "Expired",
+        detail:
+          "The authoritative lease budget was exhausted before provider execution started.",
+      },
+      this.#runtimeContext,
+    );
   }
 
   async #findProviderAttemptStatus(
@@ -1187,53 +1352,74 @@ export class AgentRuntime {
 
   async #reconcileOrphanedAttentionExecutions(): Promise<number> {
     let recoveries = 0;
-    for (let sweep = 0; sweep < 100; sweep += 1) {
+    for (
+      let sweep = 0;
+      sweep < ATTENTION_RECOVERY_SWEEP_LIMIT;
+      sweep += 1
+    ) {
+      const before = await this.#kernel.query(
+        { type: "GetAttentionRecoverySnapshot" },
+        this.#runtimeContext,
+      );
       let afterCursor:
         | {
             readonly startedAt: string;
             readonly activationId: string;
           }
         | undefined;
-      let sweepRecoveries = 0;
-      for (;;) {
-        const page = await this.#kernel.query(
-          {
-            type: "ListRecoverableAttentionExecutions",
-            ...(afterCursor ? { afterCursor } : {}),
-            limit: 100,
-          },
-          this.#runtimeContext,
-        );
-        for (const execution of page.items) {
-          if (
-            execution.activation.finishedAt === null &&
-            new Date(execution.activation.expiresAt) > this.#clock()
-          ) {
-            continue;
+      try {
+        for (;;) {
+          const page = await this.#kernel.query(
+            {
+              type: "ListRecoverableAttentionExecutions",
+              ...(afterCursor ? { afterCursor } : {}),
+              recoveryRevision: before.revision,
+              limit: 100,
+            },
+            this.#runtimeContext,
+          );
+          for (const execution of page.items) {
+            if (new Date(execution.activation.expiresAt) > this.#clock()) {
+              continue;
+            }
+            recoveries +=
+              await this.#reconcileAttentionExecution(
+                execution,
+                before.revision,
+              );
           }
-          sweepRecoveries +=
-            await this.#reconcileAttentionExecution(execution);
+          await this.#hooks.afterAttentionRecoveryPage?.({
+            itemCount: page.items.length,
+            hasMore: page.hasMore,
+            nextCursor: page.nextCursor,
+          });
+          if (!page.hasMore || !page.nextCursor) {
+            break;
+          }
+          afterCursor = page.nextCursor;
         }
-        await this.#hooks.afterAttentionRecoveryPage?.({
-          itemCount: page.items.length,
-          hasMore: page.hasMore,
-          nextCursor: page.nextCursor,
-        });
-        if (!page.hasMore || !page.nextCursor) {
-          break;
+      } catch (error) {
+        if (error instanceof KernelError && error.code === "StaleRevision") {
+          continue;
         }
-        afterCursor = page.nextCursor;
+        throw error;
       }
-      recoveries += sweepRecoveries;
-      if (sweepRecoveries === 0) {
-        break;
+      const after = await this.#kernel.query(
+        { type: "GetAttentionRecoverySnapshot" },
+        this.#runtimeContext,
+      );
+      if (after.revision === before.revision) {
+        return recoveries;
       }
     }
-    return recoveries;
+    throw new Error(
+      `Attention recovery did not reach a stable revision after ${ATTENTION_RECOVERY_SWEEP_LIMIT} sweeps.`,
+    );
   }
 
   async #reconcileAttentionExecution(
     execution: RecoverableAttentionExecutionView,
+    recoveryRevision: number,
   ): Promise<number> {
     let recoveries = 0;
     let outcome: "Completed" | "Failed" | "Expired" = "Expired";
@@ -1241,13 +1427,59 @@ export class AgentRuntime {
       "The Attention Activation expired before it was reconciled.";
     const latestAttempt = execution.providerAttempts.at(-1);
     let latestStatus = latestAttempt?.status;
-    for (const attempt of execution.providerAttempts) {
-      if (
-        attempt.status !== "Started" &&
-        attempt.status !== "Acknowledged"
-      ) {
-        continue;
+    const unsettledAttempts = execution.providerAttempts.filter(
+      (attempt) =>
+        attempt.status === "Started" ||
+        attempt.status === "Acknowledged",
+    );
+    if (
+      latestAttempt &&
+      (latestAttempt.status === "Started" ||
+        latestAttempt.status === "Acknowledged")
+    ) {
+      latestStatus = "Unknown";
+    }
+    if (latestStatus === "Completed") {
+      outcome = "Completed";
+      detail = "Recovered a completed Attention ProviderAttempt.";
+    } else if (latestStatus === "Failed") {
+      outcome = "Failed";
+      detail = "Recovered a failed Attention ProviderAttempt.";
+    } else if (unsettledAttempts.length > 0) {
+      detail = "Recovered an uncertain expired Attention ProviderAttempt.";
+    }
+    if (execution.activation.finishedAt === null) {
+      if (unsettledAttempts.length === 0) {
+        const current = await this.#kernel.query(
+          { type: "GetAttentionRecoverySnapshot" },
+          this.#runtimeContext,
+        );
+        if (current.revision !== recoveryRevision) {
+          throw new KernelError(
+            "StaleRevision",
+            "Attention recovery authority changed before Activation settlement.",
+          );
+        }
       }
+      try {
+        await this.#kernel.execute(
+          {
+            type: "FinishActivation",
+            idempotencyKey: `${execution.activation.id}:attention-reconciled-${outcome.toLowerCase()}`,
+            activationId: execution.activation.id,
+            outcome,
+            detail,
+          },
+          this.#runtimeContext,
+        );
+      } catch (error) {
+        if (!(error instanceof KernelError && error.code === "Conflict")) {
+          throw error;
+        }
+      }
+      recoveries += 1;
+    }
+    for (const attempt of unsettledAttempts) {
       await this.#hooks.beforeAttentionRecoverySettlement?.({
         activationId: execution.activation.id,
         providerAttemptId: attempt.id,
@@ -1263,27 +1495,6 @@ export class AgentRuntime {
       if (attempt.id === latestAttempt?.id) {
         latestStatus = settledStatus;
       }
-      detail = "Recovered an uncertain expired Attention ProviderAttempt.";
-    }
-    if (latestStatus === "Completed") {
-      outcome = "Completed";
-      detail = "Recovered a completed Attention ProviderAttempt.";
-    } else if (latestStatus === "Failed") {
-      outcome = "Failed";
-      detail = "Recovered a failed Attention ProviderAttempt.";
-    }
-    if (execution.activation.finishedAt === null) {
-      await this.#kernel.execute(
-        {
-          type: "FinishActivation",
-          idempotencyKey: `${execution.activation.id}:attention-reconciled-${outcome.toLowerCase()}`,
-          activationId: execution.activation.id,
-          outcome,
-          detail,
-        },
-        this.#runtimeContext,
-      );
-      recoveries += 1;
     }
     return recoveries;
   }
@@ -1590,7 +1801,12 @@ function providerStatusForActivation(
   );
 }
 
-function isTerminalProviderStatus(status: ProviderAttemptStatus): boolean {
+function isTerminalProviderStatus(
+  status: ProviderAttemptStatus,
+): status is Extract<
+  ProviderAttemptStatus,
+  "Completed" | "Failed" | "Unknown"
+> {
   return status === "Completed" || status === "Failed" || status === "Unknown";
 }
 
@@ -1642,6 +1858,16 @@ function requireProviderStatus(payload: JsonValue): ProviderAttemptStatus {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function requireIntegerAtLeast(
+  value: number,
+  minimum: number,
+  name: string,
+): void {
+  if (!Number.isInteger(value) || value < minimum) {
+    throw new Error(`${name} must be an integer of at least ${minimum}.`);
+  }
 }
 
 async function executeWithAbort<T>(
