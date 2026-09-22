@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 12;
+export const CURRENT_SCHEMA_VERSION = 13;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -399,6 +399,98 @@ CREATE TABLE IF NOT EXISTS outbox_events (
 
 CREATE INDEX IF NOT EXISTS outbox_pending_idx
   ON outbox_events(acknowledged_at, lease_expires_at, sequence);
+
+CREATE TABLE IF NOT EXISTS worktree_writer_leases (
+  worktree_id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL CHECK (revision > 0),
+  generation INTEGER NOT NULL CHECK (generation >= 0),
+  fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+  status TEXT NOT NULL CHECK (status IN ('Active', 'Released', 'Expired', 'Quarantined')),
+  holder_principal_id TEXT REFERENCES principals(id),
+  lease_token TEXT,
+  acquired_at TEXT,
+  renewed_at TEXT,
+  expires_at TEXT,
+  released_at TEXT,
+  quarantine_reason TEXT,
+  quarantine_token TEXT,
+  quarantine_evidence_json TEXT,
+  quarantined_at TEXT,
+  quarantine_resolved_at TEXT,
+  quarantine_resolution TEXT,
+  updated_at TEXT NOT NULL,
+  CHECK (
+    (status = 'Active'
+      AND generation > 0
+      AND holder_principal_id IS NOT NULL
+      AND lease_token IS NOT NULL
+      AND acquired_at IS NOT NULL
+      AND expires_at IS NOT NULL
+      AND released_at IS NULL
+      AND quarantine_reason IS NULL
+      AND quarantine_token IS NULL
+      AND quarantined_at IS NULL
+      AND quarantine_resolved_at IS NULL
+      AND quarantine_resolution IS NULL)
+    OR
+    (status = 'Quarantined'
+      AND holder_principal_id IS NULL
+      AND lease_token IS NULL
+      AND expires_at IS NULL
+      AND released_at IS NULL
+      AND quarantine_reason IS NOT NULL
+      AND quarantine_token IS NOT NULL
+      AND quarantined_at IS NOT NULL
+      AND quarantine_resolved_at IS NULL
+      AND quarantine_resolution IS NULL)
+    OR
+    (status IN ('Released', 'Expired')
+      AND holder_principal_id IS NULL
+      AND lease_token IS NULL
+      AND expires_at IS NULL
+      AND quarantine_reason IS NULL
+      AND quarantine_token IS NULL
+      AND quarantine_evidence_json IS NULL
+      AND quarantined_at IS NULL
+      AND (
+        (quarantine_resolved_at IS NULL AND quarantine_resolution IS NULL)
+        OR
+        (status = 'Released'
+          AND quarantine_resolved_at IS NOT NULL
+          AND quarantine_resolution IS NOT NULL)
+      ))
+  )
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS worktree_writer_leases_status_expiry_idx
+  ON worktree_writer_leases(status, expires_at, worktree_id);
+
+CREATE TABLE IF NOT EXISTS worktree_writer_lease_events (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  worktree_id TEXT NOT NULL REFERENCES worktree_writer_leases(worktree_id),
+  type TEXT NOT NULL CHECK (type IN (
+    'WorktreeWriterLeaseAcquired',
+    'WorktreeWriterLeaseRenewed',
+    'WorktreeWriterLeaseReleased',
+    'WorktreeWriterLeaseExpired',
+    'WorktreeWriterLeaseQuarantined',
+    'WorktreeWriterLeaseQuarantineResolved'
+  )),
+  revision INTEGER NOT NULL CHECK (revision > 0),
+  generation INTEGER NOT NULL CHECK (generation >= 0),
+  fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+  actor_principal_id TEXT NOT NULL REFERENCES principals(id),
+  holder_principal_id TEXT REFERENCES principals(id),
+  expires_at TEXT,
+  reason TEXT,
+  evidence_json TEXT,
+  correlation_id TEXT NOT NULL,
+  occurred_at TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS worktree_writer_lease_events_worktree_idx
+  ON worktree_writer_lease_events(worktree_id, sequence);
 
 CREATE TABLE IF NOT EXISTS public_events (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,

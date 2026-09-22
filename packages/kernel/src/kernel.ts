@@ -15,7 +15,7 @@ import {
   translateError,
   type KernelContext,
 } from "./database.js";
-import { KernelError } from "./errors.js";
+import { DurableKernelError, KernelError } from "./errors.js";
 import {
   appendRunActivity,
   failProviderAttempt,
@@ -76,6 +76,17 @@ import {
   withdrawRunInput,
 } from "./runs.js";
 import { mapPublicEvent } from "./mappings.js";
+import {
+  acquireWorktreeWriterLease,
+  getWorktreeWriterLease,
+  listWorktreeWriterLeaseEvents,
+  quarantineWorktreeWriterLease,
+  releaseWorktreeWriterLease,
+  renewWorktreeWriterLease,
+  resolveCachedWorktreeWriterLeaseQuarantine,
+  resolveCachedWorktreeWriterLeaseAuthority,
+  resolveWorktreeWriterLeaseQuarantine,
+} from "./worktree-writer-leases.js";
 import type {
   CommandResult,
   KernelCommand,
@@ -253,6 +264,53 @@ export class TorsorKernel {
           this.#context.database.exec("COMMIT");
           return refreshed;
         }
+        if (
+          command.type === "AcquireWorktreeWriterLease" ||
+          command.type === "RenewWorktreeWriterLease"
+        ) {
+          const refreshed = resolveCachedWorktreeWriterLeaseAuthority(
+            this.#context,
+            command,
+            result,
+            principal,
+          );
+          if (JSON.stringify(refreshed) !== JSON.stringify(result)) {
+            run(
+              this.#context,
+              `UPDATE idempotency_records
+                  SET result_json = ?
+                WHERE principal_id = ? AND command_name = ? AND idempotency_key = ?`,
+              JSON.stringify(refreshed),
+              text(principal.id),
+              command.type,
+              command.idempotencyKey,
+            );
+          }
+          this.#context.database.exec("COMMIT");
+          return refreshed;
+        }
+        if (command.type === "QuarantineWorktreeWriterLease") {
+          const refreshed = resolveCachedWorktreeWriterLeaseQuarantine(
+            this.#context,
+            command,
+            result,
+            principal,
+          );
+          if (JSON.stringify(refreshed) !== JSON.stringify(result)) {
+            run(
+              this.#context,
+              `UPDATE idempotency_records
+                  SET result_json = ?
+                WHERE principal_id = ? AND command_name = ? AND idempotency_key = ?`,
+              JSON.stringify(refreshed),
+              text(principal.id),
+              command.type,
+              command.idempotencyKey,
+            );
+          }
+          this.#context.database.exec("COMMIT");
+          return refreshed;
+        }
         this.#context.database.exec("COMMIT");
         return result;
       }
@@ -281,6 +339,10 @@ export class TorsorKernel {
       this.#context.database.exec("COMMIT");
       return result;
     } catch (error) {
+      if (error instanceof DurableKernelError) {
+        this.#context.database.exec("COMMIT");
+        throw error;
+      }
       this.#context.database.exec("ROLLBACK");
       throw translateError(error);
     }
@@ -297,6 +359,7 @@ export class TorsorKernel {
     );
     const advancesRecoveryClock =
       query.type === "GetAttentionRecoverySnapshot" ||
+      query.type === "GetWorktreeWriterLease" ||
       (
         query.type === "ListRecoverableAttentionExecutions" &&
         query.recoveryRevision === undefined
@@ -598,6 +661,22 @@ export class TorsorKernel {
             query.agentId,
           );
           break;
+        case "GetWorktreeWriterLease":
+          result = getWorktreeWriterLease(
+            this.#context,
+            query.worktreeId,
+            principal,
+          );
+          break;
+        case "ListWorktreeWriterLeaseEvents":
+          result = listWorktreeWriterLeaseEvents(
+            this.#context,
+            query.worktreeId,
+            query.afterCursor ?? 0,
+            boundedLimit(query.limit),
+            principal,
+          );
+          break;
         default:
           result = assertNever(query);
       }
@@ -824,6 +903,41 @@ export class TorsorKernel {
           command,
           principal,
           context,
+          correlationId,
+        );
+      case "AcquireWorktreeWriterLease":
+        return acquireWorktreeWriterLease(
+          this.#context,
+          command,
+          principal,
+          correlationId,
+        );
+      case "RenewWorktreeWriterLease":
+        return renewWorktreeWriterLease(
+          this.#context,
+          command,
+          principal,
+          correlationId,
+        );
+      case "ReleaseWorktreeWriterLease":
+        return releaseWorktreeWriterLease(
+          this.#context,
+          command,
+          principal,
+          correlationId,
+        );
+      case "QuarantineWorktreeWriterLease":
+        return quarantineWorktreeWriterLease(
+          this.#context,
+          command,
+          principal,
+          correlationId,
+        );
+      case "ResolveWorktreeWriterLeaseQuarantine":
+        return resolveWorktreeWriterLeaseQuarantine(
+          this.#context,
+          command,
+          principal,
           correlationId,
         );
       default:

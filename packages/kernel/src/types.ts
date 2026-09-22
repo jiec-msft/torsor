@@ -34,6 +34,18 @@ export type ActivationOutcome =
   | "Failed"
   | "Cancelled"
   | "Expired";
+export type WorktreeWriterLeaseStatus =
+  | "Active"
+  | "Released"
+  | "Expired"
+  | "Quarantined";
+export type WorktreeWriterLeaseEventType =
+  | "WorktreeWriterLeaseAcquired"
+  | "WorktreeWriterLeaseRenewed"
+  | "WorktreeWriterLeaseReleased"
+  | "WorktreeWriterLeaseExpired"
+  | "WorktreeWriterLeaseQuarantined"
+  | "WorktreeWriterLeaseQuarantineResolved";
 
 export interface PrincipalContext {
   readonly principalId: string;
@@ -294,6 +306,51 @@ export interface RecordLateOutputCommand extends IdempotentCommand {
   readonly payload: JsonValue;
 }
 
+export interface AcquireWorktreeWriterLeaseCommand extends IdempotentCommand {
+  readonly type: "AcquireWorktreeWriterLease";
+  readonly worktreeId: string;
+  readonly leaseDurationMs: number;
+}
+
+interface WorktreeWriterLeaseAuthorityCommand extends IdempotentCommand {
+  readonly worktreeId: string;
+  readonly generation: number;
+  readonly fencingToken: number;
+  readonly leaseToken: string;
+}
+
+export interface RenewWorktreeWriterLeaseCommand
+  extends WorktreeWriterLeaseAuthorityCommand {
+  readonly type: "RenewWorktreeWriterLease";
+  readonly leaseDurationMs: number;
+}
+
+export interface ReleaseWorktreeWriterLeaseCommand
+  extends WorktreeWriterLeaseAuthorityCommand {
+  readonly type: "ReleaseWorktreeWriterLease";
+}
+
+export interface QuarantineWorktreeWriterLeaseCommand
+  extends IdempotentCommand {
+  readonly type: "QuarantineWorktreeWriterLease";
+  readonly worktreeId: string;
+  readonly expectedGeneration?: number;
+  readonly expectedFencingToken?: number;
+  readonly leaseToken?: string;
+  readonly reason: string;
+  readonly evidence?: JsonValue;
+}
+
+export interface ResolveWorktreeWriterLeaseQuarantineCommand
+  extends IdempotentCommand {
+  readonly type: "ResolveWorktreeWriterLeaseQuarantine";
+  readonly worktreeId: string;
+  readonly expectedRevision: number;
+  readonly expectedFencingToken: number;
+  readonly quarantineToken: string;
+  readonly resolution: string;
+}
+
 export type KernelCommand =
   | StartThreadCommand
   | ReplyToThreadCommand
@@ -318,7 +375,12 @@ export type KernelCommand =
   | CompleteRunCommand
   | WaitRunCommand
   | FailRunCommand
-  | RecordLateOutputCommand;
+  | RecordLateOutputCommand
+  | AcquireWorktreeWriterLeaseCommand
+  | RenewWorktreeWriterLeaseCommand
+  | ReleaseWorktreeWriterLeaseCommand
+  | QuarantineWorktreeWriterLeaseCommand
+  | ResolveWorktreeWriterLeaseQuarantineCommand;
 
 export interface GetBootstrapQuery {
   readonly type: "GetBootstrap";
@@ -416,6 +478,18 @@ export interface GetProjectAgentStatusQuery {
   readonly agentId?: string;
 }
 
+export interface GetWorktreeWriterLeaseQuery {
+  readonly type: "GetWorktreeWriterLease";
+  readonly worktreeId: string;
+}
+
+export interface ListWorktreeWriterLeaseEventsQuery {
+  readonly type: "ListWorktreeWriterLeaseEvents";
+  readonly worktreeId: string;
+  readonly afterCursor?: number;
+  readonly limit?: number;
+}
+
 export type KernelQuery =
   | GetBootstrapQuery
   | GetThreadProjectionQuery
@@ -429,7 +503,9 @@ export type KernelQuery =
   | ListThreadProjectionsQuery
   | ListRunProjectionsQuery
   | ReadPublicEventsQuery
-  | GetProjectAgentStatusQuery;
+  | GetProjectAgentStatusQuery
+  | GetWorktreeWriterLeaseQuery
+  | ListWorktreeWriterLeaseEventsQuery;
 
 export interface MessageRevisionView {
   readonly id: string;
@@ -695,6 +771,48 @@ export interface ProjectAgentStatusProjection {
   readonly agents: readonly ProjectAgentStatusView[];
 }
 
+export interface WorktreeWriterLeaseView {
+  readonly worktreeId: string;
+  readonly revision: number;
+  readonly generation: number;
+  readonly fencingToken: number;
+  readonly status: WorktreeWriterLeaseStatus;
+  readonly holderPrincipalId: string | null;
+  readonly acquiredAt: string | null;
+  readonly renewedAt: string | null;
+  readonly expiresAt: string | null;
+  readonly releasedAt: string | null;
+  readonly quarantineReason: string | null;
+  readonly quarantineEvidence: JsonValue | null;
+  readonly quarantinedAt: string | null;
+  readonly quarantineResolvedAt: string | null;
+  readonly quarantineResolution: string | null;
+  readonly updatedAt: string;
+}
+
+export interface WorktreeWriterLeaseEventView {
+  readonly cursor: number;
+  readonly id: string;
+  readonly worktreeId: string;
+  readonly type: WorktreeWriterLeaseEventType;
+  readonly revision: number;
+  readonly generation: number;
+  readonly fencingToken: number;
+  readonly actorPrincipalId: string;
+  readonly holderPrincipalId: string | null;
+  readonly expiresAt: string | null;
+  readonly reason: string | null;
+  readonly evidence: JsonValue | null;
+  readonly correlationId: string;
+  readonly occurredAt: string;
+}
+
+export interface WorktreeWriterLeaseEventPage {
+  readonly items: readonly WorktreeWriterLeaseEventView[];
+  readonly nextCursor: number | null;
+  readonly hasMore: boolean;
+}
+
 export interface QueryResultMap {
   readonly GetBootstrap: BootstrapProjection;
   readonly GetThreadProjection: ThreadProjection;
@@ -709,6 +827,8 @@ export interface QueryResultMap {
   readonly ListRunProjections: RunProjectionPage;
   readonly ReadPublicEvents: AuthorizedPublicEventPage;
   readonly GetProjectAgentStatus: ProjectAgentStatusProjection;
+  readonly GetWorktreeWriterLease: WorktreeWriterLeaseView;
+  readonly ListWorktreeWriterLeaseEvents: WorktreeWriterLeaseEventPage;
 }
 
 export type QueryResult<Q extends KernelQuery> = QueryResultMap[Q["type"]];
@@ -723,4 +843,8 @@ export interface CommandResult {
   readonly leaseExpiresAt?: string;
   readonly authorityObservedAt?: string;
   readonly outboxEvents?: readonly OutboxEventView[];
+  readonly leaseGeneration?: number;
+  readonly fencingToken?: number;
+  readonly quarantineToken?: string;
+  readonly worktreeWriterLease?: WorktreeWriterLeaseView;
 }

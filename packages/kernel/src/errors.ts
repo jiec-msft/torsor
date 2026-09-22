@@ -20,3 +20,5 @@ export class KernelError extends Error {
     this.name = "KernelError";
   }
 }
+
+export class DurableKernelError extends KernelError {}
