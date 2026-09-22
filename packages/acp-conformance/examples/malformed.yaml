@@ -1,0 +1,14 @@
+schemaVersion: 1
+id: malformed-frame
+expectFailure: malformed_frame
+steps:
+  - type: request
+    id: init
+    method: initialize
+    params: { protocolVersion: 1, clientCapabilities: {} }
+  - { type: response, id: init }
+mock:
+  handlers:
+    - kind: request
+      method: initialize
+      actions: [{ type: fault, fault: { kind: malformed } }]

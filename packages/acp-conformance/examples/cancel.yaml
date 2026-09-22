@@ -1,0 +1,58 @@
+schemaVersion: 1
+id: cancel-permission
+steps:
+  - type: request
+    id: init
+    method: initialize
+    params: { protocolVersion: 1, clientCapabilities: {} }
+  - { type: response, id: init }
+  - type: request
+    id: session
+    method: session/new
+    params: { cwd: { $ref: workspace }, mcpServers: [] }
+  - { type: response, id: session }
+  - type: request
+    id: turn
+    method: session/prompt
+    params:
+      sessionId: { $ref: "session#/sessionId" }
+      prompt: [{ type: text, text: "Wait for cancellation." }]
+  - { type: update, sessionUpdate: agent_message_chunk }
+  - type: notification
+    method: session/cancel
+    params: { sessionId: { $ref: "session#/sessionId" } }
+  - type: response
+    id: turn
+    expect: [{ path: /stopReason, equals: cancelled }]
+mock:
+  handlers:
+    - kind: request
+      method: initialize
+      actions:
+        - type: reply
+          result: { protocolVersion: 1, agentCapabilities: {}, authMethods: [] }
+    - kind: request
+      method: session/new
+      actions: [{ type: reply, result: { sessionId: synthetic-session } }]
+    - kind: request
+      method: session/prompt
+      actions:
+        - type: notify
+          method: session/update
+          params:
+            sessionId: synthetic-session
+            update:
+              sessionUpdate: agent_message_chunk
+              content: { type: text, text: "Synthetic cancellation barrier." }
+        - { type: wait, gate: cancel }
+        - type: request
+          method: session/request_permission
+          params:
+            sessionId: synthetic-session
+            toolCall: { toolCallId: synthetic-tool }
+            options: [{ optionId: allow, name: Allow, kind: allow_once }]
+          expect: [{ path: /outcome/outcome, equals: cancelled }]
+        - { type: reply, result: { stopReason: cancelled } }
+    - kind: notification
+      method: session/cancel
+      actions: [{ type: release, gate: cancel }]

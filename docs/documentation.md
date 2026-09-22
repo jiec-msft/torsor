@@ -34,6 +34,8 @@ At adoption, `docs/prototype/001-overview.zh-cn.md` was the only locale-suffixed
 | `apps/server/README.md` | Not required | Component implementation reference | English-only; route and authentication reference tied directly to English API syntax, not a product specification or owner onboarding entry point |
 | `apps/web/README.md` | Not required | Component implementation reference | English-only; build and client-state reference tied directly to implementation |
 | `packages/agent-runtime/README.md` | Not required | Package implementation reference | English-only; detailed runtime contract maintained with code rather than used as the human product baseline |
+| `docs/specs/acp-conformance.md` | `docs/specs/acp-conformance.zh-cn.md` | Independent ACP harness specification and public reuse research | Paired; normative |
+| `packages/acp-conformance/README.md` | `packages/acp-conformance/README.zh-cn.md` | Independent tool onboarding | Paired; owner-facing and external provider-author entry point |
 | `packages/kernel/README.md` | Not required | Package implementation reference | English-only; detailed API and schema reference maintained with code rather than used as the human product baseline |
 
 Generated assets, source files under documentation prototype directories, screenshots, the license text, and nonexistent changelog/vendor artifacts are not product specifications and are outside Markdown pairing scope.

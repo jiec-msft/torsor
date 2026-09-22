@@ -1,0 +1,34 @@
+{
+  "name": "@torsor/acp-conformance",
+  "version": "0.1.0",
+  "description": "Independent scenario-driven ACP provider conformance runner",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": { "acp-conformance": "./bin/acp-conformance.mjs" },
+  "files": ["bin", "dist", "examples", "README.md", "README.zh-cn.md"],
+  "scripts": {
+    "test": "npm run build && vitest run --testTimeout=20000 --maxWorkers=2",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.4.0",
+    "ajv": "8.17.1",
+    "yaml": "2.8.1",
+    "zod": "4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.1"
+  },
+  "engines": { "node": ">=22.13" }
+}
