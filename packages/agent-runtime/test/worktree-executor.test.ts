@@ -276,10 +276,13 @@ describe("controlled Worktree executor (§22, §24, §38)", () => {
     const repo = syntheticRepository();
     repo.addWorktree("first");
     repo.addWorktree("second");
-    const kernel = TorsorKernel.open({ databasePath: repo.databasePath, bootstrap });
+    const now = new Date();
+    const kernel = TorsorKernel.open({ databasePath: repo.databasePath, bootstrap, clock: () => now });
     const run = await activeRun(kernel, "automatic-stop");
+    let actual!: ControlledChild;
     const executor = new LocalWorktreeExecutor({
       kernel, runtimePrincipalId: "runtime", ...repo, leaseDurationMs: 1_000,
+      driver: { start: (input) => { actual = nodeProbeDriver.start(input); return actual; } },
     });
     try {
       for (const worktreeId of ["first", "second"]) {
@@ -292,10 +295,11 @@ describe("controlled Worktree executor (§22, §24, §38)", () => {
       expect(await cancelled.stop("Cancellation observed.")).toBe("StopConfirmed");
       const expired = await executor.start({ worktreeId: "second", activationId: run.activationId });
       await expired.result;
-      await expect.poll(async () => (await kernel.query({
+      await actual.closed;
+      expect(await expired.stop("Deadline already observed.")).toBe("StopConfirmed");
+      expect((await kernel.query({
         type: "GetPhysicalWorktree", worktreeId: "second",
       }, runtimeContext)).latestExecution?.state).toBe("StopConfirmed");
-      expect(await expired.stop("Deadline already observed.")).toBe("StopConfirmed");
     } finally { await executor.close(); await run.close(); kernel.close(); repo.dispose(); }
   });
 
