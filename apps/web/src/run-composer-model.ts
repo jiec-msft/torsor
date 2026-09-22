@@ -17,6 +17,20 @@ export interface RunComposerEntry {
   readonly error: string | null;
   readonly rejectionCode: string | null;
   readonly rejectedRevision: number | null;
+  readonly acknowledged: {
+    readonly request: SendToRunRequest;
+    readonly principalId: string;
+    readonly receipt: SendToRunReceipt;
+  } | null;
+  readonly projectionStatus: "idle" | "refreshing" | "failed";
+}
+
+interface SendToRunReceipt {
+  readonly messageId: string;
+  readonly messageRevisionId: string;
+  readonly runInputId: string;
+  readonly runId: string;
+  readonly revision: number;
 }
 
 export const emptyRunComposer: RunComposerEntry = {
@@ -28,6 +42,8 @@ export const emptyRunComposer: RunComposerEntry = {
   error: null,
   rejectionCode: null,
   rejectedRevision: null,
+  acknowledged: null,
+  projectionStatus: "idle",
 };
 
 export function isTerminalRun(run: Run): boolean {
@@ -42,6 +58,7 @@ export function needsRunRefresh(entry: RunComposerEntry, run: Run): boolean {
 export class RunComposerModel {
   readonly #listeners = new Set<() => void>();
   #entries: Readonly<Record<string, RunComposerEntry>> = {};
+  readonly #refreshVersions = new Map<string, number>();
 
   getSnapshot = (): Readonly<Record<string, RunComposerEntry>> => this.#entries;
 
@@ -60,6 +77,20 @@ export class RunComposerModel {
       draft,
       ...(entry.status === "submitted" ? { status: "draft", error: null } as const : {}),
     });
+  }
+
+  beginRefresh(runId: string): (succeeded: boolean) => void {
+    const version = (this.#refreshVersions.get(runId) ?? 0) + 1;
+    this.#refreshVersions.set(runId, version);
+    this.#set(runId, {
+      ...(this.#entries[runId] ?? emptyRunComposer), projectionStatus: "refreshing",
+    });
+    return (succeeded) => {
+      if (this.#refreshVersions.get(runId) !== version) return;
+      this.#set(runId, {
+        ...this.#entries[runId]!, projectionStatus: succeeded ? "idle" : "failed",
+      });
+    };
   }
 
   async submit(
@@ -100,8 +131,12 @@ export class RunComposerModel {
     this.#set(run.id, pending);
     try {
       const response = await send(request);
-      requireSendToRunReceipt(response, request);
-      this.#set(run.id, { ...emptyRunComposer, status: "submitted" });
+      const receipt = requireSendToRunReceipt(response, request);
+      this.#refreshVersions.set(run.id, (this.#refreshVersions.get(run.id) ?? 0) + 1);
+      this.#set(run.id, {
+        ...emptyRunComposer, status: "submitted",
+        acknowledged: { request, principalId, receipt },
+      });
       return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : "The submission response could not be read.";
@@ -141,7 +176,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function requireSendToRunReceipt(value: unknown, request: SendToRunRequest): void {
+function requireSendToRunReceipt(value: unknown, request: SendToRunRequest): SendToRunReceipt {
   const result = isRecord(value) ? value.result : null;
   const related = isRecord(result) ? result.relatedIds : null;
   if (
@@ -154,4 +189,11 @@ function requireSendToRunReceipt(value: unknown, request: SendToRunRequest): voi
   ) {
     throw new Error("The server response did not confirm both Message and RunInput.");
   }
+  return {
+    messageId: result.entityId,
+    messageRevisionId: related.messageRevisionId,
+    runInputId: related.runInputId,
+    runId: related.runId,
+    revision: result.revision,
+  };
 }

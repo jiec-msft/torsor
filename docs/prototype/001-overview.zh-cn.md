@@ -2094,6 +2094,8 @@ Also published in #torsor-core / current Thread
 6. 已提交不代表 Provider 已收到、接受或纳入工作。没有公开交付证据时不得显示 `Delivered` 或 `Accepted`；RunInput disposition 独立展示。实时 Steer 能力未知时明确说明不保证即时投递，不阻止持久 RunInput 提交。
 7. 提供 label、可感知的 Pending/成功/错误状态、可见焦点、键盘提交和恢复。Enter 在多行正文中换行，Ctrl/Cmd+Enter 显式提交且不能干扰 IME；异步结果不得抢走其他 Run 或控件的焦点。窄视口中目的地、正文、状态和按钮必须可换行/滚动并可通过键盘访问。
 8. 未选择/加载到匹配 Run、无可用认证、终态及未实现的 Successor/实时控制能力都有明确说明；不能呈现可点击但无效果的操作。
+9. Thread 与 Run 的投影读取各自拥有 replacement、loading 和错误归属，组合刷新不得以共享 freshness 条件丢弃仍有效的一半。某一半被单独刷新或另一组合刷新替代时，只交接该投影的归属；仍有效的一半必须完成或明确失败。替代失败必须传递给等待者；旧响应不得清除新选择、新 Session 或新 Project 的 loading、错误或事实。两半仍有效且成功时一起发布；两半仍有效但任一读取失败时保留原投影并结束 loading，允许重试读取。
+10. 已确认提交后的任一投影读取失败，必须在该 Run 的 Composer 内显示可感知的 `Committed; projections could not be refreshed`，包括窄屏 modal；不能只在 modal 外的 inert 主区域报告。Composer 内现有刷新操作只重试读取，不重新提交命令。保留已确认请求的幂等身份与回执，和未确认请求的恢复身份分开；刷新失败不把已提交状态变成未知或可重发命令。刷新状态按 Run 和刷新尝试隔离，跨 Pane 重新挂载保留；旧刷新结果不覆盖较新的刷新，异步状态不抢走 Human 焦点。
 
 ### 44.3 Tool Call 展开和失败
 

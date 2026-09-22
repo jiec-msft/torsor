@@ -19,7 +19,7 @@ export function RunComposer({
   );
   const entry = entries[runId] ?? emptyRunComposer;
   const id = useId();
-  const [refreshing, setRefreshing] = useState(false);
+  const refreshing = entry.projectionStatus === "refreshing";
   const [actionError, setActionError] = useState<string | null>(null);
   const run = state.run?.run.id === runId ? state.run.run : null;
   const agent = state.agents.find((candidate) => candidate.id === run?.ownerAgentId);
@@ -42,14 +42,8 @@ export function RunComposer({
     }
   };
   const refresh = async () => {
-    setRefreshing(true);
     setActionError(null);
-    try {
-      const refreshed = await controller.refreshRunComposer(runId);
-      if (!refreshed) setActionError("Run and Thread could not be refreshed. Try again.");
-    } finally {
-      setRefreshing(false);
-    }
+    await controller.refreshRunComposer(runId);
   };
 
   return (
@@ -73,7 +67,7 @@ export function RunComposer({
         value={entry.draft}
         rows={3}
         readOnly={recovery}
-        aria-describedby={`${id}-destination ${id}-status ${id}-help`}
+        aria-describedby={`${id}-destination ${id}-status ${id}-help${entry.projectionStatus === "failed" ? ` ${id}-refresh-error` : ""}`}
         onChange={(event) => controller.runComposer.edit(runId, event.target.value)}
         onKeyDown={(event) => {
           if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.nativeEvent.isComposing) {
@@ -92,6 +86,12 @@ export function RunComposer({
         {entry.error ? ` ${entry.error}` : ""}
         {recovery ? ` Original revision ${entry.request!.expectedRunRevision}.` : ""}
       </p>
+      {entry.projectionStatus === "failed" ? (
+        <p id={`${id}-refresh-error`} role="alert" aria-atomic="true">
+          {entry.acknowledged ? "Committed; projections could not be refreshed." : "Run and Thread could not be refreshed."}
+          {" "}Use Refresh Run and Thread to retry reads, not the submission.
+        </p>
+      ) : null}
       {actionError ? <p role="alert">{actionError}</p> : null}
       {state.session !== "ready" ? <p>Reconnect to send or recover. Your draft and submission identity are retained in this window.</p> : null}
       {terminal ? <p>This Run is {run.state}. New input is unavailable. Successor creation is unavailable in this client; request follow-up in the public Thread.</p> : null}

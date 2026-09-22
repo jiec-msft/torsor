@@ -118,6 +118,19 @@ interface CoalescedRefresh {
   refresh: () => Promise<boolean>;
 }
 
+interface ProjectionRefresh {
+  readonly key: string;
+  readonly completion: DeferredBoolean;
+  readonly inScope: () => boolean;
+  readonly current: () => boolean;
+  readonly settled: Partial<WebState>;
+  readonly read: () => Promise<() => Partial<WebState>>;
+}
+
+type ProjectionRead =
+  | { readonly ok: true; readonly state: () => Partial<WebState> }
+  | { readonly ok: false; readonly error: unknown };
+
 export class WebController {
   readonly runComposer = new RunComposerModel();
   readonly #apiBase: string;
@@ -376,6 +389,8 @@ export class WebController {
       this.#clearProjectionErrors(["thread:"]);
     }
     this.#threadId = threadId;
+    const inScope = () =>
+      this.#sessionGeneration === sessionGeneration && this.#threadId === threadId;
     this.#setState({
       ...(changedThread ? { thread: null } : {}),
       loadingThread: true,
@@ -400,7 +415,7 @@ export class WebController {
           });
           return true;
         }
-        return this.#replacementResult(projectionKey, request);
+        return this.#replacementResult(projectionKey, request, inScope);
       } catch (error) {
         const stillCurrent =
           this.#sessionGeneration === sessionGeneration &&
@@ -421,7 +436,7 @@ export class WebController {
           });
           return false;
         }
-        return this.#replacementResult(projectionKey, request);
+        return this.#replacementResult(projectionKey, request, inScope);
       }
     })();
     this.#latestProjectionRequests.set(projectionKey, request);
@@ -463,6 +478,8 @@ export class WebController {
       this.#clearProjectionErrors(["run:"]);
     }
     this.#runId = runId;
+    const inScope = () =>
+      this.#sessionGeneration === sessionGeneration && this.#runId === runId;
     this.#setState({
       ...(changedRun ? { run: null } : {}),
       loadingRun: true,
@@ -487,7 +504,7 @@ export class WebController {
           });
           return true;
         }
-        return this.#replacementResult(projectionKey, request);
+        return this.#replacementResult(projectionKey, request, inScope);
       } catch (error) {
         const stillCurrent =
           this.#sessionGeneration === sessionGeneration &&
@@ -508,7 +525,7 @@ export class WebController {
           });
           return false;
         }
-        return this.#replacementResult(projectionKey, request);
+        return this.#replacementResult(projectionKey, request, inScope);
       }
     })();
     this.#latestProjectionRequests.set(projectionKey, request);
@@ -679,52 +696,130 @@ export class WebController {
   async refreshRunComposer(runId: string): Promise<boolean> {
     const selected = this.#state.run?.run;
     if (!selected || selected.id !== runId || this.#runId !== runId) return false;
+    const finishRefresh = this.runComposer.beginRefresh(runId);
     const sessionGeneration = this.#sessionGeneration;
-    const csrfRevision = this.#csrfRevision;
+    const projectId = this.#projectId;
     const runGeneration = ++this.#runRequestGeneration;
     const threadId = selected.threadRootId;
-    const threadSelected = this.#threadId === threadId;
+    const selectedThreadId = this.#threadId;
+    const threadSelected = selectedThreadId === threadId;
     const threadGeneration = threadSelected
       ? ++this.#threadRequestGeneration
       : this.#threadRequestGeneration;
-    const stillCurrent = () =>
+    const sessionCurrent = () =>
       this.#sessionGeneration === sessionGeneration &&
-      this.#runId === runId &&
-      this.#runRequestGeneration === runGeneration &&
-      (!threadSelected || (this.#threadId === threadId && this.#threadRequestGeneration === threadGeneration));
-    try {
-      const [run, thread] = await Promise.all([
-        this.#request<{ readonly run: RunProjection }>(
-          `/api/v1/runs/${encodeURIComponent(runId)}`, {}, sessionGeneration, csrfRevision,
-        ),
-        this.#request<{ readonly thread: ThreadProjection }>(
-          `/api/v1/threads/${encodeURIComponent(threadId)}`, {}, sessionGeneration, csrfRevision,
-        ),
-      ]);
-      if (!stillCurrent()) return false;
-      this.#projectionErrors.delete(`run:${runId}`);
-      if (threadSelected) this.#projectionErrors.delete(`thread:${threadId}`);
+      this.#projectId === projectId;
+    const runRefresh: ProjectionRefresh = {
+      key: `run:${runId}`,
+      completion: deferredBoolean(),
+      inScope: () => sessionCurrent() && this.#runId === runId,
+      current: () => runRefresh.inScope() && this.#runRequestGeneration === runGeneration,
+      settled: { loadingRun: false },
+      read: async () => {
+        const { run } = await this.#request<{ readonly run: RunProjection }>(
+          `/api/v1/runs/${encodeURIComponent(runId)}`, {}, sessionGeneration,
+        );
+        return () => ({
+          run,
+          runs: this.#state.runs.map((item) =>
+            item.run.id === runId && item.run.revision <= run.run.revision ? run : item),
+        });
+      },
+    };
+    const threadRefresh: ProjectionRefresh = {
+      key: `thread:${threadId}`,
+      completion: deferredBoolean(),
+      inScope: () => sessionCurrent() && this.#threadId === selectedThreadId &&
+        (threadSelected || this.#runId === runId),
+      current: () => threadRefresh.inScope() &&
+        (threadSelected
+          ? this.#threadRequestGeneration === threadGeneration
+          : this.#latestProjectionRequests.get(`thread:${threadId}`) === threadRefresh.completion.promise),
+      settled: threadSelected ? { loadingThread: false } : {},
+      read: async () => {
+        const { thread } = await this.#request<{ readonly thread: ThreadProjection }>(
+          `/api/v1/threads/${encodeURIComponent(threadId)}`, {}, sessionGeneration,
+        );
+        return () => ({
+          ...(threadSelected ? { thread } : {}),
+          threads: this.#state.threads.map((item) =>
+            item.threadRootId === threadId && item.cursor <= thread.cursor ? thread : item),
+        });
+      },
+    };
+    // Single reads and SSE invalidations must follow only their own replacement,
+    // never the combined promise (which could depend on the other projection).
+    for (const refresh of [runRefresh, threadRefresh]) {
+      this.#latestProjectionRequests.set(refresh.key, refresh.completion.promise);
+    }
+    this.#setState({
+      loadingRun: true,
+      ...(threadSelected ? { loadingThread: true } : {}),
+    });
+    const [run, thread] = await Promise.all([
+      this.#readComposerProjection(runRefresh),
+      this.#readComposerProjection(threadRefresh),
+    ]);
+    const bothCurrent = runRefresh.current() && threadRefresh.current();
+    if (bothCurrent && run.ok && thread.ok) {
+      this.#projectionErrors.delete(runRefresh.key);
+      this.#projectionErrors.delete(threadRefresh.key);
       this.#setState({
-        run: run.run,
-        runs: this.#state.runs.map((item) => item.run.id === runId ? run.run : item),
-        ...(threadSelected ? { thread: thread.thread, loadingThread: false } : {}),
-        threads: this.#state.threads.map((item) => item.threadRootId === threadId ? thread.thread : item),
-        loadingRun: false,
+        ...run.state(), ...thread.state(),
+        ...runRefresh.settled, ...threadRefresh.settled,
         queryError: this.#currentProjectionError(),
       });
+      runRefresh.completion.resolve(true);
+      threadRefresh.completion.resolve(true);
+      finishRefresh(true);
       return true;
-    } catch (error) {
-      if (!stillCurrent()) return false;
-      if (error instanceof ApiError && error.status === 401 &&
-          this.#csrfRevision !== csrfRevision && this.#csrfToken) {
-        return this.refreshRunComposer(runId);
-      }
-      this.#projectionFailed(`run:${runId}`, error, {
-        loadingRun: false,
-        ...(threadSelected ? { loadingThread: false } : {}),
-      });
-      return false;
     }
+    const results = await Promise.all([
+      this.#settleComposerProjection(runRefresh, run, bothCurrent),
+      this.#settleComposerProjection(threadRefresh, thread, bothCurrent),
+    ]);
+    const refreshed = results.every(Boolean);
+    finishRefresh(refreshed);
+    return refreshed;
+  }
+
+  async #readComposerProjection(refresh: ProjectionRefresh): Promise<ProjectionRead> {
+    const csrfRevision = this.#csrfRevision;
+    try {
+      return { ok: true, state: await refresh.read() };
+    } catch (error) {
+      if (refresh.current() && error instanceof ApiError && error.status === 401 &&
+          this.#csrfRevision !== csrfRevision && this.#csrfToken) {
+        return this.#readComposerProjection(refresh);
+      }
+      return { ok: false, error };
+    }
+  }
+
+  async #settleComposerProjection(
+    refresh: ProjectionRefresh,
+    result: ProjectionRead,
+    preservePair: boolean,
+  ): Promise<boolean> {
+    let succeeded = false;
+    if (!refresh.inScope()) {
+      // Selection/session clearing owns its loading flags; do not touch them.
+    } else if (!refresh.current()) {
+      succeeded = await this.#replacementResult(
+        refresh.key, refresh.completion.promise, refresh.inScope,
+      );
+    } else if (!result.ok) {
+      this.#projectionFailed(refresh.key, result.error, refresh.settled);
+    } else if (preservePair) {
+      this.#setState(refresh.settled);
+    } else {
+      this.#projectionSucceeded(refresh.key, {
+        ...result.state(), ...refresh.settled,
+      });
+      succeeded = true;
+    }
+    refresh.completion.resolve(succeeded);
+    return succeeded;
   }
 
   dispose(): void {
@@ -1560,12 +1655,16 @@ export class WebController {
     }, this.#reconnectProbeDelayMs);
   }
 
-  #replacementResult(
+  async #replacementResult(
     projectionKey: string,
     request: Promise<boolean>,
-  ): Promise<boolean> | false {
+    inScope: () => boolean = () => true,
+  ): Promise<boolean> {
+    if (!inScope()) return false;
     const replacement = this.#latestProjectionRequests.get(projectionKey);
-    return replacement && replacement !== request ? replacement : false;
+    return replacement && replacement !== request
+      ? (await replacement) && inScope()
+      : false;
   }
 
   #projectionSucceeded(
