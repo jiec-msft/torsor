@@ -1,5 +1,7 @@
 # Security Policy
 
+> English | [简体中文](SECURITY.zh-cn.md)
+
 ## Reporting a vulnerability
 
 Do not report vulnerabilities in public discussions, pull requests, or issues.
