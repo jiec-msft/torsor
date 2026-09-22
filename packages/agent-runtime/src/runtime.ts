@@ -663,9 +663,23 @@ export class AgentRuntime {
       { type: "GetRunProjection", runId: event.aggregateId },
       this.#runtimeContext,
     );
+    const triggeringInputId = requirePayloadString(
+      event.payload,
+      "runInputId",
+    );
+    if (
+      !projection.inputs.some(
+        (input) =>
+          input.id === triggeringInputId &&
+          input.disposition === "Pending",
+      )
+    ) {
+      await this.#reconcileRunProjection(projection);
+      return true;
+    }
     const requestIdempotencyKey = `outbox:${event.id}:provider`;
     let currentProjection = projection;
-    let activationView: ActivationAttemptView;
+    let activationView: ActivationAttemptView | undefined;
     const priorAttempt = currentProjection.providerAttempts
       .filter(
         (candidate) =>
@@ -675,6 +689,8 @@ export class AgentRuntime {
     const priorAttemptDidNotStart =
       priorAttempt?.status === "Failed" &&
       priorAttempt.detail === PROVIDER_NOT_STARTED_DETAIL;
+    let startNewActivation =
+      priorAttempt === undefined || priorAttemptDidNotStart;
     if (priorAttempt && !priorAttemptDidNotStart) {
       activationView = requireActivation(
         currentProjection,
@@ -702,23 +718,16 @@ export class AgentRuntime {
         await this.#reconcileRunProjection(currentProjection);
         return true;
       }
-      if (
-        !isActivationUsable(
-          activationView,
-          currentProjection,
-          this.#clock(),
-        ) ||
-        !this.#adapter.capabilities.supportsIdempotentRequests
-      ) {
-        await this.#settleUncertainAttempt(
-          currentProjection,
-          activationView.id,
-          priorAttempt.status,
-        );
-        currentProjection = await this.#kernel.query(
-          { type: "GetRunProjection", runId: currentProjection.run.id },
-          this.#runtimeContext,
-        );
+      await this.#settleUncertainAttempt(
+        currentProjection,
+        activationView.id,
+        priorAttempt.status,
+      );
+      currentProjection = await this.#kernel.query(
+        { type: "GetRunProjection", runId: currentProjection.run.id },
+        this.#runtimeContext,
+      );
+      if (!this.#adapter.capabilities.supportsIdempotentRequests) {
         if (currentProjection.run.state === "Active") {
           await this.#parkRunAfterDeliveryFailure(
             currentProjection,
@@ -731,7 +740,9 @@ export class AgentRuntime {
         }
         return true;
       }
-    } else {
+      startNewActivation = true;
+    }
+    if (startNewActivation) {
       if (
         currentProjection.run.state !== "Active" &&
         !(
@@ -763,6 +774,11 @@ export class AgentRuntime {
       activationView = requireActivation(
         currentProjection,
         activation.entityId,
+      );
+    }
+    if (!activationView) {
+      throw new Error(
+        `Outbox delivery ${event.id} has no current Activation.`,
       );
     }
     let agent = this.#agents.get(currentProjection.run.ownerAgentId);
@@ -813,6 +829,7 @@ export class AgentRuntime {
       agent,
       cause,
       outboxEvent: event,
+      outboxLeaseToken: authorityLeaseToken,
       authorityLeaseExpiresAt,
       runInputIds: deliveryInputIds,
       requestIdempotencyKey,
@@ -826,6 +843,7 @@ export class AgentRuntime {
     readonly attentionRevision?: number;
     readonly handlerLeaseToken?: string;
     readonly outboxEvent?: OutboxEventView;
+    readonly outboxLeaseToken?: string;
     readonly authorityLeaseExpiresAt: string;
     readonly runInputIds: readonly string[];
     readonly requestIdempotencyKey: string;
@@ -834,17 +852,24 @@ export class AgentRuntime {
       await this.#finishActivationBeforeProvider(input.activationId);
       return false;
     }
+    const admissionCommand = {
+      type: "StartProviderAttempt",
+      idempotencyKey: `${input.activationId}:provider-attempt`,
+      activationId: input.activationId,
+      ...(input.cause.type === "run"
+        ? {
+            outboxEventId: input.outboxEvent!.id,
+            outboxLeaseToken: input.outboxLeaseToken!,
+          }
+        : {}),
+      adapter: this.#adapter.name,
+      adapterVersion: this.#adapter.version,
+      capabilitySnapshot: providerCapabilitiesJson(this.#adapter),
+      runInputIds: input.runInputIds,
+      requestIdempotencyKey: input.requestIdempotencyKey,
+    } as const;
     const attempt = await this.#kernel.execute(
-      {
-        type: "StartProviderAttempt",
-        idempotencyKey: `${input.activationId}:provider-attempt`,
-        activationId: input.activationId,
-        adapter: this.#adapter.name,
-        adapterVersion: this.#adapter.version,
-        capabilitySnapshot: providerCapabilitiesJson(this.#adapter),
-        runInputIds: input.runInputIds,
-        requestIdempotencyKey: input.requestIdempotencyKey,
-      },
+      admissionCommand,
       this.#runtimeContext,
     );
     await this.#hooks.afterProviderAttemptStarted?.({
@@ -924,8 +949,25 @@ export class AgentRuntime {
             causeType: "run",
             projection: input.cause.run,
           });
+    const admission = await this.#kernel.execute(
+      admissionCommand,
+      this.#runtimeContext,
+    );
+    if (admission.entityId !== attempt.entityId) {
+      throw new Error(
+        `ProviderAttempt admission changed from ${attempt.entityId} to ${admission.entityId}.`,
+      );
+    }
+    const admittedLeaseExpiresAt = admission.leaseExpiresAt;
+    const authorityObservedAt = admission.authorityObservedAt;
+    if (!admittedLeaseExpiresAt || !authorityObservedAt) {
+      throw new Error(
+        `ProviderAttempt ${attempt.entityId} returned no authoritative admission window.`,
+      );
+    }
     const executionBudgetMs = this.#providerExecutionBudget(
-      input.authorityLeaseExpiresAt,
+      admittedLeaseExpiresAt,
+      authorityObservedAt,
     );
     if (executionBudgetMs <= 0) {
       await this.#settleProviderAttempt({
@@ -1143,15 +1185,45 @@ export class AgentRuntime {
     };
   }
 
-  #providerExecutionBudget(leaseExpiresAt: string): number {
+  #providerExecutionBudget(
+    leaseExpiresAt: string,
+    authorityObservedAt?: string,
+  ): number {
     const leaseExpiryMs = Date.parse(leaseExpiresAt);
     if (!Number.isFinite(leaseExpiryMs)) {
       throw new Error(`Invalid authoritative lease expiry ${leaseExpiresAt}.`);
     }
-    return Math.min(
+    const nowMs = this.#clock().getTime();
+    if (!Number.isFinite(nowMs)) {
+      throw new Error("Runtime clock returned a non-finite time.");
+    }
+    const localBudgetMs =
+      leaseExpiryMs - this.#leaseSafetyMs - nowMs;
+    const authoritativeBudgetMs =
+      authorityObservedAt === undefined
+        ? Number.POSITIVE_INFINITY
+        : (() => {
+            const observedAtMs = Date.parse(authorityObservedAt);
+            if (!Number.isFinite(observedAtMs)) {
+              throw new Error(
+                `Invalid authority observation time ${authorityObservedAt}.`,
+              );
+            }
+            return (
+              leaseExpiryMs -
+              this.#leaseSafetyMs -
+              observedAtMs
+            );
+          })();
+    const budget = Math.min(
       this.#providerTimeoutMs,
-      leaseExpiryMs - this.#leaseSafetyMs - this.#clock().getTime(),
+      localBudgetMs,
+      authoritativeBudgetMs,
     );
+    if (!Number.isFinite(budget)) {
+      throw new Error("Provider execution budget is non-finite.");
+    }
+    return budget;
   }
 
   async #finishActivationBeforeProvider(
@@ -1379,9 +1451,6 @@ export class AgentRuntime {
             this.#runtimeContext,
           );
           for (const execution of page.items) {
-            if (new Date(execution.activation.expiresAt) > this.#clock()) {
-              continue;
-            }
             recoveries +=
               await this.#reconcileAttentionExecution(
                 execution,
@@ -1808,20 +1877,6 @@ function isTerminalProviderStatus(
   "Completed" | "Failed" | "Unknown"
 > {
   return status === "Completed" || status === "Failed" || status === "Unknown";
-}
-
-function isActivationUsable(
-  activation: ActivationAttemptView,
-  projection: RunProjection,
-  now: Date,
-): boolean {
-  return (
-    activation.finishedAt === null &&
-    activation.revokedAt === null &&
-    new Date(activation.expiresAt) > now &&
-    projection.run.state === "Active" &&
-    activation.runActivationGeneration === projection.run.activationGeneration
-  );
 }
 
 function providerCapabilitiesJson(adapter: ProviderAdapter): JsonValue {

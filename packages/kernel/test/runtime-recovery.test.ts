@@ -5,6 +5,7 @@ import {
   TorsorKernel,
 } from "../src/index.js";
 import {
+  claimRunOutboxAuthority,
   humanContext,
   openMemoryKernel,
   runtimeContext,
@@ -94,11 +95,17 @@ async function startProviderAttempt(
   fixture: Awaited<ReturnType<typeof createRunFixture>>,
   key: string,
 ) {
-  return kernel.execute(
+  const outboxAuthority = await claimRunOutboxAuthority(
+    kernel,
+    fixture.runId,
+    key,
+  );
+  const attempt = await kernel.execute(
     {
       type: "StartProviderAttempt",
       idempotencyKey: `${key}-provider`,
       activationId: fixture.activationId,
+      ...outboxAuthority,
       adapter: "deterministic-fake",
       adapterVersion: "1",
       capabilitySnapshot: { supportsIdempotentRequests: true },
@@ -107,6 +114,16 @@ async function startProviderAttempt(
     },
     runtimeContext,
   );
+  await kernel.execute(
+    {
+      type: "AcknowledgeOutboxEvents",
+      idempotencyKey: `${key}-outbox-ack`,
+      outboxEventIds: [outboxAuthority.outboxEventId],
+      leaseToken: outboxAuthority.outboxLeaseToken,
+    },
+    runtimeContext,
+  );
+  return attempt;
 }
 
 async function settleProviderFailure(
@@ -784,6 +801,7 @@ describe("Runtime provider recovery", () => {
       );
       now = new Date("2026-09-21T08:00:05.000Z");
       await createAttentionExecution(kernel, "recover-live");
+      now = new Date("2026-09-21T08:05:04.000Z");
 
       await expect(
         kernel.query(

@@ -359,10 +359,118 @@ describe("AgentRuntime", () => {
           providerTimeoutMs: Number.NaN,
         }),
       ).toThrow("providerTimeoutMs must be an integer of at least 1.");
+      expect(() =>
+        createRuntime(kernel, new DeterministicFakeAdapter(), {
+          providerTimeoutMs: Number.POSITIVE_INFINITY,
+        }),
+      ).toThrow("providerTimeoutMs must be an integer of at least 1.");
     } finally {
       kernel.close();
     }
   });
+
+  it("creates no Attention attempt when the Runtime clock is non-finite", async () => {
+    const kernel = openKernel(":memory:");
+    const adapter = new DeterministicFakeAdapter();
+    try {
+      await mentionAgent(kernel, "invalid-attention-runtime-clock");
+
+      await expect(
+        createRuntime(kernel, adapter, {
+          clock: () => new Date(Number.NaN),
+        }).runOnce(),
+      ).rejects.toThrow("Runtime clock returned a non-finite time.");
+
+      expect(adapter.invocationCount).toBe(0);
+      expect(
+        (await kernel.readEvents(null, 500)).filter(
+          (event) => event.type === "ProviderAttemptStarted",
+        ),
+      ).toHaveLength(0);
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("creates no Attention attempt for an invalid authoritative expiry", async () => {
+    const kernel = openKernel(":memory:");
+    const adapter = new DeterministicFakeAdapter();
+    const originalExecute = kernel.execute.bind(kernel);
+    try {
+      await mentionAgent(kernel, "invalid-attention-authority-expiry");
+      vi.spyOn(kernel, "execute").mockImplementation(
+        async (command, context) => {
+          const result = await originalExecute(command, context);
+          return command.type === "ClaimAttention"
+            ? { ...result, leaseExpiresAt: "not-a-date" }
+            : result;
+        },
+      );
+
+      await expect(
+        createRuntime(kernel, adapter).runOnce(),
+      ).rejects.toThrow("Invalid authoritative lease expiry not-a-date.");
+
+      expect(adapter.invocationCount).toBe(0);
+      expect(
+        (await kernel.readEvents(null, 500)).filter(
+          (event) => event.type === "ProviderAttemptStarted",
+        ),
+      ).toHaveLength(0);
+    } finally {
+      vi.restoreAllMocks();
+      kernel.close();
+    }
+  });
+
+  it.each([
+    {
+      invalidWindow: "expiry",
+      mutate: { leaseExpiresAt: "not-a-date" },
+      message: "Invalid authoritative lease expiry not-a-date.",
+    },
+    {
+      invalidWindow: "observation",
+      mutate: { authorityObservedAt: "not-a-date" },
+      message: "Invalid authority observation time not-a-date.",
+    },
+  ])(
+    "does not invoke the provider for an invalid admission $invalidWindow",
+    async ({ mutate, message }) => {
+      const kernel = openKernel(":memory:");
+      const adapter = new DeterministicFakeAdapter();
+      const originalExecute = kernel.execute.bind(kernel);
+      let admissions = 0;
+      try {
+        await mentionAgent(
+          kernel,
+          `invalid-provider-admission-${Object.keys(mutate)[0]}`,
+        );
+        vi.spyOn(kernel, "execute").mockImplementation(
+          async (command, context) => {
+            const result = await originalExecute(command, context);
+            if (command.type !== "StartProviderAttempt") {
+              return result;
+            }
+            admissions += 1;
+            return admissions === 2
+              ? { ...result, ...mutate }
+              : result;
+          },
+        );
+
+        await expect(
+          createRuntime(kernel, adapter).runOnce(),
+        ).rejects.toThrow(message);
+
+        expect(admissions).toBe(2);
+        expect(adapter.invocationCount).toBe(0);
+      } finally {
+        vi.restoreAllMocks();
+        kernel.close();
+      }
+    },
+  );
 
   it(
     "starts an independent next-page domain without waiting for a busy first page",
@@ -2301,11 +2409,7 @@ describe("AgentRuntime", () => {
         },
         runtimeContext,
       );
-      expect(recoverable.items[0]?.activation).toMatchObject({
-        id: activation.entityId,
-        finishedAt: now.toISOString(),
-        expiresAt: new Date(now.getTime() + 30_000).toISOString(),
-      });
+      expect(recoverable.items).toEqual([]);
 
       await createRuntime(
         kernel,
@@ -2323,6 +2427,18 @@ describe("AgentRuntime", () => {
       ).toBeUndefined();
 
       now = new Date(now.getTime() + 31_000);
+      const due = await kernel.query(
+        {
+          type: "ListRecoverableAttentionExecutions",
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      expect(due.items[0]?.activation).toMatchObject({
+        id: activation.entityId,
+        finishedAt: "2026-09-21T08:00:00.000Z",
+        expiresAt: "2026-09-21T08:00:30.000Z",
+      });
       await createRuntime(
         kernel,
         new DeterministicFakeAdapter(),
@@ -2340,6 +2456,81 @@ describe("AgentRuntime", () => {
       kernel.close();
     }
   });
+
+  it.each([
+    {
+      clockCase: "ahead",
+      localTimes: [new Date("2030-01-01T00:00:00.000Z")],
+    },
+    {
+      clockCase: "behind",
+      localTimes: [new Date("2020-01-01T00:00:00.000Z")],
+    },
+    {
+      clockCase: "invalid",
+      localTimes: [new Date(Number.NaN)],
+    },
+    {
+      clockCase: "rollback",
+      localTimes: [
+        new Date("2030-01-01T00:00:00.000Z"),
+        new Date("2020-01-01T00:00:00.000Z"),
+      ],
+    },
+  ])(
+    "uses only the Kernel recovery set when the Runtime clock is $clockCase",
+    async ({ localTimes }) => {
+      let kernelNow = new Date("2026-09-21T08:00:00.000Z");
+      const kernel = openKernel(":memory:", () => kernelNow);
+      let localTimeIndex = 0;
+      const localClock = vi.fn(
+        () =>
+          localTimes[
+            Math.min(localTimeIndex++, localTimes.length - 1)
+          ]!,
+      );
+      try {
+        const execution = await prepareAttentionAttempt(
+          kernel,
+          `authoritative-recovery-clock-${localTimes[0]!.getTime()}`,
+          1_000,
+        );
+        await kernel.execute(
+          {
+            type: "FinishActivation",
+            idempotencyKey: `${execution.activationId}:decision-finished`,
+            activationId: execution.activationId,
+            outcome: "Completed",
+          },
+          runtimeContext,
+        );
+        await clearOutbox(kernel);
+        kernelNow = new Date(kernelNow.getTime() + 1_001);
+
+        await createRuntime(
+          kernel,
+          new DeterministicFakeAdapter(),
+          {
+            projectIds: ["project-secondary"],
+            clock: localClock,
+          },
+        ).runOnce();
+
+        expect(localClock).not.toHaveBeenCalled();
+        expect(
+          await kernel.query(
+            {
+              type: "GetProviderAttempt",
+              providerAttemptId: execution.attemptId,
+            },
+            runtimeContext,
+          ),
+        ).toMatchObject({ status: "Unknown" });
+      } finally {
+        kernel.close();
+      }
+    },
+  );
 
   it("does not recover a provider still returning after its Attention decision", async () => {
     const kernel = openKernel(":memory:");
@@ -2786,6 +2977,29 @@ describe("AgentRuntime", () => {
     }
   });
 
+  it("creates no Run attempt when the Outbox Runtime clock is non-finite", async () => {
+    const kernel = openKernel(":memory:");
+    const adapter = new DeterministicFakeAdapter();
+    try {
+      await mentionAgent(kernel, "invalid-outbox-runtime-clock");
+      await createRuntime(kernel, adapter, {
+        outboxBatchSize: 1,
+      }).runOnce();
+
+      await expect(
+        createRuntime(kernel, adapter, {
+          projectIds: ["project-secondary"],
+          clock: () => new Date(Number.NaN),
+        }).runOnce(),
+      ).rejects.toThrow("Runtime clock returned a non-finite time.");
+
+      const run = await getOnlyRun(kernel);
+      expect(run.providerAttempts).toHaveLength(0);
+    } finally {
+      kernel.close();
+    }
+  });
+
   it("parks a terminal Outbox attempt that races provider startup", async () => {
     const kernel = openKernel(":memory:");
     let runDeliveries = 0;
@@ -2914,7 +3128,91 @@ describe("AgentRuntime", () => {
     }
   });
 
-  it("retries when an Outbox lease expires after attempt creation", async () => {
+  it("blocks a lagging Runtime after another Runtime reclaims provider authority", async () => {
+    let kernelNow = new Date("2026-09-21T08:00:00.000Z");
+    let runtimeNow = kernelNow;
+    const kernel = openKernel(":memory:", () => kernelNow);
+    let staleRunDeliveries = 0;
+    let replacementRunDeliveries = 0;
+    const staleAdapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+        return;
+      }
+      staleRunDeliveries += 1;
+      await context.capabilities.complete();
+    });
+    const replacementAdapter = new DeterministicFakeAdapter(
+      async (context) => {
+        if (context.cause.type !== "run") {
+          throw new Error(
+            "The replacement Runtime must only deliver Run work.",
+          );
+        }
+        replacementRunDeliveries += 1;
+        await context.capabilities.complete();
+      },
+    );
+    try {
+      await mentionAgent(kernel, "outbox-post-attempt-takeover");
+      await createRuntime(kernel, staleAdapter, {
+        attentionLeaseMs: 6_000,
+        outboxLeaseMs: 6_000,
+        providerTimeoutMs: 5_000,
+        leaseSafetyMs: 1_000,
+        clock: () => runtimeNow,
+      }).runOnce();
+
+      let replacementPass:
+        | Awaited<ReturnType<AgentRuntime["runOnce"]>>
+        | undefined;
+      const stalePass = createRuntime(kernel, staleAdapter, {
+        attentionLeaseMs: 6_000,
+        outboxLeaseMs: 6_000,
+        providerTimeoutMs: 5_000,
+        leaseSafetyMs: 1_000,
+        clock: () => runtimeNow,
+        hooks: {
+          afterProviderAttemptStarted: async ({ causeType }) => {
+            if (causeType !== "run" || replacementPass) {
+              return;
+            }
+            kernelNow = new Date(kernelNow.getTime() + 6_001);
+            runtimeNow = new Date(kernelNow.getTime() - 60_000);
+            replacementPass = await createRuntime(
+              kernel,
+              replacementAdapter,
+              {
+                projectIds: ["project-secondary"],
+                attentionLeaseMs: 6_000,
+                outboxLeaseMs: 6_000,
+                providerTimeoutMs: 5_000,
+                leaseSafetyMs: 1_000,
+                clock: () => kernelNow,
+              },
+            ).runOnce();
+          },
+        },
+      }).runOnce();
+
+      await expect(stalePass).rejects.toMatchObject({
+        code: "InvalidCommand",
+      });
+      expect(replacementPass?.outboxEventsProcessed).toBe(1);
+      expect(staleRunDeliveries).toBe(0);
+      expect(replacementRunDeliveries).toBe(1);
+      const run = await getOnlyRun(kernel);
+      expect(run.run.state).toBe("Completed");
+      expect(run.providerAttempts.map((attempt) => attempt.status)).toEqual([
+        "Unknown",
+        "Completed",
+      ]);
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("retries when local setup exhausts an admitted provider budget", async () => {
     let kernelNow = new Date("2026-09-21T08:00:00.000Z");
     let runtimeNow = kernelNow;
     const kernel = openKernel(":memory:", () => kernelNow);
@@ -2928,7 +3226,7 @@ describe("AgentRuntime", () => {
       await context.capabilities.complete();
     });
     try {
-      await mentionAgent(kernel, "outbox-post-attempt-budget-retry");
+      await mentionAgent(kernel, "outbox-local-post-attempt-budget-retry");
       await createRuntime(kernel, adapter, {
         attentionLeaseMs: 6_000,
         outboxLeaseMs: 6_000,
@@ -3218,7 +3516,7 @@ describe("AgentRuntime", () => {
         { type: "GetRunProjection", runId: runId! },
         humanContext,
       );
-      expect(run.run.state).toBe("Completed");
+      expect(run.run.state).toBe("Waiting");
       expect(
         run.inputs.find((input) => input.id === sent.relatedIds!.runInputId)
           ?.disposition,

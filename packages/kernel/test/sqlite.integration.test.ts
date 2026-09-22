@@ -501,7 +501,7 @@ describe("SQLite persistence", () => {
       const metadata = new DatabaseSync(databasePath, { readOnly: true });
       try {
         expect(metadata.prepare("PRAGMA user_version").get()).toMatchObject({
-          user_version: 11,
+          user_version: 12,
         });
       } finally {
         metadata.close();
@@ -1443,6 +1443,7 @@ describe("SQLite persistence", () => {
     const unsupportedPath = join(directory, "unsupported.sqlite");
     const priorPrSchemaPath = join(directory, "schema-9.sqlite");
     const supersededSchemaPath = join(directory, "schema-10.sqlite");
+    const priorRuntimeSchemaPath = join(directory, "schema-11.sqlite");
     const unversionedPath = join(directory, "unversioned.sqlite");
     try {
       const unsupported = new DatabaseSync(unsupportedPath);
@@ -1494,6 +1495,17 @@ describe("SQLite persistence", () => {
         TorsorKernel.open({ databasePath: supersededSchemaPath, bootstrap }),
       ).toThrow(
         /Incompatible development database schema version 10.*recreate the disposable local database/,
+      );
+
+      const priorRuntimeSchema = new DatabaseSync(priorRuntimeSchemaPath);
+      priorRuntimeSchema.exec(
+        "CREATE TABLE preserved_schema_11_state (id TEXT PRIMARY KEY); PRAGMA user_version = 11",
+      );
+      priorRuntimeSchema.close();
+      expect(() =>
+        TorsorKernel.open({ databasePath: priorRuntimeSchemaPath, bootstrap }),
+      ).toThrow(
+        /Incompatible development database schema version 11.*recreate the disposable local database/,
       );
 
       const unversioned = new DatabaseSync(unversionedPath);

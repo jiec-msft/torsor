@@ -174,6 +174,8 @@ export interface FinishActivationCommand extends IdempotentCommand {
 export interface StartProviderAttemptCommand extends IdempotentCommand {
   readonly type: "StartProviderAttempt";
   readonly activationId: string;
+  readonly outboxEventId?: string;
+  readonly outboxLeaseToken?: string;
   readonly adapter: string;
   readonly adapterVersion: string;
   readonly capabilitySnapshot: JsonValue;
@@ -717,5 +719,6 @@ export interface CommandResult {
   readonly relatedIds?: Readonly<Record<string, string>>;
   readonly leaseToken?: string;
   readonly leaseExpiresAt?: string;
+  readonly authorityObservedAt?: string;
   readonly outboxEvents?: readonly OutboxEventView[];
 }

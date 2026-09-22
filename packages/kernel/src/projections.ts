@@ -901,8 +901,7 @@ export function getAttentionRecoverySnapshot(
   const observedAt = db.now(kernel);
   const promotionSql = `UPDATE attention_recovery_executions AS recovery
         SET expired_recoverable = 1
-      WHERE recovery.unfinished = 1
-        AND recovery.expired_recoverable = 0
+      WHERE recovery.expired_recoverable = 0
         AND recovery.expires_at <= ?
         AND EXISTS (
           SELECT 1
@@ -912,11 +911,25 @@ export function getAttentionRecoverySnapshot(
             JOIN attention_domain_fences AS attention_domain
               ON attention_domain.attention_id = attention.id
            WHERE activation.id = recovery.activation_id
-             AND ${recoverableUnfinishedAttentionPredicate(
-               "activation",
-               "attention",
-               "attention_domain",
-             )}
+             AND (
+               (
+                 recovery.unfinished = 1
+                 AND ${recoverableUnfinishedAttentionPredicate(
+                   "activation",
+                   "attention",
+                   "attention_domain",
+                 )}
+               )
+               OR
+               (
+                 recovery.finished_with_unsettled_provider = 1
+                 AND ${recoverableFinishedAttentionPredicate(
+                   "activation",
+                   "attention",
+                   "attention_domain",
+                 )}
+               )
+             )
         )`;
   const promotedCount = db.run(
     kernel,
@@ -970,14 +983,27 @@ function readAttentionRecoverySnapshot(
          ON attention.id = activation.attention_id
        CROSS JOIN attention_domain_fences AS attention_domain
          ON attention_domain.attention_id = attention.id
-      WHERE recovery.unfinished = 1
-         AND recovery.expired_recoverable = 0
+      WHERE recovery.expired_recoverable = 0
          AND recovery.expires_at > ?
-         AND ${recoverableUnfinishedAttentionPredicate(
-           "activation",
-           "attention",
-           "attention_domain",
-         )}`,
+         AND (
+           (
+             recovery.unfinished = 1
+             AND ${recoverableUnfinishedAttentionPredicate(
+               "activation",
+               "attention",
+               "attention_domain",
+             )}
+           )
+           OR
+           (
+             recovery.finished_with_unsettled_provider = 1
+             AND ${recoverableFinishedAttentionPredicate(
+               "activation",
+               "attention",
+               "attention_domain",
+             )}
+           )
+         )`,
     observedAt,
   );
   return {
@@ -1009,6 +1035,7 @@ export function listRecoverableAttentionExecutions(
   ];
   const unsettledClauses = [
     "recovery.finished_with_unsettled_provider = 1",
+    "recovery.expired_recoverable = 1",
     recoverableFinishedAttentionPredicate(
       "activation",
       "attention",
@@ -1194,14 +1221,27 @@ function resolveAttentionRecoverySnapshot(
          ON attention.id = activation.attention_id
        CROSS JOIN attention_domain_fences AS attention_domain
          ON attention_domain.attention_id = attention.id
-      WHERE recovery.unfinished = 1
-         AND recovery.expired_recoverable = 0
+      WHERE recovery.expired_recoverable = 0
          AND recovery.expires_at <= ?
-         AND ${recoverableUnfinishedAttentionPredicate(
-           "activation",
-           "attention",
-           "attention_domain",
-         )}
+         AND (
+           (
+             recovery.unfinished = 1
+             AND ${recoverableUnfinishedAttentionPredicate(
+               "activation",
+               "attention",
+               "attention_domain",
+             )}
+           )
+           OR
+           (
+             recovery.finished_with_unsettled_provider = 1
+             AND ${recoverableFinishedAttentionPredicate(
+               "activation",
+               "attention",
+               "attention_domain",
+             )}
+           )
+         )
       ORDER BY recovery.expires_at
       LIMIT 1`,
     observedAt,

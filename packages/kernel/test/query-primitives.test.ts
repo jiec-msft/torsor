@@ -9,6 +9,7 @@ import {
 } from "../src/index.js";
 import {
   bootstrap,
+  claimRunOutboxAuthority,
   humanContext,
   openMemoryKernel,
   runtimeContext,
@@ -375,18 +376,24 @@ describe("Kernel server query primitives", () => {
         principalId: "principal-orbit",
         activationId: activation.entityId,
       } as const;
+      const outboxAuthority = await claimRunOutboxAuthority(
+        kernel,
+        resolved.entityId,
+        "component-history",
+      );
       const provider = await kernel.execute(
         {
           type: "StartProviderAttempt",
           idempotencyKey: "component-history-provider",
           activationId: activation.entityId,
+          ...outboxAuthority,
           adapter: "deterministic-fake",
           adapterVersion: "1",
           capabilitySnapshot: { streaming: true },
           runInputIds: [resolved.relatedIds!.runInputId!],
           requestIdempotencyKey: "component-history-request",
         },
-        runContext,
+        runtimeContext,
       );
       await kernel.execute(
         {
@@ -675,11 +682,17 @@ describe("Kernel server query primitives", () => {
     const kernel = openMemoryKernel();
     try {
       const setup = await createActiveRun(kernel, "parked-activity");
+      const outboxAuthority = await claimRunOutboxAuthority(
+        kernel,
+        setup.runId,
+        "parked-activity",
+      );
       const provider = await kernel.execute(
         {
           type: "StartProviderAttempt",
           idempotencyKey: "parked-activity-provider",
           activationId: setup.runActivationId,
+          ...outboxAuthority,
           adapter: "deterministic-fake",
           adapterVersion: "1",
           capabilitySnapshot: {},

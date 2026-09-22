@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { KernelError, TorsorKernel } from "../src/index.js";
 import {
   bootstrap,
+  claimRunOutboxAuthority,
   createRun,
   humanContext,
   openMemoryKernel,
@@ -250,11 +251,17 @@ describe("TorsorKernel transactions and invariants", () => {
     const kernel = openMemoryKernel();
     try {
       const setup = await createRun(kernel);
+      const outboxAuthority = await claimRunOutboxAuthority(
+        kernel,
+        setup.runId,
+        "provider-delivery",
+      );
       const provider = await kernel.execute(
         {
           type: "StartProviderAttempt",
           idempotencyKey: "provider-start",
           activationId: setup.activationId,
+          ...outboxAuthority,
           adapter: "deterministic-fake",
           adapterVersion: "1",
           capabilitySnapshot: { acceptsInputWhileRunning: false },
@@ -350,11 +357,17 @@ describe("TorsorKernel transactions and invariants", () => {
     const kernel = openMemoryKernel();
     try {
       const setup = await createRun(kernel);
+      const outboxAuthority = await claimRunOutboxAuthority(
+        kernel,
+        setup.runId,
+        "async-provider",
+      );
       const provider = await kernel.execute(
         {
           type: "StartProviderAttempt",
           idempotencyKey: "async-provider-start",
           activationId: setup.activationId,
+          ...outboxAuthority,
           adapter: "deterministic-fake",
           adapterVersion: "1",
           capabilitySnapshot: {},
@@ -650,11 +663,17 @@ describe("TorsorKernel transactions and invariants", () => {
     const kernel = openMemoryKernel();
     try {
       const setup = await createRun(kernel);
+      const outboxAuthority = await claimRunOutboxAuthority(
+        kernel,
+        setup.runId,
+        "provider-before-terminal",
+      );
       const provider = await kernel.execute(
         {
           type: "StartProviderAttempt",
           idempotencyKey: "provider-before-terminal",
           activationId: setup.activationId,
+          ...outboxAuthority,
           adapter: "deterministic-fake",
           adapterVersion: "1",
           capabilitySnapshot: {},

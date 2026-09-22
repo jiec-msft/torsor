@@ -22,6 +22,7 @@ import {
   finishActivation,
   finishProviderAttempt,
   parkRunAfterProviderAttemptFailure,
+  resolveCachedProviderAttempt,
   startActivation,
   startProviderAttempt,
 } from "./execution.js";
@@ -190,6 +191,29 @@ export class TorsorKernel {
             command,
             result,
             principal,
+          );
+          if (JSON.stringify(refreshed) !== JSON.stringify(result)) {
+            run(
+              this.#context,
+              `UPDATE idempotency_records
+                  SET result_json = ?
+                WHERE principal_id = ? AND command_name = ? AND idempotency_key = ?`,
+              JSON.stringify(refreshed),
+              text(principal.id),
+              command.type,
+              command.idempotencyKey,
+            );
+          }
+          this.#context.database.exec("COMMIT");
+          return refreshed;
+        }
+        if (command.type === "StartProviderAttempt") {
+          const refreshed = resolveCachedProviderAttempt(
+            this.#context,
+            command,
+            result,
+            principal,
+            effectiveContext,
           );
           if (JSON.stringify(refreshed) !== JSON.stringify(result)) {
             run(

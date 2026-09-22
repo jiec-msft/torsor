@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { type KernelCommand } from "../src/index.js";
 import {
+  claimRunOutboxAuthority,
   createRun,
   humanContext,
   openMemoryKernel,
@@ -9,6 +10,142 @@ import {
 } from "./helpers.js";
 
 describe("independent review regressions", () => {
+  it("revalidates cached provider admission against the live Outbox frontier", async () => {
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const kernel = openMemoryKernel(() => now);
+    try {
+      const setup = await createRun(kernel);
+      const authority = await claimRunOutboxAuthority(
+        kernel,
+        setup.runId,
+        "cached-provider-authority",
+      );
+      const command = {
+        type: "StartProviderAttempt",
+        idempotencyKey: "cached-provider-authority:start",
+        activationId: setup.activationId,
+        ...authority,
+        adapter: "deterministic-fake",
+        adapterVersion: "1",
+        capabilitySnapshot: {},
+        runInputIds: [setup.runInputId],
+        requestIdempotencyKey: "cached-provider-authority:request",
+      } as const;
+
+      const first = await kernel.execute(command, runtimeContext);
+      now = new Date("2026-09-21T08:00:01.000Z");
+      const retry = await kernel.execute(command, runtimeContext);
+
+      expect(retry).toMatchObject({
+        entityId: first.entityId,
+        leaseExpiresAt: "2026-09-21T08:00:30.000Z",
+        authorityObservedAt: now.toISOString(),
+      });
+
+      await kernel.execute(
+        {
+          type: "AcknowledgeOutboxEvents",
+          idempotencyKey: "cached-provider-authority:ack",
+          outboxEventIds: [authority.outboxEventId],
+          leaseToken: authority.outboxLeaseToken,
+        },
+        runtimeContext,
+      );
+      await expect(
+        kernel.execute(command, runtimeContext),
+      ).rejects.toMatchObject({ code: "Conflict" });
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("rejects an intervening Outbox lease and admits its replacement once", async () => {
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const kernel = openMemoryKernel(() => now);
+    try {
+      const setup = await createRun(kernel);
+      const originalAuthority = await claimRunOutboxAuthority(
+        kernel,
+        setup.runId,
+        "intervening-provider-authority",
+      );
+      const originalCommand = {
+        type: "StartProviderAttempt",
+        idempotencyKey: "intervening-provider-authority:original",
+        activationId: setup.activationId,
+        ...originalAuthority,
+        adapter: "deterministic-fake",
+        adapterVersion: "1",
+        capabilitySnapshot: {},
+        runInputIds: [setup.runInputId],
+        requestIdempotencyKey: "intervening-provider-authority:request",
+      } as const;
+      await kernel.execute(originalCommand, runtimeContext);
+
+      now = new Date("2026-09-21T08:00:31.000Z");
+      const replacementClaim = await kernel.execute(
+        {
+          type: "ClaimOutboxEvents",
+          idempotencyKey: "intervening-provider-authority:replacement-claim",
+          limit: 1,
+          leaseDurationMs: 30_000,
+        },
+        runtimeContext,
+      );
+      expect(replacementClaim.outboxEvents?.[0]?.id).toBe(
+        originalAuthority.outboxEventId,
+      );
+      await expect(
+        kernel.execute(originalCommand, runtimeContext),
+      ).rejects.toMatchObject({ code: "Conflict" });
+
+      const replacementActivation = await kernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey:
+            "intervening-provider-authority:replacement-activation",
+          runId: setup.runId,
+          expectedRunRevision: 1,
+        },
+        runtimeContext,
+      );
+      const replacement = await kernel.execute(
+        {
+          ...originalCommand,
+          idempotencyKey:
+            "intervening-provider-authority:replacement-attempt",
+          activationId: replacementActivation.entityId,
+          outboxLeaseToken: replacementClaim.leaseToken!,
+        },
+        runtimeContext,
+      );
+      const retry = await kernel.execute(
+        {
+          ...originalCommand,
+          idempotencyKey:
+            "intervening-provider-authority:replacement-attempt",
+          activationId: replacementActivation.entityId,
+          outboxLeaseToken: replacementClaim.leaseToken!,
+        },
+        runtimeContext,
+      );
+
+      expect(retry.entityId).toBe(replacement.entityId);
+      const projection = await kernel.query(
+        { type: "GetRunProjection", runId: setup.runId },
+        runtimeContext,
+      );
+      expect(
+        projection.providerAttempts.filter(
+          (attempt) =>
+            attempt.activationId === replacementActivation.entityId,
+        ),
+      ).toHaveLength(1);
+    } finally {
+      kernel.close();
+    }
+  });
+
   it("revokes execution authority when a Run enters Waiting", async () => {
     const kernel = openMemoryKernel();
     try {
@@ -455,11 +592,18 @@ describe("independent review regressions", () => {
         },
         runtimeContext,
       );
+      const outboxAuthority = await claimRunOutboxAuthority(
+        kernel,
+        setup.runId,
+        "provider-withdrawal",
+        runInputId,
+      );
       const alreadyStarted = await kernel.execute(
         {
           type: "StartProviderAttempt",
           idempotencyKey: "provider-before-withdrawal",
           activationId: activation.entityId,
+          ...outboxAuthority,
           adapter: "deterministic-fake",
           adapterVersion: "1",
           capabilitySnapshot: {},
@@ -487,6 +631,7 @@ describe("independent review regressions", () => {
             type: "StartProviderAttempt",
             idempotencyKey: "provider-after-withdrawal",
             activationId: activation.entityId,
+            ...outboxAuthority,
             adapter: "deterministic-fake",
             adapterVersion: "1",
             capabilitySnapshot: {},
@@ -777,11 +922,17 @@ describe("independent review regressions", () => {
     const kernel = openMemoryKernel();
     try {
       const setup = await createRun(kernel);
+      const outboxAuthority = await claimRunOutboxAuthority(
+        kernel,
+        setup.runId,
+        "provider-status",
+      );
       const provider = await kernel.execute(
         {
           type: "StartProviderAttempt",
           idempotencyKey: "provider-status-start",
           activationId: setup.activationId,
+          ...outboxAuthority,
           adapter: "deterministic-fake",
           adapterVersion: "1",
           capabilitySnapshot: {},

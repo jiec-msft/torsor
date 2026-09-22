@@ -54,13 +54,21 @@ decision commits and before the provider returns.
 
 The current Kernel contract does not expose lease renewal. The runtime
 therefore claims one outbox event at a time. Attention and non-empty outbox
-claims return their persisted lease expiry. Immediately before provider work,
-the runtime limits execution to the smaller of the configured provider timeout
-and the authoritative remaining lease time minus a one-second default safety
-margin. Runtime-requested Activation windows cover the corresponding lease
-window, so a shorter Kernel default cannot truncate provider authority.
-Non-positive budgets never start provider work, and stale outbox claim
-authority is allowed to fail closed rather than being treated as refreshable.
+claims return their persisted lease expiry. Run ProviderAttempt admission
+atomically validates the exact Outbox event, lease token and principal, live
+Kernel-clock expiry, oldest pending frontier, and delivered RunInput. The same
+idempotent admission is revalidated immediately before adapter invocation, so
+an acknowledged, expired, superseded, or reclaimed event cannot reuse a cached
+ProviderAttempt as fresh authority.
+
+Immediately before provider work, the runtime limits execution to the smaller
+of the configured provider timeout, local remaining lease time, and the
+Kernel-observed remaining admission window, minus a one-second default safety
+margin. Local time can shorten that window but cannot extend it after rollback.
+Runtime-requested Activation windows cover the corresponding lease window, so
+a shorter Kernel default cannot truncate provider authority. Non-finite or
+non-positive budgets never start provider work, and stale authority fails
+closed rather than being treated as refreshable.
 
 Because the Kernel outbox is globally ordered, runtime instances coordinate
 through the same leased stream. `projectIds` supplies the Projects whose
