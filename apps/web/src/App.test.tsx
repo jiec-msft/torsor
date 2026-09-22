@@ -133,6 +133,26 @@ describe("TorsorApp", () => {
     expect(screen.queryByText("Loading atomic Run projection")).not.toBeInTheDocument();
   });
 
+  it("does not let queued drawer focus steal the Human's timeline focus", () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 375 });
+    let frame!: FrameRequestCallback;
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frame = callback;
+      return 42;
+    });
+    const cancel = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
+    window.history.replaceState(
+      {}, "", "/?project=project-sample&channel=channel-general&thread=thread-1&run=run-1&panel=run&panels=detail",
+    );
+    const { unmount } = render(<TorsorApp controller={stubController()} />);
+    const timeline = screen.getByRole("region", { name: "Live Agent Timeline" });
+    timeline.focus();
+    act(() => frame(0));
+    expect(timeline).toHaveFocus();
+    unmount();
+    expect(cancel).toHaveBeenCalledWith(42);
+  });
+
   it("keeps timeline history and disclosure controls reachable in a compact Run drawer", async () => {
     const user = userEvent.setup();
     Object.defineProperty(window, "innerWidth", { configurable: true, value: 375 });

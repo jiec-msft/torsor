@@ -260,18 +260,23 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
         openDrawer === "channels"
           ? channelsPanelRef.current
           : detailPanelRef.current;
-      requestAnimationFrame(() => panel?.focus());
-      return;
+      const frame = requestAnimationFrame(() => {
+        if (panel && !panel.contains(document.activeElement)) {
+          panel.focus();
+        }
+      });
+      return () => cancelAnimationFrame(frame);
     }
     const closedDrawer = previousDrawer.current;
     previousDrawer.current = null;
     if (closedDrawer) {
-      requestAnimationFrame(() => {
+      const frame = requestAnimationFrame(() => {
         (closedDrawer === "channels"
           ? channelsToggleRef.current
           : detailToggleRef.current
         )?.focus();
       });
+      return () => cancelAnimationFrame(frame);
     }
   }, [compactPanels, route.channelsOpen, route.detailOpen]);
 
