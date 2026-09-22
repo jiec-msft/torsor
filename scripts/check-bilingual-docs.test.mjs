@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -66,7 +66,8 @@ function document(path, body = "Synthetic documentation.\n") {
   const chinese = path.endsWith(".zh-cn.md");
   const other = encodeURIComponent(posix.basename(chinese
     ? path.replace(/\.zh-cn\.md$/, ".md")
-    : path.replace(/\.md$/, ".zh-cn.md")));
+    : path.replace(/\.md$/, ".zh-cn.md")))
+    .replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
   const navigation = chinese
     ? `> 简体中文（主要版本） | [English](${other})`
     : `> English | [简体中文](${other})`;
@@ -91,6 +92,66 @@ test("either missing counterpart reports its exact repository-relative path", (t
     stderr: "docs/alpha.zh-cn.md: [missing-counterpart] expected docs/alpha.md\n"
       + "docs/zeta.md: [missing-counterpart] expected docs/zeta.zh-cn.md\n",
   });
+});
+
+test("locale naming rejects non-reversible suffix chains, mixed case and empty stems", (t) => {
+  const repo = repository(t);
+  repo.pair("guide.md");
+  const invalid = [
+    "guide.zh-cn.zh-cn.md",
+    "nested/reference.zh-cn.zh-cn.zh-cn.md",
+    "upper.ZH-CN.md",
+    "mixed.zh-CN.md",
+    "mixed-chain.ZH-CN.zh-cn.md",
+    "reverse.zh-cn.ZH-CN.md",
+    "extension.MD",
+    "extension-cn.zh-cn.Md",
+    ".md",
+    ".zh-cn.md",
+  ];
+  for (const path of invalid) repo.write(path, document(path));
+  repo.git("add", "--all");
+  assert.deepEqual(repo.check(), {
+    status: 1, stdout: "",
+    stderr: invalid.map((path) => `${path}: [document-name] use a nonempty English stem with .md or one lowercase .zh-cn.md suffix; rename this file and its counterpart`)
+      .sort().join("\n") + "\n",
+  });
+});
+
+test("locale suffix rules apply to basenames, not directories or interior filename text", (t) => {
+  const repo = repository(t);
+  for (const path of [
+    "folder.zh-cn/Guide.md",
+    "folder.ZH-CN/guide.zh-cn.notes.md",
+    "folder.zh-cn.zh-cn/guide.ZH-CN.notes.md",
+    "other/guide.md.md",
+  ]) repo.pair(path);
+  repo.git("add", "--all");
+  assert.deepEqual(repo.check(), { status: 0, stdout: success, stderr: "" });
+});
+
+test("explicit exclusions cannot waive invalid locale names", (t) => {
+  const repo = repository(t);
+  const path = "reference.ZH-CN.md";
+  repo.write(path, "# Reference\n");
+  repo.policy([{ path, reason: "Synthetic implementation reference." }]);
+  repo.git("add", "--all");
+  const result = repo.check();
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /reference\.ZH-CN\.md: \[document-name\]/);
+  assert.match(result.stderr, /docs\/documentation\.md: \[exclusion-path\]/);
+});
+
+test("invalid old locale names can be removed or renamed without inventing counterparts", (t) => {
+  const repo = repository(t);
+  repo.write("legacy.zh-cn.zh-cn.md", document("legacy.zh-cn.zh-cn.md"));
+  repo.write("renamed.ZH-CN.md", document("renamed.ZH-CN.md"));
+  const base = repo.commit();
+  repo.git("rm", "--quiet", "legacy.zh-cn.zh-cn.md");
+  repo.git("mv", "renamed.ZH-CN.md", "renamed.md");
+  repo.pair("renamed.md");
+  repo.git("add", "--all");
+  assert.deepEqual(repo.check("--base", base), { status: 0, stdout: success, stderr: "" });
 });
 
 test("both directions must link to the exact counterpart in top navigation", (t) => {
@@ -141,6 +202,89 @@ test("existing navigation variants, BOM, CRLF and encoded sibling paths pass", (
     "\uFEFF# Sample\r\n\r\n> [简体中文（主要版本）](./sample%20notes.zh-cn.md) | English\r\n");
   repo.write("docs/sample notes.zh-cn.md",
     "# Sample\n\n> 简体中文（主要版本） | [English](./sample%20notes.md)\n");
+  repo.git("add", "--all");
+  assert.deepEqual(repo.check(), { status: 0, stdout: success, stderr: "" });
+});
+
+test("raw entity-bearing destinations fail in both directions; percent-encoded literals pass", (t) => {
+  const repo = repository(t);
+  const paths = [];
+  for (const stem of [
+    "..&sol;guide", "..&#47;guide", "..&#x2f;guide", "..&bsol;guide",
+    "guide&amp;notes", "guide&colon;notes", "guide&num;notes", "guide&quest;notes",
+    "guide&NewLine;notes", "guide&unknown;notes", "guide&notes",
+  ]) {
+    for (const suffix of [".md", ".zh-cn.md"]) {
+      const path = `docs/${stem}${suffix}`;
+      const target = `${stem}${suffix === ".md" ? ".zh-cn.md" : ".md"}`;
+      paths.push(path);
+      repo.write(path, document(path).replace(`(${encodeURIComponent(target)})`, `(${target})`));
+    }
+  }
+  repo.git("add", "--all");
+  assert.deepEqual(repo.check(), {
+    status: 1, stdout: "",
+    stderr: paths.map((path) => `${path}: [navigation-encoding] raw & is not allowed; encode a literal & as %26 in the sibling filename`)
+      .sort().join("\n") + "\n",
+  });
+  for (const path of paths) repo.write(path, document(path));
+  assert.deepEqual(repo.check(), { status: 0, stdout: success, stderr: "" });
+});
+
+test("raw URL-reserved and non-ASCII filename characters require percent encoding", (t) => {
+  const repo = repository(t);
+  const paths = ["docs/literal!.md", "docs/literal'.md", "docs/literal[bracket].md", "docs/样例.md"];
+  for (const path of paths) {
+    repo.pair(path);
+    const target = posix.basename(path.replace(/\.md$/, ".zh-cn.md"));
+    repo.write(path, `# Sample\n\n> English | [简体中文](${target})\n`);
+  }
+  repo.git("add", "--all");
+  assert.deepEqual(repo.check(), {
+    status: 1, stdout: "",
+    stderr: paths.map((path) => `${path}: [navigation] expected top language navigation to ${path.replace(/\.md$/, ".zh-cn.md")}`)
+      .sort().join("\n") + "\n",
+  });
+  for (const path of paths) repo.write(path, document(path));
+  assert.deepEqual(repo.check(), { status: 0, stdout: success, stderr: "" });
+});
+
+test("navigation normalization rejects traversal, URL syntax, malformed escapes and hidden characters", (t) => {
+  const repo = repository(t);
+  repo.pair("docs/guide.md");
+  repo.git("add", "--all");
+  for (const target of [
+    "../guide.zh-cn.md", "./../guide.zh-cn.md", "././guide.zh-cn.md", ".//guide.zh-cn.md",
+    "%2e%2e%2fguide.zh-cn.md", "%2E%2Fguide.zh-cn.md", "%2Fguide.zh-cn.md",
+    ".\\guide.zh-cn.md", "%5Cguide.zh-cn.md", "guide%5c.zh-cn.md",
+    "guide.zh-cn.md#section", "guide.zh-cn.md?locale=zh",
+    "guide.zh-cn.md%23section", "guide.zh-cn.md%3Flocale=zh",
+    "//example.invalid/guide.zh-cn.md", "https:guide.zh-cn.md", "<guide.zh-cn.md>",
+    "%2567uide.zh-cn.md", "guide%.zh-cn.md", "guide%GG.zh-cn.md",
+    "%FFguide.zh-cn.md", "%C0%AFguide.zh-cn.md",
+    "%00guide.zh-cn.md", "%09guide.zh-cn.md", "%0D%0Aguide.zh-cn.md", "guide.zh-cn.md%7f",
+    "\uFEFFguide.zh-cn.md", "%EF%BB%BFguide.zh-cn.md", "guide.\r\nzh-cn.md", "Guide.zh-cn.md",
+  ]) {
+    repo.write("docs/guide.md", `# Sample\n\n> English | [简体中文](${target})\n`);
+    assert.deepEqual(repo.check(), {
+      status: 1, stdout: "",
+      stderr: "docs/guide.md: [navigation] expected top language navigation to docs/guide.zh-cn.md\n",
+    }, `unexpected acceptance of ${JSON.stringify(target)}`);
+  }
+});
+
+test("single percent decoding preserves literal filenames with CRLF and a leading BOM", (t) => {
+  const repo = repository(t);
+  const paths = [
+    "docs/space notes.md", "docs/样例.md", "docs/fragment#literal.md",
+    "docs/name%20literal.md", "docs/name%2Fliteral.md", "docs/entity&sol;literal.md",
+    "docs/punctuation!'().md",
+  ];
+  for (const path of paths) {
+    for (const name of [path, path.replace(/\.md$/, ".zh-cn.md")]) {
+      repo.write(name, "\uFEFF" + document(name).replace("](", "](./").replace(/\n/g, "\r\n"));
+    }
+  }
   repo.git("add", "--all");
   assert.deepEqual(repo.check(), { status: 0, stdout: success, stderr: "" });
 });
@@ -332,6 +476,51 @@ test("diff mode compares with the merge base, not an independently advanced base
   repo.commit();
   repo.git("checkout", "--quiet", "topic");
   assert.deepEqual(repo.check("--base", "base-tip"), { status: 0, stdout: success, stderr: "" });
+});
+
+test("CI checks the immutable PR head rather than the synthetic merge, with a push SHA fallback", (t) => {
+  const repo = repository(t);
+  const english = "Topic wording: original.\n\n"
+    + "Shared context one.\nShared context two.\nShared context three.\n"
+    + "Shared context four.\nShared context five.\n\nBase wording: original.\n";
+  repo.write("guide.md", document("guide.md", english));
+  repo.write("guide.zh-cn.md", document("guide.zh-cn.md"));
+  const ancestor = repo.commit();
+  repo.git("checkout", "--quiet", "-b", "topic");
+  repo.write("guide.md", document("guide.md", english.replace("Topic wording: original.", "Topic wording: revised.")));
+  repo.write("guide.zh-cn.md", document("guide.zh-cn.md", "Shared Chinese revision.\n"));
+  const head = repo.commit();
+  repo.git("checkout", "--quiet", "-b", "advanced-main", ancestor);
+  repo.write("guide.md", document("guide.md", english.replace("Base wording: original.", "Base wording: revised.")));
+  repo.write("guide.zh-cn.md", document("guide.zh-cn.md", "Shared Chinese revision.\n"));
+  const base = repo.commit();
+  repo.git("merge", "--quiet", "--no-ff", "--no-edit", head);
+  const merge = repo.git("rev-parse", "HEAD");
+  assert.deepEqual(repo.check("--base", base), {
+    status: 1, stdout: "",
+    stderr: "guide.md: [unilateral-change] counterpart must also change: guide.zh-cn.md\n",
+  });
+  assert.deepEqual(repo.check(), { status: 0, stdout: success, stderr: "" });
+  repo.git("checkout", "--quiet", "--detach", head);
+  const sourceResult = repo.check("--base", base);
+  assert.deepEqual(sourceResult, { status: 0, stdout: success, stderr: "" });
+  repo.git("branch", "--force", "topic", merge);
+
+  const workflow = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+  const ref = workflow.match(/^\s+ref: (.+)$/m)?.[1];
+  // Model only checkout's default and the explicit two-SHA fallback, then run the real CLI.
+  assert.ok(ref === undefined || ref === "${{ github.event.pull_request.head.sha || github.sha }}",
+    "the fixture must model the workflow's checkout expression");
+  for (const event of [
+    { sha: merge, pull_request: { head: { sha: head }, base: { sha: base } } },
+    { sha: base },
+  ]) {
+    const selected = ref ? (event.pull_request?.head.sha || event.sha) : event.sha;
+    repo.git("checkout", "--quiet", "--detach", selected);
+    const args = event.pull_request ? ["--base", event.pull_request.base.sha] : [];
+    assert.deepEqual(repo.check(...args), sourceResult);
+    assert.equal(repo.git("rev-parse", "HEAD"), event.pull_request ? head : base);
+  }
 });
 
 test("legacy bases allow rollout without silently granting base-side exclusions", (t) => {

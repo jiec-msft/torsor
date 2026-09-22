@@ -22,7 +22,7 @@ function git(root, args, failure) {
 }
 
 function paths(output) {
-  return output.split("\0").filter((path) => path.endsWith(".md")).sort();
+  return output.split("\0").filter((path) => /\.md$/i.test(path)).sort();
 }
 
 function counterpart(path) {
@@ -31,11 +31,19 @@ function counterpart(path) {
     : path.replace(/\.md$/, ".zh-cn.md");
 }
 
+function hasPairName(path) {
+  if (!path.endsWith(".md")) return false;
+  const english = path.endsWith(".zh-cn.md") ? counterpart(path) : path;
+  const stem = posix.basename(english).slice(0, -3);
+  return stem.length > 0 && !/\.zh-cn$/i.test(stem)
+    && counterpart(counterpart(path)) === path;
+}
+
 function workingDocuments(root, report) {
   const tracked = git(root, ["ls-files", "--stage", "-z"], "cannot list tracked files")
     .split("\0").filter(Boolean)
     .map((entry) => ({ mode: entry.slice(0, 6), path: entry.slice(entry.indexOf("\t") + 1) }))
-    .filter(({ path }) => path.endsWith(".md"));
+    .filter(({ path }) => /\.md$/i.test(path));
   const documents = new Map();
   for (const { mode, path } of tracked) {
     try {
@@ -82,7 +90,7 @@ function exclusionList(content, path, files, report) {
       continue;
     }
     const excluded = entry.path;
-    if (typeof excluded !== "string" || !excluded.endsWith(".md")
+    if (typeof excluded !== "string" || !hasPairName(excluded)
       || excluded.endsWith(".zh-cn.md") || excluded.startsWith("/")
       || excluded.trim() !== excluded || /[\\:*?[\]{}\x00-\x1f\x7f]/.test(excluded)
       || posix.normalize(excluded) !== excluded || excluded.split("/").includes("..")) {
@@ -114,22 +122,30 @@ function exclusions(documents, files, report) {
   return new Set([...lists[0]].filter((path) => lists[1].has(path)));
 }
 
-function hasNavigation(content, path) {
+function checkNavigation(content, path, report) {
+  const fail = () => report(path, "navigation", `expected top language navigation to ${counterpart(path)}`);
   const [title, navigation] = content.replace(/^\uFEFF/, "").split(/\r?\n/)
     .map((line) => line.trimEnd()).filter((line) => line.trim());
-  if (!/^# \S/.test(title ?? "") || title.includes("<!--")) return false;
+  if (!/^# \S/.test(title ?? "") || title.includes("<!--")) return fail();
   const pattern = path.endsWith(".zh-cn.md")
     ? /^> 简体中文（主要版本） \| \[English\]\(([^()\s]+)\)$/
     : /^> (?:English \| \[简体中文\]\(([^()\s]+)\)|\[简体中文（主要版本）\]\(([^()\s]+)\) \| English)$/;
   const match = (navigation ?? "").match(pattern);
-  if (!match) return false;
+  if (!match) return fail();
   const target = (match[1] ?? match[2]).replace(/^\.\//, "");
-  if (/[?#\\]/.test(target)) return false;
+  if (target.includes("&")) {
+    return report(path, "navigation-encoding", "raw & is not allowed; encode a literal & as %26 in the sibling filename");
+  }
+  if (!/^(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+$/.test(target)) return fail();
+  let decoded;
   try {
-    return decodeURIComponent(target) === posix.basename(counterpart(path));
+    decoded = decodeURIComponent(target);
   } catch (error) {
     if (!(error instanceof URIError)) throw error;
-    return false;
+    return fail();
+  }
+  if (/[/\\\x00-\x1f\x7f]/.test(decoded) || decoded !== posix.basename(counterpart(path))) {
+    fail();
   }
 }
 
@@ -158,6 +174,8 @@ function checkChanges(root, ref, documents, excluded, report) {
     ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", base, "--"],
     "cannot compare working tree with merge base")));
   for (const path of changed) {
+    // Current invalid names are diagnosed separately; deleted invalid names have no valid mapping.
+    if (!hasPairName(path)) continue;
     const required = (baseFiles.has(path) && !baseExcluded.has(path))
       || (documents.has(path) && !excluded.has(path));
     if (required && !changed.has(counterpart(path))) {
@@ -184,14 +202,16 @@ function main(args) {
   const documents = workingDocuments(root, report);
   const excluded = exclusions(documents, documents, report);
   for (const [path, content] of documents) {
+    if (!hasPairName(path)) {
+      report(path, "document-name", "use a nonempty English stem with .md or one lowercase .zh-cn.md suffix; rename this file and its counterpart");
+      continue;
+    }
     if (excluded.has(path)) continue;
     const other = counterpart(path);
     if (!documents.has(other)) {
       report(path, "missing-counterpart", `expected ${other}`);
     }
-    if (content !== null && !hasNavigation(content, path)) {
-      report(path, "navigation", `expected top language navigation to ${other}`);
-    }
+    if (content !== null) checkNavigation(content, path, report);
   }
   if (args.length === 2) {
     checkChanges(root, args[1], documents, excluded, report);
