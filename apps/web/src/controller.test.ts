@@ -493,6 +493,76 @@ describe("WebController", () => {
     expect(durableThreads.get("Start durable operation B.")).toBe(1);
   });
 
+  it("retains an uncertain start request through 401 and reauthentication", async () => {
+    const committedKeys = new Set<string>();
+    let durableThreads = 0;
+    let durableAttentions = 0;
+    const harness = createHarness({
+      commandResponse: (callNumber, init) => {
+        const request = JSON.parse(String(init?.body)) as {
+          idempotencyKey: string;
+          targetAgentIds?: readonly string[];
+        };
+        if (!committedKeys.has(request.idempotencyKey)) {
+          committedKeys.add(request.idempotencyKey);
+          durableThreads += 1;
+          if (request.targetAgentIds?.length) {
+            durableAttentions += 1;
+          }
+        }
+        if (callNumber === 1) {
+          return Promise.reject(
+            new TypeError("The committed response was lost."),
+          );
+        }
+        if (callNumber === 2) {
+          return Promise.resolve(
+            json(
+              {
+                error: {
+                  code: "unauthorized",
+                  message: "The browser session was revoked.",
+                },
+              },
+              401,
+            ),
+          );
+        }
+        return Promise.resolve(json({ result: { entityId: "thread-auth" } }));
+      },
+    });
+    await harness.controller.exchangeSession("local-secret", "project-sample");
+    const input = {
+      channelId: "channel-general",
+      body: "Start once across reauthentication.",
+      targetAgentIds: ["agent-orbit"],
+    } as const;
+
+    await expect(harness.controller.startThread(input)).rejects.toThrow(
+      "The committed response was lost.",
+    );
+    await expect(harness.controller.startThread(input)).rejects.toThrow(
+      "The browser session was revoked.",
+    );
+    expect(harness.controller.getSnapshot().session).toBe("expired");
+
+    await harness.controller.exchangeSession("local-secret", "project-sample");
+    await harness.controller.startThread(input);
+
+    const commands = harness.calls.filter((call) =>
+      call.url.includes("/commands/start-thread"),
+    );
+    expect(commands).toHaveLength(3);
+    expect(JSON.parse(String(commands[1]?.init?.body))).toEqual(
+      JSON.parse(String(commands[0]?.init?.body)),
+    );
+    expect(JSON.parse(String(commands[2]?.init?.body))).toEqual(
+      JSON.parse(String(commands[0]?.init?.body)),
+    );
+    expect(durableThreads).toBe(1);
+    expect(durableAttentions).toBe(1);
+  });
+
   it("reuses the complete reply request after a committed response is lost", async () => {
     const committedKeys = new Set<string>();
     let projectedThread = thread;
@@ -581,6 +651,123 @@ describe("WebController", () => {
     expect(committedKeys.size).toBe(1);
     expect(harness.controller.getSnapshot().thread?.messages).toHaveLength(3);
     expect(harness.controller.getSnapshot().thread?.attentions).toHaveLength(2);
+  });
+
+  it("retains an uncertain reply request through 401 and reauthentication", async () => {
+    const committedKeys = new Set<string>();
+    let durableReplies = 0;
+    let projectedThread = thread;
+    const harness = createHarness({
+      threadResponse: () => Promise.resolve(json({ thread: projectedThread })),
+      commandResponse: (callNumber, init) => {
+        const request = JSON.parse(String(init?.body)) as {
+          idempotencyKey: string;
+        };
+        if (!committedKeys.has(request.idempotencyKey)) {
+          committedKeys.add(request.idempotencyKey);
+          durableReplies += 1;
+          projectedThread = {
+            ...thread,
+            cursor: 3,
+            messages: [
+              ...thread.messages,
+              {
+                ...thread.messages[0]!,
+                id: "message-auth-reply",
+                replyToMessageId: "thread-1",
+                authorPrincipalId: "principal-human",
+                authorAgentId: null,
+                causedByAttentionId: null,
+                causedByRunId: null,
+                threadCursor: 3,
+                revisions: [
+                  {
+                    id: "revision-auth-reply",
+                    revision: 1,
+                    body: "Reply once across reauthentication.",
+                    createdAt: "2026-09-22T04:03:00.000Z",
+                  },
+                ],
+                targetAgentIds: [],
+                createdAt: "2026-09-22T04:03:00.000Z",
+              },
+            ],
+          };
+        }
+        if (callNumber === 1) {
+          return Promise.reject(
+            new TypeError("The committed response was lost."),
+          );
+        }
+        if (callNumber === 2) {
+          return Promise.resolve(
+            json(
+              {
+                error: {
+                  code: "unauthorized",
+                  message: "The browser session was revoked.",
+                },
+              },
+              401,
+            ),
+          );
+        }
+        return Promise.resolve(
+          json({ result: { entityId: "message-auth-reply" } }),
+        );
+      },
+    });
+    await harness.controller.exchangeSession("local-secret", "project-sample");
+    await harness.controller.loadThread("thread-1");
+    const input = {
+      threadRootId: "thread-1",
+      expectedThreadCursor: 2,
+      body: "Reply once across reauthentication.",
+    } as const;
+
+    await expect(harness.controller.replyToThread(input)).rejects.toThrow(
+      "The committed response was lost.",
+    );
+    FakeEventSource.instances[0]!.emit(
+      publicEvent({ eventId: "event-auth-reply", threadCursor: 3 }),
+    );
+    await waitFor(() =>
+      expect(harness.controller.getSnapshot().thread?.cursor).toBe(3),
+    );
+    await expect(
+      harness.controller.replyToThread({
+        ...input,
+        expectedThreadCursor: 3,
+      }),
+    ).rejects.toThrow("The browser session was revoked.");
+
+    await harness.controller.exchangeSession("local-secret", "project-sample");
+    await harness.controller.loadThread("thread-1");
+    await harness.controller.replyToThread({
+      ...input,
+      expectedThreadCursor: 3,
+    });
+
+    const commands = harness.calls.filter((call) =>
+      call.url.includes("/commands/reply-to-thread"),
+    );
+    expect(commands).toHaveLength(3);
+    expect(JSON.parse(String(commands[1]?.init?.body))).toEqual(
+      JSON.parse(String(commands[0]?.init?.body)),
+    );
+    expect(JSON.parse(String(commands[2]?.init?.body))).toEqual(
+      JSON.parse(String(commands[0]?.init?.body)),
+    );
+    expect(durableReplies).toBe(1);
+    expect(
+      harness.controller
+        .getSnapshot()
+        .thread?.messages.filter(
+          (message) =>
+            message.revisions[0]?.body ===
+            "Reply once across reauthentication.",
+        ),
+    ).toHaveLength(1);
   });
 
   it("marks reconnection stale and refetches only event-affected projections", async () => {
@@ -979,6 +1166,103 @@ describe("WebController", () => {
       );
       await vi.advanceTimersByTimeAsync(0);
       expect(harness.counts.runs).toBe(baselineRuns + 3);
+      harness.controller.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("joins new Run events to an existing projection backoff", async () => {
+    vi.useFakeTimers();
+    try {
+      const convergedRun = {
+        ...runProjection,
+        run: {
+          ...runProjection.run,
+          state: "Completed" as const,
+          terminalReason: "Backoff reconciled.",
+        },
+      };
+      const harness = createHarness({
+        reconnectProbeDelayMs: 1_000,
+        agentLivenessRefreshMs: 10_000,
+        runsResponse: (callNumber) => {
+          if (callNumber === 2) {
+            return Promise.resolve(
+              json(
+                {
+                  error: {
+                    code: "projection_unavailable",
+                    message: "Run projection is temporarily unavailable.",
+                  },
+                },
+                503,
+              ),
+            );
+          }
+          return Promise.resolve(
+            json({
+              items: [callNumber >= 3 ? convergedRun : runProjection],
+              nextCursor: null,
+              hasMore: false,
+              snapshotEventId: "event-7",
+            }),
+          );
+        },
+      });
+      await harness.controller.exchangeSession(
+        "local-secret",
+        "project-sample",
+      );
+      const baselineRuns = harness.counts.runs;
+      const baselineTimers = vi.getTimerCount();
+      const events = FakeEventSource.instances[0]!;
+
+      events.emit(
+        publicEvent({
+          eventId: "event-backoff-run-0",
+          type: "RunInputAdded",
+          entityType: "RunInput",
+          channelId: null,
+          threadRootId: null,
+          payload: { runId: "run-1" },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.counts.runs).toBe(baselineRuns + 1);
+
+      for (let index = 1; index < 20; index += 1) {
+        await vi.advanceTimersByTimeAsync(10);
+        events.emit(
+          publicEvent({
+            eventId: `event-backoff-run-${index}`,
+            type: "RunInputAdded",
+            entityType: "RunInput",
+            channelId: null,
+            threadRootId: null,
+            payload: { runId: "run-1" },
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(0);
+      }
+
+      expect(harness.counts.runs).toBe(baselineRuns + 1);
+      expect(vi.getTimerCount()).toBeLessThanOrEqual(baselineTimers + 1);
+
+      await vi.advanceTimersByTimeAsync(810);
+      expect(harness.counts.runs).toBe(baselineRuns + 2);
+      expect(harness.controller.getSnapshot().runs[0]?.run.state).toBe(
+        "Completed",
+      );
+
+      events.emit(
+        publicEvent({
+          eventId: "event-backoff-run-19",
+          entityType: "RunInput",
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.counts.runs).toBe(baselineRuns + 2);
       harness.controller.dispose();
     } finally {
       vi.useRealTimers();

@@ -1864,8 +1864,12 @@ function useActivationClock(activation: Activation): number {
     if (!Number.isFinite(expiresAt)) {
       return;
     }
-    const remaining = expiresAt - Date.now();
+    const currentTime = Date.now();
+    const remaining = expiresAt - currentTime;
     if (remaining <= 0) {
+      if (now < expiresAt) {
+        setNow(currentTime);
+      }
       return;
     }
     const timer = window.setTimeout(

@@ -226,6 +226,26 @@ describe("TorsorApp", () => {
     }
   });
 
+  it("repairs expiry crossed between render and passive-effect setup", async () => {
+    const expiresAt = Date.parse(runProjection.activations[0]!.expiresAt);
+    vi.spyOn(Date, "now")
+      .mockReturnValueOnce(expiresAt - 1)
+      .mockReturnValue(expiresAt + 1);
+    window.history.replaceState(
+      {},
+      "",
+      "/?project=project-sample&channel=channel-general&thread=thread-1&run=run-1&panel=run&panels=detail",
+    );
+
+    render(<TorsorApp controller={stubController()} />);
+
+    await waitFor(() =>
+      expect(screen.getByText("Expired")).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/→ live$/)).not.toBeInTheDocument();
+    expect(screen.getByText(/→ expired /)).toBeInTheDocument();
+  });
+
   it("collapses panels from the keyboard with explicit expanded state", async () => {
     const user = userEvent.setup();
     window.history.replaceState(

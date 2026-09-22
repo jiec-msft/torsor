@@ -90,6 +90,7 @@ interface PendingStartThread {
     readonly body: string;
     readonly targetAgentIds?: readonly string[];
   };
+  uncertain: boolean;
 }
 
 interface PendingReply {
@@ -100,6 +101,7 @@ interface PendingReply {
     readonly body: string;
     readonly targetAgentIds?: readonly string[];
   };
+  uncertain: boolean;
 }
 
 interface DeferredBoolean {
@@ -514,6 +516,7 @@ export class WebController {
             ? { targetAgentIds: [...input.targetAgentIds] }
             : {}),
         },
+        uncertain: false,
       } satisfies PendingStartThread);
     this.#pendingStartThreads.set(fingerprint, pending);
     const selectedChannelId = this.#channelId;
@@ -523,9 +526,13 @@ export class WebController {
         this.#pendingStartThreads.delete(fingerprint);
       }
     } catch (error) {
+      if (isUncertainCommandError(error)) {
+        pending.uncertain = true;
+      }
       if (
         this.#pendingStartThreads.get(fingerprint) === pending &&
-        !isUncertainCommandError(error)
+        !isUncertainCommandError(error) &&
+        !(pending.uncertain && isAuthenticationCommandError(error))
       ) {
         this.#pendingStartThreads.delete(fingerprint);
       }
@@ -563,6 +570,7 @@ export class WebController {
             ? { targetAgentIds: [...input.targetAgentIds] }
             : {}),
         },
+        uncertain: false,
       } satisfies PendingReply);
     this.#pendingReplies.set(fingerprint, pending);
     const selectedThreadId = this.#threadId;
@@ -572,9 +580,13 @@ export class WebController {
         this.#pendingReplies.delete(fingerprint);
       }
     } catch (error) {
+      if (isUncertainCommandError(error)) {
+        pending.uncertain = true;
+      }
       if (
         this.#pendingReplies.get(fingerprint) === pending &&
-        !isUncertainCommandError(error)
+        !isUncertainCommandError(error) &&
+        !(pending.uncertain && isAuthenticationCommandError(error))
       ) {
         this.#pendingReplies.delete(fingerprint);
       }
@@ -897,16 +909,22 @@ export class WebController {
 
     const work: Array<{
       readonly key: string;
-      readonly promise: Promise<boolean>;
+      readonly promise: Promise<boolean | null>;
     }> = [];
     const queue = (
       key: string,
       refresh: () => Promise<boolean>,
     ): void => {
-      this.#registerProjectionInvalidation(event, key, refresh);
+      const pending = this.#registerProjectionInvalidation(
+        event,
+        key,
+        refresh,
+      );
       work.push({
         key,
-        promise: this.#coalesceProjectionRefresh(key, refresh),
+        promise: pending.timer
+          ? Promise.resolve(null)
+          : this.#coalesceProjectionRefresh(key, refresh),
       });
     };
     if (event.channelId && event.channelId === this.#channelId) {
@@ -979,9 +997,9 @@ export class WebController {
         })),
       );
       for (const result of results) {
-        if (result.succeeded) {
+        if (result.succeeded === true) {
           this.#reconcileEventProjection(event.eventId, result.key);
-        } else {
+        } else if (result.succeeded === false) {
           this.#scheduleProjectionRetry(result.key);
         }
       }
@@ -1133,7 +1151,7 @@ export class WebController {
     event: PublicEvent,
     key: string,
     refresh: () => Promise<boolean>,
-  ): void {
+  ): ProjectionInvalidation {
     const pending =
       this.#pendingInvalidations.get(event.eventId) ??
       {
@@ -1154,6 +1172,7 @@ export class WebController {
     projection.eventIds.add(event.eventId);
     projection.refresh = refresh;
     this.#projectionInvalidations.set(key, projection);
+    return projection;
   }
 
   #scheduleProjectionRetry(key: string): void {
@@ -1619,4 +1638,12 @@ function deferredBoolean(): DeferredBoolean {
 
 function isUncertainCommandError(error: unknown): boolean {
   return !(error instanceof ApiError) || error.status >= 500;
+}
+
+function isAuthenticationCommandError(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    (error.status === 401 ||
+      (error.status === 403 && error.code === "invalid_csrf_token"))
+  );
 }
