@@ -46,10 +46,15 @@ function expectIndexedRecoverablePlan(planDetails: readonly string[]): void {
     planDetails.some((detail) => /\bCORRELATED\b/i.test(detail)),
   ).toBe(false);
   expect(
-    planDetails.some(
-      (detail) => /\bSCAN\s+recovery\b/i.test(detail),
-    ),
+    planDetails.some((detail) => /\bSCAN\b/i.test(detail)),
   ).toBe(false);
+  for (const alias of ["activation", "attention", "attention_domain"]) {
+    expect(
+      planDetails.some((detail) =>
+        new RegExp(`\\bSEARCH\\s+${alias}\\b`, "i").test(detail)
+      ),
+    ).toBe(true);
+  }
   expect(
     planDetails.some((detail) => /USE TEMP B-TREE/i.test(detail)),
   ).toBe(false);
@@ -879,6 +884,264 @@ describe("Runtime recovery with SQLite", () => {
     }
   });
 
+  it("removes superseded promoted Activations from recovery across rollback and reopen", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-recovery-fence-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const options = {
+      databasePath,
+      bootstrap,
+      clock: () => now,
+    };
+    const beforeCommitHookSymbol = Symbol.for(
+      "torsor.kernel.command-before-commit",
+    );
+    let first: TorsorKernel | undefined;
+    let second: TorsorKernel | undefined;
+    let reopened: TorsorKernel | undefined;
+    try {
+      first = TorsorKernel.open(options);
+      second = TorsorKernel.open(options);
+      const firstMessage = await first.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: "recovery-fence-first-message",
+          projectId: "project-sample",
+          channelId: "channel-general",
+          body: "Orbit, recover the first synthetic execution.",
+          targetAgentIds: ["agent-orbit"],
+        },
+        humanContext,
+      );
+      const secondMessage = await first.execute(
+        {
+          type: "ReplyToThread",
+          idempotencyKey: "recovery-fence-second-message",
+          threadRootId: firstMessage.entityId,
+          body: "Orbit, recover the second synthetic execution.",
+          targetAgentIds: ["agent-orbit"],
+        },
+        humanContext,
+      );
+      const attentions = await first.query(
+        {
+          type: "ListOpenAttentions",
+          targetAgentId: "agent-orbit",
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      const attentionA = attentions.items.find(
+        (attention) =>
+          attention.messageRevisionId ===
+          firstMessage.relatedIds!.messageRevisionId,
+      );
+      const attentionB = attentions.items.find(
+        (attention) =>
+          attention.messageRevisionId ===
+          secondMessage.relatedIds!.messageRevisionId,
+      );
+      if (!attentionA || !attentionB) {
+        throw new Error("Expected two same-domain Attentions.");
+      }
+      const claimA = await first.execute(
+        {
+          type: "ClaimAttention",
+          idempotencyKey: "recovery-fence-first-claim",
+          attentionId: attentionA.id,
+          expectedAttentionRevision: attentionA.revision,
+          leaseDurationMs: 1_000,
+        },
+        runtimeContext,
+      );
+      const activationA = await first.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "recovery-fence-first-activation",
+          attentionId: attentionA.id,
+          handlerLeaseToken: claimA.relatedIds!.handlerLeaseToken!,
+          durationMs: 1_000,
+        },
+        runtimeContext,
+      );
+
+      now = new Date("2026-09-21T08:00:02.000Z");
+      const promotedA = await first.query(
+        { type: "GetAttentionRecoverySnapshot" },
+        runtimeContext,
+      );
+      await expect(
+        first.query(
+          {
+            type: "ListRecoverableAttentionExecutions",
+            recoveryRevision: promotedA.revision,
+            limit: 10,
+          },
+          runtimeContext,
+        ),
+      ).resolves.toMatchObject({
+        items: [
+          {
+            activation: { id: activationA.entityId },
+            attention: { id: attentionA.id },
+          },
+        ],
+      });
+
+      const claimBCommand = {
+        type: "ClaimAttention",
+        idempotencyKey: "recovery-fence-second-claim",
+        attentionId: attentionB.id,
+        expectedAttentionRevision: attentionB.revision,
+        leaseDurationMs: 1_000,
+      } as const;
+      Reflect.set(
+        globalThis,
+        beforeCommitHookSymbol,
+        ({ commandType }: { readonly commandType: string }) => {
+          if (commandType === "ClaimAttention") {
+            throw new Error("Synthetic recovery takeover rollback.");
+          }
+        },
+      );
+      await expect(
+        second.execute(claimBCommand, runtimeContext),
+      ).rejects.toThrow("Synthetic recovery takeover rollback.");
+      Reflect.deleteProperty(globalThis, beforeCommitHookSymbol);
+
+      const afterRollback = await first.query(
+        {
+          type: "ListRecoverableAttentionExecutions",
+          recoveryRevision: promotedA.revision,
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      expect(
+        afterRollback.items.map((item) => item.activation.id),
+      ).toEqual([activationA.entityId]);
+      const rollbackDatabase = new DatabaseSync(databasePath, {
+        readOnly: true,
+      });
+      try {
+        expect(
+          rollbackDatabase.prepare(
+            `SELECT activation.revoked_at,
+                    recovery.expired_recoverable,
+                    domain.attention_id AS domain_attention_id
+               FROM activation_attempts AS activation
+               JOIN attention_recovery_executions AS recovery
+                 ON recovery.activation_id = activation.id
+               JOIN attention_domain_fences AS domain
+                 ON domain.attention_id = activation.attention_id
+              WHERE activation.id = ?`,
+          ).get(activationA.entityId),
+        ).toMatchObject({
+          revoked_at: null,
+          expired_recoverable: 1,
+          domain_attention_id: attentionA.id,
+        });
+      } finally {
+        rollbackDatabase.close();
+      }
+
+      const claimB = await second.execute(claimBCommand, runtimeContext);
+      await expect(
+        first.query(
+          {
+            type: "ListRecoverableAttentionExecutions",
+            recoveryRevision: promotedA.revision,
+            limit: 10,
+          },
+          runtimeContext,
+        ),
+      ).rejects.toMatchObject({ code: "StaleRevision" });
+      const activationB = await second.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "recovery-fence-second-activation",
+          attentionId: attentionB.id,
+          handlerLeaseToken: claimB.relatedIds!.handlerLeaseToken!,
+          durationMs: 1_000,
+        },
+        runtimeContext,
+      );
+      first.close();
+      first = undefined;
+      second.close();
+      second = undefined;
+
+      now = new Date("2026-09-21T08:00:04.000Z");
+      reopened = TorsorKernel.open(options);
+      const promotedB = await reopened.query(
+        { type: "GetAttentionRecoverySnapshot" },
+        runtimeContext,
+      );
+      const currentPage = await reopened.query(
+        {
+          type: "ListRecoverableAttentionExecutions",
+          recoveryRevision: promotedB.revision,
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      expect(
+        currentPage.items.map((item) => item.activation.id),
+      ).toEqual([activationB.entityId]);
+
+      now = new Date("2026-09-21T08:00:00.500Z");
+      const rollbackPage = await reopened.query(
+        {
+          type: "ListRecoverableAttentionExecutions",
+          recoveryRevision: promotedB.revision,
+          limit: 10,
+        },
+        runtimeContext,
+      );
+      expect(
+        rollbackPage.items.map((item) => item.activation.id),
+      ).toEqual([activationB.entityId]);
+      expect(
+        rollbackPage.items.some(
+          (item) => item.activation.id === activationA.entityId,
+        ),
+      ).toBe(false);
+      reopened.close();
+      reopened = undefined;
+
+      const committedDatabase = new DatabaseSync(databasePath, {
+        readOnly: true,
+      });
+      try {
+        expect(
+          committedDatabase.prepare(
+            `SELECT 1
+               FROM attention_recovery_executions
+              WHERE activation_id = ?`,
+          ).get(activationA.entityId),
+        ).toBeUndefined();
+        expect(
+          committedDatabase.prepare(
+            `SELECT revoked_at, revocation_reason
+               FROM activation_attempts
+              WHERE id = ?`,
+          ).get(activationA.entityId),
+        ).toMatchObject({
+          revoked_at: "2026-09-21T08:00:02.000Z",
+          revocation_reason: "attention_domain_superseded",
+        });
+      } finally {
+        committedDatabase.close();
+      }
+    } finally {
+      Reflect.deleteProperty(globalThis, beforeCommitHookSymbol);
+      first?.close();
+      second?.close();
+      reopened?.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("maintains Attention domain counts across rollback and concurrent settlements", async () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-domain-count-"));
     const databasePath = join(directory, "kernel.sqlite");
@@ -1130,20 +1393,41 @@ describe("Runtime recovery with SQLite", () => {
       const historyDatabase = new DatabaseSync(databasePath);
       try {
         const source = historyDatabase.prepare(
-          `SELECT attention_id
-             FROM activation_attempts
-            WHERE id = ?`,
+          `SELECT activation.attention_id,
+                  attention.message_revision_id
+             FROM activation_attempts AS activation
+             JOIN attentions AS attention
+               ON attention.id = activation.attention_id
+            WHERE activation.id = ?`,
         ).get(execution.activationId) as
-          | { readonly attention_id: string }
+          | {
+            readonly attention_id: string;
+            readonly message_revision_id: string;
+          }
           | undefined;
         if (!source) {
           throw new Error("Expected the recoverable Activation.");
         }
-        const insertHistory = historyDatabase.prepare(
-          `INSERT INTO activation_attempts
-            (id, agent_id, attention_id, attention_lease_token, cause,
-             config_revision, started_at, expires_at)
-           VALUES (?, 'agent-orbit', ?, ?, 'Attention', 3, ?, ?)`,
+        const insertAttention = historyDatabase.prepare(
+          `INSERT INTO attentions
+            (id, project_id, channel_id, thread_root_id,
+             message_revision_id, target_agent_id, trigger_kind, status,
+             revision, handler_lease_holder_principal_id,
+             handler_lease_token, handler_lease_expires_at, created_at)
+           VALUES (
+             ?, 'project-sample', 'channel-general', ?, ?,
+             'agent-orbit', ?, 'Open', 1, 'principal-runtime', ?, ?, ?
+           )`,
+        );
+        const insertDomainFence = historyDatabase.prepare(
+          `INSERT INTO attention_domain_fences
+            (agent_id, project_id, channel_id, thread_root_id, attention_id,
+             lease_token, lease_expires_at,
+             unsettled_provider_attempt_count)
+           VALUES (
+             'agent-orbit', 'project-sample', 'channel-general', ?, ?,
+             ?, ?, 0
+           )`,
         );
         const insertRecovery = historyDatabase.prepare(
           `INSERT INTO attention_recovery_executions
@@ -1168,31 +1452,175 @@ describe("Runtime recovery with SQLite", () => {
            DROP TRIGGER attention_domain_provider_insert;`,
         );
         historyDatabase.exec("BEGIN");
-        for (let index = 0; index < 100_000; index += 1) {
-          const suffix = index.toString().padStart(6, "0");
-          const timestamp = new Date(
-            Date.UTC(2025, 0, 1, 0, 0, index),
-          ).toISOString();
-          insertHistory.run(
-            `activation-history-${suffix}`,
-            source.attention_id,
-            `lease-history-${suffix}`,
-            timestamp,
-            timestamp,
-          );
-          insertRecovery.run(
-            `activation-history-${suffix}`,
-            timestamp,
-            timestamp,
-          );
-          insertSettledAttempt.run(
-            `provider-history-${suffix}`,
-            `activation-history-${suffix}`,
-            `request-history-${suffix}`,
-            timestamp,
-            timestamp,
-          );
-        }
+        historyDatabase.prepare(
+          `WITH RECURSIVE sequence(value) AS (
+             VALUES (0)
+             UNION ALL
+             SELECT value + 1
+               FROM sequence
+              WHERE value < 99999
+           )
+           INSERT INTO attentions
+             (id, project_id, channel_id, thread_root_id,
+              message_revision_id, target_agent_id, trigger_kind, status,
+              revision, handler_lease_holder_principal_id,
+              handler_lease_token, handler_lease_expires_at, created_at)
+           SELECT
+             'attention-history-' || printf('%06d', value),
+             'project-sample',
+             'channel-general',
+             'thread-history-' || printf('%06d', value),
+             ?,
+             'agent-orbit',
+             'SyntheticHistory' || printf('%06d', value),
+             'Open',
+             1,
+             'principal-runtime',
+             'lease-history-' || printf('%06d', value),
+             strftime(
+               '%Y-%m-%dT%H:%M:%fZ',
+               '2025-01-01T00:00:00.000Z',
+               '+' || value || ' seconds'
+             ),
+             strftime(
+               '%Y-%m-%dT%H:%M:%fZ',
+               '2025-01-01T00:00:00.000Z',
+               '+' || value || ' seconds'
+             )
+             FROM sequence`,
+        ).run(source.message_revision_id);
+        historyDatabase.exec(
+          `WITH RECURSIVE sequence(value) AS (
+             VALUES (0)
+             UNION ALL
+             SELECT value + 1
+               FROM sequence
+              WHERE value < 99999
+           )
+           INSERT INTO attention_domain_fences
+             (agent_id, project_id, channel_id, thread_root_id, attention_id,
+              lease_token, lease_expires_at,
+              unsettled_provider_attempt_count)
+           SELECT
+             'agent-orbit',
+             'project-sample',
+             'channel-general',
+             'thread-history-' || printf('%06d', value),
+             'attention-history-' || printf('%06d', value),
+             'lease-history-' || printf('%06d', value),
+             strftime(
+               '%Y-%m-%dT%H:%M:%fZ',
+               '2025-01-01T00:00:00.000Z',
+               '+' || value || ' seconds'
+             ),
+             0
+             FROM sequence;
+
+           WITH RECURSIVE sequence(value) AS (
+             VALUES (0)
+             UNION ALL
+             SELECT value + 1
+               FROM sequence
+              WHERE value < 99999
+           )
+           INSERT INTO activation_attempts
+             (id, agent_id, attention_id, attention_lease_token, cause,
+              config_revision, started_at, expires_at)
+           SELECT
+             'activation-history-' || printf('%06d', value),
+             'agent-orbit',
+             'attention-history-' || printf('%06d', value),
+             'lease-history-' || printf('%06d', value),
+             'Attention',
+             3,
+             strftime(
+               '%Y-%m-%dT%H:%M:%fZ',
+               '2025-01-01T00:00:00.000Z',
+               '+' || value || ' seconds'
+             ),
+             strftime(
+               '%Y-%m-%dT%H:%M:%fZ',
+               '2025-01-01T00:00:00.000Z',
+               '+' || value || ' seconds'
+             )
+             FROM sequence;
+
+           WITH RECURSIVE sequence(value) AS (
+             VALUES (0)
+             UNION ALL
+             SELECT value + 1
+               FROM sequence
+              WHERE value < 99999
+           )
+           INSERT INTO attention_recovery_executions
+             (activation_id, started_at, expires_at, unfinished,
+              expired_recoverable, unsettled_provider_attempt_count,
+              finished_with_unsettled_provider)
+           SELECT
+             'activation-history-' || printf('%06d', value),
+             strftime(
+               '%Y-%m-%dT%H:%M:%fZ',
+               '2025-01-01T00:00:00.000Z',
+               '+' || value || ' seconds'
+             ),
+             strftime(
+               '%Y-%m-%dT%H:%M:%fZ',
+               '2025-01-01T00:00:00.000Z',
+               '+' || value || ' seconds'
+             ),
+             1,
+             0,
+             0,
+             0
+             FROM sequence;
+
+           WITH RECURSIVE sequence(value) AS (
+             VALUES (0)
+             UNION ALL
+             SELECT value + 1
+               FROM sequence
+              WHERE value < 99999
+           )
+           INSERT INTO provider_attempts
+             (id, activation_id, adapter, adapter_version,
+              capability_snapshot_json, run_input_ids_json,
+              request_idempotency_key, status, started_at, finished_at)
+           SELECT
+             'provider-history-' || printf('%06d', value),
+             'activation-history-' || printf('%06d', value),
+             'deterministic-fake',
+             '1',
+             '{}',
+             '[]',
+             'request-history-' || printf('%06d', value),
+             'Completed',
+             strftime(
+               '%Y-%m-%dT%H:%M:%fZ',
+               '2025-01-01T00:00:00.000Z',
+               '+' || value || ' seconds'
+             ),
+             strftime(
+               '%Y-%m-%dT%H:%M:%fZ',
+               '2025-01-01T00:00:00.000Z',
+               '+' || value || ' seconds'
+             )
+             FROM sequence;`,
+        );
+        insertAttention.run(
+          "attention-expired-recoverable",
+          "thread-expired-recoverable",
+          source.message_revision_id,
+          "SyntheticExpiredRecoverable",
+          "lease-expired-recoverable",
+          "2026-09-21T07:59:30.000Z",
+          "2026-09-21T07:59:00.000Z",
+        );
+        insertDomainFence.run(
+          "thread-expired-recoverable",
+          "attention-expired-recoverable",
+          "lease-expired-recoverable",
+          "2026-09-21T07:59:30.000Z",
+        );
         historyDatabase.prepare(
           `INSERT INTO activation_attempts
             (id, agent_id, attention_id, attention_lease_token, cause,
@@ -1207,7 +1635,7 @@ describe("Runtime recovery with SQLite", () => {
              '2026-09-21T07:59:00.000Z',
              '2026-09-21T07:59:30.000Z'
            )`,
-        ).run(source.attention_id);
+        ).run("attention-expired-recoverable");
         insertRecovery.run(
           "activation-expired-recoverable",
           "2026-09-21T07:59:00.000Z",
@@ -1341,7 +1769,6 @@ describe("Runtime recovery with SQLite", () => {
             (promotion) => !/\bRETURNING\b/i.test(promotion.sql),
           ),
         ).toBe(true);
-
         const initialStartedAt = performance.now();
         const initialPage = await reopened.query(
           {
@@ -1472,7 +1899,7 @@ describe("Runtime recovery with SQLite", () => {
         expect(
           promotionPlan.some(
             (row) =>
-              /\bSEARCH\s+attention_recovery_executions\b/i.test(row.detail) &&
+              /\bSEARCH\s+recovery\b/i.test(row.detail) &&
               row.detail.includes("attention_recovery_expiry_horizon_idx"),
           ),
         ).toBe(true);

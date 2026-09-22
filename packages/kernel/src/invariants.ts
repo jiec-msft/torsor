@@ -597,13 +597,23 @@ export function liveAttentionActivationPredicate(
         AND ${attentionAlias}.handler_lease_expires_at IS NOT NULL
         AND ${attentionAlias}.handler_lease_expires_at > ?
         AND ${activationAlias}.agent_id = ${attentionAlias}.target_agent_id
-        AND ${domainFenceAlias}.attention_id = ${attentionAlias}.id
+        AND ${attentionDomainOwnershipPredicate(
+          attentionAlias,
+          domainFenceAlias,
+        )}
+        AND ${domainFenceAlias}.lease_token = ${attentionAlias}.handler_lease_token
+        AND ${domainFenceAlias}.lease_expires_at = ${attentionAlias}.handler_lease_expires_at`;
+}
+
+export function attentionDomainOwnershipPredicate(
+  attentionAlias: string,
+  domainFenceAlias: string,
+): string {
+  return `${domainFenceAlias}.attention_id = ${attentionAlias}.id
         AND ${domainFenceAlias}.agent_id = ${attentionAlias}.target_agent_id
         AND ${domainFenceAlias}.project_id = ${attentionAlias}.project_id
         AND ${domainFenceAlias}.channel_id = ${attentionAlias}.channel_id
-        AND ${domainFenceAlias}.thread_root_id = ${attentionAlias}.thread_root_id
-        AND ${domainFenceAlias}.lease_token = ${attentionAlias}.handler_lease_token
-        AND ${domainFenceAlias}.lease_expires_at = ${attentionAlias}.handler_lease_expires_at`;
+        AND ${domainFenceAlias}.thread_root_id = ${attentionAlias}.thread_root_id`;
 }
 
 export function revokeRunActivations(kernel: db.KernelContext, runId: string, reason: string, revokedAt: string): void {

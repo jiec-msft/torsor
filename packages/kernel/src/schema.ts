@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 10;
+export const CURRENT_SCHEMA_VERSION = 11;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -513,11 +513,18 @@ BEGIN
     NEW.id,
     NEW.started_at,
     NEW.expires_at,
-    CASE WHEN NEW.finished_at IS NULL THEN 1 ELSE 0 END,
+    CASE
+      WHEN NEW.finished_at IS NULL AND NEW.revoked_at IS NULL THEN 1
+      ELSE 0
+    END,
     0,
     0,
     0
   );
+  DELETE FROM attention_recovery_executions
+   WHERE activation_id = NEW.id
+     AND NEW.revoked_at IS NOT NULL
+     AND NEW.finished_at IS NULL;
   UPDATE kernel_runtime_state
      SET attention_recovery_revision = attention_recovery_revision + 1
    WHERE singleton = 1;
@@ -539,10 +546,15 @@ BEGIN
   UPDATE attention_recovery_executions
      SET started_at = NEW.started_at,
          expires_at = NEW.expires_at,
-         unfinished = CASE WHEN NEW.finished_at IS NULL THEN 1 ELSE 0 END,
+         unfinished =
+           CASE
+             WHEN NEW.finished_at IS NULL AND NEW.revoked_at IS NULL THEN 1
+             ELSE 0
+           END,
          expired_recoverable =
            CASE
              WHEN NEW.finished_at IS NULL
+              AND NEW.revoked_at IS NULL
               AND NEW.expires_at = OLD.expires_at
              THEN expired_recoverable
              ELSE 0
@@ -555,6 +567,10 @@ BEGIN
              ELSE 0
            END
    WHERE activation_id = NEW.id;
+  DELETE FROM attention_recovery_executions
+   WHERE activation_id = NEW.id
+     AND NEW.revoked_at IS NOT NULL
+     AND unsettled_provider_attempt_count = 0;
   UPDATE kernel_runtime_state
      SET attention_recovery_revision = attention_recovery_revision + 1
    WHERE singleton = 1;

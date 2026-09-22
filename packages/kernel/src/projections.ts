@@ -859,15 +859,65 @@ export function getProviderAttempt(
   return mapProviderAttempt(attempt);
 }
 
+function recoverableUnfinishedAttentionPredicate(
+  activationAlias: string,
+  attentionAlias: string,
+  domainFenceAlias: string,
+): string {
+  return `${activationAlias}.cause = 'Attention'
+        AND ${activationAlias}.finished_at IS NULL
+        AND ${activationAlias}.revoked_at IS NULL
+        AND ${activationAlias}.agent_id = ${attentionAlias}.target_agent_id
+        AND ${attentionAlias}.status = 'Open'
+        AND ${attentionAlias}.handler_lease_token =
+            ${activationAlias}.attention_lease_token
+        AND ${domainFenceAlias}.lease_token =
+            ${attentionAlias}.handler_lease_token
+        AND ${domainFenceAlias}.lease_expires_at =
+            ${attentionAlias}.handler_lease_expires_at
+        AND ${invariants.attentionDomainOwnershipPredicate(
+          attentionAlias,
+          domainFenceAlias,
+        )}`;
+}
+
+function recoverableFinishedAttentionPredicate(
+  activationAlias: string,
+  attentionAlias: string,
+  domainFenceAlias: string,
+): string {
+  return `${activationAlias}.cause = 'Attention'
+        AND ${activationAlias}.finished_at IS NOT NULL
+        AND ${activationAlias}.agent_id = ${attentionAlias}.target_agent_id
+        AND ${invariants.attentionDomainOwnershipPredicate(
+          attentionAlias,
+          domainFenceAlias,
+        )}`;
+}
+
 export function getAttentionRecoverySnapshot(
   kernel: db.KernelContext,
 ): AttentionRecoverySnapshot {
   const observedAt = db.now(kernel);
-  const promotionSql = `UPDATE attention_recovery_executions
+  const promotionSql = `UPDATE attention_recovery_executions AS recovery
         SET expired_recoverable = 1
-      WHERE unfinished = 1
-        AND expired_recoverable = 0
-        AND expires_at <= ?`;
+      WHERE recovery.unfinished = 1
+        AND recovery.expired_recoverable = 0
+        AND recovery.expires_at <= ?
+        AND EXISTS (
+          SELECT 1
+            FROM activation_attempts AS activation
+            JOIN attentions AS attention
+              ON attention.id = activation.attention_id
+            JOIN attention_domain_fences AS attention_domain
+              ON attention_domain.attention_id = attention.id
+           WHERE activation.id = recovery.activation_id
+             AND ${recoverableUnfinishedAttentionPredicate(
+               "activation",
+               "attention",
+               "attention_domain",
+             )}
+        )`;
   const promotedCount = db.run(
     kernel,
     promotionSql,
@@ -911,11 +961,23 @@ function readAttentionRecoverySnapshot(
   }
   const horizon = db.getRow(
     kernel,
-    `SELECT MIN(expires_at) AS next_expiry_at
-       FROM attention_recovery_executions
-      WHERE unfinished = 1
-         AND expired_recoverable = 0
-         AND expires_at > ?`,
+    `SELECT MIN(recovery.expires_at) AS next_expiry_at
+       FROM attention_recovery_executions AS recovery
+            INDEXED BY attention_recovery_expiry_horizon_idx
+       CROSS JOIN activation_attempts AS activation
+         ON activation.id = recovery.activation_id
+       CROSS JOIN attentions AS attention
+         ON attention.id = activation.attention_id
+       CROSS JOIN attention_domain_fences AS attention_domain
+         ON attention_domain.attention_id = attention.id
+      WHERE recovery.unfinished = 1
+         AND recovery.expired_recoverable = 0
+         AND recovery.expires_at > ?
+         AND ${recoverableUnfinishedAttentionPredicate(
+           "activation",
+           "attention",
+           "attention_domain",
+         )}`,
     observedAt,
   );
   return {
@@ -939,9 +1001,19 @@ export function listRecoverableAttentionExecutions(
   );
   const expiredClauses = [
     "recovery.expired_recoverable = 1",
+    recoverableUnfinishedAttentionPredicate(
+      "activation",
+      "attention",
+      "attention_domain",
+    ),
   ];
   const unsettledClauses = [
     "recovery.finished_with_unsettled_provider = 1",
+    recoverableFinishedAttentionPredicate(
+      "activation",
+      "attention",
+      "attention_domain",
+    ),
   ];
   const expiredParameters: SQLInputValue[] = [];
   const unsettledParameters: SQLInputValue[] = [];
@@ -968,12 +1040,24 @@ export function listRecoverableAttentionExecutions(
   const expiredSql = `SELECT recovery.activation_id, recovery.started_at
        FROM attention_recovery_executions AS recovery
             INDEXED BY attention_recovery_unfinished_order_idx
+       CROSS JOIN activation_attempts AS activation
+         ON activation.id = recovery.activation_id
+       CROSS JOIN attentions AS attention
+         ON attention.id = activation.attention_id
+       CROSS JOIN attention_domain_fences AS attention_domain
+         ON attention_domain.attention_id = attention.id
       WHERE ${expiredClauses.join(" AND ")}
       ORDER BY recovery.started_at, recovery.activation_id
       LIMIT ?`;
   const unsettledSql = `SELECT recovery.activation_id, recovery.started_at
        FROM attention_recovery_executions AS recovery
             INDEXED BY attention_recovery_finished_order_idx
+       CROSS JOIN activation_attempts AS activation
+         ON activation.id = recovery.activation_id
+       CROSS JOIN attentions AS attention
+         ON attention.id = activation.attention_id
+       CROSS JOIN attention_domain_fences AS attention_domain
+         ON attention_domain.attention_id = attention.id
       WHERE ${unsettledClauses.join(" AND ")}
       ORDER BY recovery.started_at, recovery.activation_id
       LIMIT ?`;
@@ -1101,12 +1185,24 @@ function resolveAttentionRecoverySnapshot(
   const current = readAttentionRecoverySnapshot(kernel, observedAt);
   const due = db.getRow(
     kernel,
-    `SELECT activation_id
-       FROM attention_recovery_executions
-      WHERE unfinished = 1
-         AND expired_recoverable = 0
-         AND expires_at <= ?
-      ORDER BY expires_at
+    `SELECT recovery.activation_id
+       FROM attention_recovery_executions AS recovery
+            INDEXED BY attention_recovery_expiry_horizon_idx
+       CROSS JOIN activation_attempts AS activation
+         ON activation.id = recovery.activation_id
+       CROSS JOIN attentions AS attention
+         ON attention.id = activation.attention_id
+       CROSS JOIN attention_domain_fences AS attention_domain
+         ON attention_domain.attention_id = attention.id
+      WHERE recovery.unfinished = 1
+         AND recovery.expired_recoverable = 0
+         AND recovery.expires_at <= ?
+         AND ${recoverableUnfinishedAttentionPredicate(
+           "activation",
+           "attention",
+           "attention_domain",
+         )}
+      ORDER BY recovery.expires_at
       LIMIT 1`,
     observedAt,
   );

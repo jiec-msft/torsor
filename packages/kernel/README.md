@@ -171,6 +171,11 @@ Activations that still own a `Started` or `Acknowledged` ProviderAttempt. The
 Kernel merges at most `limit + 1` rows from each range and projects all
 ProviderAttempts for each selected Activation once through the
 `(activation_id, started_at, id)` order index.
+Expired unfinished rows must remain non-revoked and match the current durable
+domain lease; finished unsettled rows must remain owned by the same durable
+domain fence. Supersession removes the old unfinished Activation from recovery
+state and advances the recovery revision, so an in-progress sweep becomes
+stale instead of returning revoked work.
 
 Runtime can prove a full recovery sweep stable with
 `GetAttentionRecoverySnapshot`. That write-serialized query advances
@@ -201,9 +206,11 @@ finalize content in durable storage and verify its digest before
 location into a finalized Artifact. A failed or incomplete upload must not
 publish the descriptor.
 
-The current direct schema version is 10. Version 10 adds normalized Attention
-recovery current state and ordered indexes, count-only expiry promotion, the
-recovery mutation revision, incremental provider/domain counters, and durable
-Agent/Project/Channel/Thread execution fences.
+The current direct schema version is 11. Version 11 makes recovery membership
+require a non-revoked Activation and current durable Attention-domain
+ownership, while retaining the normalized recovery state, ordered indexes,
+count-only expiry promotion, recovery mutation revision, incremental
+provider/domain counters, and durable Agent/Project/Channel/Thread execution
+fences introduced in version 10.
 This pre-release schema is intentionally breaking: stop old processes and
-recreate disposable databases rather than migrating version 8 or 9.
+recreate disposable databases rather than migrating version 8, 9, or 10.
