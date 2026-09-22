@@ -183,6 +183,24 @@ describe("Torsor HTTP and SSE service", () => {
     const cookie = session.headers.get("set-cookie");
     expect(cookie).toContain("HttpOnly");
     expect(cookie).toContain("SameSite=Strict");
+    const sessionBody = (await session.json()) as {
+      principalId: string;
+      csrfToken: string;
+    };
+    expect(sessionBody.principalId).toBe("principal-human");
+
+    const reused = await fetch(`${harness.origin}/api/v1/session`, {
+      method: "POST",
+      headers: {
+        ...authorization(),
+        Cookie: cookie!,
+      },
+    });
+    expect(reused.status).toBe(201);
+    expect(await reused.json()).toEqual(sessionBody);
+    expect(reused.headers.get("set-cookie")?.split(";", 1)[0]).toBe(
+      cookie?.split(";", 1)[0],
+    );
 
     const snapshotResponse = await fetch(
       `${harness.origin}/api/v1/projects/project-sample/bootstrap`,
@@ -205,6 +223,65 @@ describe("Torsor HTTP and SSE service", () => {
       channelId: "channel-general",
       body: "Native EventSource receives this with its session cookie.",
     });
+    expect(await eventPromise).toHaveLength(1);
+  });
+
+  it("isolates sessions created by independent cookie jars", async () => {
+    const harness = await startHarness();
+    const first = await createBrowserSession(harness.origin);
+    const second = await createBrowserSession(harness.origin);
+    expect(first.cookie).not.toBe(second.cookie);
+    expect(first.csrfToken).not.toBe(second.csrfToken);
+
+    const snapshotResponse = await fetch(
+      `${harness.origin}/api/v1/projects/project-sample/bootstrap`,
+      { headers: { Cookie: second.cookie } },
+    );
+    expect(snapshotResponse.status).toBe(200);
+    const snapshot = (await snapshotResponse.json()) as {
+      bootstrap: { latestEventId: string | null };
+    };
+    const eventPromise = collectEventsWithHeaders(
+      harness.origin,
+      snapshot.bootstrap.latestEventId,
+      1,
+      { Cookie: second.cookie },
+    );
+
+    const signedOut = await fetch(`${harness.origin}/api/v1/session`, {
+      method: "DELETE",
+      headers: { Cookie: first.cookie },
+    });
+    expect(signedOut.status).toBe(204);
+    const revoked = await fetch(
+      `${harness.origin}/api/v1/projects/project-sample/bootstrap`,
+      { headers: { Cookie: first.cookie } },
+    );
+    expect(revoked.status).toBe(401);
+    const stillAuthenticated = await fetch(
+      `${harness.origin}/api/v1/projects/project-sample/bootstrap`,
+      { headers: { Cookie: second.cookie } },
+    );
+    expect(stillAuthenticated.status).toBe(200);
+
+    const created = await fetch(
+      `${harness.origin}/api/v1/commands/start-thread`,
+      {
+        method: "POST",
+        headers: {
+          Cookie: second.cookie,
+          "Content-Type": "application/json",
+          "X-Torsor-CSRF": second.csrfToken,
+        },
+        body: JSON.stringify({
+          idempotencyKey: "independent-browser-session",
+          projectId: "project-sample",
+          channelId: "channel-general",
+          body: "The second browser remains independently authenticated.",
+        }),
+      },
+    );
+    expect(created.status).toBe(200);
     expect(await eventPromise).toHaveLength(1);
   });
 
