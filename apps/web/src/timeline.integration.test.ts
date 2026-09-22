@@ -87,11 +87,15 @@ describe("durable Live Timeline public path", () => {
       expect(before.activity.items).toHaveLength(0);
       const bootstrap = await kernel.query({ type: "GetBootstrap", projectId: "project" }, { principalId: "human" });
 
+      const fixtureUpdateBound = 256;
       const adapter = new CopilotAcpAdapter({
         command: process.execPath,
         commandArgs: [fileURLToPath(new URL("../../../packages/agent-runtime/test/fixtures/mock-acp-server.mjs", import.meta.url)), "slow-split", "4"],
         unsafeAllowCustomCommandArgs: true,
         cwd: process.cwd(),
+        // A loaded runner may deliver the entire bounded transcript in one pipe
+        // read. This projection test must not depend on notification scheduling.
+        limits: { maxPendingPersistenceOperations: fixtureUpdateBound },
       });
       const runtime = new AgentRuntime({ ...runtimeOptions, adapter });
       const execution = runtime.drainUntilIdle();
@@ -114,6 +118,7 @@ describe("durable Live Timeline public path", () => {
       );
       const activityEvents = events.filter((event) => event.type === "RunActivityAppended");
       expect(activityEvents.length).toBeGreaterThan(100);
+      expect(activityEvents.length).toBeLessThanOrEqual(fixtureUpdateBound);
       expect(activityEvents[0]?.payload).not.toHaveProperty("text");
       for (const event of [...events].reverse()) sources[0]!.emit(event);
       for (const event of activityEvents) sources[0]!.emit(event);
@@ -122,6 +127,7 @@ describe("durable Live Timeline public path", () => {
         expect(controller.getSnapshot().run?.activity.items).toHaveLength(activityEvents.length);
       }, { timeout: 5000 });
       const projected = controller.getSnapshot().run!;
+      expect(controller.getSnapshot().queryError).toBeNull();
       expect(projected.activity.items.map((event) => event.sequence)).toEqual(
         Array.from({ length: activityEvents.length }, (_, index) => index + 1),
       );
@@ -158,16 +164,14 @@ describe("durable Live Timeline public path", () => {
   }, 15_000);
 });
 
-class ReplaySource {
+class ReplaySource extends EventTarget {
   onopen: ((event: Event) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
-  readonly listeners: EventListener[] = [];
-  constructor(readonly url: string) {}
-  addEventListener(_type: string, listener: EventListener) { this.listeners.push(listener); }
+  constructor(readonly url: string) { super(); }
   close() {}
   emit(event: PublicEvent) {
     const message = new MessageEvent("torsor", { data: JSON.stringify(event), lastEventId: event.eventId });
-    for (const listener of this.listeners) listener(message);
+    this.dispatchEvent(message);
   }
 }
 
