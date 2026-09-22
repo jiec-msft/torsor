@@ -21,7 +21,7 @@ jobs:
           cache-dependency-path: |
             package-lock.json
             prototype/package-lock.json
-      - name: Install kernel dependencies
+      - name: Install workspace dependencies
         run: npm ci
       - name: Install prototype dependencies
         run: npm --prefix prototype ci

@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 11;
+export const CURRENT_SCHEMA_VERSION = 12;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -300,9 +300,9 @@ CREATE INDEX IF NOT EXISTS attention_recovery_finished_order_idx
 
 CREATE INDEX IF NOT EXISTS attention_recovery_expiry_horizon_idx
   ON attention_recovery_executions(
-    unfinished,
     expired_recoverable,
-    expires_at
+    expires_at,
+    activation_id
   );
 
 CREATE TABLE IF NOT EXISTS attention_domain_fences (

@@ -1,6 +1,10 @@
 import * as db from "./database.js";
 import { KernelError } from "./errors.js";
 import * as invariants from "./invariants.js";
+import {
+  requireOutboxActivationAuthority,
+  requireOutboxProviderAuthority,
+} from "./outbox.js";
 import type {
   CommandResult,
   JsonValue,
@@ -35,6 +39,12 @@ export function startActivation(kernel: db.KernelContext, command: Extract<Kerne
   let projectId: string;
   let channelId: string;
   let threadRootId: string;
+  let runAuthority:
+    | Readonly<{
+        leaseExpiresAt: string;
+        observedAt: string;
+      }>
+    | undefined;
   const durationMs = boundedDuration(command.durationMs ?? kernel.activationDurationMs, "durationMs");
   const now = kernel.clock();
   let expiresAt = new Date(now.getTime() + durationMs).toISOString();
@@ -43,6 +53,12 @@ export function startActivation(kernel: db.KernelContext, command: Extract<Kerne
       throw new KernelError("InvalidCommand", "Run Activation requires an expected Run revision.");
     }
     const run = invariants.requireMutableRun(kernel, command.runId, command.expectedRunRevision);
+    runAuthority = requireOutboxActivationAuthority(
+      kernel,
+      command,
+      principal,
+      command.runId,
+    );
     runId = command.runId;
     agent = invariants.requireAgent(kernel, text(run.owner_agent_id));
     configRevision = integer(run.agent_config_revision);
@@ -154,6 +170,12 @@ export function startActivation(kernel: db.KernelContext, command: Extract<Kerne
   return {
     commandType: command.type,
     entityId: activationId,
+    ...(runAuthority
+      ? {
+          leaseExpiresAt: runAuthority.leaseExpiresAt,
+          authorityObservedAt: runAuthority.observedAt,
+        }
+      : {}),
     ...(resultRunRevision === undefined
       ? {}
       : { revision: resultRunRevision }),
@@ -161,6 +183,38 @@ export function startActivation(kernel: db.KernelContext, command: Extract<Kerne
       agentId: text(agent.id),
       ...(runId ? { runId } : { attentionId: attentionId! }),
     },
+  };
+}
+
+export function resolveCachedActivation(
+  kernel: db.KernelContext,
+  command: Extract<KernelCommand, { type: "StartActivation" }>,
+  result: CommandResult,
+  principal: Row,
+): CommandResult {
+  if (!command.runId) {
+    return result;
+  }
+  const activation = invariants.requireLiveActivation(
+    kernel,
+    result.entityId,
+  );
+  invariants.assertActivationScopeCurrent(kernel, activation);
+  if (optionalText(activation.run_id) !== command.runId) {
+    throw new Error(
+      `Cached Activation ${result.entityId} does not match its Run command.`,
+    );
+  }
+  const authority = requireOutboxActivationAuthority(
+    kernel,
+    command,
+    principal,
+    command.runId,
+  );
+  return {
+    ...result,
+    leaseExpiresAt: authority.leaseExpiresAt,
+    authorityObservedAt: authority.observedAt,
   };
 }
 
@@ -212,6 +266,13 @@ export function startProviderAttempt(kernel: db.KernelContext, command: Extract<
   invariants.assertActivationScopeCurrent(kernel, activation);
   const runId = optionalText(activation.run_id);
   const runInputIds = unique(command.runInputIds);
+  const authority = providerAttemptAuthority(
+    kernel,
+    command,
+    principal,
+    runId,
+    runInputIds,
+  );
   for (const inputId of runInputIds) {
     const input = db.getRow(kernel, "SELECT run_id, disposition FROM run_inputs WHERE id = ?", inputId);
     if (!input) {
@@ -256,7 +317,89 @@ export function startProviderAttempt(kernel: db.KernelContext, command: Extract<
   return {
     commandType: command.type,
     entityId: providerAttemptId,
+    leaseExpiresAt: authority.leaseExpiresAt,
+    authorityObservedAt: authority.observedAt,
     relatedIds: { activationId: command.activationId },
+  };
+}
+
+export function resolveCachedProviderAttempt(
+  kernel: db.KernelContext,
+  command: Extract<KernelCommand, { type: "StartProviderAttempt" }>,
+  result: CommandResult,
+  principal: Row,
+  context: PrincipalContext,
+): CommandResult {
+  const activation = invariants.requireLiveActivation(
+    kernel,
+    command.activationId,
+  );
+  invariants.authorizeActivationActor(
+    kernel,
+    principal,
+    context,
+    activation,
+  );
+  invariants.assertActivationScopeCurrent(kernel, activation);
+  const runId = optionalText(activation.run_id);
+  const authority = providerAttemptAuthority(
+    kernel,
+    command,
+    principal,
+    runId,
+    unique(command.runInputIds),
+  );
+  const attempt = invariants.requireProviderAttempt(kernel, result.entityId);
+  if (
+    text(attempt.activation_id) !== command.activationId ||
+    text(attempt.request_idempotency_key) !==
+      command.requestIdempotencyKey
+  ) {
+    throw new Error(
+      `Cached ProviderAttempt ${result.entityId} does not match its admission command.`,
+    );
+  }
+  return {
+    ...result,
+    leaseExpiresAt: authority.leaseExpiresAt,
+    authorityObservedAt: authority.observedAt,
+  };
+}
+
+function providerAttemptAuthority(
+  kernel: db.KernelContext,
+  command: Extract<KernelCommand, { type: "StartProviderAttempt" }>,
+  principal: Row,
+  runId: string | null,
+  runInputIds: readonly string[],
+): Readonly<{
+  leaseExpiresAt: string;
+  observedAt: string;
+}> {
+  if (runId !== null) {
+    return requireOutboxProviderAuthority(
+      kernel,
+      command,
+      principal,
+      runId,
+      runInputIds,
+    );
+  }
+  if (
+    command.outboxEventId !== undefined ||
+    command.outboxLeaseToken !== undefined
+  ) {
+    throw new KernelError(
+      "InvalidCommand",
+      "Attention ProviderAttempts cannot carry Outbox authority.",
+    );
+  }
+  const observed = kernel.clock();
+  return {
+    leaseExpiresAt: text(
+      invariants.requireActivation(kernel, command.activationId).expires_at,
+    ),
+    observedAt: observed.toISOString(),
   };
 }
 
