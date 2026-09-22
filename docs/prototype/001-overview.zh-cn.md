@@ -806,6 +806,8 @@ disposition_revision
 6. 同一 Message revision 可以分别加入不同 Run。
 7. RunInput 创建时原子分配单调递增的 `run_input_sequence`。
 8. RunInput 创建会增加 Run revision。
+9. Human `send_to_run` 必须携带观察到的 `expected_run_revision`；不是可选字段。revision 检查、公开 Message、Human-assigned RunInput、revision 增加和投递 Outbox 在同一事务内提交。
+10. Client 提交状态与 RunInput `Pending` disposition 分离。确定的事务拒绝不产生 Message 或 RunInput；响应丢失则提交结果未知，不能据此声称两者未提交。
 
 ### 19.3 语义 disposition
 
@@ -1450,7 +1452,7 @@ Run Workbench 中的输入框不是绕过 Channel 的私有 Provider 输入。
 send_to_run(
   run_id,
   message_body,
-  expected_run_revision?
+  expected_run_revision
 )
 
 → 在 Run 的 home Thread 创建 Human Message
@@ -1468,6 +1470,10 @@ send_to_run(
 5. 终态 Run 拒绝 Send-to-Run，并让 Client 提供创建 Successor 的操作。
 6. Provider 不支持实时 Steer 时，RunInput 保持 Pending，Human仍立即看到“已加入 Run”。
 7. Message 和 RunInput 必须一起成功或一起失败。
+8. Web 使用现有 `POST /api/v1/commands/send-to-run`，请求包含 `idempotencyKey`、`runId`、`body` 和必填 `expectedRunRevision`；目标 Thread 和 Agent 由 Run 决定，不能改走普通 Reply 或直接 Provider 输入。
+9. 一个提交身份固定 Human Principal、Run、正文、revision 和幂等键。响应丢失、网络错误、不可读响应或服务端结果不确定时，保留该身份；恢复必须重试同一请求，不能以新 revision 或新 key 猜测重发。幂等重放返回原结果，即使 Run 已推进或进入终态。
+10. 当前凭据失效时要求重新认证，并保留草稿和提交身份；恢复必须使用原 Human Principal。旧凭据请求的迟到 `401` 不得清除替代会话，可在同一 Principal 的替代凭据下重试原请求。恢复中的认证/权限拒绝不能证明之前的未知提交未发生。
+11. 明确的 stale revision 或 terminal Run 事务拒绝不创建任何一半；保留草稿，刷新事实供 Human 重新判断，不自动修改 revision 重发。终态不允许新发送；若 Client 尚无 Successor 创建能力，明确显示不可用并引导 Human 回到公开 Thread 请求后续工作，不提供虚假操作。
 
 这不是普通 `@Agent` 的替代：
 
@@ -2078,16 +2084,16 @@ Send to Sable · R184
 Also published in #torsor-core / current Thread
 ```
 
-发送继续使用第 36 节的原子 `send_to_run`。Client 可以先乐观显示 Human item，
-随后根据服务端事件更新：
+发送继续使用第 36 节的原子 `send_to_run`，不依赖 Live Timeline 的实现。
 
-```text
-Pending → Delivered → Accepted
-```
-
-这些交付状态不能替代 RunInput 的语义 disposition。发送失败时，Composer 恢复
-草稿并明确显示 Message 和 RunInput 均未提交，不能制造“看起来已经进入 Thread”
-的半成功状态。
+1. Composer 显示目标 Agent 名称和 ID、完整 Run ID、观察到的 revision，以及公开 home Channel/Thread 的明确目的地与返回入口。
+2. 提交中显示 `Submitting`，禁止重复提交；未确认前不将乐观 Message 或 RunInput 插入已提交投影。成功显示两者已提交，刷新 Thread 与 RunInput 事实；读取失败只表示投影待刷新，不能撤销已确认的提交。
+3. 确定的事务拒绝显示原因及两者均未提交。revision conflict 保留草稿，要求刷新并由 Human 再次发送；终态拒绝不能退化为普通 Reply。
+4. 丢失响应或其他不确定结果显示 `Submission outcome unknown`，绝不显示 `Not submitted`。冻结原请求并提供 `Retry same submission`；此前结果未知时，即使重试遭遇认证/权限失败，也继续保留未知状态，直到同一身份的幂等重放确认结果。
+5. 草稿和待恢复身份按 Run 保留为当前 Client Window 的本地状态，跨 Panel 关闭、Run 切换、后台刷新和重新认证保留。旧 Run 的迟到结果只更新该 Run 的提交状态，不清空另一 Run 的草稿或切回旧 Run。此切片不承诺浏览器重载或进程退出后的草稿恢复。
+6. 已提交不代表 Provider 已收到、接受或纳入工作。没有公开交付证据时不得显示 `Delivered` 或 `Accepted`；RunInput disposition 独立展示。实时 Steer 能力未知时明确说明不保证即时投递，不阻止持久 RunInput 提交。
+7. 提供 label、可感知的 Pending/成功/错误状态、可见焦点、键盘提交和恢复。Enter 在多行正文中换行，Ctrl/Cmd+Enter 显式提交且不能干扰 IME；异步结果不得抢走其他 Run 或控件的焦点。窄视口中目的地、正文、状态和按钮必须可换行/滚动并可通过键盘访问。
+8. 未选择/加载到匹配 Run、无可用认证、终态及未实现的 Successor/实时控制能力都有明确说明；不能呈现可点击但无效果的操作。
 
 ### 44.3 Tool Call 展开和失败
 
