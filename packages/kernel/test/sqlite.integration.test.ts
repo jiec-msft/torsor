@@ -501,7 +501,7 @@ describe("SQLite persistence", () => {
       const metadata = new DatabaseSync(databasePath, { readOnly: true });
       try {
         expect(metadata.prepare("PRAGMA user_version").get()).toMatchObject({
-          user_version: 4,
+          user_version: 11,
         });
       } finally {
         metadata.close();
@@ -633,6 +633,12 @@ describe("SQLite persistence", () => {
           nextClaim.outboxEvents![0]!.id,
         ]);
         expect(recovered.leaseToken).not.toBe(nextClaim.leaseToken);
+        expect(recovered.leaseExpiresAt).toBe(
+          "2026-09-21T08:00:03.000Z",
+        );
+        expect(recovered.outboxEvents![0]!.leaseExpiresAt).toBe(
+          recovered.leaseExpiresAt,
+        );
         expect(recovered.outboxEvents![0]!.deliveryAttempts).toBe(2);
         await reopened.execute(
           {
@@ -643,6 +649,17 @@ describe("SQLite persistence", () => {
           },
           runtimeContext,
         );
+        await expect(
+          reopened.execute(
+            {
+              type: "ClaimOutboxEvents",
+              idempotencyKey: "outbox-next-claim",
+              limit: 1,
+              leaseDurationMs: 1_000,
+            },
+            runtimeContext,
+          ),
+        ).rejects.toMatchObject({ code: "Conflict" });
         const all = await reopened.query(
           {
             type: "ListOutboxEvents",
@@ -663,7 +680,7 @@ describe("SQLite persistence", () => {
     }
   });
 
-  it("never retargets an expired Outbox idempotency key", async () => {
+  it("rejects an expired Outbox idempotency key after another lease or frontier advance", async () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-outbox-key-"));
     const databasePath = join(directory, "kernel.sqlite");
     let now = new Date("2026-09-21T08:00:00.000Z");
@@ -702,16 +719,54 @@ describe("SQLite persistence", () => {
           type: "ClaimOutboxEvents",
           idempotencyKey: "other-worker-recovery",
           limit: 1,
-          leaseDurationMs: 30_000,
+          leaseDurationMs: 1_000,
         },
         runtimeContext,
       );
+      const competingRetry = TorsorKernel.open(options);
+      try {
+        await expect(
+          competingRetry.execute(
+            {
+              type: "ClaimOutboxEvents",
+              idempotencyKey: "stable-claim-key",
+              limit: 1,
+              leaseDurationMs: 1_000,
+            },
+            runtimeContext,
+          ),
+        ).rejects.toMatchObject({ code: "Conflict" });
+      } finally {
+        competingRetry.close();
+      }
+      now = new Date("2026-09-21T08:00:04.000Z");
+      await expect(
+        workerB.execute(
+          {
+            type: "ClaimOutboxEvents",
+            idempotencyKey: "stable-claim-key",
+            limit: 1,
+            leaseDurationMs: 1_000,
+          },
+          runtimeContext,
+        ),
+      ).rejects.toMatchObject({ code: "Conflict" });
+      const refreshed = await workerB.execute(
+        {
+          type: "ClaimOutboxEvents",
+          idempotencyKey: "other-worker-recovery",
+          limit: 1,
+          leaseDurationMs: 1_000,
+        },
+        runtimeContext,
+      );
+      expect(refreshed.leaseToken).not.toBe(recovered.leaseToken);
       await workerB.execute(
         {
           type: "AcknowledgeOutboxEvents",
           idempotencyKey: "other-worker-ack",
-          outboxEventIds: recovered.outboxEvents!.map((event) => event.id),
-          leaseToken: recovered.leaseToken!,
+          outboxEventIds: refreshed.outboxEvents!.map((event) => event.id),
+          leaseToken: refreshed.leaseToken!,
         },
         runtimeContext,
       );
@@ -729,17 +784,18 @@ describe("SQLite persistence", () => {
 
       const retried = TorsorKernel.open(options);
       try {
-        const sameKey = await retried.execute(
-          {
-            type: "ClaimOutboxEvents",
-            idempotencyKey: "stable-claim-key",
-            limit: 1,
-            leaseDurationMs: 1_000,
-          },
-          runtimeContext,
-        );
-        expect(sameKey.outboxEvents?.map((event) => event.id)).toEqual(
-          original.outboxEvents?.map((event) => event.id),
+        await expect(
+          retried.execute(
+            {
+              type: "ClaimOutboxEvents",
+              idempotencyKey: "stable-claim-key",
+              limit: 1,
+              leaseDurationMs: 1_000,
+            },
+            runtimeContext,
+          ),
+        ).rejects.toMatchObject(
+          { code: "Conflict" },
         );
 
         const newKey = await retried.execute(
@@ -757,6 +813,75 @@ describe("SQLite persistence", () => {
         );
       } finally {
         retried.close();
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a cached Outbox batch after a partial external acknowledgement", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-outbox-partial-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    const options = {
+      databasePath,
+      bootstrap,
+      clock: () => new Date("2026-09-21T08:00:00.000Z"),
+    };
+    try {
+      const kernel = TorsorKernel.open(options);
+      for (let index = 0; index < 2; index += 1) {
+        await kernel.execute(
+          {
+            type: "StartThread",
+            idempotencyKey: `partial-cache-message-${index}`,
+            projectId: "project-sample",
+            channelId: "channel-general",
+            body: `Partial cached batch ${index}.`,
+          },
+          humanContext,
+        );
+      }
+      const claim = await kernel.execute(
+        {
+          type: "ClaimOutboxEvents",
+          idempotencyKey: "partial-cache-claim",
+          limit: 2,
+          leaseDurationMs: 30_000,
+        },
+        runtimeContext,
+      );
+      kernel.close();
+
+      const database = new DatabaseSync(databasePath);
+      try {
+        database.prepare(
+          `UPDATE outbox_events
+              SET acknowledged_at = '2026-09-21T08:00:01.000Z',
+                  acknowledged_by_principal_id = 'principal-runtime',
+                  lease_holder_principal_id = NULL,
+                  lease_token = NULL,
+                  lease_expires_at = NULL
+            WHERE id = ?`,
+        ).run(claim.outboxEvents![0]!.id);
+      } finally {
+        database.close();
+      }
+
+      const reopened = TorsorKernel.open(options);
+      try {
+        await expect(
+          reopened.execute(
+            {
+              type: "ClaimOutboxEvents",
+              idempotencyKey: "partial-cache-claim",
+              limit: 2,
+              leaseDurationMs: 30_000,
+            },
+            runtimeContext,
+          ),
+        ).rejects.toMatchObject({ code: "Conflict" });
+      } finally {
+        reopened.close();
       }
     } finally {
       await rm(directory, { recursive: true, force: true });
@@ -1067,6 +1192,76 @@ describe("SQLite persistence", () => {
     }
   });
 
+  it("keeps projection page metadata and rows on one committed read snapshot", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-query-snapshot-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    let held: HeldActivationCommand | undefined;
+    let kernel: TorsorKernel | undefined;
+    try {
+      kernel = TorsorKernel.open({ databasePath, bootstrap });
+      const setup = await createRun(kernel);
+      await kernel.execute(
+        {
+          type: "WaitRun",
+          idempotencyKey: "query-snapshot-wait",
+          runId: setup.runId,
+          expectedRunRevision: 1,
+          reason: "Prepare a committed Waiting projection.",
+        },
+        setup.agentContext,
+      );
+
+      held = await startActivationHoldingBeforeCommit(
+        databasePath,
+        {
+          type: "StartActivation",
+          idempotencyKey: "query-snapshot-resume",
+          runId: setup.runId,
+          expectedRunRevision: 2,
+        },
+      );
+      const whileUncommitted = await kernel.query(
+        {
+          type: "ListRunProjections",
+          projectId: "project-sample",
+          limit: 10,
+        },
+        humanContext,
+      );
+      expect(whileUncommitted.items[0]?.run).toMatchObject({
+        id: setup.runId,
+        state: "Waiting",
+        revision: 2,
+      });
+
+      held.release();
+      await held.result;
+      const afterCommit = await kernel.query(
+        {
+          type: "ListRunProjections",
+          projectId: "project-sample",
+          limit: 10,
+        },
+        humanContext,
+      );
+      expect(afterCommit.items[0]?.run).toMatchObject({
+        id: setup.runId,
+        state: "Active",
+        revision: 3,
+      });
+      expect(afterCommit.snapshotEventId).not.toBe(
+        whileUncommitted.snapshotEventId,
+      );
+    } finally {
+      held?.release();
+      if (held) {
+        await held.worker.terminate();
+      }
+      kernel?.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("rejects cached Agent retries for Runtime-only authority commands", async () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-authority-cache-"));
     const databasePath = join(directory, "kernel.sqlite");
@@ -1246,6 +1441,8 @@ describe("SQLite persistence", () => {
   it("rejects incompatible and unversioned development schemas", async () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-schema-"));
     const unsupportedPath = join(directory, "unsupported.sqlite");
+    const priorPrSchemaPath = join(directory, "schema-9.sqlite");
+    const supersededSchemaPath = join(directory, "schema-10.sqlite");
     const unversionedPath = join(directory, "unversioned.sqlite");
     try {
       const unsupported = new DatabaseSync(unsupportedPath);
@@ -1276,6 +1473,28 @@ describe("SQLite persistence", () => {
       } finally {
         preserved.close();
       }
+
+      const priorPrSchema = new DatabaseSync(priorPrSchemaPath);
+      priorPrSchema.exec(
+        "CREATE TABLE preserved_schema_9_state (id TEXT PRIMARY KEY); PRAGMA user_version = 9",
+      );
+      priorPrSchema.close();
+      expect(() =>
+        TorsorKernel.open({ databasePath: priorPrSchemaPath, bootstrap }),
+      ).toThrow(
+        /Incompatible development database schema version 9.*recreate the disposable local database/,
+      );
+
+      const supersededSchema = new DatabaseSync(supersededSchemaPath);
+      supersededSchema.exec(
+        "CREATE TABLE preserved_schema_10_state (id TEXT PRIMARY KEY); PRAGMA user_version = 10",
+      );
+      supersededSchema.close();
+      expect(() =>
+        TorsorKernel.open({ databasePath: supersededSchemaPath, bootstrap }),
+      ).toThrow(
+        /Incompatible development database schema version 10.*recreate the disposable local database/,
+      );
 
       const unversioned = new DatabaseSync(unversionedPath);
       unversioned.exec("CREATE VIEW preserved_view AS SELECT 1 AS value");

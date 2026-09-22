@@ -12,6 +12,10 @@ export type RunState =
   | "Failed"
   | "Cancelled";
 export type AttentionStatus = "Open" | "Resolved" | "Ignored";
+export type AttentionResolutionOutcome =
+  | "RunCreated"
+  | "ExistingRunContinued"
+  | "Ignored";
 export type RunInputDisposition =
   | "Pending"
   | "Incorporated"
@@ -133,6 +137,24 @@ export interface ResolveAttentionWithRunCommand extends IdempotentCommand {
   readonly handlerLeaseToken: string;
 }
 
+export interface IgnoreAttentionCommand extends IdempotentCommand {
+  readonly type: "IgnoreAttention";
+  readonly attentionId: string;
+  readonly expectedAttentionRevision: number;
+  readonly handlerLeaseToken: string;
+  readonly reason: string;
+}
+
+export interface ResolveAttentionWithExistingRunCommand
+  extends IdempotentCommand {
+  readonly type: "ResolveAttentionWithExistingRun";
+  readonly attentionId: string;
+  readonly expectedAttentionRevision: number;
+  readonly handlerLeaseToken: string;
+  readonly runId: string;
+  readonly expectedRunRevision: number;
+}
+
 export interface StartActivationCommand extends IdempotentCommand {
   readonly type: "StartActivation";
   readonly runId?: string;
@@ -183,6 +205,16 @@ export interface FailProviderAttemptCommand extends IdempotentCommand {
   readonly type: "FailProviderAttempt";
   readonly providerAttemptId: string;
   readonly error: string;
+}
+
+export interface ParkRunAfterProviderAttemptFailureCommand
+  extends IdempotentCommand {
+  readonly type: "ParkRunAfterProviderAttemptFailure";
+  readonly runId: string;
+  readonly providerAttemptId: string;
+  readonly expectedRunRevision: number;
+  readonly expectedActivationGeneration: number;
+  readonly reason: string;
 }
 
 export interface AppendRunActivityCommand extends IdempotentCommand {
@@ -266,11 +298,14 @@ export type KernelCommand =
   | WithdrawRunInputCommand
   | ClaimAttentionCommand
   | ResolveAttentionWithRunCommand
+  | IgnoreAttentionCommand
+  | ResolveAttentionWithExistingRunCommand
   | StartActivationCommand
   | FinishActivationCommand
   | StartProviderAttemptCommand
   | FinishProviderAttemptCommand
   | FailProviderAttemptCommand
+  | ParkRunAfterProviderAttemptFailureCommand
   | ClaimOutboxEventsCommand
   | AcknowledgeOutboxEventsCommand
   | AppendRunActivityCommand
@@ -319,13 +354,78 @@ export interface ListOutboxEventsQuery {
   readonly includeAcknowledged?: boolean;
 }
 
+export interface GetProviderAttemptQuery {
+  readonly type: "GetProviderAttempt";
+  readonly providerAttemptId: string;
+}
+
+export interface RecoverableAttentionExecutionCursor {
+  readonly startedAt: string;
+  readonly activationId: string;
+}
+
+export interface AttentionRecoverySnapshot {
+  readonly revision: number;
+  readonly observedAt: string;
+  readonly nextExpiryAt: string | null;
+}
+
+export interface GetAttentionRecoverySnapshotQuery {
+  readonly type: "GetAttentionRecoverySnapshot";
+}
+
+export interface ListRecoverableAttentionExecutionsQuery {
+  readonly type: "ListRecoverableAttentionExecutions";
+  readonly afterCursor?: RecoverableAttentionExecutionCursor;
+  readonly recoveryRevision?: number;
+  readonly limit?: number;
+}
+
+export interface ListThreadProjectionsQuery {
+  readonly type: "ListThreadProjections";
+  readonly projectId: string;
+  readonly channelId?: string;
+  readonly afterEventId?: string | null;
+  readonly snapshotEventId?: string | null;
+  readonly limit?: number;
+}
+
+export interface ListRunProjectionsQuery {
+  readonly type: "ListRunProjections";
+  readonly projectId: string;
+  readonly channelId?: string;
+  readonly afterEventId?: string | null;
+  readonly snapshotEventId?: string | null;
+  readonly limit?: number;
+}
+
+export interface ReadPublicEventsQuery {
+  readonly type: "ReadPublicEvents";
+  readonly projectId: string;
+  readonly afterEventId?: string | null;
+  readonly limit?: number;
+}
+
+export interface GetProjectAgentStatusQuery {
+  readonly type: "GetProjectAgentStatus";
+  readonly projectId: string;
+  readonly agentId?: string;
+}
+
 export type KernelQuery =
   | GetBootstrapQuery
   | GetThreadProjectionQuery
   | GetRunProjectionQuery
   | ListActivityQuery
   | ListOpenAttentionsQuery
-  | ListOutboxEventsQuery;
+  | ListOutboxEventsQuery
+  | GetProviderAttemptQuery
+  | GetAttentionRecoverySnapshotQuery
+  | ListRecoverableAttentionExecutionsQuery
+  | ListThreadProjectionsQuery
+  | ListRunProjectionsQuery
+  | ReadPublicEventsQuery
+  | GetProjectAgentStatusQuery;
 
 export interface MessageRevisionView {
   readonly id: string;
@@ -352,6 +452,9 @@ export interface MessageView {
 export interface AttentionView {
   readonly cursor: number;
   readonly id: string;
+  readonly projectId: string;
+  readonly channelId: string;
+  readonly threadRootId: string;
   readonly messageRevisionId: string;
   readonly targetAgentId: string;
   readonly triggerKind: string;
@@ -359,6 +462,7 @@ export interface AttentionView {
   readonly revision: number;
   readonly handlerLeaseHolderPrincipalId: string | null;
   readonly handlerLeaseExpiresAt: string | null;
+  readonly resolutionOutcome: AttentionResolutionOutcome | null;
   readonly resolvedRunId: string | null;
   readonly createdAt: string;
   readonly resolvedAt: string | null;
@@ -479,6 +583,20 @@ export interface OutboxPage {
   readonly hasMore: boolean;
 }
 
+export interface RecoverableAttentionExecutionView {
+  readonly cursor: RecoverableAttentionExecutionCursor;
+  readonly attention: AttentionView;
+  readonly activation: ActivationAttemptView;
+  readonly providerAttempts: readonly ProviderAttemptView[];
+}
+
+export interface RecoverableAttentionExecutionPage {
+  readonly items: readonly RecoverableAttentionExecutionView[];
+  readonly nextCursor: RecoverableAttentionExecutionCursor | null;
+  readonly hasMore: boolean;
+  readonly recoverySnapshot: AttentionRecoverySnapshot;
+}
+
 export interface ArtifactView {
   readonly id: string;
   readonly contentDigest: string;
@@ -537,6 +655,42 @@ export interface RunProjection {
   readonly artifacts: readonly ArtifactView[];
 }
 
+export interface ThreadProjectionPage {
+  readonly items: readonly ThreadProjection[];
+  readonly nextAfterEventId: string | null;
+  readonly hasMore: boolean;
+  readonly snapshotEventId: string | null;
+}
+
+export interface RunProjectionPage {
+  readonly items: readonly RunProjection[];
+  readonly nextAfterEventId: string | null;
+  readonly hasMore: boolean;
+  readonly snapshotEventId: string | null;
+}
+
+export interface AuthorizedPublicEventPage {
+  readonly events: readonly PublicEventEnvelope[];
+  readonly scannedThroughEventId: string | null;
+  readonly hasMore: boolean;
+}
+
+export type ProjectAgentDerivedStatus = "active" | "waiting" | "idle";
+
+export interface ProjectAgentStatusView {
+  readonly agentId: string;
+  readonly liveRunActivationCount: number;
+  readonly liveAttentionActivationCount: number;
+  readonly liveActivationCount: number;
+  readonly nonterminalRunCount: number;
+  readonly status: ProjectAgentDerivedStatus;
+}
+
+export interface ProjectAgentStatusProjection {
+  readonly projectId: string;
+  readonly agents: readonly ProjectAgentStatusView[];
+}
+
 export interface QueryResultMap {
   readonly GetBootstrap: BootstrapProjection;
   readonly GetThreadProjection: ThreadProjection;
@@ -544,6 +698,13 @@ export interface QueryResultMap {
   readonly ListActivity: ActivityPage;
   readonly ListOpenAttentions: AttentionPage;
   readonly ListOutboxEvents: OutboxPage;
+  readonly GetProviderAttempt: ProviderAttemptView;
+  readonly GetAttentionRecoverySnapshot: AttentionRecoverySnapshot;
+  readonly ListRecoverableAttentionExecutions: RecoverableAttentionExecutionPage;
+  readonly ListThreadProjections: ThreadProjectionPage;
+  readonly ListRunProjections: RunProjectionPage;
+  readonly ReadPublicEvents: AuthorizedPublicEventPage;
+  readonly GetProjectAgentStatus: ProjectAgentStatusProjection;
 }
 
 export type QueryResult<Q extends KernelQuery> = QueryResultMap[Q["type"]];
@@ -555,5 +716,6 @@ export interface CommandResult {
   readonly threadCursor?: number;
   readonly relatedIds?: Readonly<Record<string, string>>;
   readonly leaseToken?: string;
+  readonly leaseExpiresAt?: string;
   readonly outboxEvents?: readonly OutboxEventView[];
 }
