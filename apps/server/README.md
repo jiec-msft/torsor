@@ -49,3 +49,12 @@ SSE `id`, accepts either `Last-Event-ID` or `cursor`, and sends heartbeat
 comments while idle. On automatic browser reconnect, `Last-Event-ID` takes
 precedence over the original URL cursor. Clients bootstrap first, then
 subscribe from `bootstrap.latestEventId` to avoid a snapshot/subscription gap.
+Replay uses the Kernel `ReadPublicEvents` query, so authorization and filtered
+cursor advancement remain project-scoped and bounded without rebuilding Thread
+projections for every event.
+
+Thread and Run list routes use the Kernel's atomic as-of projection pages.
+`snapshot` from the first page is reused with `after` on later pages, excluding
+concurrent creates and reconstructing mutable state at the advertised snapshot.
+Agent status is returned from the authoritative Kernel status projection,
+including Attention-only Activations and current Run work.

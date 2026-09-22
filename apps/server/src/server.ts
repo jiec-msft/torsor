@@ -10,20 +10,16 @@ import { once } from "node:events";
 import {
   KernelError,
   TorsorKernel,
-  type BootstrapAgent,
   type KernelBootstrap,
   type KernelCommand,
   type PrincipalContext,
   type PublicEventEnvelope,
-  type RunProjection,
-  type ThreadProjection,
 } from "@torsor/kernel";
 
 const apiPrefix = "/api/v1";
 const defaultBodyLimitBytes = 1_048_576;
 const defaultEventBatchSize = 50;
 const maximumPageSize = 100;
-const eventScanBatchSize = 100;
 const defaultSessionDurationMs = 86_400_000;
 
 const commandTypes = {
@@ -82,13 +78,6 @@ interface AuthenticatedRequest {
   readonly sessionCsrfToken?: string;
 }
 
-interface EntityPage<T> {
-  readonly items: readonly T[];
-  readonly nextCursor: string | null;
-  readonly hasMore: boolean;
-  readonly snapshotEventId: string | null;
-}
-
 class HttpError extends Error {
   constructor(
     readonly status: number,
@@ -122,7 +111,11 @@ class Service implements TorsorHttpService {
   readonly #heartbeatIntervalMs: number;
   readonly #sessionDurationMs: number;
   #origin: string | null = null;
-  #closed = false;
+  #state: "created" | "starting" | "listening" | "closing" | "closed" =
+    "created";
+  #listenPromise: Promise<string> | null = null;
+  #listenSettledPromise: Promise<void> | null = null;
+  #closePromise: Promise<void> | null = null;
 
   constructor(options: TorsorHttpServiceOptions) {
     if (options.credentials.length === 0) {
@@ -181,27 +174,58 @@ class Service implements TorsorHttpService {
   }
 
   async listen(): Promise<string> {
-    if (this.#closed) {
+    if (this.#state === "closing" || this.#state === "closed") {
       throw new Error("The HTTP service is closed.");
     }
     if (this.#origin) {
       return this.#origin;
     }
+    if (!this.#listenPromise) {
+      this.#state = "starting";
+      const listenPromise = this.#bind();
+      this.#listenPromise = listenPromise;
+      this.#listenSettledPromise = listenPromise.then(
+        () => undefined,
+        () => {
+          if (!this.#closePromise) {
+            this.#state = "closing";
+            this.#closePromise = this.#shutdown();
+          }
+        },
+      );
+    }
+    return this.#listenPromise;
+  }
+
+  async close(): Promise<void> {
+    if (!this.#closePromise) {
+      this.#state = "closing";
+      this.#closePromise = (async () => {
+        if (this.#listenSettledPromise) {
+          await this.#listenSettledPromise;
+        }
+        await this.#shutdown();
+      })();
+    }
+    return this.#closePromise;
+  }
+
+  async #bind(): Promise<string> {
     this.#server.listen(this.#port, this.#host);
     await once(this.#server, "listening");
     const address = this.#server.address();
     if (!address || typeof address === "string") {
       throw new Error("The HTTP service did not bind a TCP address.");
     }
-    this.#origin = `http://${formatHost(address.address)}:${address.port}`;
-    return this.#origin;
+    const origin = `http://${formatHost(address.address)}:${address.port}`;
+    this.#origin = origin;
+    if (this.#state === "starting") {
+      this.#state = "listening";
+    }
+    return origin;
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) {
-      return;
-    }
-    this.#closed = true;
+  async #shutdown(): Promise<void> {
     for (const controller of this.#eventStreams) {
       controller.abort();
     }
@@ -214,6 +238,7 @@ class Service implements TorsorHttpService {
     this.#sessions.clear();
     this.#kernel.close();
     this.#origin = null;
+    this.#state = "closed";
   }
 
   async #handle(
@@ -441,6 +466,7 @@ class Service implements TorsorHttpService {
     }
     const type = commandTypes[commandSlug as keyof typeof commandTypes];
     const command = { ...body, type } as unknown as KernelCommand;
+    this.#requireCurrentAuthentication(authenticated);
     const result = await this.#kernel.execute(
       command,
       authenticated.context,
@@ -476,12 +502,22 @@ class Service implements TorsorHttpService {
         return;
       }
       if (segments[4] === "runs" && segments.length === 5) {
-        const page = await this.#listRuns(
-          projectId,
-          url,
+        const page = await this.#kernel.query(
+          {
+            type: "ListRunProjections",
+            projectId,
+            ...optionalStringAs(url, "after", "afterEventId"),
+            ...optionalStringAs(url, "snapshot", "snapshotEventId"),
+            limit: pageSize(url),
+          },
           authenticated.context,
         );
-        sendJson(response, 200, page);
+        sendJson(response, 200, {
+          items: page.items,
+          nextCursor: page.nextAfterEventId,
+          hasMore: page.hasMore,
+          snapshotEventId: page.snapshotEventId,
+        });
         return;
       }
       if (segments[4] === "agents" && segments.length === 5) {
@@ -515,13 +551,23 @@ class Service implements TorsorHttpService {
       segments.length === 5
     ) {
       const projectId = requiredQuery(url, "projectId");
-      const page = await this.#listThreads(
-        projectId,
-        segments[3],
-        url,
+      const page = await this.#kernel.query(
+        {
+          type: "ListThreadProjections",
+          projectId,
+          channelId: segments[3],
+          ...optionalStringAs(url, "after", "afterEventId"),
+          ...optionalStringAs(url, "snapshot", "snapshotEventId"),
+          limit: pageSize(url),
+        },
         authenticated.context,
       );
-      sendJson(response, 200, page);
+      sendJson(response, 200, {
+        items: page.items,
+        nextCursor: page.nextAfterEventId,
+        hasMore: page.hasMore,
+        snapshotEventId: page.snapshotEventId,
+      });
       return;
     }
 
@@ -561,197 +607,21 @@ class Service implements TorsorHttpService {
     throw new HttpError(404, "not_found", "The endpoint does not exist.");
   }
 
-  async #listThreads(
-    projectId: string,
-    channelId: string,
-    url: URL,
-    context: PrincipalContext,
-  ): Promise<EntityPage<ThreadProjection>> {
-    const bootstrap = await this.#kernel.query(
-      { type: "GetBootstrap", projectId },
-      context,
-    );
-    if (!bootstrap.channels.some((channel) => channel.id === channelId)) {
-      throw new HttpError(
-        404,
-        "not_found",
-        `Channel ${channelId} does not exist in Project ${projectId}.`,
-      );
-    }
-    return this.#listEntityPage(
-      url,
-      bootstrap.latestEventId,
-      (event) =>
-        event.projectId === projectId &&
-        event.channelId === channelId &&
-        event.type === "MessagePublished" &&
-        event.entityId === event.threadRootId,
-      (event) =>
-        this.#kernel.query(
-          { type: "GetThreadProjection", threadRootId: event.entityId },
-          context,
-        ),
-    );
-  }
-
-  async #listRuns(
-    projectId: string,
-    url: URL,
-    context: PrincipalContext,
-  ): Promise<EntityPage<RunProjection>> {
-    const bootstrap = await this.#kernel.query(
-      { type: "GetBootstrap", projectId },
-      context,
-    );
-    return this.#listEntityPage(
-      url,
-      bootstrap.latestEventId,
-      (event) =>
-        event.projectId === projectId &&
-        event.type === "RunCreated" &&
-        event.entityType === "Run",
-      (event) =>
-        this.#kernel.query(
-          { type: "GetRunProjection", runId: event.entityId },
-          context,
-        ),
-    );
-  }
-
-  async #listEntityPage<T>(
-    url: URL,
-    defaultSnapshotEventId: string | null,
-    matches: (event: PublicEventEnvelope) => boolean,
-    project: (event: PublicEventEnvelope) => Promise<T>,
-  ): Promise<EntityPage<T>> {
-    const limit = pageSize(url);
-    const afterEventId = url.searchParams.get("after");
-    const snapshotEventId =
-      url.searchParams.get("snapshot") ?? defaultSnapshotEventId;
-    if (snapshotEventId === null) {
-      if (afterEventId !== null) {
-        await this.#kernel.readEvents(afterEventId, 1);
-        throw new HttpError(
-          400,
-          "invalid_cursor_window",
-          "A page cursor cannot follow an empty snapshot.",
-        );
-      }
-      return {
-        items: [],
-        nextCursor: null,
-        hasMore: false,
-        snapshotEventId,
-      };
-    }
-    await this.#kernel.readEvents(snapshotEventId, 1);
-    if (afterEventId === snapshotEventId) {
-      return {
-        items: [],
-        nextCursor: null,
-        hasMore: false,
-        snapshotEventId,
-      };
-    }
-    let cursor = afterEventId;
-    const matched: PublicEventEnvelope[] = [];
-    let snapshotReached = false;
-    while (!snapshotReached) {
-      const batch = await this.#kernel.readEvents(cursor, eventScanBatchSize);
-      if (batch.length === 0) {
-        break;
-      }
-      for (const event of batch) {
-        cursor = event.eventId;
-        if (matched.length <= limit && matches(event)) {
-          matched.push(event);
-        }
-        if (event.eventId === snapshotEventId) {
-          snapshotReached = true;
-          break;
-        }
-      }
-    }
-    if (!snapshotReached) {
-      throw new HttpError(
-        400,
-        "invalid_cursor_window",
-        "The snapshot cursor does not follow the page cursor.",
-      );
-    }
-    const selected = matched.slice(0, limit);
-    const items: T[] = [];
-    for (const event of selected) {
-      items.push(await project(event));
-    }
-    const hasMore = matched.length > limit;
-    return {
-      items,
-      nextCursor: hasMore ? selected.at(-1)?.eventId ?? null : null,
-      hasMore,
-      snapshotEventId,
-    };
-  }
-
   async #listAgents(
     projectId: string,
     context: PrincipalContext,
   ): Promise<readonly unknown[]> {
-    const bootstrap = await this.#kernel.query(
-      { type: "GetBootstrap", projectId },
-      context,
+    const [bootstrap, status] = await Promise.all([
+      this.#kernel.query({ type: "GetBootstrap", projectId }, context),
+      this.#kernel.query({ type: "GetProjectAgentStatus", projectId }, context),
+    ]);
+    const statusByAgentId = new Map(
+      status.agents.map((agentStatus) => [agentStatus.agentId, agentStatus]),
     );
-    const runs = await this.#allRuns(
-      projectId,
-      bootstrap.latestEventId,
-      context,
-    );
-    return bootstrap.agents.map((agent) =>
-      agentStatus(agent, runs, new Date()),
-    );
-  }
-
-  async #allRuns(
-    projectId: string,
-    snapshotEventId: string | null,
-    context: PrincipalContext,
-  ): Promise<readonly RunProjection[]> {
-    if (!snapshotEventId) {
-      return [];
-    }
-    let cursor: string | null = null;
-    const runIds: string[] = [];
-    let snapshotReached = false;
-    while (!snapshotReached) {
-      const batch = await this.#kernel.readEvents(cursor, eventScanBatchSize);
-      if (batch.length === 0) {
-        break;
-      }
-      for (const event of batch) {
-        cursor = event.eventId;
-        if (
-          event.projectId === projectId &&
-          event.type === "RunCreated" &&
-          event.entityType === "Run"
-        ) {
-          runIds.push(event.entityId);
-        }
-        if (event.eventId === snapshotEventId) {
-          snapshotReached = true;
-          break;
-        }
-      }
-    }
-    const runs: RunProjection[] = [];
-    for (const runId of runIds) {
-      runs.push(
-        await this.#kernel.query(
-          { type: "GetRunProjection", runId },
-          context,
-        ),
-      );
-    }
-    return runs;
+    return bootstrap.agents.map((agent) => ({
+      ...agent,
+      ...statusByAgentId.get(agent.id),
+    }));
   }
 
   async #handleEventStream(
@@ -781,7 +651,15 @@ class Service implements TorsorHttpService {
             maximumPageSize,
             "batchSize",
           );
-    let batch = await this.#kernel.readEvents(cursor, batchSize);
+    let page = await this.#kernel.query(
+      {
+        type: "ReadPublicEvents",
+        projectId,
+        afterEventId: cursor,
+        limit: batchSize,
+      },
+      authenticated.context,
+    );
 
     response.writeHead(200, {
       "Content-Type": "text/event-stream; charset=utf-8",
@@ -810,7 +688,8 @@ class Service implements TorsorHttpService {
         !controller.signal.aborted &&
         this.#authenticationIsCurrent(authenticated)
       ) {
-        if (batch.length === 0) {
+        cursor = page.scannedThroughEventId;
+        if (page.events.length === 0 && !page.hasMore) {
           await delay(
             this.#authenticationDelay(
               authenticated,
@@ -836,20 +715,21 @@ class Service implements TorsorHttpService {
           ) {
             break;
           }
-          batch = await this.#kernel.readEvents(cursor, batchSize);
+          page = await this.#kernel.query(
+            {
+              type: "ReadPublicEvents",
+              projectId,
+              afterEventId: cursor,
+              limit: batchSize,
+            },
+            authenticated.context,
+          );
           continue;
         }
-        for (const event of batch) {
+        for (const event of page.events) {
           if (!this.#authenticationIsCurrent(authenticated)) {
             controller.abort();
             break;
-          }
-          cursor = event.eventId;
-          if (
-            event.projectId !== projectId ||
-            !(await this.#canReadEvent(event, authenticated.context))
-          ) {
-            continue;
           }
           await writeStreamChunk(
             response,
@@ -864,7 +744,18 @@ class Service implements TorsorHttpService {
         if (controller.signal.aborted) {
           break;
         }
-        batch = await this.#kernel.readEvents(cursor, batchSize);
+        if (page.hasMore) {
+          await yieldToEventLoop();
+        }
+        page = await this.#kernel.query(
+          {
+            type: "ReadPublicEvents",
+            projectId,
+            afterEventId: cursor,
+            limit: batchSize,
+          },
+          authenticated.context,
+        );
       }
     } finally {
       request.off("aborted", disconnect);
@@ -899,6 +790,21 @@ class Service implements TorsorHttpService {
     return true;
   }
 
+  #requireCurrentAuthentication(
+    authenticated: AuthenticatedRequest,
+  ): void {
+    if (
+      authenticated.authentication === "session" &&
+      !this.#authenticationIsCurrent(authenticated)
+    ) {
+      throw new HttpError(
+        401,
+        "unauthorized",
+        "The browser session expired or was revoked.",
+      );
+    }
+  }
+
   #authenticationDelay(
     authenticated: AuthenticatedRequest,
     maximumMs: number,
@@ -912,75 +818,12 @@ class Service implements TorsorHttpService {
     );
   }
 
-  async #canReadEvent(
-    event: PublicEventEnvelope,
-    context: PrincipalContext,
-  ): Promise<boolean> {
-    if (!event.threadRootId) {
-      return false;
-    }
-    try {
-      await this.#kernel.query(
-        { type: "GetThreadProjection", threadRootId: event.threadRootId },
-        context,
-      );
-      return true;
-    } catch (error) {
-      if (
-        error instanceof KernelError &&
-        ["Unauthorized", "Forbidden", "NotFound"].includes(error.code)
-      ) {
-        return false;
-      }
-      throw error;
-    }
-  }
 }
 
 export function createTorsorHttpService(
   options: TorsorHttpServiceOptions,
 ): TorsorHttpService {
   return new Service(options);
-}
-
-function agentStatus(
-  agent: BootstrapAgent,
-  runs: readonly RunProjection[],
-  now: Date,
-): unknown {
-  const owned = runs.filter((projection) => projection.run.ownerAgentId === agent.id);
-  const liveActivationCount = owned.reduce(
-    (count, projection) =>
-      count +
-      projection.activations.filter(
-        (activation) =>
-          activation.finishedAt === null &&
-          activation.revokedAt === null &&
-          new Date(activation.expiresAt) > now,
-      ).length,
-    0,
-  );
-  const counts = {
-    active: owned.filter((projection) => projection.run.state === "Active").length,
-    waiting: owned.filter((projection) => projection.run.state === "Waiting").length,
-    completed: owned.filter((projection) => projection.run.state === "Completed").length,
-    failed: owned.filter((projection) => projection.run.state === "Failed").length,
-    cancelled: owned.filter((projection) => projection.run.state === "Cancelled").length,
-  };
-  const status =
-    liveActivationCount > 0
-      ? "running"
-      : counts.active > 0
-        ? "active"
-        : counts.waiting > 0
-          ? "waiting"
-          : "idle";
-  return {
-    ...agent,
-    status,
-    liveActivationCount,
-    runCounts: counts,
-  };
 }
 
 async function readJsonObject(
@@ -1085,6 +928,7 @@ function kernelStatus(code: KernelError["code"]): number {
     case "InvalidCommand":
       return 400;
     case "Conflict":
+    case "DomainBusy":
     case "StaleRevision":
     case "ConditionalCheckFailed":
     case "TerminalRun":
@@ -1184,6 +1028,17 @@ function optionalString(
     return {};
   }
   return { [name]: url.searchParams.get(name) };
+}
+
+function optionalStringAs(
+  url: URL,
+  queryName: string,
+  propertyName: string,
+): Readonly<Record<string, string | null>> {
+  if (!url.searchParams.has(queryName)) {
+    return {};
+  }
+  return { [propertyName]: url.searchParams.get(queryName) };
 }
 
 function optionalInteger(
@@ -1295,4 +1150,8 @@ async function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
     signal.addEventListener("abort", abort, { once: true });
     timer.unref();
   });
+}
+
+async function yieldToEventLoop(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
 }

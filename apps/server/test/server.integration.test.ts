@@ -1,5 +1,6 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { once } from "node:events";
+import { createServer as createHttpServer } from "node:http";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,12 +27,20 @@ const bootstrap: KernelBootstrap = {
     { id: "principal-runtime", kind: "runtime", displayName: "Local Runtime" },
     { id: "principal-orbit", kind: "agent", displayName: "Orbit" },
   ],
-  projects: [{ id: "project-sample", name: "Sample Project" }],
+  projects: [
+    { id: "project-sample", name: "Sample Project" },
+    { id: "project-other", name: "Other Project" },
+  ],
   channels: [
     {
       id: "channel-general",
       projectId: "project-sample",
       name: "general",
+    },
+    {
+      id: "channel-other",
+      projectId: "project-other",
+      name: "other",
     },
   ],
   agents: [
@@ -247,6 +256,42 @@ describe("Torsor HTTP and SSE service", () => {
     expect(safe.status).toBe(200);
   });
 
+  it("rejects commands when a browser session expires or is revoked while reading the body", async () => {
+    const harness = await startHarness({ sessionDurationMs: 150 });
+    const expiring = await createBrowserSession(harness.origin);
+    const expiredResponse = await sendPartialCookieCommand(
+      harness.origin,
+      expiring,
+      async () => {
+        await new Promise((resolve) => setTimeout(resolve, 180));
+      },
+      "expired-partial-body",
+    );
+    expect(expiredResponse).toContain("HTTP/1.1 401");
+    expect(expiredResponse).toContain('"code":"unauthorized"');
+
+    const revocable = await createBrowserSession(harness.origin);
+    const revokedResponse = await sendPartialCookieCommand(
+      harness.origin,
+      revocable,
+      async () => {
+        const deleted = await fetch(`${harness.origin}/api/v1/session`, {
+          method: "DELETE",
+          headers: { Cookie: revocable.cookie },
+        });
+        expect(deleted.status).toBe(204);
+      },
+      "revoked-partial-body",
+    );
+    expect(revokedResponse).toContain("HTTP/1.1 401");
+    expect(revokedResponse).toContain('"code":"unauthorized"');
+
+    const threads = await jsonRequest<{ items: readonly unknown[] }>(
+      `${harness.origin}/api/v1/channels/channel-general/threads?projectId=project-sample`,
+    );
+    expect(threads.items).toEqual([]);
+  });
+
   it("expires browser sessions on the server", async () => {
     const harness = await startHarness({ sessionDurationMs: 20 });
     const session = await fetch(`${harness.origin}/api/v1/session`, {
@@ -330,6 +375,55 @@ describe("Torsor HTTP and SSE service", () => {
     expect(firstEvent.occurredAt <= secondEvent.occurredAt).toBe(true);
   });
 
+  it("replays through bounded authorized event queries without Thread projection rebuilds", async () => {
+    const harness = await startHarness({ eventBatchSize: 5 });
+    for (let index = 0; index < 20; index += 1) {
+      await command(harness.origin, "start-thread", {
+        idempotencyKey: `bounded-replay-${index}`,
+        projectId: "project-sample",
+        channelId: "channel-general",
+        body: `Bounded replay event ${index}.`,
+      });
+    }
+
+    const eventQueryHook = Symbol.for(
+      "torsor.kernel.authorized-public-event-query",
+    );
+    const originalQuery = Reflect.get(
+      TorsorKernel.prototype,
+      "query",
+    ) as Function;
+    let eventQueryCount = 0;
+    let threadProjectionQueryCount = 0;
+    Reflect.set(globalThis, eventQueryHook, () => {
+      eventQueryCount += 1;
+    });
+    Reflect.set(
+      TorsorKernel.prototype,
+      "query",
+      function (
+        this: TorsorKernel,
+        query: Readonly<{ type: string }>,
+        context: PrincipalContext,
+      ) {
+        if (query.type === "GetThreadProjection") {
+          threadProjectionQueryCount += 1;
+        }
+        return Reflect.apply(originalQuery, this, [query, context]);
+      },
+    );
+    try {
+      const events = await collectEvents(harness.origin, null, 20);
+      expect(events).toHaveLength(20);
+    } finally {
+      Reflect.deleteProperty(globalThis, eventQueryHook);
+      Reflect.set(TorsorKernel.prototype, "query", originalQuery);
+    }
+    expect(eventQueryCount).toBeGreaterThanOrEqual(4);
+    expect(eventQueryCount).toBeLessThanOrEqual(6);
+    expect(threadProjectionQueryCount).toBe(0);
+  });
+
   it("shares durable data across concurrent clients while pagination stays stable", async () => {
     const harness = await startHarness();
     const [left, right] = await Promise.all([
@@ -375,6 +469,94 @@ describe("Torsor HTTP and SSE service", () => {
     expect(secondPage.items).toHaveLength(1);
   });
 
+  it("returns Thread and Run projections exactly as of the first-page snapshot", async () => {
+    const directory = await temporaryDirectory();
+    const databasePath = join(directory, "torsor.sqlite");
+    const firstRun = await seedRun(databasePath, "snapshot-run-first");
+    const secondRun = await seedRun(databasePath, "snapshot-run-second");
+    const harness = await startHarness({ databasePath });
+
+    const firstThreadPage = await jsonRequest<{
+      items: ReadonlyArray<{ threadRootId: string }>;
+      nextCursor: string;
+      snapshotEventId: string;
+    }>(
+      `${harness.origin}/api/v1/channels/channel-general/threads?projectId=project-sample&limit=1`,
+    );
+    const historicalThreads = await jsonRequest<{
+      items: ReadonlyArray<{
+        threadRootId: string;
+        messages: readonly unknown[];
+      }>;
+    }>(
+      `${harness.origin}/api/v1/channels/channel-general/threads?projectId=project-sample&limit=10&snapshot=${encodeURIComponent(firstThreadPage.snapshotEventId)}`,
+    );
+    const secondThread = historicalThreads.items.find(
+      (thread) => thread.threadRootId !== firstThreadPage.items[0]!.threadRootId,
+    )!;
+
+    await command(harness.origin, "reply-to-thread", {
+      idempotencyKey: "snapshot-thread-mutation",
+      threadRootId: secondThread.threadRootId,
+      body: "This reply is newer than the page snapshot.",
+    });
+    await command(harness.origin, "start-thread", {
+      idempotencyKey: "snapshot-thread-late",
+      projectId: "project-sample",
+      channelId: "channel-general",
+      body: "This Thread is newer than the page snapshot.",
+    });
+
+    const secondThreadPage = await jsonRequest<{
+      items: ReadonlyArray<{ messages: readonly unknown[] }>;
+      hasMore: boolean;
+      snapshotEventId: string;
+    }>(
+      `${harness.origin}/api/v1/channels/channel-general/threads?projectId=project-sample&limit=1&after=${encodeURIComponent(firstThreadPage.nextCursor)}&snapshot=${encodeURIComponent(firstThreadPage.snapshotEventId)}`,
+    );
+    expect(secondThreadPage.items[0]?.messages).toHaveLength(1);
+    expect(secondThreadPage.hasMore).toBe(false);
+    expect(secondThreadPage.snapshotEventId).toBe(
+      firstThreadPage.snapshotEventId,
+    );
+
+    const firstRunPage = await jsonRequest<{
+      items: ReadonlyArray<{ run: { id: string } }>;
+      nextCursor: string;
+      snapshotEventId: string;
+    }>(
+      `${harness.origin}/api/v1/projects/project-sample/runs?limit=1`,
+    );
+    const secondRunId =
+      firstRunPage.items[0]!.run.id === firstRun.runId
+        ? secondRun.runId
+        : firstRun.runId;
+    await command(harness.origin, "send-to-run", {
+      idempotencyKey: "snapshot-run-mutation",
+      runId: secondRunId,
+      expectedRunRevision: 1,
+      body: "This RunInput is newer than the page snapshot.",
+    });
+    await seedRun(databasePath, "snapshot-run-late");
+
+    const secondRunPage = await jsonRequest<{
+      items: ReadonlyArray<{
+        run: { id: string; revision: number };
+        inputs: readonly unknown[];
+      }>;
+      hasMore: boolean;
+      snapshotEventId: string;
+    }>(
+      `${harness.origin}/api/v1/projects/project-sample/runs?limit=1&after=${encodeURIComponent(firstRunPage.nextCursor)}&snapshot=${encodeURIComponent(firstRunPage.snapshotEventId)}`,
+    );
+    expect(secondRunPage.items[0]).toMatchObject({
+      run: { id: secondRunId, revision: 1 },
+    });
+    expect(secondRunPage.items[0]?.inputs).toHaveLength(1);
+    expect(secondRunPage.hasMore).toBe(false);
+    expect(secondRunPage.snapshotEventId).toBe(firstRunPage.snapshotEventId);
+  });
+
   it("rejects reversed and nonexistent pagination windows", async () => {
     const harness = await startHarness();
     await command(harness.origin, "start-thread", {
@@ -398,7 +580,7 @@ describe("Torsor HTTP and SSE service", () => {
     );
     expect(reversed.status).toBe(400);
     expect(await reversed.json()).toMatchObject({
-      error: { code: "invalid_cursor_window" },
+      error: { code: "invalid_command" },
     });
 
     const nonexistent = await fetch(
@@ -408,6 +590,52 @@ describe("Torsor HTTP and SSE service", () => {
     expect(nonexistent.status).toBe(404);
     expect(await nonexistent.json()).toMatchObject({
       error: { code: "not_found" },
+    });
+  });
+
+  it("does not distinguish foreign Project cursors from nonexistent cursors", async () => {
+    const harness = await startHarness();
+    await command(harness.origin, "start-thread", {
+      idempotencyKey: "foreign-cursor-thread",
+      projectId: "project-other",
+      channelId: "channel-other",
+      body: "This cursor belongs to another Project.",
+    });
+    const foreignPage = await jsonRequest<{ snapshotEventId: string }>(
+      `${harness.origin}/api/v1/channels/channel-other/threads?projectId=project-other`,
+    );
+
+    const capture = async (url: string) => {
+      const response = await fetch(url, { headers: authorization() });
+      const body = (await response.json()) as {
+        error?: { requestId?: string; [key: string]: unknown };
+      };
+      if (body.error) {
+        delete body.error.requestId;
+      }
+      return {
+        status: response.status,
+        body,
+      };
+    };
+    const foreignProjection = await capture(
+      `${harness.origin}/api/v1/channels/channel-general/threads?projectId=project-sample&snapshot=${encodeURIComponent(foreignPage.snapshotEventId)}`,
+    );
+    const missingProjection = await capture(
+      `${harness.origin}/api/v1/channels/channel-general/threads?projectId=project-sample&snapshot=event-does-not-exist`,
+    );
+    expect(foreignProjection).toEqual(missingProjection);
+
+    const foreignReplay = await capture(
+      `${harness.origin}/api/v1/events?projectId=project-sample&cursor=${encodeURIComponent(foreignPage.snapshotEventId)}`,
+    );
+    const missingReplay = await capture(
+      `${harness.origin}/api/v1/events?projectId=project-sample&cursor=event-does-not-exist`,
+    );
+    expect(foreignReplay).toEqual(missingReplay);
+    expect(foreignReplay).toMatchObject({
+      status: 404,
+      body: { error: { code: "not_found" } },
     });
   });
 
@@ -481,18 +709,30 @@ describe("Torsor HTTP and SSE service", () => {
     expect(replay[0]?.entityId).toBe(body.result.entityId);
   });
 
-  it("reports agent configuration and current durable status", async () => {
+  it("uses authoritative Attention and Run Activation status precedence", async () => {
     const directory = await temporaryDirectory();
     const databasePath = join(directory, "torsor.sqlite");
-    await seedRun(databasePath);
-    const harness = await startHarness({ databasePath });
+    let now = new Date("2026-09-22T00:00:00.000Z");
+    const attention = await seedAttentionActivation(
+      databasePath,
+      "agent-status",
+      () => now,
+    );
+    const harness = await startHarness({
+      databasePath,
+      clock: () => now,
+    });
+
     const agents = await jsonRequest<{
       items: ReadonlyArray<{
         id: string;
         configRevision: number;
         config: unknown;
         status: string;
-        runCounts: { active: number };
+        liveRunActivationCount: number;
+        liveAttentionActivationCount: number;
+        liveActivationCount: number;
+        nonterminalRunCount: number;
       }>;
     }>(`${harness.origin}/api/v1/projects/project-sample/agents`);
     expect(agents.items[0]).toMatchObject({
@@ -500,7 +740,125 @@ describe("Torsor HTTP and SSE service", () => {
       configRevision: 3,
       config: { model: "deterministic-fake", mode: "read-only" },
       status: "active",
-      runCounts: { active: 1 },
+      liveRunActivationCount: 0,
+      liveAttentionActivationCount: 1,
+      liveActivationCount: 1,
+      nonterminalRunCount: 0,
+    });
+
+    const kernel = TorsorKernel.open({
+      databasePath,
+      bootstrap,
+      clock: () => now,
+    });
+    let runId: string;
+    try {
+      const resolved = await kernel.execute(
+        {
+          type: "ResolveAttentionWithRun",
+          idempotencyKey: "agent-status-resolve",
+          attentionId: attention.attentionId,
+          expectedAttentionRevision: attention.attentionRevision,
+          handlerLeaseToken: attention.handlerLeaseToken,
+        },
+        attention.agentContext,
+      );
+      runId = resolved.entityId;
+    } finally {
+      kernel.close();
+    }
+    let current = await jsonRequest<{
+      items: ReadonlyArray<{
+        status: string;
+        liveAttentionActivationCount: number;
+        nonterminalRunCount: number;
+      }>;
+    }>(`${harness.origin}/api/v1/projects/project-sample/agents`);
+    expect(current.items[0]).toMatchObject({
+      status: "waiting",
+      liveAttentionActivationCount: 0,
+      nonterminalRunCount: 1,
+    });
+
+    const activationKernel = TorsorKernel.open({
+      databasePath,
+      bootstrap,
+      clock: () => now,
+    });
+    let runActivationId: string;
+    try {
+      const activation = await activationKernel.execute(
+        {
+          type: "StartActivation",
+          idempotencyKey: "agent-status-run-activation",
+          runId,
+          expectedRunRevision: 1,
+        },
+        runtimeContext,
+      );
+      runActivationId = activation.entityId;
+    } finally {
+      activationKernel.close();
+    }
+    current = await jsonRequest(
+      `${harness.origin}/api/v1/projects/project-sample/agents`,
+    );
+    expect(current.items[0]).toMatchObject({
+      status: "active",
+      nonterminalRunCount: 1,
+    });
+
+    const finishKernel = TorsorKernel.open({
+      databasePath,
+      bootstrap,
+      clock: () => now,
+    });
+    try {
+      await finishKernel.execute(
+        {
+          type: "FinishActivation",
+          idempotencyKey: "agent-status-finish-run",
+          activationId: runActivationId,
+          outcome: "Completed",
+        },
+        {
+          principalId: "principal-orbit",
+          activationId: runActivationId,
+        },
+      );
+    } finally {
+      finishKernel.close();
+    }
+    current = await jsonRequest(
+      `${harness.origin}/api/v1/projects/project-sample/agents`,
+    );
+    expect(current.items[0]).toMatchObject({
+      status: "waiting",
+      liveActivationCount: 0,
+      nonterminalRunCount: 1,
+    });
+
+    await seedAttentionActivation(
+      databasePath,
+      "agent-status-expiring",
+      () => now,
+      1_000,
+    );
+    current = await jsonRequest(
+      `${harness.origin}/api/v1/projects/project-sample/agents`,
+    );
+    expect(current.items[0]).toMatchObject({
+      status: "active",
+      liveAttentionActivationCount: 1,
+    });
+    now = new Date(now.getTime() + 1_001);
+    current = await jsonRequest(
+      `${harness.origin}/api/v1/projects/project-sample/agents`,
+    );
+    expect(current.items[0]).toMatchObject({
+      status: "waiting",
+      liveAttentionActivationCount: 0,
+      liveActivationCount: 0,
     });
   });
 
@@ -559,6 +917,7 @@ describe("Torsor HTTP and SSE service", () => {
         },
       ],
       port: 0,
+      eventBatchSize: 1,
       eventPollIntervalMs: 5,
       heartbeatIntervalMs: 20,
     });
@@ -580,10 +939,43 @@ describe("Torsor HTTP and SSE service", () => {
     expect(response.status).toBe(200);
     const reader = response.body!.getReader();
     const firstChunk = await reader.read();
-    controller.abort();
-    await reader.cancel().catch(() => undefined);
     const text = new TextDecoder().decode(firstChunk.value);
     expect(text).toMatch(/^: heartbeat /);
+
+    const activityKernel = TorsorKernel.open({ databasePath, bootstrap });
+    try {
+      await activityKernel.execute(
+        {
+          type: "AppendRunActivity",
+          idempotencyKey: "agent-event-visible-activity",
+          runId: seeded.runId,
+          activationId,
+          kind: "progress",
+          payload: { detail: "Visible after a fully filtered page." },
+          retentionClass: "durable",
+        },
+        {
+          principalId: "principal-orbit",
+          activationId,
+        },
+      );
+    } finally {
+      activityKernel.close();
+    }
+    const secondChunk = await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("Visible event was starved after a filtered page.")),
+          1_000,
+        ),
+      ),
+    ]);
+    expect(new TextDecoder().decode(secondChunk.value)).toContain(
+      '"type":"RunActivityAppended"',
+    );
+    controller.abort();
+    await reader.cancel().catch(() => undefined);
   });
 
   it("rejects incompatible development schemas on service startup", async () => {
@@ -635,6 +1027,70 @@ describe("Torsor HTTP and SSE service", () => {
     ]);
     socket.destroy();
   });
+
+  it("serializes concurrent listen and close without leaving a listener", async () => {
+    const directory = await temporaryDirectory();
+    const service = createTorsorHttpService({
+      databasePath: join(directory, "torsor.sqlite"),
+      bootstrap,
+      credentials,
+      port: 0,
+    });
+    const listenPromise = service.listen();
+    const closePromise = service.close();
+    const [listenResult, closeResult] = await Promise.allSettled([
+      listenPromise,
+      closePromise,
+    ]);
+    expect(closeResult.status).toBe("fulfilled");
+    expect(listenResult.status).toBe("fulfilled");
+    const origin = (listenResult as PromiseFulfilledResult<string>).value;
+    await expect(fetch(`${origin}/health`)).rejects.toThrow();
+
+    await Promise.all([service.close(), service.close(), service.close()]);
+    await expect(service.listen()).rejects.toThrow(
+      "The HTTP service is closed.",
+    );
+  });
+
+  it("cleans up after startup failure and keeps later close idempotent", async () => {
+    const blocker = createHttpServer();
+    blocker.listen(0, "127.0.0.1");
+    await once(blocker, "listening");
+    const address = blocker.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Expected a TCP blocker address.");
+    }
+    const directory = await temporaryDirectory();
+    const databasePath = join(directory, "torsor.sqlite");
+    const service = createTorsorHttpService({
+      databasePath,
+      bootstrap,
+      credentials,
+      host: "127.0.0.1",
+      port: address.port,
+    });
+
+    await expect(service.listen()).rejects.toMatchObject({
+      code: "EADDRINUSE",
+    });
+    await Promise.all([service.close(), service.close()]);
+    await expect(service.listen()).rejects.toThrow(
+      "The HTTP service is closed.",
+    );
+
+    blocker.close();
+    await once(blocker, "close");
+    const replacement = createTorsorHttpService({
+      databasePath,
+      bootstrap,
+      credentials,
+      port: 0,
+    });
+    const origin = await replacement.listen();
+    expect((await fetch(`${origin}/health`)).status).toBe(200);
+    await replacement.close();
+  });
 });
 
 interface Harness {
@@ -649,6 +1105,7 @@ async function startHarness(
     readonly eventPollIntervalMs?: number;
     readonly heartbeatIntervalMs?: number;
     readonly sessionDurationMs?: number;
+    readonly clock?: () => Date;
   } = {},
 ): Promise<Harness> {
   const databasePath =
@@ -670,6 +1127,7 @@ async function startHarness(
     ...(options.sessionDurationMs
       ? { sessionDurationMs: options.sessionDurationMs }
       : {}),
+    ...(options.clock ? { clock: options.clock } : {}),
   });
   const origin = await service.listen();
   cleanup.push(() => service.close());
@@ -684,13 +1142,19 @@ async function temporaryDirectory(): Promise<string> {
 
 async function seedRun(
   databasePath: string,
+  prefix = "seed",
+  clock?: () => Date,
 ): Promise<{ readonly runId: string }> {
-  const kernel = TorsorKernel.open({ databasePath, bootstrap });
+  const kernel = TorsorKernel.open({
+    databasePath,
+    bootstrap,
+    ...(clock ? { clock } : {}),
+  });
   try {
     const thread = await kernel.execute(
       {
         type: "StartThread",
-        idempotencyKey: "seed-thread",
+        idempotencyKey: `${prefix}-thread`,
         projectId: "project-sample",
         channelId: "channel-general",
         body: "Orbit, create a durable Run.",
@@ -710,7 +1174,7 @@ async function seedRun(
     const claim = await kernel.execute(
       {
         type: "ClaimAttention",
-        idempotencyKey: "seed-claim",
+        idempotencyKey: `${prefix}-claim`,
         attentionId: attention.id,
         expectedAttentionRevision: attention.revision,
         leaseDurationMs: 30_000,
@@ -720,7 +1184,7 @@ async function seedRun(
     const activation = await kernel.execute(
       {
         type: "StartActivation",
-        idempotencyKey: "seed-attention-activation",
+        idempotencyKey: `${prefix}-attention-activation`,
         attentionId: attention.id,
         handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
       },
@@ -729,7 +1193,7 @@ async function seedRun(
     const run = await kernel.execute(
       {
         type: "ResolveAttentionWithRun",
-        idempotencyKey: "seed-run",
+        idempotencyKey: `${prefix}-run`,
         attentionId: attention.id,
         expectedAttentionRevision: claim.revision!,
         handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
@@ -744,6 +1208,131 @@ async function seedRun(
   } finally {
     kernel.close();
   }
+}
+
+async function seedAttentionActivation(
+  databasePath: string,
+  prefix: string,
+  clock: () => Date,
+  durationMs = 30_000,
+): Promise<{
+  readonly attentionId: string;
+  readonly attentionRevision: number;
+  readonly handlerLeaseToken: string;
+  readonly activationId: string;
+  readonly agentContext: PrincipalContext;
+}> {
+  const kernel = TorsorKernel.open({ databasePath, bootstrap, clock });
+  try {
+    await kernel.execute(
+      {
+        type: "StartThread",
+        idempotencyKey: `${prefix}-thread`,
+        projectId: "project-sample",
+        channelId: "channel-general",
+        body: "Orbit, inspect this synthetic Attention.",
+        targetAgentIds: ["agent-orbit"],
+      },
+      humanContext,
+    );
+    const attentionPage = await kernel.query(
+      {
+        type: "ListOpenAttentions",
+        projectId: "project-sample",
+        targetAgentId: "agent-orbit",
+      },
+      runtimeContext,
+    );
+    const attention = attentionPage.items.at(-1)!;
+    const claim = await kernel.execute(
+      {
+        type: "ClaimAttention",
+        idempotencyKey: `${prefix}-claim`,
+        attentionId: attention.id,
+        expectedAttentionRevision: attention.revision,
+        leaseDurationMs: Math.max(durationMs, 1_000),
+      },
+      runtimeContext,
+    );
+    const activation = await kernel.execute(
+      {
+        type: "StartActivation",
+        idempotencyKey: `${prefix}-activation`,
+        attentionId: attention.id,
+        handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
+        durationMs,
+      },
+      runtimeContext,
+    );
+    return {
+      attentionId: attention.id,
+      attentionRevision: claim.revision!,
+      handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
+      activationId: activation.entityId,
+      agentContext: {
+        principalId: "principal-orbit",
+        activationId: activation.entityId,
+      },
+    };
+  } finally {
+    kernel.close();
+  }
+}
+
+async function createBrowserSession(
+  origin: string,
+): Promise<{ readonly cookie: string; readonly csrfToken: string }> {
+  const response = await fetch(`${origin}/api/v1/session`, {
+    method: "POST",
+    headers: authorization(),
+  });
+  expect(response.status).toBe(201);
+  const body = (await response.json()) as { csrfToken: string };
+  return {
+    cookie: response.headers.get("set-cookie")!.split(";")[0]!,
+    csrfToken: body.csrfToken,
+  };
+}
+
+async function sendPartialCookieCommand(
+  origin: string,
+  session: { readonly cookie: string; readonly csrfToken: string },
+  whilePaused: () => Promise<void>,
+  idempotencyKey: string,
+): Promise<string> {
+  const address = new URL(origin);
+  const body = JSON.stringify({
+    idempotencyKey,
+    projectId: "project-sample",
+    channelId: "channel-general",
+    body: "This command must not execute after session invalidation.",
+  });
+  const midpoint = Math.floor(body.length / 2);
+  const socket = createConnection({
+    host: address.hostname,
+    port: Number(address.port),
+  });
+  socket.setEncoding("utf8");
+  const chunks: string[] = [];
+  socket.on("data", (chunk: string) => chunks.push(chunk));
+  await once(socket, "connect");
+  socket.write(
+    [
+      "POST /api/v1/commands/start-thread HTTP/1.1",
+      `Host: ${address.host}`,
+      `Cookie: ${session.cookie}`,
+      `X-Torsor-CSRF: ${session.csrfToken}`,
+      "Content-Type: application/json",
+      `Content-Length: ${Buffer.byteLength(body)}`,
+      "Connection: close",
+      "",
+      body.slice(0, midpoint),
+    ].join("\r\n"),
+  );
+  await whilePaused();
+  socket.write(body.slice(midpoint));
+  await once(socket, "close");
+  return chunks.join("");
 }
 
 async function command(
