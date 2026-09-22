@@ -1,5 +1,6 @@
 import {
   AgentRuntime,
+  type AgentRuntimeHooks,
   type ProviderAdapter,
   type RuntimePassResult,
 } from "@torsor/agent-runtime";
@@ -37,6 +38,7 @@ export interface LocalRuntimeHostOptions {
   readonly providerTimeoutMs?: number;
   readonly cancellationPollMs?: number;
   readonly leaseSafetyMs?: number;
+  readonly runtimeHooks?: AgentRuntimeHooks;
   readonly clock?: () => Date;
   readonly idFactory?: (prefix: string) => string;
 }
@@ -54,8 +56,8 @@ class Host implements LocalRuntimeHost {
   readonly #runtime: AgentRuntime;
   readonly #runtimePollIntervalMs: number;
   readonly #started = deferred<string>();
-  readonly #stopped = deferred<void>();
   readonly #finished = deferred<void>();
+  readonly #stopController = new AbortController();
   #state: "created" | "starting" | "running" | "closing" | "closed" =
     "created";
   #lifecyclePromise: Promise<void> | null = null;
@@ -108,7 +110,7 @@ class Host implements LocalRuntimeHost {
     }
     if (this.#state !== "closed") {
       this.#state = "closing";
-      this.#stopped.resolve();
+      this.#requestStop();
       this.#beginServiceClose();
     }
     if (this.#lifecyclePromise) {
@@ -129,7 +131,7 @@ class Host implements LocalRuntimeHost {
       this.#started.reject(error);
     } finally {
       this.#state = "closing";
-      this.#stopped.resolve();
+      this.#requestStop();
       try {
         await this.#beginServiceClose();
       } catch (error) {
@@ -150,20 +152,23 @@ class Host implements LocalRuntimeHost {
   }
 
   async #runRuntimeLoop(): Promise<void> {
-    while (!this.#stopped.settled) {
+    const signal = this.#stopController.signal;
+    while (!signal.aborted) {
       const result = await this.#runtime.runOnce();
+      if (signal.aborted) {
+        return;
+      }
       if (isIdle(result)) {
-        await Promise.race([
-          delay(this.#runtimePollIntervalMs),
-          this.#stopped.promise,
-        ]);
+        await interruptibleDelay(this.#runtimePollIntervalMs, signal);
+      } else {
+        await yieldToEventLoop();
       }
     }
   }
 
   async #closeBeforeStart(): Promise<void> {
     let failure: { readonly error: unknown } | null = null;
-    this.#stopped.resolve();
+    this.#requestStop();
     try {
       await this.#beginServiceClose();
     } catch (error) {
@@ -180,6 +185,12 @@ class Host implements LocalRuntimeHost {
       throw failure.error;
     }
     this.#finished.resolve();
+  }
+
+  #requestStop(): void {
+    if (!this.#stopController.signal.aborted) {
+      this.#stopController.abort();
+    }
   }
 
   #beginServiceClose(): Promise<void> {
@@ -256,6 +267,7 @@ export function createLocalRuntimeHost(
       ...(options.leaseSafetyMs !== undefined
         ? { leaseSafetyMs: options.leaseSafetyMs }
         : {}),
+      ...(options.runtimeHooks ? { hooks: options.runtimeHooks } : {}),
       ...(options.clock ? { clock: options.clock } : {}),
     });
     return new Host(
@@ -312,8 +324,40 @@ function isIdle(result: RuntimePassResult): boolean {
   );
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+async function interruptibleDelay(
+  milliseconds: number,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    let timer: ReturnType<typeof setTimeout>;
+    let settled = false;
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      resolve();
+    };
+    const abort = () => {
+      finish();
+    };
+    timer = setTimeout(finish, milliseconds);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    timer.unref();
+  });
+}
+
+async function yieldToEventLoop(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 function positiveInteger(value: number, name: string): number {

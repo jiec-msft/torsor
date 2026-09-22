@@ -11,6 +11,10 @@ bounded Runtime pass, and then closes the Kernel. Startup, Runtime-loop, and
 shutdown failures reject the host lifecycle and make the executable exit
 unsuccessfully.
 
+The Runtime loop yields to the event loop after each busy pass and rechecks
+shutdown before continuing. Idle polling uses one interruptible timer whose
+shutdown listener and timer are removed as soon as either side completes.
+
 Build the workspace, then start the host with a local Human credential and a
 Runtime principal:
 

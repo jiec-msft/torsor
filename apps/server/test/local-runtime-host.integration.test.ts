@@ -3,12 +3,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { DeterministicFakeAdapter } from "@torsor/agent-runtime";
+import type { AgentRuntimeHooks } from "@torsor/agent-runtime";
 import {
   TorsorKernel,
   type KernelBootstrap,
   type ThreadProjection,
 } from "@torsor/kernel";
-import { afterEach, describe, expect, it } from "vitest";
+import {
+  afterEach,
+  describe,
+  expect,
+  it,
+  type MockInstance,
+  vi,
+} from "vitest";
 
 import {
   createLocalRuntimeHost,
@@ -114,7 +122,7 @@ describe("Local runtime host", () => {
     const host = createHost(
       join(directory, "torsor.sqlite"),
       new DeterministicFakeAdapter(),
-      ["project-missing"],
+      { projectIds: ["project-missing"] },
     );
 
     await host.start();
@@ -123,12 +131,104 @@ describe("Local runtime host", () => {
     );
     expect(host.origin).toBeNull();
   });
+
+  it("yields between busy passes so shutdown interrupts an outbox backlog", async () => {
+    const directory = await temporaryDirectory();
+    const databasePath = join(directory, "torsor.sqlite");
+    const backlogSize = 100;
+    await seedOutboxBacklog(databasePath, backlogSize);
+    const firstAcknowledgement = deferred<void>();
+    const releaseFirstAcknowledgement = deferred<void>();
+    let acknowledgementCount = 0;
+    const host = createHost(
+      databasePath,
+      new DeterministicFakeAdapter(),
+      {
+        runtimePollIntervalMs: 60_000,
+        runtimeHooks: {
+          beforeOutboxAcknowledge: async () => {
+            acknowledgementCount += 1;
+            if (acknowledgementCount === 1) {
+              firstAcknowledgement.resolve();
+              await releaseFirstAcknowledgement.promise;
+            }
+          },
+        },
+      },
+    );
+    cleanup.push(() => host.close());
+
+    await host.start();
+    await firstAcknowledgement.promise;
+    let acknowledgementsWhenCloseRan = -1;
+    let closePromise: Promise<void> | undefined;
+    const closeTimer = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        acknowledgementsWhenCloseRan = acknowledgementCount;
+        closePromise = host.close();
+        resolve();
+      }, 0);
+    });
+    releaseFirstAcknowledgement.resolve();
+
+    await closeTimer;
+    await closePromise;
+
+    expect(acknowledgementsWhenCloseRan).toBeGreaterThan(0);
+    expect(acknowledgementsWhenCloseRan).toBeLessThan(backlogSize);
+  });
+
+  it("cleans idle polling listeners and timers across repeated passes", async () => {
+    vi.useFakeTimers();
+    const addListener = vi.spyOn(AbortSignal.prototype, "addEventListener");
+    const removeListener = vi.spyOn(
+      AbortSignal.prototype,
+      "removeEventListener",
+    );
+    const directory = await temporaryDirectory();
+    const host = createHost(
+      join(directory, "torsor.sqlite"),
+      new DeterministicFakeAdapter(),
+      { runtimePollIntervalMs: 60_000 },
+    );
+
+    try {
+      await host.start();
+      await waitForTimerCount(1);
+
+      for (let pass = 0; pass < 3; pass += 1) {
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(vi.getTimerCount()).toBe(1);
+      }
+      expect(abortListenerCount(addListener)).toBe(
+        abortListenerCount(removeListener) + 1,
+      );
+
+      await host.close();
+
+      expect(vi.getTimerCount()).toBe(0);
+      expect(abortListenerCount(addListener)).toBe(
+        abortListenerCount(removeListener),
+      );
+    } finally {
+      await host.close();
+      addListener.mockRestore();
+      removeListener.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 });
+
+interface HostTestOptions {
+  readonly projectIds?: readonly string[];
+  readonly runtimePollIntervalMs?: number;
+  readonly runtimeHooks?: AgentRuntimeHooks;
+}
 
 function createHost(
   databasePath: string,
   adapter: DeterministicFakeAdapter,
-  projectIds: readonly string[] = ["project-sample"],
+  options: HostTestOptions = {},
 ): LocalRuntimeHost {
   return createLocalRuntimeHost({
     databasePath,
@@ -140,11 +240,35 @@ function createHost(
       },
     ],
     runtimePrincipalId: "principal-runtime",
-    projectIds,
+    projectIds: options.projectIds ?? ["project-sample"],
     adapter,
     port: 0,
-    runtimePollIntervalMs: 5,
+    runtimePollIntervalMs: options.runtimePollIntervalMs ?? 5,
+    ...(options.runtimeHooks ? { runtimeHooks: options.runtimeHooks } : {}),
   });
+}
+
+async function seedOutboxBacklog(
+  databasePath: string,
+  itemCount: number,
+): Promise<void> {
+  const kernel = TorsorKernel.open({ databasePath, bootstrap });
+  try {
+    for (let index = 0; index < itemCount; index += 1) {
+      await kernel.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: `busy-backlog:${index}`,
+          projectId: "project-sample",
+          channelId: "channel-general",
+          body: `Synthetic backlog item ${index}.`,
+        },
+        { principalId: "principal-human" },
+      );
+    }
+  } finally {
+    kernel.close();
+  }
 }
 
 async function waitForCompletedThread(
@@ -169,6 +293,35 @@ async function waitForCompletedThread(
 
 function authorization(): Record<string, string> {
   return { Authorization: ["Bearer", "human-token"].join(" ") };
+}
+
+interface TestDeferred<T> {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+}
+
+function deferred<T>(): TestDeferred<T> {
+  let resolvePromise!: (value: T) => void;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: resolvePromise };
+}
+
+async function waitForTimerCount(expected: number): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (vi.getTimerCount() === expected) {
+      return;
+    }
+    await Promise.resolve();
+  }
+  expect(vi.getTimerCount()).toBe(expected);
+}
+
+function abortListenerCount(
+  spy: MockInstance,
+): number {
+  return spy.mock.calls.filter((call) => call[0] === "abort").length;
 }
 
 async function temporaryDirectory(): Promise<string> {

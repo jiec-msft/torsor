@@ -755,6 +755,8 @@ One database transaction covers Message plus Attention, RunInput plus delivery s
 
 Runtime periodically recovers unfinished Outbox work, expired Activation, Unknown ProviderAttempt, Open Attention, suspect Writer Lease, and incomplete Artifact finalization. Recovery continues to use idempotency keys.
 
+The Runtime Host must bound consecutive recovery passes, yield to the event loop before continuing, and recheck shutdown. Backlog processing must not starve HTTP, timers, signals, or shutdown handling. Idle polling waits must be interruptible by shutdown and must remove their listener and cancel any no-longer-needed timer regardless of which side completes first.
+
 ## 22. Worktree and Writer Lease
 
 ### 22.1 Ownership
