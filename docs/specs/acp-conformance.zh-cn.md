@@ -25,7 +25,7 @@ Paseo 根 [LICENSE](https://github.com/getpaseo/paseo/blob/91d9cf1dbd0c095c8971d
 
 **复用决定：**直接依赖 Apache-2.0 的 `@agentclientprotocol/sdk` **1.4.0**，其公开源码 Commit 为 [`e6463f444093ed7c5f1cc937c3f32afb5853e906`](https://github.com/agentclientprotocol/typescript-sdk/tree/e6463f444093ed7c5f1cc937c3f32afb5853e906)。使用稳定 v1 `client()` / `agent()` / `ndJsonStream`，不使用弃用连接类、私有测试工具或 experimental v2。复用请求关联、双向方法派发和协议类型；Harness 只补充严格 Wire 观察、场景执行、断言、预算、进程所有权和公开 Artifact 策略。SDK 的未终止行缓冲和合作式取消不提供敌对输出/整体期限保证，因此必须在其外层限制。Zod（MIT）提供唯一配置 Schema，YAML（ISC）只负责解析；不引入第二套验证规则。
 
-Windows 原生边界复用 MIT 的 [`koffi` 3.2.0](https://www.npmjs.com/package/koffi/v/3.2.0) 公开 FFI / Struct API 绑定[文档化 Job Object API](https://learn.microsoft.com/windows/win32/procthread/job-objects)，不自行维护 Native Addon。其按平台发布的预编译包支持 Windows x86/x64/ARM64；仅 Windows 所有权子进程加载它。GitHub Windows 运行曾在 PowerShell `Add-Type` 编译阶段超时，因此不再依赖运行时编译或 PowerShell Guardian；原生绑定不可用时明确失败，不降级为可能遗漏孤儿进程的 PID 树遍历。
+原生边界复用 MIT 的 [`koffi` 3.2.0](https://www.npmjs.com/package/koffi/v/3.2.0) 公开 FFI / Struct API 绑定[文档化 Job Object API](https://learn.microsoft.com/windows/win32/procthread/job-objects)，不自行维护 Native Addon。其按平台发布的预编译包支持 Windows x86/x64/ARM64；Windows 所有权子进程及 Windows/Linux CLI Artifact 发布器按需加载它。GitHub Windows 运行曾在 PowerShell `Add-Type` 编译阶段超时，因此不再依赖运行时编译或 PowerShell Guardian；原生绑定不可用时明确失败，不降级为可能遗漏孤儿进程的 PID 树遍历。
 
 ## 2. 公共接口和范围
 
@@ -38,15 +38,27 @@ Package 遵循现有 ESM / TypeScript Workspace 约定，但不依赖任何 Tors
 - `acp-conformance run <scenario...> [--out <directory>] [--allow-real] [--profile copilot-cli-v1 | -- <command> <args...>]`。显式 `--inherit-env NAME` 只传递被授权的环境值，不打印或记录它们。
 - `acp-conformance mock <scenario>`：运行确定性的声明式 stdio 对端，可供其他 ACP Client 使用。
 
-CLI 退出码：`0` 全部通过；`1` 场景失败；`2` 配置、用法或 Artifact I/O 错误；`3` 未启用真实 Provider 导致跳过。Human 输出只含场景 ID、步骤和固定诊断；`--out` 保存每场景 `.result.json` / `.transcript.jsonl`，不覆盖现有文件。真实 Provider 没有自动安装、登录、认证或重试。
+CLI 退出码：`0` 全部通过；`1` 场景失败；`2` 配置、用法或 Artifact I/O 错误；`3` 未启用真实 Provider 导致跳过。Human 输出只含场景 ID、步骤和固定诊断；`--out` 保存每场景 `<id>.artifacts/` Bundle，不覆盖任何现有目标。真实 Provider 没有自动安装、登录、认证或重试。
 
-每个场景的 Artifact 对先独占预留两个目标，再写入内容。任一目标已存在时保留现有文件，关闭并删除本次已创建的预留文件；拒绝覆盖后不留下新的半对 Artifact，可在调用者移除冲突后直接重试。写入/关闭失败也回滚本次新建文件，回滚失败明确返回 I/O 错误。此保证按场景对生效，不是跨场景事务，也不承诺进程崩溃或掉电时的二文件原子提交。
+### 2.1 可恢复的 Artifact 发布
+
+预发布阶段以 Bundle 干净替换旧的平铺文件，不自动迁移或删除旧文件。消费者只读取最终 `<id>.artifacts/` 中的 `result.json`、`transcript.jsonl` 和 `manifest.json`。Manifest 使用 `schemaVersion: 1`、`kind: "acp-artifact-bundle"`、场景 `id`、随机 `commitId` 及两个数据文件的 UTF-8 字节数和 SHA-256；不包含路径、环境、原始协议内容或机器身份。只有单次原子目录发布才构成提交，隐藏暂存目录从不是 Artifact。
+
+每次尝试在输出目录内独占创建 `.acp-artifact-<id>-<UUID>/`，内含 `claim.json` 和 `bundle/`。先独占创建 Bundle 的三个隐藏文件，再将不可变 Claim 写入并同步，随后写入并同步三个文件。Claim 最多 8 KiB，使用版本 1、`kind: "acp-artifact-attempt"`、`state: "staging"`、场景 ID、UUID、固定目标名称，以及尝试目录、Claim、Bundle 和三个文件的设备/文件身份；没有可解析为任意路径的字段。整个尝试持有 Claim 的非阻塞独占 OS 锁。锁随进程终止释放，不使用 PID、时钟、TTL 或文件名猜测所有权。
+
+完成暂存后，一次同文件系统、禁止替换的目录 Rename 发布 Bundle：Windows 使用 `MoveFileExW`（无 replace/copy 标志），Linux 使用 `renameat2(RENAME_NOREPLACE)`。绝不以最终路径作为临时预留，也不回退到可覆盖的 Node Rename。目标为任何已有文件、目录（包括空目录）、Symlink 或 Junction 时保留原状并返回 `2`。本切片支持具有这些原语和稳定文件身份的 Windows/Linux 本地文件系统；缺失原语、其他平台和不支持的文件系统明确失败。文件使用 `sync`，Linux 还同步相关目录；不承诺网络文件系统、掉电后的磁盘持久性或跨场景事务。
+
+每次普通运行在新建尝试前恢复同场景的旧尝试，最多扫描 4096 个直接子项、处理 128 个候选；超额或身份不明残留保留并给出固定警告。恢复必须先获得同一 OS 锁，再重新验证：严格规范化 JSON、版本/状态/ID/UUID 与目录名相符、Claim 句柄与路径身份相同、所有目录和存在的文件身份匹配、没有链接或额外条目。缺失条目仅用于容忍已中断的清理。损坏、过大、复制、未知版本或身份不匹配的 Claim 不能授权删除；仅占用约定文件名也不够。
+
+清理只逐个删除已验证的暂存文件，随后删除空 Bundle、Claim 和空尝试目录；不递归删除，不跟随链接，永远不修改最终 Bundle。活跃 Writer 的锁不能被恢复者抢占；并发恢复者重新校验后只有锁持有者清理。完整 Claim 形成前的中断可能留下无法证明身份的残留，必须保留；新的 UUID 使它不阻止重试。写入、同步、关闭或清理失败明确返回 I/O 错误；已知提交后的错误明确说明 Bundle 已提交。发布前重新校验暂存身份和完整文件集合，拒绝可观察到的外部修改。原子发布前的任一步骤中断后，普通 CLI 可重新运行并提交完整 Bundle；发布后、确认或清理前中断时，最终 Bundle 已经提交，重试只恢复隐藏残留并拒绝覆盖。消费者不会看到 Harness 发布的半对数据文件。
 
 ## 3. 唯一版本化配置
 
 顶层：`schemaVersion: 1`、`id`、`steps`、可选 `limits`、`mock` 和 `expectFailure`。`id` / 请求标签使用短 ASCII 标识符。JSON 和 YAML 输入进入同一 Zod Schema，默认值、未知字段和诊断完全一致。所有控制对象拒绝未知字段；ACP `params` / `result` 是有界 JSON，可以包含协议扩展字段，不把这些字段当 Harness 指令。
 
 输入最多 256 KiB、JSON 深度最多 32、最多 128 个步骤/Handler/Action；YAML 只接受 JSON 兼容核心类型，拒绝重复键、自定义 Tag、Alias、Merge Key 和多个 Document。拒绝未知 Schema 版本，不猜测向前兼容。新增控制字段必须显式升级消费者；Provider 的未知扩展不等于配置字段可以静默忽略。
+
+深层嵌套 YAML（Flow Sequence、Flow Mapping 和 Block Mapping）的解析/资源失败必须迅速返回脱敏的 `ConfigurationError`，不泄漏原始解析异常、源码或值。生产依赖使用不受已报告公告影响的 `yaml` 2.9.1（ISC）和 `ajv` 8.20.0（MIT），分别避开 GHSA-48c2-rrv3-qjmp 和 GHSA-2g4f-4pwh-qvx6 的版本范围；不启用 Ajv `$data`。升级解析器不能放宽既有大小、深度和 JSON 兼容性限制。
 
 场景 ID 拒绝 Windows 保留的设备名称，使 Artifact 名称跨平台安全；同一 CLI Suite 的 ID 大小写不敏感地唯一。
 

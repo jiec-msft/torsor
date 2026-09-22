@@ -49,9 +49,11 @@ npm exec -- acp-conformance mock packages\acp-conformance\examples\basic.json
 
 ## 结果与预算
 
-`--out <directory>` 生成每场景的 `.result.json` 和 `.transcript.jsonl`，拒绝覆盖。返回状态为 `passed`、`failed` 或 `skipped`。CLI 退出码分别为全通过 `0`、失败 `1`、配置/用法/I/O 错误 `2`、真实 Provider 未启用 `3`；失败优先于跳过。
+`--out <directory>` 生成每场景的 `<id>.artifacts/`，包含 `result.json`、`transcript.jsonl` 和记录版本、场景 ID、提交 UUID、数据文件字节数及 SHA-256 的 `manifest.json`，拒绝覆盖。返回状态为 `passed`、`failed` 或 `skipped`。CLI 退出码分别为全通过 `0`、失败 `1`、配置/用法/I/O 错误 `2`、真实 Provider 未启用 `3`；失败优先于跳过。
 
-每对文件先独占预留两个目标；任一目标冲突时不修改现有文件，并回滚本次预留，不留下新的半对 Artifact。移除冲突后可直接重试。回滚失败明确报 I/O 错误；不保证跨场景或崩溃时的原子提交。
+Bundle 是唯一的消费者提交边界，替代旧的平铺文件（不自动迁移/删除旧文件）。在唯一的隐藏尝试目录内暂存并同步完整内容，再用 Windows/Linux 同文件系统禁止替换的原子目录 Rename 发布；任何现有目标（包括空目录、文件、Symlink 或 Junction）均保持不变。不要读取隐藏暂存目录。
+
+普通重试会先通过 OS 独占锁和严格、限长、绑定文件身份的版本化 Claim 恢复死亡 Writer 的已知暂存，不依赖 PID/时间或仅凭文件名删除。清理只删除已验证的暂存文件及空目录，不跟随链接，也不修改最终 Bundle。活跃 Writer、未知/损坏 Claim、额外文件或身份变化的残留会保留；无法验证的残留给出固定警告，但唯一尝试名使它不阻止新提交。发布前终止可正常重试；发布后、确认前终止时完整 Bundle 已提交，重试保留它并拒绝覆盖。I/O/清理失败明确报错。需要 Windows/Linux 本地文件系统的原生锁、稳定文件身份和 no-replace Rename；不降级为覆盖式 Rename，也不保证网络文件系统、掉电或跨场景原子性。完整边界见[规格 §2.1](../../docs/specs/acp-conformance.zh-cn.md#21-可恢复的-artifact-发布)。
 
 Diagnostic 包含稳定 `code`、从零开始的 `step`（启动阶段为 `-1`）和不包含原始值的说明。`expectFailure` 用于测试 Harness 的错误路径；匹配时保留 Diagnostic，清理失败永不视为成功。
 

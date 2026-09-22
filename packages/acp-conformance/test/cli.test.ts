@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,24 +24,26 @@ function invoke(args: string[], closeInput = false) {
 describe("CLI and opt-in contract (spec sections 2 and 6)", () => {
   it.each(["result.json", "transcript.jsonl"])("preserves existing %s without creating a partial pair and permits clean retry", async (extension) => {
     const directory = await mkdtemp(join(tmpdir(), "acp-cli-pair-"));
-    const existing = `basic.${extension}`;
+    const existing = join(directory, "basic.artifacts");
     try {
-      await writeFile(join(directory, existing), "synthetic-existing-content\n");
+      await mkdir(existing);
+      await writeFile(join(existing, extension), "synthetic-existing-content\n");
       for (let attempt = 0; attempt < 2; attempt++) {
         expect((await invoke(["run", example, "--out", directory])).code).toBe(2);
-        expect(await readdir(directory)).toEqual([existing]);
-        expect(await readFile(join(directory, existing), "utf8")).toBe("synthetic-existing-content\n");
+        expect(await readdir(directory)).toEqual(["basic.artifacts"]);
+        expect(await readdir(existing)).toEqual([extension]);
+        expect(await readFile(join(existing, extension), "utf8")).toBe("synthetic-existing-content\n");
       }
-      await unlink(join(directory, existing));
+      await rm(existing, { recursive: true });
       expect((await invoke(["run", example, "--out", directory])).code).toBe(0);
-      expect((await readdir(directory)).sort()).toEqual(["basic.result.json", "basic.transcript.jsonl"]);
-      const summary = await readFile(join(directory, "basic.result.json"), "utf8");
-      const transcript = await readFile(join(directory, "basic.transcript.jsonl"), "utf8");
+      expect(await readdir(directory)).toEqual(["basic.artifacts"]);
+      const summary = await readFile(join(existing, "result.json"), "utf8");
+      const transcript = await readFile(join(existing, "transcript.jsonl"), "utf8");
       expect(JSON.parse(summary)).toMatchObject({ status: "passed", schemaVersion: 1 });
       expect(transcript.trim().split("\n").map((line) => JSON.parse(line))).not.toHaveLength(0);
       expect((await invoke(["run", example, "--out", directory])).code).toBe(2);
-      expect(await readFile(join(directory, "basic.result.json"), "utf8")).toBe(summary);
-      expect(await readFile(join(directory, "basic.transcript.jsonl"), "utf8")).toBe(transcript);
+      expect(await readFile(join(existing, "result.json"), "utf8")).toBe(summary);
+      expect(await readFile(join(existing, "transcript.jsonl"), "utf8")).toBe(transcript);
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
 
@@ -52,9 +54,9 @@ describe("CLI and opt-in contract (spec sections 2 and 6)", () => {
         invoke(["run", example, "--out", directory]), invoke(["run", example, "--out", directory]),
       ]);
       expect(results.map((result) => result.code).sort()).toEqual([0, 2]);
-      expect((await readdir(directory)).sort()).toEqual(["basic.result.json", "basic.transcript.jsonl"]);
-      expect(JSON.parse(await readFile(join(directory, "basic.result.json"), "utf8")).status).toBe("passed");
-      const transcript = await readFile(join(directory, "basic.transcript.jsonl"), "utf8");
+      expect(await readdir(directory)).toEqual(["basic.artifacts"]);
+      expect(JSON.parse(await readFile(join(directory, "basic.artifacts", "result.json"), "utf8")).status).toBe("passed");
+      const transcript = await readFile(join(directory, "basic.artifacts", "transcript.jsonl"), "utf8");
       expect(JSON.parse(transcript.trim().split("\n").at(-1)!)).toMatchObject({ direction: "harness", kind: "closed" });
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
@@ -91,7 +93,7 @@ describe("CLI and opt-in contract (spec sections 2 and 6)", () => {
       const scenario = join(directory, "basic.yaml");
       await writeFile(scenario, stringify(basic));
       expect((await invoke(["run", scenario, "--out", directory])).code).toBe(0);
-      const resultPath = join(directory, "basic.result.json");
+      const resultPath = join(directory, "basic.artifacts", "result.json");
       const before = await readFile(resultPath, "utf8");
       expect((await invoke(["run", scenario, "--out", directory])).code).toBe(2);
       expect(await readFile(resultPath, "utf8")).toBe(before);

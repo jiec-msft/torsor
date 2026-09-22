@@ -32,9 +32,9 @@ describe("public conformance runner (spec sections 2-5)", () => {
         "--out", directory,
       ], { timeout: 40_000 });
       expect(stdout).toContain("PASSED basic");
-      expect(JSON.parse(await readFile(join(directory, "basic.result.json"), "utf8")))
+      expect(JSON.parse(await readFile(join(directory, "basic.artifacts", "result.json"), "utf8")))
         .toMatchObject({ schemaVersion: 1, status: "passed" });
-      const lines = await readFile(join(directory, "basic.transcript.jsonl"), "utf8");
+      const lines = await readFile(join(directory, "basic.artifacts", "transcript.jsonl"), "utf8");
       expect(lines).toContain('"method":"session/prompt"');
       expect(lines).not.toContain(directory);
     } finally {

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { stringify } from "yaml";
 import { describe, expect, it } from "vitest";
@@ -105,6 +106,29 @@ describe("canonical scenario contract (spec section 3)", () => {
     expect(() => loadScenario(deep, { format: "json" })).toThrow("bounded JSON");
     try { loadScenario('{"synthetic-secret":', { format: "json" }); }
     catch (error) { expect(String(error)).not.toContain("synthetic-secret"); }
+  });
+
+  it.each([
+    ["flow sequence", "[".repeat(16_384) + '"synthetic-secret"' + "]".repeat(16_384)],
+    ["flow mapping", "{key: ".repeat(4096) + '"synthetic-secret"' + "}".repeat(4096)],
+    ["block mapping", Array.from({ length: 256 }, (_, index) => `${"  ".repeat(index)}key:\n`).join("")
+      + "  ".repeat(256) + "synthetic-secret\n"],
+  ])("promptly rejects deeply nested YAML %s with a sanitized configuration error", (_name, text) => {
+    expect(Buffer.byteLength(text)).toBeLessThan(262_144);
+    const output = execFileSync(process.execPath, ["--input-type=module", "-e", `
+      import assert from "node:assert/strict";
+      import { readFileSync } from "node:fs";
+      import { ConfigurationError, loadScenario } from "@torsor/acp-conformance";
+      assert.throws(() => loadScenario(readFileSync(0, "utf8"), { format: "yaml" }), (error) => {
+        assert(error instanceof ConfigurationError);
+        assert.deepEqual(error.paths, ["$"]);
+        assert(!error.message.includes("synthetic-secret"));
+        assert(!error.message.includes("RangeError"));
+        return true;
+      });
+      console.log("rejected");
+    `], { input: text, encoding: "utf8", timeout: 5000, maxBuffer: 4096, windowsHide: true });
+    expect(output).toBe("rejected\n");
   });
 
   it("accepts explicit JSON-compatible YAML core tags and rejects reserved artifact names", () => {
