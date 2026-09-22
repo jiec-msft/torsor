@@ -884,6 +884,14 @@ describe("independent review regressions", () => {
         runtimeContext,
       );
       expect(claim.outboxEvents).toHaveLength(2);
+      expect(claim.leaseExpiresAt).toBe(
+        "2026-09-21T08:00:30.000Z",
+      );
+      expect(
+        claim.outboxEvents?.every(
+          (event) => event.leaseExpiresAt === claim.leaseExpiresAt,
+        ),
+      ).toBe(true);
 
       await expect(
         kernel.execute(
@@ -906,6 +914,17 @@ describe("independent review regressions", () => {
         },
         runtimeContext,
       );
+      await expect(
+        kernel.execute(
+          {
+            type: "ClaimOutboxEvents",
+            idempotencyKey: "outbox-batch-claim",
+            limit: 2,
+            leaseDurationMs: 30_000,
+          },
+          runtimeContext,
+        ),
+      ).rejects.toMatchObject({ code: "Conflict" });
     } finally {
       kernel.close();
     }

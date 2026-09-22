@@ -22,6 +22,7 @@ import {
 import type {
   ActivityPage,
   ActivityWindow,
+  AttentionRecoverySnapshot,
   AuthorizedPublicEventPage,
   AttentionPage,
   BootstrapProjection,
@@ -46,6 +47,12 @@ import {
 
 const recoverableAttentionQueryHookSymbol = Symbol.for(
   "torsor.kernel.recoverable-attention-query",
+);
+const recoverableAttentionHydrationQueryHookSymbol = Symbol.for(
+  "torsor.kernel.recoverable-attention-hydration-query",
+);
+const recoverySnapshotPromotionHookSymbol = Symbol.for(
+  "torsor.kernel.recovery-snapshot-promotion",
 );
 const publicEventQueryHookSymbol = Symbol.for(
   "torsor.kernel.authorized-public-event-query",
@@ -641,7 +648,13 @@ export function getProjectAgentStatus(
      SELECT activation.agent_id, 'Attention' AS scope
        FROM activation_attempts AS activation INDEXED BY ${attentionActivationIndex}
        JOIN attentions AS attention ON attention.id = activation.attention_id
-      WHERE ${invariants.liveAttentionActivationPredicate("activation", "attention")}
+       JOIN attention_domain_fences AS attention_domain
+         ON attention_domain.attention_id = attention.id
+      WHERE ${invariants.liveAttentionActivationPredicate(
+        "activation",
+        "attention",
+        "attention_domain",
+      )}
         AND attention.project_id = ?
         ${agentId ? "AND activation.agent_id = ?" : ""}
        ) AS live
@@ -846,69 +859,290 @@ export function getProviderAttempt(
   return mapProviderAttempt(attempt);
 }
 
+function recoverableUnfinishedAttentionPredicate(
+  activationAlias: string,
+  attentionAlias: string,
+  domainFenceAlias: string,
+): string {
+  return `${activationAlias}.cause = 'Attention'
+        AND ${activationAlias}.finished_at IS NULL
+        AND ${activationAlias}.revoked_at IS NULL
+        AND ${activationAlias}.agent_id = ${attentionAlias}.target_agent_id
+        AND ${attentionAlias}.status = 'Open'
+        AND ${attentionAlias}.handler_lease_token =
+            ${activationAlias}.attention_lease_token
+        AND ${domainFenceAlias}.lease_token =
+            ${attentionAlias}.handler_lease_token
+        AND ${domainFenceAlias}.lease_expires_at =
+            ${attentionAlias}.handler_lease_expires_at
+        AND ${invariants.attentionDomainOwnershipPredicate(
+          attentionAlias,
+          domainFenceAlias,
+        )}`;
+}
+
+function recoverableFinishedAttentionPredicate(
+  activationAlias: string,
+  attentionAlias: string,
+  domainFenceAlias: string,
+): string {
+  return `${activationAlias}.cause = 'Attention'
+        AND ${activationAlias}.finished_at IS NOT NULL
+        AND ${activationAlias}.agent_id = ${attentionAlias}.target_agent_id
+        AND ${invariants.attentionDomainOwnershipPredicate(
+          attentionAlias,
+          domainFenceAlias,
+        )}`;
+}
+
+export function getAttentionRecoverySnapshot(
+  kernel: db.KernelContext,
+): AttentionRecoverySnapshot {
+  const observedAt = db.now(kernel);
+  const promotionSql = `UPDATE attention_recovery_executions AS recovery
+        SET expired_recoverable = 1
+      WHERE recovery.unfinished = 1
+        AND recovery.expired_recoverable = 0
+        AND recovery.expires_at <= ?
+        AND EXISTS (
+          SELECT 1
+            FROM activation_attempts AS activation
+            JOIN attentions AS attention
+              ON attention.id = activation.attention_id
+            JOIN attention_domain_fences AS attention_domain
+              ON attention_domain.attention_id = attention.id
+           WHERE activation.id = recovery.activation_id
+             AND ${recoverableUnfinishedAttentionPredicate(
+               "activation",
+               "attention",
+               "attention_domain",
+             )}
+        )`;
+  const promotedCount = db.run(
+    kernel,
+    promotionSql,
+    observedAt,
+  );
+  const promotionHook = Reflect.get(
+    globalThis,
+    recoverySnapshotPromotionHookSymbol,
+  );
+  if (typeof promotionHook === "function") {
+    promotionHook({
+      sql: promotionSql,
+      parameters: [observedAt],
+      changes: promotedCount,
+    });
+  }
+  if (promotedCount > 0) {
+    db.run(
+      kernel,
+      `UPDATE kernel_runtime_state
+          SET attention_recovery_revision =
+                attention_recovery_revision + 1
+        WHERE singleton = 1`,
+    );
+  }
+  return readAttentionRecoverySnapshot(kernel, observedAt);
+}
+
+function readAttentionRecoverySnapshot(
+  kernel: db.KernelContext,
+  observedAt: string,
+): AttentionRecoverySnapshot {
+  const state = db.getRow(
+    kernel,
+    `SELECT attention_recovery_revision
+       FROM kernel_runtime_state
+      WHERE singleton = 1`,
+  );
+  if (!state) {
+    throw new Error("Kernel runtime state is missing.");
+  }
+  const horizon = db.getRow(
+    kernel,
+    `SELECT MIN(recovery.expires_at) AS next_expiry_at
+       FROM attention_recovery_executions AS recovery
+            INDEXED BY attention_recovery_expiry_horizon_idx
+       CROSS JOIN activation_attempts AS activation
+         ON activation.id = recovery.activation_id
+       CROSS JOIN attentions AS attention
+         ON attention.id = activation.attention_id
+       CROSS JOIN attention_domain_fences AS attention_domain
+         ON attention_domain.attention_id = attention.id
+      WHERE recovery.unfinished = 1
+         AND recovery.expired_recoverable = 0
+         AND recovery.expires_at > ?
+         AND ${recoverableUnfinishedAttentionPredicate(
+           "activation",
+           "attention",
+           "attention_domain",
+         )}`,
+    observedAt,
+  );
+  return {
+    revision: integer(state.attention_recovery_revision),
+    observedAt,
+    nextExpiryAt: horizon
+      ? optionalText(horizon.next_expiry_at)
+      : null,
+  };
+}
+
 export function listRecoverableAttentionExecutions(
   kernel: db.KernelContext,
   afterCursor: RecoverableAttentionExecutionCursor | undefined,
+  requestedRevision: number | undefined,
   limit: number,
 ): RecoverableAttentionExecutionPage {
+  const recoverySnapshot = resolveAttentionRecoverySnapshot(
+    kernel,
+    requestedRevision,
+  );
   const expiredClauses = [
-    "expired.cause = 'Attention'",
-    "expired.finished_at IS NULL",
-    "expired.expires_at <= ?",
+    "recovery.expired_recoverable = 1",
+    recoverableUnfinishedAttentionPredicate(
+      "activation",
+      "attention",
+      "attention_domain",
+    ),
   ];
   const unsettledClauses = [
-    "activation.cause = 'Attention'",
-    "activation.finished_at IS NOT NULL",
+    "recovery.finished_with_unsettled_provider = 1",
+    recoverableFinishedAttentionPredicate(
+      "activation",
+      "attention",
+      "attention_domain",
+    ),
   ];
-  const parameters: SQLInputValue[] = [db.now(kernel)];
+  const expiredParameters: SQLInputValue[] = [];
+  const unsettledParameters: SQLInputValue[] = [];
   if (afterCursor) {
     requireNonEmpty(afterCursor.startedAt, "afterCursor.startedAt");
     requireNonEmpty(afterCursor.activationId, "afterCursor.activationId");
-    expiredClauses.push("(expired.started_at, expired.id) > (?, ?)");
-    parameters.push(
+    expiredClauses.push(
+      "(recovery.started_at, recovery.activation_id) > (?, ?)",
+    );
+    expiredParameters.push(
       afterCursor.startedAt,
       afterCursor.activationId,
     );
     unsettledClauses.push(
-      "(activation.started_at, activation.id) > (?, ?)",
+      "(recovery.started_at, recovery.activation_id) > (?, ?)",
     );
-    parameters.push(
+    unsettledParameters.push(
       afterCursor.startedAt,
       afterCursor.activationId,
     );
   }
-  parameters.push(limit + 1);
-  const sql = `SELECT expired.*
-       FROM activation_attempts AS expired
+  expiredParameters.push(limit + 1);
+  unsettledParameters.push(limit + 1);
+  const expiredSql = `SELECT recovery.activation_id, recovery.started_at
+       FROM attention_recovery_executions AS recovery
+            INDEXED BY attention_recovery_unfinished_order_idx
+       CROSS JOIN activation_attempts AS activation
+         ON activation.id = recovery.activation_id
+       CROSS JOIN attentions AS attention
+         ON attention.id = activation.attention_id
+       CROSS JOIN attention_domain_fences AS attention_domain
+         ON attention_domain.attention_id = attention.id
       WHERE ${expiredClauses.join(" AND ")}
-      UNION ALL
-     SELECT DISTINCT activation.*
-       FROM provider_attempts AS unsettled
-       JOIN activation_attempts AS activation
-         ON activation.id = unsettled.activation_id
-      WHERE unsettled.status IN ('Started', 'Acknowledged')
-        AND ${unsettledClauses.join(" AND ")}
-      ORDER BY started_at, id
+      ORDER BY recovery.started_at, recovery.activation_id
       LIMIT ?`;
-  const queryHook = Reflect.get(
-    globalThis,
+  const unsettledSql = `SELECT recovery.activation_id, recovery.started_at
+       FROM attention_recovery_executions AS recovery
+            INDEXED BY attention_recovery_finished_order_idx
+       CROSS JOIN activation_attempts AS activation
+         ON activation.id = recovery.activation_id
+       CROSS JOIN attentions AS attention
+         ON attention.id = activation.attention_id
+       CROSS JOIN attention_domain_fences AS attention_domain
+         ON attention_domain.attention_id = attention.id
+      WHERE ${unsettledClauses.join(" AND ")}
+      ORDER BY recovery.started_at, recovery.activation_id
+      LIMIT ?`;
+  recordQuery(
     recoverableAttentionQueryHookSymbol,
+    expiredSql,
+    expiredParameters,
   );
-  if (typeof queryHook === "function") {
-    queryHook({ sql, parameters: [...parameters] });
+  recordQuery(
+    recoverableAttentionQueryHookSymbol,
+    unsettledSql,
+    unsettledParameters,
+  );
+  const recoveryRows = mergeRecoveryRows(
+    db.allRows(kernel, expiredSql, ...expiredParameters),
+    db.allRows(kernel, unsettledSql, ...unsettledParameters),
+    limit + 1,
+  );
+  const hasMore = recoveryRows.length > limit;
+  const selectedRows = recoveryRows.slice(0, limit);
+  if (selectedRows.length === 0) {
+    return {
+      items: [],
+      nextCursor: null,
+      hasMore: false,
+      recoverySnapshot,
+    };
   }
-  const rows = db.allRows(
+  const activationIds = selectedRows.map((row) => text(row.activation_id));
+  const placeholders = activationIds.map(() => "?").join(", ");
+  const activations = db.allRows(
     kernel,
-    sql,
-    ...parameters,
+    `SELECT *
+       FROM activation_attempts
+      WHERE id IN (${placeholders})`,
+    ...activationIds,
   );
-  const hasMore = rows.length > limit;
-  const items = rows.slice(0, limit).map((activation) => {
-    const activationId = text(activation.id);
-    const attention = invariants.requireAttention(
-      kernel,
-      text(activation.attention_id),
-    );
+  const activationsById = new Map(
+    activations.map((activation) => [text(activation.id), activation]),
+  );
+  const attentionIds = [
+    ...new Set(activations.map((activation) => text(activation.attention_id))),
+  ];
+  const attentionPlaceholders = attentionIds.map(() => "?").join(", ");
+  const attentions = db.allRows(
+    kernel,
+    `SELECT *
+       FROM attentions
+      WHERE id IN (${attentionPlaceholders})`,
+    ...attentionIds,
+  );
+  const attentionsById = new Map(
+    attentions.map((attention) => [text(attention.id), attention]),
+  );
+  const attemptsByActivation = new Map<string, Row[]>();
+  const hydrationSql = `SELECT *
+       FROM provider_attempts
+      WHERE activation_id IN (${placeholders})
+      ORDER BY activation_id, started_at, id`;
+  recordQuery(
+    recoverableAttentionHydrationQueryHookSymbol,
+    hydrationSql,
+    activationIds,
+  );
+  for (const attempt of db.allRows(
+    kernel,
+    hydrationSql,
+    ...activationIds,
+  )) {
+    const activationId = text(attempt.activation_id);
+    const attempts = attemptsByActivation.get(activationId) ?? [];
+    attempts.push(attempt);
+    attemptsByActivation.set(activationId, attempts);
+  }
+  const items = selectedRows.map((recovery) => {
+    const activationId = text(recovery.activation_id);
+    const activation = activationsById.get(activationId);
+    if (!activation) {
+      throw new Error(`Recovery Activation ${activationId} is missing.`);
+    }
+    const attentionId = text(activation.attention_id);
+    const attention = attentionsById.get(attentionId);
+    if (!attention) {
+      throw new Error(`Recovery Attention ${attentionId} is missing.`);
+    }
     return {
       cursor: {
         startedAt: text(activation.started_at),
@@ -917,30 +1151,124 @@ export function listRecoverableAttentionExecutions(
       attention: mapAttention(attention),
       activation: mapActivation(
         activation,
-        db.allRows(
-          kernel,
-          `SELECT run_input_id
-             FROM activation_run_inputs
-            WHERE activation_id = ?
-            ORDER BY run_input_sequence`,
-          activationId,
-        ).map((row) => text(row.run_input_id)),
+        [],
       ),
-      providerAttempts: db.allRows(
-        kernel,
-        `SELECT *
-           FROM provider_attempts
-          WHERE activation_id = ?
-          ORDER BY started_at, id`,
-        activationId,
-      ).map(mapProviderAttempt),
+      providerAttempts:
+        (attemptsByActivation.get(activationId) ?? []).map(mapProviderAttempt),
     };
   });
   return {
     items,
     nextCursor: hasMore ? items.at(-1)?.cursor ?? null : null,
     hasMore,
+    recoverySnapshot,
   };
+}
+
+function resolveAttentionRecoverySnapshot(
+  kernel: db.KernelContext,
+  requestedRevision: number | undefined,
+): AttentionRecoverySnapshot {
+  if (requestedRevision === undefined) {
+    return getAttentionRecoverySnapshot(kernel);
+  }
+  if (
+    !Number.isInteger(requestedRevision) ||
+    requestedRevision < 0
+  ) {
+    throw new KernelError(
+      "InvalidCommand",
+      "The Attention recovery revision is invalid.",
+    );
+  }
+  const observedAt = db.now(kernel);
+  const current = readAttentionRecoverySnapshot(kernel, observedAt);
+  const due = db.getRow(
+    kernel,
+    `SELECT recovery.activation_id
+       FROM attention_recovery_executions AS recovery
+            INDEXED BY attention_recovery_expiry_horizon_idx
+       CROSS JOIN activation_attempts AS activation
+         ON activation.id = recovery.activation_id
+       CROSS JOIN attentions AS attention
+         ON attention.id = activation.attention_id
+       CROSS JOIN attention_domain_fences AS attention_domain
+         ON attention_domain.attention_id = attention.id
+      WHERE recovery.unfinished = 1
+         AND recovery.expired_recoverable = 0
+         AND recovery.expires_at <= ?
+         AND ${recoverableUnfinishedAttentionPredicate(
+           "activation",
+           "attention",
+           "attention_domain",
+         )}
+      ORDER BY recovery.expires_at
+      LIMIT 1`,
+    observedAt,
+  );
+  if (
+    current.revision !== requestedRevision ||
+    due !== undefined
+  ) {
+    throw new KernelError(
+      "StaleRevision",
+      "The Attention recovery revision changed or has unmaterialized expired work.",
+      {
+        expectedRevision: requestedRevision,
+        actualRevision: current.revision,
+        observedAt: current.observedAt,
+        nextExpiryAt: current.nextExpiryAt,
+      },
+    );
+  }
+  return current;
+}
+
+function mergeRecoveryRows(
+  expired: readonly Row[],
+  unsettled: readonly Row[],
+  limit: number,
+): Row[] {
+  const merged: Row[] = [];
+  let expiredIndex = 0;
+  let unsettledIndex = 0;
+  while (
+    merged.length < limit &&
+    (expiredIndex < expired.length || unsettledIndex < unsettled.length)
+  ) {
+    const expiredRow = expired[expiredIndex];
+    const unsettledRow = unsettled[unsettledIndex];
+    if (!expiredRow) {
+      merged.push(unsettledRow!);
+      unsettledIndex += 1;
+      continue;
+    }
+    if (!unsettledRow) {
+      merged.push(expiredRow);
+      expiredIndex += 1;
+      continue;
+    }
+    const expiredKey = [
+      text(expiredRow.started_at),
+      text(expiredRow.activation_id),
+    ];
+    const unsettledKey = [
+      text(unsettledRow.started_at),
+      text(unsettledRow.activation_id),
+    ];
+    if (
+      expiredKey[0]! < unsettledKey[0]! ||
+      (expiredKey[0] === unsettledKey[0] &&
+        expiredKey[1]! < unsettledKey[1]!)
+    ) {
+      merged.push(expiredRow);
+      expiredIndex += 1;
+    } else {
+      merged.push(unsettledRow);
+      unsettledIndex += 1;
+    }
+  }
+  return merged;
 }
 
 function recordQuery(

@@ -364,9 +364,20 @@ export interface RecoverableAttentionExecutionCursor {
   readonly activationId: string;
 }
 
+export interface AttentionRecoverySnapshot {
+  readonly revision: number;
+  readonly observedAt: string;
+  readonly nextExpiryAt: string | null;
+}
+
+export interface GetAttentionRecoverySnapshotQuery {
+  readonly type: "GetAttentionRecoverySnapshot";
+}
+
 export interface ListRecoverableAttentionExecutionsQuery {
   readonly type: "ListRecoverableAttentionExecutions";
   readonly afterCursor?: RecoverableAttentionExecutionCursor;
+  readonly recoveryRevision?: number;
   readonly limit?: number;
 }
 
@@ -409,6 +420,7 @@ export type KernelQuery =
   | ListOpenAttentionsQuery
   | ListOutboxEventsQuery
   | GetProviderAttemptQuery
+  | GetAttentionRecoverySnapshotQuery
   | ListRecoverableAttentionExecutionsQuery
   | ListThreadProjectionsQuery
   | ListRunProjectionsQuery
@@ -582,6 +594,7 @@ export interface RecoverableAttentionExecutionPage {
   readonly items: readonly RecoverableAttentionExecutionView[];
   readonly nextCursor: RecoverableAttentionExecutionCursor | null;
   readonly hasMore: boolean;
+  readonly recoverySnapshot: AttentionRecoverySnapshot;
 }
 
 export interface ArtifactView {
@@ -686,6 +699,7 @@ export interface QueryResultMap {
   readonly ListOpenAttentions: AttentionPage;
   readonly ListOutboxEvents: OutboxPage;
   readonly GetProviderAttempt: ProviderAttemptView;
+  readonly GetAttentionRecoverySnapshot: AttentionRecoverySnapshot;
   readonly ListRecoverableAttentionExecutions: RecoverableAttentionExecutionPage;
   readonly ListThreadProjections: ThreadProjectionPage;
   readonly ListRunProjections: RunProjectionPage;
@@ -702,5 +716,6 @@ export interface CommandResult {
   readonly threadCursor?: number;
   readonly relatedIds?: Readonly<Record<string, string>>;
   readonly leaseToken?: string;
+  readonly leaseExpiresAt?: string;
   readonly outboxEvents?: readonly OutboxEventView[];
 }
