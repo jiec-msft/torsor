@@ -125,6 +125,171 @@ export function acknowledgeOutboxEvents(kernel: db.KernelContext, command: Extra
   };
 }
 
+type OutboxAuthorityCommand = Readonly<{
+  outboxEventId?: string;
+  outboxLeaseToken?: string;
+}>;
+
+export function requireOutboxActivationAuthority(
+  kernel: db.KernelContext,
+  command: OutboxAuthorityCommand,
+  principal: Row,
+  runId: string,
+): Readonly<{
+  leaseExpiresAt: string;
+  observedAt: string;
+}> {
+  const authority = requireOutboxDeliveryAuthority(
+    kernel,
+    command,
+    principal,
+    runId,
+  );
+  const runInput = db.getRow(
+    kernel,
+    "SELECT run_id, disposition FROM run_inputs WHERE id = ?",
+    authority.runInputId,
+  );
+  if (
+    !runInput ||
+    text(runInput.run_id) !== runId ||
+    text(runInput.disposition) !== "Pending"
+  ) {
+    throw new KernelError(
+      "Conflict",
+      "The Outbox event input is not a Pending input for this Run.",
+    );
+  }
+  return authority;
+}
+
+export function requireOutboxProviderAuthority(
+  kernel: db.KernelContext,
+  command: OutboxAuthorityCommand,
+  principal: Row,
+  runId: string,
+  runInputIds: readonly string[],
+): Readonly<{
+  leaseExpiresAt: string;
+  observedAt: string;
+}> {
+  const authority = requireOutboxDeliveryAuthority(
+    kernel,
+    command,
+    principal,
+    runId,
+  );
+  if (!runInputIds.includes(authority.runInputId)) {
+    throw new KernelError(
+      "Conflict",
+      "The Outbox event input is not included in this provider delivery.",
+    );
+  }
+  return authority;
+}
+
+function requireOutboxDeliveryAuthority(
+  kernel: db.KernelContext,
+  command: OutboxAuthorityCommand,
+  principal: Row,
+  runId: string,
+): Readonly<{
+  leaseExpiresAt: string;
+  observedAt: string;
+  runInputId: string;
+}> {
+  invariants.requireKind(kernel, principal, "runtime");
+  requireNonEmpty(command.outboxEventId ?? "", "outboxEventId");
+  requireNonEmpty(command.outboxLeaseToken ?? "", "outboxLeaseToken");
+  const event = invariants.requireOutboxEvent(
+    kernel,
+    command.outboxEventId!,
+  );
+  const observed = kernel.clock();
+  const leaseExpiresAt = optionalText(event.lease_expires_at);
+  if (
+    event.acknowledged_at !== null ||
+    optionalText(event.lease_holder_principal_id) !== text(principal.id) ||
+    optionalText(event.lease_token) !== command.outboxLeaseToken ||
+    leaseExpiresAt === null ||
+    new Date(leaseExpiresAt) <= observed
+  ) {
+    throw new KernelError(
+      "Conflict",
+      "The Outbox event is not held by the current live lease.",
+    );
+  }
+  if (
+    text(event.aggregate_type) !== "Run" ||
+    text(event.aggregate_id) !== runId ||
+    (
+      text(event.topic) !== "run.activation-requested" &&
+      text(event.topic) !== "run-input.available"
+    )
+  ) {
+    throw new KernelError(
+      "Conflict",
+      "The Outbox event does not authorize this Run delivery.",
+    );
+  }
+  const leasedRows = db.allRows(
+    kernel,
+    `SELECT id
+       FROM outbox_events
+      WHERE acknowledged_at IS NULL
+        AND lease_holder_principal_id = ?
+        AND lease_token = ?
+      ORDER BY sequence`,
+    text(principal.id),
+    command.outboxLeaseToken!,
+  );
+  if (
+    leasedRows.length !== 1 ||
+    text(leasedRows[0]!.id) !== command.outboxEventId
+  ) {
+    throw new KernelError(
+      "Conflict",
+      "Delivery admission requires exclusive authority over one Outbox event.",
+    );
+  }
+  const frontier = db.getRow(
+    kernel,
+    `SELECT id
+       FROM outbox_events
+      WHERE acknowledged_at IS NULL
+      ORDER BY sequence
+      LIMIT 1`,
+  );
+  if (!frontier || text(frontier.id) !== command.outboxEventId) {
+    throw new KernelError(
+      "Conflict",
+      "The Outbox event is no longer the oldest pending frontier.",
+    );
+  }
+  const payload = JSON.parse(text(event.payload_json)) as unknown;
+  const payloadRunInputId =
+    payload !== null &&
+    typeof payload === "object" &&
+    !Array.isArray(payload)
+      ? (payload as Record<string, unknown>).runInputId
+      : undefined;
+  const runInputId =
+    typeof payloadRunInputId === "string"
+      ? payloadRunInputId
+      : null;
+  if (runInputId === null) {
+    throw new KernelError(
+      "Conflict",
+      "The Outbox event does not identify a Run input.",
+    );
+  }
+  return {
+    leaseExpiresAt,
+    observedAt: observed.toISOString(),
+    runInputId,
+  };
+}
+
 export function resolveCachedOutboxClaim(kernel: db.KernelContext, command: Extract<KernelCommand, {
   type: "ClaimOutboxEvents";
 }>, result: CommandResult, principal: Row): CommandResult {

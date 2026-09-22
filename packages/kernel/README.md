@@ -136,6 +136,17 @@ batch that was acknowledged, superseded, moved outside the pending frontier,
 or acquired by another lease fails with `Conflict`; Kernel never returns its
 old token, expiry, or stale event views as delivery authority.
 
+Run `StartActivation` and `StartProviderAttempt` admission carry the exact
+Outbox event ID and lease token. Before a Run Activation can advance the
+generation or revoke an existing owner, the Kernel transaction verifies the
+Runtime principal, live Kernel-clock lease, one-event ownership, oldest pending
+frontier, Run association, and Pending RunInput. ProviderAttempt admission
+revalidates the same authority and verifies that the event input is included in
+the delivery. Cached admission retries repeat those checks and return a fresh
+`authorityObservedAt`; acknowledgement, expiry, supersession, frontier loss,
+or an intervening lease fails closed before ownership changes or provider
+invocation.
+
 `ClaimAttention` also returns the exact persisted `leaseExpiresAt`. Runtime
 must derive provider execution time from that authority rather than request
 time:
@@ -173,9 +184,10 @@ ProviderAttempts for each selected Activation once through the
 `(activation_id, started_at, id)` order index.
 Expired unfinished rows must remain non-revoked and match the current durable
 domain lease; finished unsettled rows must remain owned by the same durable
-domain fence. Supersession removes the old unfinished Activation from recovery
-state and advances the recovery revision, so an in-progress sweep becomes
-stale instead of returning revoked work.
+domain fence and do not enter the authoritative set before their Activation
+expiry. Supersession removes the old unfinished Activation from recovery state
+and advances the recovery revision, so an in-progress sweep becomes stale
+instead of returning revoked work.
 
 Runtime can prove a full recovery sweep stable with
 `GetAttentionRecoverySnapshot`. That write-serialized query advances
@@ -206,11 +218,13 @@ finalize content in durable storage and verify its digest before
 location into a finalized Artifact. A failed or incomplete upload must not
 publish the descriptor.
 
-The current direct schema version is 11. Version 11 makes recovery membership
-require a non-revoked Activation and current durable Attention-domain
-ownership, while retaining the normalized recovery state, ordered indexes,
-count-only expiry promotion, recovery mutation revision, incremental
-provider/domain counters, and durable Agent/Project/Channel/Thread execution
-fences introduced in version 10.
+The current direct schema version is 12. Version 12 gives unfinished and
+finished-unsettled Attention recovery one bounded expiry-horizon index, so
+Kernel-clock promotion and revision checks remain indexed after recovery
+membership moves fully into the Kernel. It retains version 11's non-revoked
+Activation and durable Attention-domain ownership requirements plus the
+normalized recovery state, ordered page indexes, count-only expiry promotion,
+recovery mutation revision, incremental provider/domain counters, and durable
+Agent/Project/Channel/Thread execution fences.
 This pre-release schema is intentionally breaking: stop old processes and
-recreate disposable databases rather than migrating version 8, 9, or 10.
+recreate disposable databases rather than migrating version 8 through 11.

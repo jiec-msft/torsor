@@ -96,11 +96,16 @@ async function failRunProvider(
   setup: Awaited<ReturnType<typeof createRun>>,
   key: string,
 ) {
+  const outboxAuthority = {
+    outboxEventId: setup.outboxEventId,
+    outboxLeaseToken: setup.outboxLeaseToken,
+  };
   const attempt = await kernel.execute(
     {
       type: "StartProviderAttempt",
       idempotencyKey: `${key}-provider`,
       activationId: setup.activationId,
+      ...outboxAuthority,
       adapter: "deterministic-fake",
       adapterVersion: "1",
       capabilitySnapshot: {},
@@ -1385,8 +1390,13 @@ describe("Runtime recovery with SQLite", () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-runtime-query-"));
     const databasePath = join(directory, "kernel.sqlite");
     let revisionBeforePromotion = 0;
+    let recoveryKernel: TorsorKernel | undefined;
     try {
-      const first = TorsorKernel.open({ databasePath, bootstrap });
+      const first = TorsorKernel.open({
+        databasePath,
+        bootstrap,
+        clock: () => new Date("2026-09-21T08:00:00.000Z"),
+      });
       const execution = await createFinishedAttentionAttempt(first);
       first.close();
 
@@ -1713,7 +1723,12 @@ describe("Runtime recovery with SQLite", () => {
         historyDatabase.close();
       }
 
-      const reopened = TorsorKernel.open({ databasePath, bootstrap });
+      const reopened = TorsorKernel.open({
+        databasePath,
+        bootstrap,
+        clock: () => new Date("2026-09-21T08:05:01.000Z"),
+      });
+      recoveryKernel = reopened;
       const recordedQueries: RecordedQuery[] = [];
       const recordedHydrationQueries: RecordedQuery[] = [];
       const recordedPromotions: RecordedPromotion[] = [];
@@ -1761,7 +1776,7 @@ describe("Runtime recovery with SQLite", () => {
         );
         expect(unchangedSnapshot.revision).toBe(snapshot.revision);
         expect(recordedPromotions).toEqual([
-          expect.objectContaining({ changes: 100_001 }),
+          expect.objectContaining({ changes: 100_002 }),
           expect.objectContaining({ changes: 0 }),
         ]);
         expect(
@@ -1849,6 +1864,7 @@ describe("Runtime recovery with SQLite", () => {
         status: "Started",
       });
       reopened.close();
+      recoveryKernel = undefined;
       expect(recordedQueries).toHaveLength(8);
       expect(recordedHydrationQueries).toHaveLength(4);
 
@@ -2080,6 +2096,7 @@ describe("Runtime recovery with SQLite", () => {
         expectIndexedRecoverablePlan(planDetails);
       }
     } finally {
+      recoveryKernel?.close();
       await rm(directory, { recursive: true, force: true });
     }
   }, 60_000);

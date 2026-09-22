@@ -99,6 +99,8 @@ describe("Kernel server query primitives with SQLite", () => {
           idempotencyKey: "sqlite-query-resume",
           runId: setup.runId,
           expectedRunRevision: 2,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
         },
         runtimeContext,
       );
@@ -108,6 +110,8 @@ describe("Kernel server query primitives with SQLite", () => {
           idempotencyKey: "sqlite-query-new-generation",
           runId: setup.runId,
           expectedRunRevision: 3,
+          outboxEventId: setup.outboxEventId,
+          outboxLeaseToken: setup.outboxLeaseToken,
         },
         runtimeContext,
       );
@@ -737,6 +741,8 @@ describe("Kernel server query primitives with SQLite", () => {
               idempotencyKey: `activation-linear-${index}`,
               runId: setup.runId,
               expectedRunRevision: 1,
+              outboxEventId: setup.outboxEventId,
+              outboxLeaseToken: setup.outboxLeaseToken,
             },
             runtimeContext,
           );

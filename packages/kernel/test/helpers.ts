@@ -49,6 +49,63 @@ export function openMemoryKernel(clock?: () => Date): TorsorKernel {
   });
 }
 
+export async function claimRunOutboxAuthority(
+  kernel: TorsorKernel,
+  runId: string,
+  key: string,
+  runInputId?: string,
+): Promise<{
+  readonly outboxEventId: string;
+  readonly outboxLeaseToken: string;
+}> {
+  for (let index = 0; index < 100; index += 1) {
+    const claim = await kernel.execute(
+      {
+        type: "ClaimOutboxEvents",
+        idempotencyKey: `${key}-outbox-claim-${index}`,
+        limit: 1,
+        leaseDurationMs: 30_000,
+      },
+      runtimeContext,
+    );
+    const event = claim.outboxEvents?.[0];
+    if (!event || !claim.leaseToken) {
+      throw new Error(`Expected an Outbox event for Run ${runId}.`);
+    }
+    if (
+      event.aggregateId === runId &&
+      (
+        event.topic === "run.activation-requested" ||
+        event.topic === "run-input.available"
+      ) &&
+      (
+        runInputId === undefined ||
+        (
+          event.payload !== null &&
+          typeof event.payload === "object" &&
+          !Array.isArray(event.payload) &&
+          event.payload.runInputId === runInputId
+        )
+      )
+    ) {
+      return {
+        outboxEventId: event.id,
+        outboxLeaseToken: claim.leaseToken,
+      };
+    }
+    await kernel.execute(
+      {
+        type: "AcknowledgeOutboxEvents",
+        idempotencyKey: `${key}-outbox-ack-${index}`,
+        outboxEventIds: [event.id],
+        leaseToken: claim.leaseToken,
+      },
+      runtimeContext,
+    );
+  }
+  throw new Error(`Outbox authority for Run ${runId} was not found.`);
+}
+
 export async function createRun(kernel: TorsorKernel) {
   const thread = await kernel.execute(
     {
@@ -105,12 +162,19 @@ export async function createRun(kernel: TorsorKernel) {
       activationId: attentionActivation.entityId,
     },
   );
+  const outboxAuthority = await claimRunOutboxAuthority(
+    kernel,
+    resolved.entityId,
+    "start-run",
+    resolved.relatedIds!.runInputId!,
+  );
   const activation = await kernel.execute(
     {
       type: "StartActivation",
       idempotencyKey: "start-run-activation",
       runId: resolved.entityId,
       expectedRunRevision: 1,
+      ...outboxAuthority,
     },
     runtimeContext,
   );
@@ -121,6 +185,7 @@ export async function createRun(kernel: TorsorKernel) {
     runId: resolved.entityId,
     runInputId: resolved.relatedIds!.runInputId!,
     activationId: activation.entityId,
+    ...outboxAuthority,
     agentContext: {
       principalId: "principal-orbit",
       activationId: activation.entityId,
