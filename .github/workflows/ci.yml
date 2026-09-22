@@ -14,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -21,6 +23,11 @@ jobs:
           cache-dependency-path: |
             package-lock.json
             prototype/package-lock.json
+      - name: Check documentation changes
+        if: github.event_name == 'pull_request'
+        env:
+          DOCS_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: npm run check:docs -- --base "$DOCS_BASE_SHA"
       - name: Install workspace dependencies
         run: npm ci
       - name: Install prototype dependencies
