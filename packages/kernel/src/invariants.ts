@@ -1,4 +1,5 @@
 import * as db from "./database.js";
+import { filterVisiblePublicEvents } from "./artifact-visibility.js";
 import { KernelError } from "./errors.js";
 import {
   mapPublicEvent
@@ -325,14 +326,25 @@ export function releaseAttentionDomainLease(
   );
 }
 
-export function checkThreadCursor(kernel: db.KernelContext, thread: Row, expected?: number): void {
+export function checkThreadCursor(
+  kernel: db.KernelContext,
+  thread: Row,
+  principal: Row,
+  context: PrincipalContext,
+  expected?: number,
+): void {
   if (expected !== undefined && integer(thread.cursor) !== expected) {
-    const events = db.allRows(kernel, `SELECT * FROM public_events
+    const scope = resolvePrincipalReadScope(kernel, principal, context, text(thread.project_id));
+    const rows = db.allRows(kernel, `SELECT * FROM public_events
           WHERE thread_root_id = ? AND thread_cursor > ?
-          ORDER BY thread_cursor`, text(thread.root_message_id), expected).map(mapPublicEvent);
+          ORDER BY thread_cursor LIMIT 101`, text(thread.root_message_id), expected);
+    const scanned = rows.slice(0, 100);
+    const events = filterVisiblePublicEvents(kernel, scanned, scope).map(mapPublicEvent);
     throw new KernelError("ConditionalCheckFailed", "The Thread changed after the observed cursor.", {
       currentCursor: integer(thread.cursor),
       events: JSON.parse(JSON.stringify(events)) as JsonValue,
+      scannedThroughEventId: optionalText(scanned.at(-1)?.event_id),
+      hasMore: rows.length > 100,
     });
   }
 }
@@ -397,7 +409,7 @@ export function assertProjectAccess(kernel: db.KernelContext, principal: Row, pr
   }
 }
 
-export function assertAgentQueryScope(kernel: db.KernelContext, principal: Row, context: PrincipalContext, projectId: string, threadRootId: string, runId?: string): void {
+export function assertAgentQueryScope(kernel: db.KernelContext, principal: Row, context: PrincipalContext, projectId: string, threadRootId: string, runId?: string): PrincipalReadScope {
   const scope = resolvePrincipalReadScope(
     kernel,
     principal,
@@ -405,7 +417,7 @@ export function assertAgentQueryScope(kernel: db.KernelContext, principal: Row, 
     projectId,
   );
   if (scope.threadRootId === null) {
-    return;
+    return scope;
   }
   if (runId && scope.runId !== runId) {
     throw new KernelError("Forbidden", "The Activation cannot read this Run.");
@@ -413,6 +425,7 @@ export function assertAgentQueryScope(kernel: db.KernelContext, principal: Row, 
   if (scope.threadRootId !== threadRootId) {
     throw new KernelError("Forbidden", "The Activation cannot read this Thread.");
   }
+  return scope;
 }
 
 export function resolvePrincipalReadScope(

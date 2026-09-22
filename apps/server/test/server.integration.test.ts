@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { once } from "node:events";
 import { createServer as createHttpServer } from "node:http";
 import { createConnection } from "node:net";
@@ -1056,7 +1056,8 @@ describe("Torsor HTTP and SSE service", () => {
     const reader = response.body!.getReader();
     const firstChunk = await reader.read();
     const text = new TextDecoder().decode(firstChunk.value);
-    expect(text).toMatch(/^: heartbeat /);
+    expect(text).toContain("event: checkpoint");
+    expect(text).not.toContain("event: torsor");
 
     const activityKernel = TorsorKernel.open({ databasePath, bootstrap });
     try {
@@ -1078,27 +1079,26 @@ describe("Torsor HTTP and SSE service", () => {
     } finally {
       activityKernel.close();
     }
-    const secondChunk = await Promise.race([
-      reader.read(),
-      new Promise<never>((_, reject) =>
-        setTimeout(
-          () => reject(new Error("Visible event was starved after a filtered page.")),
-          1_000,
-        ),
-      ),
-    ]);
-    expect(new TextDecoder().decode(secondChunk.value)).toContain(
-      '"type":"RunActivityAppended"',
-    );
+    let received = "";
+    const timer = setTimeout(() => controller.abort(), 1_000);
+    try {
+      while (!received.includes('"type":"RunActivityAppended"')) {
+        const next = await reader.read();
+        expect(next.done).toBe(false);
+        received += new TextDecoder().decode(next.value);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
     controller.abort();
     await reader.cancel().catch(() => undefined);
   });
 
-  it("rejects incompatible development schemas on service startup", async () => {
+  it.each([14, 99])("rejects incompatible development schema %i on service startup", async (version) => {
     const directory = await temporaryDirectory();
     const databasePath = join(directory, "torsor.sqlite");
     const database = new DatabaseSync(databasePath);
-    database.exec("PRAGMA user_version = 99;");
+    database.exec(`PRAGMA user_version = ${version};`);
     database.close();
 
     expect(() =>
@@ -1108,7 +1108,30 @@ describe("Torsor HTTP and SSE service", () => {
         credentials,
         port: 0,
       }),
-    ).toThrow(/Incompatible development database schema version 99/);
+    ).toThrow(`Incompatible development database schema version ${version}; expected 15.`);
+  });
+
+  it.each(["partial", "missing-index", "missing-trigger"])("refuses %s schema 15 unchanged before HTTP startup", async (layout) => {
+    const directory = await temporaryDirectory();
+    const databasePath = join(directory, "state.sqlite");
+    if (layout !== "partial") TorsorKernel.open({ databasePath, bootstrap }).close();
+    const database = new DatabaseSync(databasePath);
+    database.exec(layout === "partial"
+      ? "CREATE TABLE causal_limits (singleton INTEGER PRIMARY KEY); PRAGMA user_version = 15;"
+      : layout === "missing-index" ? "DROP INDEX runs_causal_nonterminal_idx;"
+      : "DROP TRIGGER runs_causal_provenance_immutable;");
+    database.close();
+    const before = await readFile(databasePath);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let service: TorsorHttpService | undefined;
+      try {
+        expect(() => { service = createTorsorHttpService({ databasePath, bootstrap, credentials, port: 0 }); })
+          .toThrow("Incompatible development database schema 15 contract.");
+      } finally {
+        await service?.close();
+      }
+      expect((await readFile(databasePath)).equals(before)).toBe(true);
+    }
   });
 
   it("closes promptly when a client leaves a command body incomplete", async () => {

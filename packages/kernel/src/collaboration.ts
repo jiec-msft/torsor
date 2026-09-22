@@ -41,7 +41,7 @@ export function replyToThread(kernel: db.KernelContext, command: Extract<KernelC
 }>, principal: Row, context: PrincipalContext, correlationId: string): CommandResult {
   invariants.requireKind(kernel, principal, "human");
   const thread = invariants.requireThread(kernel, command.threadRootId);
-  invariants.checkThreadCursor(kernel, thread, command.expectedThreadCursor);
+  invariants.checkThreadCursor(kernel, thread, principal, context, command.expectedThreadCursor);
   const created = createMessage(kernel, {
     projectId: text(thread.project_id),
     channelId: text(thread.channel_id),

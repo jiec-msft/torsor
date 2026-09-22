@@ -1,12 +1,13 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  LocalArtifactStorage,
   TorsorKernel,
   type CommandResult,
   type KernelOpenOptions,
@@ -71,6 +72,7 @@ function durableRows(databasePath: string) {
       "runs", "run_inputs", "attentions", "activation_attempts",
       "attention_domain_fences", "public_events", "outbox_events",
       "idempotency_records", "run_history",
+      "artifacts", "causal_limits",
     ].map((table) => [table, database.prepare(`SELECT * FROM ${table}`).all()]));
   } finally {
     database.close();
@@ -223,6 +225,119 @@ async function activateRun(
 }
 
 describe("durable causal limits (MVP 25.1-25.2, 28.2, 32.7)", () => {
+  it("preserves causal admission and separate Artifact provenance across rollback, input, restart and replay", async () => {
+    const { databasePath } = await openDatabase({
+      causalLimits: { maxDepth: 4, maxNonTerminalRunsPerRoot: 2 },
+    });
+    const storage = await LocalArtifactStorage.open(join(dirname(databasePath), "artifacts"));
+    let kernel = TorsorKernel.open({ databasePath, artifactStorage: storage });
+    kernels.push(kernel);
+    const message = await startRequest(kernel, "artifact-root");
+    const rootDecision = await prepareDecision(kernel, message, "orbit", "artifact-root");
+    const root = await kernel.execute(rootDecision.command, rootDecision.context);
+    const rootContext = await activateRun(kernel, root, "orbit", "artifact-root");
+    const report = {
+      idempotencyKey: "shared-report", expectedRunRevision: 1,
+      content: Buffer.from("Shared synthetic causal report.\n"),
+    };
+    const rootReport = await kernel.finalizeReport({ ...report, runId: root.entityId }, rootContext);
+    const childDecision = await delegate(kernel, root, rootContext, "keel", "artifact-child");
+    const child = await kernel.execute(childDecision.command, childDecision.context);
+    const childContext = await activateRun(kernel, child, "keel", "artifact-child");
+
+    const beforeFailure = durableRows(databasePath);
+    const hook = Symbol.for("torsor.kernel.command-before-commit");
+    Reflect.set(globalThis, hook, ({ commandType }: { commandType: string }) => {
+      if (commandType === "PublishArtifact") throw new Error("Synthetic descriptor commit failure.");
+    });
+    try {
+      await expect(kernel.finalizeReport({ ...report, runId: child.entityId }, childContext))
+        .rejects.toThrow("Synthetic descriptor commit failure");
+    } finally {
+      Reflect.deleteProperty(globalThis, hook);
+    }
+    expect(durableRows(databasePath)).toEqual(beforeFailure);
+    const childReport = await kernel.finalizeReport({ ...report, runId: child.entityId }, childContext);
+    expect(childReport.entityId).not.toBe(rootReport.entityId);
+    const rootContent = await kernel.readArtifact(rootReport.entityId, humanContext);
+    const childContent = await kernel.readArtifact(childReport.entityId, humanContext);
+    expect(childContent.content).toEqual(report.content);
+    expect(childContent.artifact.contentDigest).toBe(rootContent.artifact.contentDigest);
+    expect(childContent.artifact).toMatchObject({
+      producerRunId: child.entityId, producerActivationId: childContext.activationId,
+      producerThreadRootId: message.entityId,
+    });
+    await expect(kernel.finalizeReport({
+      ...report, runId: child.entityId, ...{ parentRunId: root.entityId },
+    }, childContext)).rejects.toMatchObject({ code: "InvalidCommand" });
+    await expect(kernel.readArtifact(rootReport.entityId, childContext))
+      .rejects.toMatchObject({ code: "NotFound" });
+    await expect(kernel.readArtifact(childReport.entityId, rootContext))
+      .rejects.toMatchObject({ code: "NotFound" });
+
+    const grandchildDecision = await delegate(kernel, child, childContext, "orbit", "artifact-grandchild");
+    await expect(kernel.execute(grandchildDecision.command, grandchildDecision.context))
+      .rejects.toMatchObject({
+        code: "CausalLimitExceeded",
+        details: { causalRootId: message.entityId, delegationDepth: 2, nonTerminalRunCount: 2 },
+      });
+    const page = await kernel.query({
+      type: "ListRunProjections", projectId: "project-sample",
+    }, humanContext);
+    const expectedChild = {
+      causalRootId: message.entityId, parentRunId: root.entityId,
+      parentAttentionId: childDecision.command.attentionId, delegationDepth: 1,
+    };
+    expect(page.items.find((item) => item.run.id === child.entityId)).toMatchObject({
+      run: expectedChild, artifacts: [childContent.artifact],
+    });
+
+    const beforeRestart = durableRows(databasePath);
+    for (const connection of kernels) connection.close();
+    kernel = TorsorKernel.open({ databasePath, artifactStorage: storage });
+    kernels.push(kernel);
+    expect(await kernel.execute(childDecision.command, childDecision.context)).toEqual(child);
+    expect(await kernel.finalizeReport({ ...report, runId: root.entityId }, rootContext)).toEqual(rootReport);
+    expect(await kernel.finalizeReport({ ...report, runId: child.entityId }, childContext)).toEqual(childReport);
+    expect(durableRows(databasePath)).toEqual(beforeRestart);
+    await expect(kernel.execute(grandchildDecision.command, grandchildDecision.context))
+      .rejects.toMatchObject({ code: "CausalLimitExceeded" });
+
+    const send = {
+      type: "SendToRun" as const, idempotencyKey: "artifact-followup",
+      runId: child.entityId, expectedRunRevision: 1, body: "Inspect the report without resetting its causal root.",
+    };
+    const sent = await kernel.execute(send, humanContext);
+    expect(await kernel.execute(send, humanContext)).toEqual(sent);
+    expect(await kernel.finalizeReport({ ...report, runId: child.entityId }, childContext)).toEqual(childReport);
+    const updated = await kernel.query({ type: "GetRunProjection", runId: child.entityId }, humanContext);
+    expect(updated.run).toMatchObject({ ...expectedChild, state: "Active", revision: 2 });
+    expect(updated.inputs).toHaveLength(2);
+    expect(updated.inputs.every((input) => input.disposition === "Pending")).toBe(true);
+    expect(updated.artifacts).toEqual([childContent.artifact]);
+
+    await kernel.execute({
+      type: "CancelRun", idempotencyKey: "artifact-cancel-parent", runId: root.entityId,
+      expectedRunRevision: 1, reason: "Synthetic parent release.",
+    }, humanContext);
+    const grandchild = await kernel.execute(grandchildDecision.command, grandchildDecision.context);
+    expect((await kernel.query({ type: "GetRunProjection", runId: grandchild.entityId }, humanContext)).run)
+      .toMatchObject({ causalRootId: message.entityId, parentRunId: child.entityId, delegationDepth: 2 });
+    expect((await kernel.readArtifact(rootReport.entityId, humanContext)).content).toEqual(report.content);
+    await expect(kernel.readArtifact(rootReport.entityId, rootContext)).rejects.toMatchObject({ code: "Conflict" });
+    const historicalRuns = await kernel.query({
+      type: "ListRunProjections", projectId: "project-sample", snapshotEventId: page.snapshotEventId,
+    }, humanContext);
+    expect(historicalRuns).toEqual(page);
+    const historicalThreads = await kernel.query({
+      type: "ListThreadProjections", projectId: "project-sample", snapshotEventId: page.snapshotEventId,
+    }, humanContext);
+    expect(historicalThreads.items[0]!.runs.find((run) => run.id === child.entityId)).toMatchObject(expectedChild);
+    expect(historicalThreads.items[0]!.artifacts).toEqual(expect.arrayContaining([
+      rootContent.artifact, childContent.artifact,
+    ]));
+  });
+
   it("derives immutable provenance through Human requests and Agent delegation", async () => {
     const { kernel } = await openDatabase();
     const message = await startRequest(kernel, "root");

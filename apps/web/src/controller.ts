@@ -235,7 +235,7 @@ export class WebController {
         message: MessageEvent<WindowMessage>,
       ) => {
         if (message.data?.kind === "event") {
-          if (this.#state.session === "ready") {
+          if (this.#state.session === "ready" && !isArtifactEvent(message.data.event)) {
             void this.#applyEvent(message.data.event, false);
           }
         } else if (message.data?.kind === "session") {
@@ -1252,18 +1252,36 @@ export class WebController {
       }
     };
     events.addEventListener("torsor", (message) => {
+      if (this.#events !== events) return;
       const eventMessage = message as MessageEvent<string>;
       try {
         const event = JSON.parse(eventMessage.data) as PublicEvent;
         void this.#applyEvent(event, true);
       } catch {
-        this.#projectionErrors.set(
-          "events",
-          "A server event could not be read. Live updates may be stale.",
-        );
-        this.#setState({ queryError: this.#currentProjectionError() });
+        this.#eventReadFailed();
       }
     });
+    events.addEventListener("checkpoint", (message) => {
+      if (this.#events !== events) return;
+      try {
+        const checkpoint: unknown = JSON.parse((message as MessageEvent<string>).data);
+        if (
+          typeof checkpoint !== "object" || checkpoint === null ||
+          !("cursor" in checkpoint) || typeof checkpoint.cursor !== "string" || !checkpoint.cursor
+        ) throw new Error("Invalid event checkpoint.");
+        this.#setState({ lastEventId: checkpoint.cursor });
+      } catch {
+        this.#eventReadFailed();
+      }
+    });
+  }
+
+  #eventReadFailed(): void {
+    this.#projectionErrors.set(
+      "events",
+      "A server event could not be read. Live updates may be stale.",
+    );
+    this.#setState({ queryError: this.#currentProjectionError() });
   }
 
   async #applyEvent(event: PublicEvent, broadcast: boolean): Promise<void> {
@@ -1282,7 +1300,9 @@ export class WebController {
       lastEventId: event.eventId,
       ...(broadcast ? { connection: "live" as const } : {}),
     });
-    if (broadcast) {
+    // Artifact facts are Run-scoped. Other windows must obtain them from their
+    // own authenticated stream rather than a shared-origin broadcast.
+    if (broadcast && !isArtifactEvent(event)) {
       this.#broadcastChannel?.postMessage({
         kind: "event",
         event,
@@ -2021,6 +2041,10 @@ function deferredBoolean(): DeferredBoolean {
     resolve = complete;
   });
   return { promise, resolve };
+}
+
+function isArtifactEvent(event: PublicEvent): boolean {
+  return event.entityType === "Artifact" || event.type === "ArtifactPublished";
 }
 
 function isUncertainCommandError(error: unknown): boolean {
