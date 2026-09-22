@@ -294,6 +294,7 @@ export class WebController {
     }
     const projectId = this.#projectId;
     const sessionGeneration = this.#sessionGeneration;
+    const csrfRevision = this.#csrfRevision;
     const requestGeneration = ++this.#threadsRequestGeneration;
     const projectionKey = `threads:${channelId}`;
     const previousChannelId = this.#channelId;
@@ -333,11 +334,20 @@ export class WebController {
         }
         return this.#replacementResult(projectionKey, request);
       } catch (error) {
-        if (
+        const stillCurrent =
           this.#sessionGeneration === sessionGeneration &&
           this.#threadsRequestGeneration === requestGeneration &&
-          this.#channelId === channelId
+          this.#channelId === channelId;
+        if (
+          stillCurrent &&
+          error instanceof ApiError &&
+          error.status === 401 &&
+          this.#csrfRevision !== csrfRevision &&
+          this.#csrfToken
         ) {
+          return this.loadThreads(channelId);
+        }
+        if (stillCurrent) {
           this.#projectionFailed(projectionKey, error, {
             loadingThreads: false,
           });
@@ -439,6 +449,7 @@ export class WebController {
 
   async loadRun(runId: string): Promise<boolean> {
     const sessionGeneration = this.#sessionGeneration;
+    const csrfRevision = this.#csrfRevision;
     const requestGeneration = ++this.#runRequestGeneration;
     const projectionKey = `run:${runId}`;
     const previousRunId = this.#runId;
@@ -476,10 +487,20 @@ export class WebController {
         }
         return this.#replacementResult(projectionKey, request);
       } catch (error) {
-        if (
+        const stillCurrent =
           this.#sessionGeneration === sessionGeneration &&
-          this.#runRequestGeneration === requestGeneration
+          this.#runRequestGeneration === requestGeneration &&
+          this.#runId === runId;
+        if (
+          stillCurrent &&
+          error instanceof ApiError &&
+          error.status === 401 &&
+          this.#csrfRevision !== csrfRevision &&
+          this.#csrfToken
         ) {
+          return this.loadRun(runId);
+        }
+        if (stillCurrent) {
           this.#projectionFailed(projectionKey, error, {
             loadingRun: false,
           });

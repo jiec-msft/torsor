@@ -5,7 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { KernelBootstrap } from "@torsor/kernel";
+import { TorsorKernel, type KernelBootstrap } from "@torsor/kernel";
 import {
   createTorsorHttpService,
   type LocalCredential,
@@ -18,6 +18,7 @@ import { WebController } from "./controller";
 const bootstrap: KernelBootstrap = {
   principals: [
     { id: "principal-human", kind: "human", displayName: "Avery Stone" },
+    { id: "principal-runtime", kind: "runtime", displayName: "Local Runtime" },
     { id: "principal-orbit", kind: "agent", displayName: "Orbit" },
   ],
   projects: [{ id: "project-sample", name: "Sample Project" }],
@@ -422,6 +423,201 @@ describe("WebController production HTTP path", () => {
     );
     expect(second.eventSources.at(-1)?.closed).toBe(false);
   });
+
+  it("recovers a selected Thread list after a fenced shared-cookie 401", async () => {
+    const server = await startServer();
+    const browser = new BrowserTransport();
+    const broadcasts = new BroadcastHub();
+    const first = createWindowController(
+      server.origin,
+      browser,
+      broadcasts,
+    );
+    const second = createWindowController(
+      server.origin,
+      browser,
+      broadcasts,
+    );
+    await first.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    await first.controller.startThread({
+      channelId: "channel-general",
+      body: "Thread list recovered after credential replacement.",
+    });
+    await revokeBrowserSession(server.origin, browser);
+    const heldUnauthorized = browser.holdNext((url) =>
+      url.includes("/api/v1/channels/channel-general/threads"),
+    );
+    const selectedThreads = first.controller.loadThreads("channel-general");
+    await heldUnauthorized.observed;
+
+    await second.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    heldUnauthorized.release();
+    await expect(selectedThreads).resolves.toBe(true);
+
+    expect(first.controller.getSnapshot()).toMatchObject({
+      session: "ready",
+      connection: "live",
+      threadsChannelId: "channel-general",
+      loadingThreads: false,
+      queryError: null,
+    });
+    expect(first.controller.getSnapshot().threads).toHaveLength(1);
+    expect(
+      browser.requests.filter((url) =>
+        url.includes("/api/v1/channels/channel-general/threads"),
+      ),
+    ).toHaveLength(2);
+  });
+
+  it("settles a selected Thread-list error when replacement credentials fail", async () => {
+    const server = await startServer();
+    const browser = new BrowserTransport();
+    const broadcasts = new BroadcastHub();
+    const first = createWindowController(
+      server.origin,
+      browser,
+      broadcasts,
+    );
+    const second = createWindowController(
+      server.origin,
+      browser,
+      broadcasts,
+    );
+    await first.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    await revokeBrowserSession(server.origin, browser);
+    const heldUnauthorized = browser.holdNext((url) =>
+      url.includes("/api/v1/channels/channel-general/threads"),
+    );
+    const selectedThreads = first.controller.loadThreads("channel-general");
+    await heldUnauthorized.observed;
+
+    await second.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    browser.failNext(
+      (url) => url.includes("/api/v1/channels/channel-general/threads"),
+      "Replacement Thread-list projection failed.",
+    );
+    heldUnauthorized.release();
+    await expect(selectedThreads).resolves.toBe(false);
+
+    expect(first.controller.getSnapshot()).toMatchObject({
+      session: "ready",
+      connection: "live",
+      loadingThreads: false,
+      queryError: "Replacement Thread-list projection failed.",
+    });
+    expect(
+      browser.requests.filter((url) =>
+        url.includes("/api/v1/channels/channel-general/threads"),
+      ),
+    ).toHaveLength(2);
+  });
+
+  it("recovers a selected Run after a fenced shared-cookie 401", async () => {
+    const server = await startServer({ seedRun: true });
+    const browser = new BrowserTransport();
+    const broadcasts = new BroadcastHub();
+    const first = createWindowController(
+      server.origin,
+      browser,
+      broadcasts,
+    );
+    const second = createWindowController(
+      server.origin,
+      browser,
+      broadcasts,
+    );
+    await first.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    await revokeBrowserSession(server.origin, browser);
+    const heldUnauthorized = browser.holdNext((url) =>
+      url.endsWith(`/api/v1/runs/${server.runId}`),
+    );
+    const selectedRun = first.controller.loadRun(server.runId!);
+    await heldUnauthorized.observed;
+
+    await second.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    heldUnauthorized.release();
+    await expect(selectedRun).resolves.toBe(true);
+
+    expect(first.controller.getSnapshot()).toMatchObject({
+      session: "ready",
+      connection: "live",
+      loadingRun: false,
+      queryError: null,
+    });
+    expect(first.controller.getSnapshot().run?.run.id).toBe(server.runId);
+    expect(
+      browser.requests.filter((url) =>
+        url.endsWith(`/api/v1/runs/${server.runId}`),
+      ),
+    ).toHaveLength(2);
+  });
+
+  it("settles a selected Run error when replacement credentials fail", async () => {
+    const server = await startServer({ seedRun: true });
+    const browser = new BrowserTransport();
+    const broadcasts = new BroadcastHub();
+    const first = createWindowController(
+      server.origin,
+      browser,
+      broadcasts,
+    );
+    const second = createWindowController(
+      server.origin,
+      browser,
+      broadcasts,
+    );
+    await first.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    await revokeBrowserSession(server.origin, browser);
+    const heldUnauthorized = browser.holdNext((url) =>
+      url.endsWith(`/api/v1/runs/${server.runId}`),
+    );
+    const selectedRun = first.controller.loadRun(server.runId!);
+    await heldUnauthorized.observed;
+
+    await second.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    browser.failNext(
+      (url) => url.endsWith(`/api/v1/runs/${server.runId}`),
+      "Replacement Run projection failed.",
+    );
+    heldUnauthorized.release();
+    await expect(selectedRun).resolves.toBe(false);
+
+    expect(first.controller.getSnapshot()).toMatchObject({
+      session: "ready",
+      connection: "live",
+      loadingRun: false,
+      queryError: "Replacement Run projection failed.",
+    });
+    expect(
+      browser.requests.filter((url) =>
+        url.endsWith(`/api/v1/runs/${server.runId}`),
+      ),
+    ).toHaveLength(2);
+  });
 });
 
 class MemoryStorage {
@@ -487,7 +683,14 @@ class TestBroadcastChannel {
 class BrowserTransport {
   readonly #nativeFetch = globalThis.fetch.bind(globalThis);
   readonly commandRequests: Array<Record<string, unknown>> = [];
+  readonly requests: string[] = [];
   #cookie = "";
+  #failure:
+    | {
+        readonly predicate: (url: string) => boolean;
+        readonly message: string;
+      }
+    | null = null;
   #hold:
     | {
         readonly predicate: (url: string) => boolean;
@@ -505,6 +708,7 @@ class BrowserTransport {
     init?: RequestInit,
   ): Promise<Response> => {
     const url = String(input);
+    this.requests.push(url);
     if (url.includes("/api/v1/commands/") && typeof init?.body === "string") {
       this.commandRequests.push(
         JSON.parse(init.body) as Record<string, unknown>,
@@ -513,6 +717,22 @@ class BrowserTransport {
     const headers = new Headers(init?.headers);
     if (this.#cookie) {
       headers.set("Cookie", this.#cookie);
+    }
+    const failure = this.#failure;
+    if (failure?.predicate(url)) {
+      this.#failure = null;
+      return new Response(
+        JSON.stringify({
+          error: {
+            code: "projection_unavailable",
+            message: failure.message,
+          },
+        }),
+        {
+          status: 503,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
     }
     const response = await this.#nativeFetch(input, { ...init, headers });
     const setCookie = response.headers.get("set-cookie");
@@ -546,6 +766,13 @@ class BrowserTransport {
     });
     this.#hold = { predicate, gate, observed };
     return { observed: observedPromise, release };
+  }
+
+  failNext(predicate: (url: string) => boolean, message: string): void {
+    if (this.#failure) {
+      throw new Error("Only one failed browser response is supported.");
+    }
+    this.#failure = { predicate, message };
   }
 }
 
@@ -584,13 +811,20 @@ function createWindowController(
   return { controller, eventSources };
 }
 
-async function startServer(): Promise<{
+async function startServer(
+  options: { readonly seedRun?: boolean } = {},
+): Promise<{
   readonly service: TorsorHttpService;
   readonly origin: string;
+  readonly runId?: string;
 }> {
   const directory = await mkdtemp(join(tmpdir(), "torsor-web-integration-"));
+  const databasePath = join(directory, "torsor.sqlite");
+  const runId = options.seedRun
+    ? await seedRun(databasePath)
+    : undefined;
   const service = createTorsorHttpService({
-    databasePath: join(directory, "torsor.sqlite"),
+    databasePath,
     bootstrap,
     credentials,
     port: 0,
@@ -600,5 +834,66 @@ async function startServer(): Promise<{
     await service.close();
     await rm(directory, { recursive: true, force: true });
   });
-  return { service, origin };
+  return { service, origin, ...(runId ? { runId } : {}) };
+}
+
+async function seedRun(databasePath: string): Promise<string> {
+  const kernel = TorsorKernel.open({ databasePath, bootstrap });
+  try {
+    await kernel.execute(
+      {
+        type: "StartThread",
+        idempotencyKey: "selected-run-thread",
+        projectId: "project-sample",
+        channelId: "channel-general",
+        body: "Create a Run for selected projection recovery.",
+        targetAgentIds: ["agent-orbit"],
+      },
+      { principalId: "principal-human" },
+    );
+    const attentions = await kernel.query(
+      {
+        type: "ListOpenAttentions",
+        projectId: "project-sample",
+        targetAgentId: "agent-orbit",
+      },
+      { principalId: "principal-runtime" },
+    );
+    const attention = attentions.items[0]!;
+    const claim = await kernel.execute(
+      {
+        type: "ClaimAttention",
+        idempotencyKey: "selected-run-claim",
+        attentionId: attention.id,
+        expectedAttentionRevision: attention.revision,
+        leaseDurationMs: 30_000,
+      },
+      { principalId: "principal-runtime" },
+    );
+    const activation = await kernel.execute(
+      {
+        type: "StartActivation",
+        idempotencyKey: "selected-run-activation",
+        attentionId: attention.id,
+        handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
+      },
+      { principalId: "principal-runtime" },
+    );
+    const run = await kernel.execute(
+      {
+        type: "ResolveAttentionWithRun",
+        idempotencyKey: "selected-run-resolve",
+        attentionId: attention.id,
+        expectedAttentionRevision: claim.revision!,
+        handlerLeaseToken: claim.relatedIds!.handlerLeaseToken!,
+      },
+      {
+        principalId: "principal-orbit",
+        activationId: activation.entityId,
+      },
+    );
+    return run.entityId;
+  } finally {
+    kernel.close();
+  }
 }
