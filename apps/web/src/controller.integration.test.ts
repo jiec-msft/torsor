@@ -1,3 +1,4 @@
+// @vitest-environment node
 /// <reference types="node" />
 
 import { mkdtemp, rm } from "node:fs/promises";

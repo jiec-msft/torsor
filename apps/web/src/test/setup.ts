@@ -4,10 +4,14 @@ import { cleanup } from "@testing-library/react";
 import { afterEach, vi } from "vitest";
 
 afterEach(() => {
-  cleanup();
+  if (typeof document !== "undefined") {
+    cleanup();
+  }
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
-  window.history.replaceState({}, "", "/");
+  if (typeof window !== "undefined") {
+    window.history.replaceState({}, "", "/");
+  }
 });
 
 if (!globalThis.crypto.randomUUID) {
@@ -16,17 +20,19 @@ if (!globalThis.crypto.randomUUID) {
   });
 }
 
-Object.defineProperty(window, "matchMedia", {
-  configurable: true,
-  value: (query: string) => ({
-    matches:
-      query.includes("max-width: 1099px") && window.innerWidth <= 1099,
-    media: query,
-    onchange: null,
-    addListener: () => undefined,
-    removeListener: () => undefined,
-    addEventListener: () => undefined,
-    removeEventListener: () => undefined,
-    dispatchEvent: () => false,
-  }),
-});
+if (typeof window !== "undefined") {
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    value: (query: string) => ({
+      matches:
+        query.includes("max-width: 1099px") && window.innerWidth <= 1099,
+      media: query,
+      onchange: null,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      dispatchEvent: () => false,
+    }),
+  });
+}
