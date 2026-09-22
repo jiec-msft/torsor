@@ -26,7 +26,9 @@ for (let round = 1; round <= rounds; round += 1) {
   let result;
   try {
     await new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, [vitest, "run", "--reporter=json", `--outputFile=${outputFile}`], {
+      const child = spawn(process.execPath, [
+        vitest, "run", "--reporter=default", "--reporter=json", `--outputFile=${outputFile}`,
+      ], {
         cwd: directory, shell: false, stdio: ["ignore", "pipe", "pipe"], timeout: 30_000,
       });
       let stdout = "";
