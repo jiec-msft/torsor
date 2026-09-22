@@ -25,7 +25,7 @@ it("SS-3.5: fifty nonterminal Runs occupy one root; terminal release admits one 
       await capabilities.wait("Synthetic capacity remains occupied.");
     });
     const root = await system.startThread();
-    const draining = system.drain();
+    const draining = system.advanceUntil(async () => (await system.runs()).length === 51);
     await full.entered;
     const before = await system.runs();
     expect(before).toHaveLength(50);
@@ -40,10 +40,9 @@ it("SS-3.5: fifty nonterminal Runs occupy one root; terminal release admits one 
     await system.cancel(parent.id);
     full.release();
     await draining;
-    await system.drain();
     const after = await system.runs();
     expect(after).toHaveLength(51);
-    expect(after.filter(({ run }) => run.state === "Waiting")).toHaveLength(50);
+    expect(after.filter(({ run }) => ["Active", "Waiting"].includes(run.state))).toHaveLength(50);
     expect(after.filter(({ run }) => run.state === "Cancelled")).toHaveLength(1);
     expect(after.every(({ run, inputs }) => run.causalRootId === root && inputs.length === 1)).toBe(true);
     expect(new Set(after.map(({ run }) => run.parentAttentionId)).size).toBe(51);

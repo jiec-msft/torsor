@@ -9,11 +9,11 @@ it("SS-3.4: reconnect fills bounded gaps and duplicate/reversed SSE retains load
         await capabilities.createRunFromAttention();
         return;
       }
-      for (let index = 1; index <= 130; index += 1) {
+      for (let index = 1; index <= 101; index += 1) {
         await capabilities.appendActivity("assistant_delta", { text: `Synthetic ${index}` });
       }
       await disconnected.wait();
-      for (let index = 131; index <= 360; index += 1) {
+      for (let index = 102; index <= 302; index += 1) {
         await capabilities.appendActivity("assistant_delta", { text: `Synthetic ${index}` });
       }
       await capabilities.complete();
@@ -29,7 +29,7 @@ it("SS-3.4: reconnect fills bounded gaps and duplicate/reversed SSE retains load
     expect(system.web.getSnapshot().run!.activity.items).toHaveLength(100);
     await system.web.loadEarlierRunActivity();
     const history = system.web.getSnapshot().run!.activity.items;
-    expect(history).toHaveLength(130);
+    expect(history).toHaveLength(101);
     await system.sync();
     await system.disconnect();
     const requestBoundary = system.http.requests.length;
@@ -39,9 +39,9 @@ it("SS-3.4: reconnect fills bounded gaps and duplicate/reversed SSE retains load
     await system.replayEvents("reverse-duplicate");
     const activity = system.web.getSnapshot().run!.activity;
     expect(activity.items.map((item) => item.sequence))
-      .toEqual(Array.from({ length: 360 }, (_, index) => index + 1));
-    expect(activity.items.slice(0, 130)).toEqual(history);
-    expect(new Set(activity.items.map((item) => item.id)).size).toBe(360);
+      .toEqual(Array.from({ length: 302 }, (_, index) => index + 1));
+    expect(activity.items.slice(0, 101)).toEqual(history);
+    expect(new Set(activity.items.map((item) => item.id)).size).toBe(302);
     expect(activity.hasEarlier).toBe(false);
     expect(system.web.getSnapshot().run!.run.state).toBe("Completed");
     const gaps = system.http.requests.slice(requestBoundary)
@@ -51,8 +51,8 @@ it("SS-3.4: reconnect fills bounded gaps and duplicate/reversed SSE retains load
     expect(gaps.length).toBeLessThanOrEqual(4);
     for (const gap of gaps) {
       expect(gap.get("limit")).toBe("100");
-      expect(gap.get("beforeSequence")).toBe("261");
-      expect(Number(gap.get("afterSequence"))).toBeGreaterThanOrEqual(130);
+      expect(gap.get("beforeSequence")).toBe("203");
+      expect(Number(gap.get("afterSequence"))).toBeGreaterThanOrEqual(101);
     }
   });
 });

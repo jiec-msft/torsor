@@ -173,7 +173,25 @@ class SystemScenario {
   }
 
   drain(): Promise<void> {
-    const work = this.#runtime.drainUntilIdle(2_000).then(() => this.#assertProvider());
+    return this.#track(this.#runtime.drainUntilIdle(2_000).then(() => this.#assertProvider()));
+  }
+
+  advanceUntil(condition: () => Promise<boolean>): Promise<void> {
+    return this.#track((async () => {
+      if (await condition()) return;
+      for (let pass = 0; pass < 2_000; pass += 1) {
+        const result = await this.#runtime.runOnce();
+        this.#assertProvider();
+        if (await condition()) return;
+        if (result.attentionsDispatched === 0 && result.outboxEventsProcessed === 0) {
+          throw new Error("Runtime quiesced before the durable scenario condition.");
+        }
+      }
+      throw new Error("Durable scenario condition exceeded 2000 Runtime passes.");
+    })());
+  }
+
+  #track(work: Promise<void>): Promise<void> {
     this.#work.add(work);
     void work.then(
       () => this.#work.delete(work),

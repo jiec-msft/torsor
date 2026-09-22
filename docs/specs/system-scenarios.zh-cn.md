@@ -33,6 +33,8 @@ Then 读取公开 Kernel、HTTP 与 Web 投影。使用
 **SS-2.2** `system.provider` 按真实 `ProviderExecutionContext` 编排行为，
 只能通过 capability 影响领域状态；脚本错误必须使场景失败，不得被 Runtime
 记录为 Provider 失败后掩盖。`system.drain()` 有界消费持久工作，
+`system.advanceUntil(predicate)` 逐个 Runtime pass 推进至公开持久条件成立，
+条件在空闲时仍不成立则明确失败，不继续执行与断言无关的工作；
 `system.sync()` 从真实 SSE 字节推进 Web 投影；断言等待可观察条件，
 不得依赖到达时间。`system.reopen()` 丢弃 Runtime/Controller/Provider
 实例并重开同一 SQLite/Artifact root；只保留持久状态与场景显式输入。

@@ -35,7 +35,10 @@ lifecycle, without YAML, expression parsing or new domain objects.
 changing domain state only through capabilities. Script errors must fail the
 scenario, not disappear into Runtime-recorded Provider failure.
 `system.drain()` consumes bounded durable work; `system.sync()` advances Web
-projections from real SSE bytes. Assertions await observable conditions, not
+projections from real SSE bytes. `system.advanceUntil(predicate)` advances one
+Runtime pass at a time until a public durable condition holds; quiescence
+without that condition fails, avoiding work unrelated to the assertion.
+Assertions await observable conditions, not
 arrival timing. `system.reopen()` discards Runtime/Controller/Provider instances
 and reopens the same SQLite/Artifact root, retaining only durable state and
 explicit scenario input.

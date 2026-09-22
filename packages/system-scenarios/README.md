@@ -48,7 +48,9 @@ Run tests with this package's Vitest configuration; `test/setup.ts` freezes and
 audits application timers. `gate().entered/wait()/release()` controls Provider
 ordering; `clock.advance(ms)` advances only the Kernel/Runtime logical clock.
 `sync()` captures the durable SSE high-water mark at call time and releases a
-batch. `disconnect()` and `sync("reverse-duplicate")` exercise reconnect and
+batch. `advanceUntil(predicate)` stops Runtime passes at a public durable
+condition without draining unrelated execution. `disconnect()` and
+`sync("reverse-duplicate")` exercise reconnect and
 out-of-order real notifications. Ordinary `kernel`/`web` ports expose public
 commands/projections, not database tables or app internals.
 `http.loseNextResponse(path)` drops a response after server processing;
@@ -64,7 +66,7 @@ are durable but before descriptor commit; there is no arbitrary command/path API
 |---|---|
 | SS-3.2 | Human Thread → Run → ordered activity → final Reply/completion, SSE-driven Web |
 | SS-3.3 | Response loss, same-identity retry, payload conflict, read-only recovery |
-| SS-3.4 | 360 facts, 100-item pages, finite catch-up, duplicate/reversed replay, retained history |
+| SS-3.4 | 302 facts, 100-item pages, finite catch-up, duplicate/reversed replay, retained history |
 | SS-3.5 | Depth 4/5; real default cap 50, Waiting occupancy, retry after terminal release |
 | SS-3.6 | SHA-256, independent descriptors, sibling Run scope, finalization/reopen/download |
 | SS-3.7 | Real process exit, invisible uncommitted report, durable checkpoint and fresh Runtime continuation |
