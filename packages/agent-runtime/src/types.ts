@@ -124,14 +124,23 @@ const providerDiagnosticSummaries = {
 export type ProviderDiagnosticCode = keyof typeof providerDiagnosticSummaries;
 
 export class ProviderExecutionError extends Error {
+  readonly diagnosticCode: ProviderDiagnosticCode;
+  readonly outcome: Extract<ProviderAttemptStatus, "Failed" | "Unknown">;
+
   constructor(
-    public readonly diagnosticCode: ProviderDiagnosticCode,
-    public readonly outcome: Extract<
+    diagnosticCode: ProviderDiagnosticCode,
+    outcome: Extract<
       ProviderAttemptStatus,
       "Failed" | "Unknown"
     >,
   ) {
-    super(providerPublicDiagnostic(diagnosticCode));
+    const safeCode = isProviderDiagnosticCode(diagnosticCode)
+      ? diagnosticCode
+      : "provider_execution_failed";
+    const safeOutcome = outcome === "Unknown" ? "Unknown" : "Failed";
+    super(providerPublicDiagnostic(safeCode));
+    this.diagnosticCode = safeCode;
+    this.outcome = safeOutcome;
     this.name = "ProviderExecutionError";
   }
 }
@@ -162,7 +171,10 @@ export function normalizeProviderExecutionError(
   const visited = new Set<unknown>();
   for (let depth = 0; depth < 8 && !visited.has(current); depth += 1) {
     if (current instanceof ProviderExecutionError) {
-      return current;
+      return new ProviderExecutionError(
+        current.diagnosticCode,
+        current.outcome,
+      );
     }
     visited.add(current);
     current = current instanceof Error ? current.cause : undefined;
@@ -176,9 +188,21 @@ export function normalizeProviderExecutionError(
 export function providerPublicDiagnostic(
   code: ProviderDiagnosticCode,
 ): string {
-  const detail = `${code}: ${providerDiagnosticSummaries[code]}`;
+  const safeCode = isProviderDiagnosticCode(code)
+    ? code
+    : "provider_execution_failed";
+  const detail = `${safeCode}: ${providerDiagnosticSummaries[safeCode]}`;
   if (detail.length > 160) {
-    throw new Error(`Provider diagnostic ${code} exceeds 160 characters.`);
+    throw new Error(`Provider diagnostic ${safeCode} exceeds 160 characters.`);
   }
   return detail;
+}
+
+function isProviderDiagnosticCode(
+  value: unknown,
+): value is ProviderDiagnosticCode {
+  return (
+    typeof value === "string" &&
+    Object.prototype.hasOwnProperty.call(providerDiagnosticSummaries, value)
+  );
 }

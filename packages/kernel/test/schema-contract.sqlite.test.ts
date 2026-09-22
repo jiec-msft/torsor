@@ -13,7 +13,7 @@ import { bootstrap } from "./helpers.js";
 
 describe("integrated schema contract (MVP 21.5, 23.1, 25.1-25.2)", () => {
   const incompatibleLayouts = [
-    { name: "partial v15 containing only causal_limits", sql: "CREATE TABLE causal_limits (singleton INTEGER PRIMARY KEY, max_depth INTEGER, max_non_terminal_runs_per_root INTEGER);" },
+    { name: "partial v16 containing only causal_limits", sql: "CREATE TABLE causal_limits (singleton INTEGER PRIMARY KEY, max_depth INTEGER, max_non_terminal_runs_per_root INTEGER);" },
     { name: "missing index", after: "DROP INDEX runs_causal_nonterminal_idx;" },
     { name: "missing trigger", after: "DROP TRIGGER runs_causal_provenance_immutable;" },
     { name: "missing column", after: "ALTER TABLE artifacts DROP COLUMN metadata_json;" },
@@ -33,7 +33,7 @@ describe("integrated schema contract (MVP 21.5, 23.1, 25.1-25.2)", () => {
     { name: "changed string literal case", replace: ["'human', 'agent', 'runtime'", "'Human', 'agent', 'runtime'"] },
     { name: "changed trigger literal whitespace", replace: ["Run causal provenance is immutable", "Run causal  provenance is immutable"] },
     { name: "non-STRICT table", replace: [") STRICT;", ");"] },
-    { name: "predecessor-shaped Artifact table claiming v15", after: "ALTER TABLE artifacts DROP COLUMN producer_thread_root_id; ALTER TABLE artifacts DROP COLUMN byte_length; ALTER TABLE artifacts ADD COLUMN storage_location TEXT;" },
+    { name: "predecessor-shaped Artifact table claiming v16", after: "ALTER TABLE artifacts DROP COLUMN producer_thread_root_id; ALTER TABLE artifacts DROP COLUMN byte_length; ALTER TABLE artifacts ADD COLUMN storage_location TEXT;" },
     { name: "missing durable causal configuration", after: "DELETE FROM causal_limits;" },
     { name: "missing durable runtime configuration", after: "DELETE FROM kernel_runtime_state;" },
     { name: "future version", after: "PRAGMA user_version = 99;" },
@@ -51,7 +51,7 @@ describe("integrated schema contract (MVP 21.5, 23.1, 25.1-25.2)", () => {
         ddl = ddl.replace(from!, to!);
       }
       database.exec(ddl);
-      database.exec("INSERT INTO causal_limits VALUES (1, 4, 50); PRAGMA user_version = 15;");
+      database.exec("INSERT INTO causal_limits VALUES (1, 4, 50); PRAGMA user_version = 16;");
       if (layout.after) database.exec(layout.after);
       database.close();
       const before = await readFile(databasePath);
@@ -75,7 +75,7 @@ describe("integrated schema contract (MVP 21.5, 23.1, 25.1-25.2)", () => {
       const database = new DatabaseSync(databasePath);
       database.exec(schemaSql.replaceAll("CREATE TABLE", "create /* layout */ table")
         .replaceAll("CREATE INDEX", "create\nindex").replaceAll(" NOT NULL", " not null"));
-      database.exec("INSERT INTO causal_limits VALUES (1, 4, 50); PRAGMA user_version = 15; PRAGMA journal_mode = WAL;");
+      database.exec("INSERT INTO causal_limits VALUES (1, 4, 50); PRAGMA user_version = 16; PRAGMA journal_mode = WAL;");
       database.close();
       const before = await readFile(databasePath);
       const logical = logicalSnapshot(databasePath);
@@ -111,6 +111,27 @@ describe("integrated schema contract (MVP 21.5, 23.1, 25.1-25.2)", () => {
         bootstrap: { principals: [{ id: "principal-must-not-be-inserted", kind: "human", displayName: "Synthetic" }] },
       }).close();
       expect(logicalSnapshot(databasePath)).toEqual(initialized);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects the pre-redaction schema before exposing persisted diagnostics", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-schema-redaction-"));
+    const databasePath = join(directory, "state.sqlite");
+    try {
+      const database = new DatabaseSync(databasePath);
+      database.exec(schemaSql);
+      database.exec("PRAGMA user_version = 15");
+      database.close();
+      const before = await readFile(databasePath);
+
+      expect(() =>
+        TorsorKernel.open({ databasePath, bootstrap }),
+      ).toThrow(
+        "Incompatible development database schema version 15; expected 16. Stop old Torsor processes and recreate the disposable local database.",
+      );
+      expect((await readFile(databasePath)).equals(before)).toBe(true);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -156,14 +177,14 @@ describe("integrated schema contract (MVP 21.5, 23.1, 25.1-25.2)", () => {
     }
   });
 
-  it("initializes and reopens schema 15 with both causal and trusted Artifact storage contracts", async () => {
+  it("initializes and reopens schema 16 with both causal and trusted Artifact storage contracts", async () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-schema-contract-"));
     const databasePath = join(directory, "kernel.sqlite");
     try {
       TorsorKernel.open({ databasePath, bootstrap }).close();
       const database = new DatabaseSync(databasePath, { readOnly: true });
       try {
-        expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 15 });
+        expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 16 });
         expect(database.prepare("SELECT * FROM causal_limits").all()).toEqual([{
           singleton: 1, max_depth: 4, max_non_terminal_runs_per_root: 50,
         }]);
@@ -228,7 +249,7 @@ describe("integrated schema contract (MVP 21.5, 23.1, 25.1-25.2)", () => {
         const logical = logicalSnapshot(databasePath);
         for (let attempt = 0; attempt < 2; attempt += 1) {
           expect(() => TorsorKernel.open({ databasePath, bootstrap })).toThrow(
-            "Incompatible development database schema version 14; expected 15. Stop old Torsor processes and recreate the disposable local database.",
+            "Incompatible development database schema version 14; expected 16. Stop old Torsor processes and recreate the disposable local database.",
           );
           expect((await readFile(databasePath)).equals(before)).toBe(true);
           expect(logicalSnapshot(databasePath)).toEqual(logical);

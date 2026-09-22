@@ -4356,6 +4356,34 @@ describe("AgentRuntime", () => {
     }
   });
 
+  it("rejects an unrecognized diagnostic code from an older adapter contract", async () => {
+    const kernel = openKernel(":memory:");
+    const privateMarker = "SYNTHETIC_PRIVATE_OLD_ADAPTER_MESSAGE";
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+        return;
+      }
+      throw new ProviderExecutionError(privateMarker as never, "Failed");
+    });
+    try {
+      await mentionAgent(kernel, "legacy-provider-error");
+      const runtime = createRuntime(kernel, adapter);
+
+      await expect(runtime.drainUntilIdle()).rejects.toMatchObject({
+        diagnosticCode: "provider_execution_failed",
+        outcome: "Failed",
+      });
+      const run = await getOnlyRun(kernel);
+      expect(run.providerAttempts.at(-1)?.detail).toBe(
+        "provider_execution_failed: Provider execution failed.",
+      );
+      expect(JSON.stringify(run)).not.toContain(privateMarker);
+    } finally {
+      kernel.close();
+    }
+  });
+
   it.each([
     ["malformed", "provider_protocol_error"],
     ["prompt-error", "provider_protocol_error"],

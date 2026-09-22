@@ -1035,14 +1035,15 @@ Artifact 和原始 provenance，不重复发布事件。新 Activation 只有在
 阻止新 descriptor；已提交 descriptor 仍由当前获授权的 Human/Runtime 查询。
 首片不自动删除 orphan 或 staging 文件，避免与并发固化竞争；清理留给停机维护。
 
-持久因果限制与可信 Artifact 的整合数据库使用 schema **15**，同时保留第 25 节的
+持久因果限制、可信 Artifact 与 Provider 诊断边界的整合数据库使用 schema **16**，同时保留第 25 节的
 Run root/parent/depth、不可变约束、准入索引及持久配置，以及第 23 节的可信报告
 descriptor。此前 causal-only schema 14 和独立开发的 Artifact-only schema 14
-均不兼容；不得因版本数字相同而接受另一套布局。打开任何旧版或未版本化的非空
+均不兼容；schema 15 也可能包含边界修复前公开持久化的 Provider 原始诊断，因此
+必须拒绝并重建。不得因版本数字相同而接受另一套布局。打开任何旧版或未版本化的非空
 开发数据库必须在应用 DDL/Bootstrap 前明确拒绝，不迁移、不改写版本、不删除数据。
-停止旧进程后由操作者显式重建可丢弃数据库。schema 15 重开仍校验持久 causal 配置。
+停止旧进程后由操作者显式重建可丢弃数据库。schema 16 重开仍校验持久 causal 配置。
 
-`user_version = 15` 不是布局证明。已有数据库必须在任何 DDL、Bootstrap 或配置写入
+`user_version = 16` 不是布局证明。已有数据库必须在任何 DDL、Bootstrap 或配置写入
 之前，以只读方式对照由可信 DDL 在隔离内存库生成的完整 schema 指纹：对象集合、
 列/type/not-null/default/PK/FK、索引/唯一性/partial predicate、trigger、CHECK
 和 STRICT 等约束。比较 SQLite 解析后的 metadata 与保留 literal/operator 语义的
@@ -1050,7 +1051,7 @@ SQL token；只忽略空白、注释和未引用 keyword/identifier 大小写，
 缺失、额外不兼容、部分、损坏、前驱形状或未来布局必须拒绝，保持原文件字节及逻辑
 状态不变，不用 `CREATE IF NOT EXISTS` 修补。SQLite 自有统计对象不属于应用布局。
 只有没有持久对象的 version 0 数据库可在同一事务内执行 DDL、初始配置及 Bootstrap；
-失败完整回滚。有效 schema 15 重开不重新应用 Bootstrap，也不修改持久 causal 配置。
+失败完整回滚。有效 schema 16 重开不重新应用 Bootstrap，也不修改持久 causal 配置。
 
 Runtime Host 调度恢复 pass 时，连续执行的 pass 数量必须有界，并在继续前让出事件循环并重新检查关闭请求。积压处理不得饿死 HTTP、timer、signal 或关闭处理。空闲轮询等待必须可被关闭请求中断；无论等待还是关闭先完成，都必须移除对应 listener 并取消不再需要的 timer。
 
