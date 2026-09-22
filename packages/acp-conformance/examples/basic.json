@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "id": "basic",
+  "steps": [
+    {
+      "type": "request", "id": "init", "method": "initialize",
+      "params": { "protocolVersion": 1, "clientCapabilities": {} }
+    },
+    {
+      "type": "response", "id": "init",
+      "expect": [{ "path": "/protocolVersion", "equals": 1 }, { "path": "/agentCapabilities", "kind": "object" }]
+    },
+    {
+      "type": "request", "id": "session", "method": "session/new",
+      "params": { "cwd": { "$ref": "workspace" }, "mcpServers": [] }
+    },
+    { "type": "response", "id": "session", "expect": [{ "path": "/sessionId", "kind": "string" }] },
+    {
+      "type": "request", "id": "turn", "method": "session/prompt",
+      "params": {
+        "sessionId": { "$ref": "session#/sessionId" },
+        "prompt": [{ "type": "text", "text": "Reply briefly without using tools or accessing files." }]
+      }
+    },
+    { "type": "response", "id": "turn", "expect": [{ "path": "/stopReason", "equals": "end_turn" }] }
+  ],
+  "mock": {
+    "handlers": [
+      {
+        "kind": "request", "method": "initialize",
+        "actions": [{ "type": "reply", "result": { "protocolVersion": 1, "agentCapabilities": {}, "authMethods": [] } }]
+      },
+      {
+        "kind": "request", "method": "session/new",
+        "actions": [{ "type": "reply", "result": { "sessionId": "synthetic-session" } }]
+      },
+      {
+        "kind": "request", "method": "session/prompt",
+        "actions": [
+          {
+            "type": "notify", "method": "session/update",
+            "params": {
+              "sessionId": "synthetic-session",
+              "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "Synthetic reply." } }
+            }
+          },
+          { "type": "reply", "result": { "stopReason": "end_turn" } }
+        ]
+      }
+    ]
+  }
+}
