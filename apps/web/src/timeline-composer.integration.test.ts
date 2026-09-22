@@ -21,6 +21,74 @@ function sequences(first: number, last: number) {
 }
 
 describe("Composer and Timeline shared projection reads (§37.3, §44.2)", () => {
+  it("preserves causal provenance and one committed input through terminal replay at full capacity", async () => {
+    const fixture = await runComposerHttp({
+      pauseEvents: true,
+      causalLimits: { maxDepth: 4, maxNonTerminalRunsPerRoot: 1 },
+    });
+    fixtures.push(fixture);
+    const { kernel, controller, first, second, browser } = fixture;
+    const human = { principalId: "principal-human" };
+    await fixture.appendActivity(250);
+    await controller.loadRun(first.id);
+    await controller.loadEarlierRunActivity();
+    await controller.loadEarlierRunActivity();
+    const history = controller.getSnapshot().run!.activity;
+    expect(history.items).toHaveLength(250);
+    const initial = await kernel.query({ type: "GetRunProjection", runId: first.id }, human);
+    const provenance = {
+      causalRootId: first.threadId,
+      parentAttentionId: initial.run.parentAttentionId,
+      parentRunId: null,
+      delegationDepth: 0,
+    };
+    expect(controller.getSnapshot().run!.run).toMatchObject(provenance);
+    controller.runComposer.edit(second.id, "Keep the other Run's draft.");
+    controller.runComposer.edit(first.id, "One instruction at full causal capacity.");
+    const lost = browser.hold("/api/v1/commands/send-to-run", "response-loss");
+    const sending = controller.sendToRun(first.id);
+    await lost.observed;
+    lost.release();
+    await sending;
+    expect(controller.runComposer.getSnapshot()[first.id]?.status).toBe("unknown");
+    const originalRequest = controller.runComposer.getSnapshot()[first.id]!.request;
+    expect(originalRequest).not.toBeNull();
+    const committed = await kernel.query({ type: "GetRunProjection", runId: first.id }, human);
+    expect(committed.run).toMatchObject({ ...provenance, state: "Active", revision: 2 });
+    expect(committed.inputs).toHaveLength(2);
+    await kernel.execute({
+      type: "CancelRun", idempotencyKey: "causal-composer-cancel",
+      runId: first.id, expectedRunRevision: 2, reason: "Human stopped this synthetic Run.",
+    }, human);
+    expect(await controller.refreshRunComposer(first.id)).toBe(true);
+    expect(controller.getSnapshot().run!.run).toMatchObject({
+      ...provenance, state: "Cancelled", revision: 3,
+    });
+    expect(controller.runComposer.getSnapshot()[first.id]!.request).toBe(originalRequest);
+    await controller.sendToRun(first.id);
+    expect(controller.runComposer.getSnapshot()[first.id]).toMatchObject({
+      status: "submitted", request: null, projectionStatus: "idle",
+    });
+    expect(controller.getSnapshot().run!.activity).toEqual(history);
+    expect(controller.getSnapshot().run!.inputs).toHaveLength(2);
+    expect(controller.getSnapshot().thread!.messages).toHaveLength(2);
+    expect(controller.getSnapshot().thread!.runs).toHaveLength(1);
+    expect(controller.getSnapshot().run!.run).toMatchObject({
+      ...provenance, state: "Cancelled", revision: 3,
+    });
+    expect(controller.runComposer.getSnapshot()[second.id]?.draft)
+      .toBe("Keep the other Run's draft.");
+    const sends = browser.requests.filter((request) => request.path.endsWith("/send-to-run"));
+    expect(sends).toHaveLength(2);
+    expect(sends[1]!.body).toBe(sends[0]!.body);
+    const events = await kernel.query({
+      type: "ReadPublicEvents", projectId: "project-sample", limit: 100,
+    }, human);
+    expect(events.events.filter((event) =>
+      event.type === "RunCreated" && event.entityId === first.id,
+    )).toHaveLength(1);
+  });
+
   it("preserves >100 loaded activity items when a submission refreshes Run and Thread", async () => {
     const { controller, first, browser } = await setup();
     await controller.loadEarlierRunActivity();

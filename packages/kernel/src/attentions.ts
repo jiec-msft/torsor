@@ -1,4 +1,5 @@
 import * as db from "./database.js";
+import { admitRunFromAttention } from "./causal-limits.js";
 import { KernelError } from "./errors.js";
 import * as invariants from "./invariants.js";
 import * as runs from "./runs.js";
@@ -205,13 +206,15 @@ export function resolveAttentionWithRun(kernel: db.KernelContext, command: Extra
     principal,
     context,
   );
+  const admission = admitRunFromAttention(kernel, attention);
   const runId = kernel.idFactory("run");
   const now = db.now(kernel);
   const configRevision = integer(agent.current_config_revision);
   db.run(kernel, `INSERT INTO runs
         (id, project_id, home_channel_id, thread_root_id, owner_agent_id,
-         agent_config_revision, state, revision, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'Active', 1, ?, ?)`, runId, text(attention.project_id), text(attention.channel_id), text(attention.thread_root_id), text(agent.id), configRevision, now, now);
+         agent_config_revision, causal_root_id, parent_attention_id,
+         parent_run_id, delegation_depth, state, revision, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', 1, ?, ?)`, runId, text(attention.project_id), text(attention.channel_id), text(attention.thread_root_id), text(agent.id), configRevision, admission.causalRootId, admission.parentAttentionId, admission.parentRunId, admission.delegationDepth, now, now);
   const run = invariants.requireRun(kernel, runId);
   const input = runs.createRunInput(kernel, run, text(attention.message_revision_id), text(principal.id), text(activation.id), command.attentionId);
   finishAttentionActivation(
@@ -246,7 +249,7 @@ export function resolveAttentionWithRun(kernel: db.KernelContext, command: Extra
     activationId: text(activation.id),
     causationId: command.attentionId,
     correlationId,
-    payload: { state: "Active", ownerAgentId: text(agent.id) },
+    payload: { state: "Active", ownerAgentId: text(agent.id), ...admission },
   });
   const attentionEventSequence = invariants.emitEvent(kernel, {
     type: "AttentionResolved",

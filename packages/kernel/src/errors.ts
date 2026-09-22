@@ -9,6 +9,7 @@ export class KernelError extends Error {
       | "InvalidCommand"
       | "Conflict"
       | "DomainBusy"
+      | "CausalLimitExceeded"
       | "StaleRevision"
       | "ConditionalCheckFailed"
       | "TerminalRun"
