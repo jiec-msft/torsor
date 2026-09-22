@@ -1,6 +1,7 @@
 import {
   claimAttention,
   ignoreAttention,
+  resolveCachedAttentionClaim,
   resolveAttentionWithExistingRun,
   resolveAttentionWithRun,
 } from "./attentions.js";
@@ -48,6 +49,7 @@ import {
 } from "./outbox.js";
 import {
   getBootstrap,
+  getAttentionRecoverySnapshot,
   getProjectAgentStatus,
   getProviderAttempt,
   getRunProjection,
@@ -161,6 +163,27 @@ export class TorsorKernel {
           );
         }
         const result = JSON.parse(text(cached.result_json)) as CommandResult;
+        if (command.type === "ClaimAttention") {
+          const current = resolveCachedAttentionClaim(
+            this.#context,
+            result,
+            principal,
+          );
+          if (JSON.stringify(current) !== JSON.stringify(result)) {
+            run(
+              this.#context,
+              `UPDATE idempotency_records
+                  SET result_json = ?
+                WHERE principal_id = ? AND command_name = ? AND idempotency_key = ?`,
+              JSON.stringify(current),
+              text(principal.id),
+              command.type,
+              command.idempotencyKey,
+            );
+          }
+          this.#context.database.exec("COMMIT");
+          return current;
+        }
         if (command.type === "ClaimOutboxEvents") {
           const refreshed = resolveCachedOutboxClaim(
             this.#context,
@@ -225,7 +248,15 @@ export class TorsorKernel {
       this.#context,
       principalContext.principalId,
     );
-    this.#context.database.exec("BEGIN");
+    const advancesRecoveryClock =
+      query.type === "GetAttentionRecoverySnapshot" ||
+      (
+        query.type === "ListRecoverableAttentionExecutions" &&
+        query.recoveryRevision === undefined
+      );
+    this.#context.database.exec(
+      advancesRecoveryClock ? "BEGIN IMMEDIATE" : "BEGIN",
+    );
     try {
       let result: unknown;
       switch (query.type) {
@@ -370,11 +401,16 @@ export class TorsorKernel {
             principalContext,
           );
           break;
+        case "GetAttentionRecoverySnapshot":
+          requireKind(this.#context, principal, "runtime");
+          result = getAttentionRecoverySnapshot(this.#context);
+          break;
         case "ListRecoverableAttentionExecutions":
           requireKind(this.#context, principal, "runtime");
           result = listRecoverableAttentionExecutions(
             this.#context,
             query.afterCursor,
+            query.recoveryRevision,
             boundedLimit(query.limit),
           );
           break;

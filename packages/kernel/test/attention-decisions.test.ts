@@ -583,6 +583,178 @@ describe("Attention decisions", () => {
     }
   });
 
+  it("fences provider execution by Agent, Project, Channel, and Thread", async () => {
+    const kernel = openMemoryKernel();
+    try {
+      const first = await openAttention(kernel, "domain-first");
+      const second = await openAttention(
+        kernel,
+        "domain-second",
+        "agent-orbit",
+        first.threadRootId,
+      );
+      const otherAgent = await openAttention(
+        kernel,
+        "domain-other-agent",
+        "agent-keel",
+        first.threadRootId,
+      );
+      const otherThread = await openAttention(
+        kernel,
+        "domain-other-thread",
+      );
+      const claimed = await claimAttention(
+        kernel,
+        "domain-first",
+        first.attention,
+      );
+
+      await expect(
+        kernel.execute(
+          {
+            type: "ClaimAttention",
+            idempotencyKey: "domain-second-claim",
+            attentionId: second.attention.id,
+            expectedAttentionRevision: second.attention.revision,
+            leaseDurationMs: 30_000,
+          },
+          runtimeContext,
+        ),
+      ).rejects.toMatchObject({ code: "DomainBusy" });
+      await expect(
+        kernel.execute(
+          {
+            type: "ClaimAttention",
+            idempotencyKey: "domain-other-agent-claim",
+            attentionId: otherAgent.attention.id,
+            expectedAttentionRevision: otherAgent.attention.revision,
+            leaseDurationMs: 30_000,
+          },
+          runtimeContext,
+        ),
+      ).resolves.toMatchObject({
+        entityId: otherAgent.attention.id,
+      });
+      await expect(
+        kernel.execute(
+          {
+            type: "ClaimAttention",
+            idempotencyKey: "domain-other-thread-claim",
+            attentionId: otherThread.attention.id,
+            expectedAttentionRevision: otherThread.attention.revision,
+            leaseDurationMs: 30_000,
+          },
+          runtimeContext,
+        ),
+      ).resolves.toMatchObject({
+        entityId: otherThread.attention.id,
+      });
+
+      const attempt = await kernel.execute(
+        {
+          type: "StartProviderAttempt",
+          idempotencyKey: "domain-first-provider",
+          activationId: claimed.activationId,
+          adapter: "deterministic-fake",
+          adapterVersion: "1",
+          capabilitySnapshot: {},
+          runInputIds: [],
+          requestIdempotencyKey: "domain-first-request",
+        },
+        runtimeContext,
+      );
+      await kernel.execute(
+        {
+          type: "IgnoreAttention",
+          idempotencyKey: "domain-first-ignore",
+          attentionId: first.attention.id,
+          expectedAttentionRevision: claimed.attentionRevision,
+          handlerLeaseToken: claimed.leaseToken,
+          reason: "The synthetic dispatch needs no durable Run.",
+        },
+        claimed.context,
+      );
+      await expect(
+        kernel.execute(
+          {
+            type: "ClaimAttention",
+            idempotencyKey: "domain-second-after-decision",
+            attentionId: second.attention.id,
+            expectedAttentionRevision: second.attention.revision,
+            leaseDurationMs: 30_000,
+          },
+          runtimeContext,
+        ),
+      ).rejects.toMatchObject({ code: "DomainBusy" });
+
+      await kernel.execute(
+        {
+          type: "FinishProviderAttempt",
+          idempotencyKey: "domain-first-settle",
+          providerAttemptId: attempt.entityId,
+          status: "Unknown",
+          detail: "Synthetic provider work was reconciled after the decision.",
+        },
+        runtimeContext,
+      );
+      await expect(
+        kernel.execute(
+          {
+            type: "ClaimAttention",
+            idempotencyKey: "domain-second-after-settlement",
+            attentionId: second.attention.id,
+            expectedAttentionRevision: second.attention.revision,
+            leaseDurationMs: 30_000,
+          },
+          runtimeContext,
+        ),
+      ).resolves.toMatchObject({
+        entityId: second.attention.id,
+      });
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("releases an abandoned domain after its handler lease expires", async () => {
+    let now = new Date("2026-09-21T08:00:00.000Z");
+    const kernel = openMemoryKernel(() => now);
+    try {
+      const first = await openAttention(kernel, "domain-expiry-first");
+      const second = await openAttention(
+        kernel,
+        "domain-expiry-second",
+        "agent-orbit",
+        first.threadRootId,
+      );
+      await kernel.execute(
+        {
+          type: "ClaimAttention",
+          idempotencyKey: "domain-expiry-first-claim",
+          attentionId: first.attention.id,
+          expectedAttentionRevision: first.attention.revision,
+          leaseDurationMs: 1_000,
+        },
+        runtimeContext,
+      );
+      now = new Date("2026-09-21T08:00:02.000Z");
+      await expect(
+        kernel.execute(
+          {
+            type: "ClaimAttention",
+            idempotencyKey: "domain-expiry-second-claim",
+            attentionId: second.attention.id,
+            expectedAttentionRevision: second.attention.revision,
+            leaseDurationMs: 30_000,
+          },
+          runtimeContext,
+        ),
+      ).resolves.toMatchObject({ entityId: second.attention.id });
+    } finally {
+      kernel.close();
+    }
+  });
+
   it("rejects an Attention Activation after its lease is replaced", async () => {
     let now = new Date("2026-09-21T08:00:00.000Z");
     const kernel = openMemoryKernel(() => now);
@@ -598,6 +770,35 @@ describe("Attention decisions", () => {
         },
         runtimeContext,
       );
+      expect(firstClaim.leaseExpiresAt).toBe(
+        "2026-09-21T08:00:01.000Z",
+      );
+      const recoveryBeforeReplay = await kernel.query(
+        { type: "GetAttentionRecoverySnapshot" },
+        runtimeContext,
+      );
+      expect(
+        (
+          await kernel.execute(
+            {
+              type: "ClaimAttention",
+              idempotencyKey: "replaced-first-claim",
+              attentionId: opened.attention.id,
+              expectedAttentionRevision: opened.attention.revision,
+              leaseDurationMs: 1_000,
+            },
+            runtimeContext,
+          )
+        ).leaseExpiresAt,
+      ).toBe(firstClaim.leaseExpiresAt);
+      expect(
+        (
+          await kernel.query(
+            { type: "GetAttentionRecoverySnapshot" },
+            runtimeContext,
+          )
+        ).revision,
+      ).toBe(recoveryBeforeReplay.revision);
       const staleActivation = await kernel.execute(
         {
           type: "StartActivation",
@@ -608,6 +809,18 @@ describe("Attention decisions", () => {
         runtimeContext,
       );
       now = new Date("2026-09-21T08:00:02.000Z");
+      await expect(
+        kernel.execute(
+          {
+            type: "ClaimAttention",
+            idempotencyKey: "replaced-first-claim",
+            attentionId: opened.attention.id,
+            expectedAttentionRevision: opened.attention.revision,
+            leaseDurationMs: 1_000,
+          },
+          runtimeContext,
+        ),
+      ).rejects.toMatchObject({ code: "Conflict" });
       const replacementClaim = await kernel.execute(
         {
           type: "ClaimAttention",
@@ -618,6 +831,21 @@ describe("Attention decisions", () => {
         },
         runtimeContext,
       );
+      expect(replacementClaim.leaseExpiresAt).toBe(
+        "2026-09-21T08:00:32.000Z",
+      );
+      await expect(
+        kernel.execute(
+          {
+            type: "ClaimAttention",
+            idempotencyKey: "replaced-first-claim",
+            attentionId: opened.attention.id,
+            expectedAttentionRevision: opened.attention.revision,
+            leaseDurationMs: 1_000,
+          },
+          runtimeContext,
+        ),
+      ).rejects.toMatchObject({ code: "Conflict" });
 
       await expect(
         kernel.execute(
