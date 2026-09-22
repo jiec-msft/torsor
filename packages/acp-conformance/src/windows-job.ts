@@ -1,9 +1,16 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 // An external guardian keeps the job handle alive until the owner's stdin pipe closes.
-export function createWindowsJob(): Promise<ChildProcessWithoutNullStreams> {
+export function createWindowsJob(onStage: (stage: "guardian" | "compiled") => void): Promise<ChildProcessWithoutNullStreams> {
   const script = `
 $ErrorActionPreference = 'Stop'
+$control = [Console]::OpenStandardOutput()
+function Signal([string] $message) {
+  $bytes = [Text.Encoding]::ASCII.GetBytes($message + [char]10)
+  $control.Write($bytes, 0, $bytes.Length)
+  $control.Flush()
+}
+Signal 'guardian'
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -55,10 +62,10 @@ public static class OwnedJob {
   }
 }
 '@
+Signal 'compiled'
 $job = [OwnedJob]::Create(${process.pid})
 try {
-  [Console]::Out.WriteLine('ready')
-  [Console]::Out.Flush()
+  Signal 'ready'
   $null = [Console]::In.ReadLine()
 } finally {
   $null = [OwnedJob]::CloseHandle($job)
@@ -70,16 +77,25 @@ try {
       "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64"),
     ], { shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     let output = "";
+    let outputBytes = 0;
     let errorBytes = 0;
     let ready = false;
     guardian.stdout.on("data", (chunk: Buffer) => {
       if (ready) return;
-      if (output.length + chunk.length > 32) {
+      outputBytes += chunk.length;
+      if (outputBytes > 32) {
         reject(new Error("Invalid job guardian response."));
         return;
       }
       output += chunk.toString("ascii");
-      if (output.trim() === "ready" && !ready) { ready = true; resolve(guardian); }
+      let newline: number;
+      while ((newline = output.indexOf("\n")) >= 0) {
+        const message = output.slice(0, newline);
+        output = output.slice(newline + 1);
+        if (message === "guardian" || message === "compiled") onStage(message);
+        else if (message === "ready") { ready = true; resolve(guardian); }
+        else { reject(new Error("Invalid job guardian response.")); return; }
+      }
     });
     guardian.stderr.on("data", (chunk: Buffer) => {
       errorBytes += chunk.length;

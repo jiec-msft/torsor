@@ -154,6 +154,9 @@ export async function runScenario(input: Scenario, options: RunOptions = {}): Pr
       fail("process_exit", "Provider exited with an unexpected status.");
     }
   } catch (error) {
+    if (stepIndex === -1 && error instanceof HarnessError && error.code === "timeout" && owned && !owned.error) {
+      error = new HarnessError("timeout", `Startup exceeded its configured deadline during ${owned.startupStage}.`);
+    }
     if (error instanceof HarnessError) owned?.fail(error.code, error.message);
     diagnose(owned?.error ?? error);
   }

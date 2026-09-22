@@ -23,5 +23,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Run public CLI smoke
+        run: npm run build --workspace @torsor/acp-conformance && npm exec -- acp-conformance run packages/acp-conformance/examples/basic.json
       - run: npm run test:acp-conformance
       - run: npm run typecheck --workspace @torsor/acp-conformance

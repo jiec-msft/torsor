@@ -84,6 +84,8 @@ CLI 退出码：`0` 全部通过；`1` 场景失败；`2` 配置、用法或 Art
 
 Windows 释放文件句柄可能晚于进程退出；临时目录删除使用 Node 的三次有界重试，累计等待不超过 300 ms（短清理预算下相应缩小）。重试耗尽仍明确报告 `cleanup_failed`，不忽略剩余文件。
 
+所有权层通过显式 Ready 握手后才接收启动配置；Windows Guardian 使用固定 ASCII 控制帧，不依赖控制台文本编码。启动超时只报告固定阶段名称，不披露原始系统输出或机器路径。
+
 ## 5. Transcript 与安全
 
 JSONL 为唯一事件 Artifact 格式，每行 `schemaVersion: 1`、递增 `sequence`、`timestamp`、`direction`、`kind` 和安全事实。`timestamp` 是从 Unix Epoch 开始、每事件推进 1 ms 的**逻辑时间**，不是延迟测量；排序以 `sequence` 为准。

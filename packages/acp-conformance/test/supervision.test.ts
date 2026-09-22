@@ -15,6 +15,7 @@ describe("owned process lifetime (spec section 4)", () => {
     const result = await runScenario(loadScenario(JSON.stringify(data), { format: "json" }));
     expect(result.status).toBe("failed");
     expect(result.diagnostics[0]).toMatchObject({ code: "timeout", step: -1 });
+    expect(result.diagnostics[0]?.message).toMatch(/^Startup exceeded its configured deadline during /);
   });
 
   it("terminates a descendant after its provider parent exits", async () => {

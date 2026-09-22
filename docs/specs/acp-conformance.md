@@ -84,6 +84,8 @@ Only an explicit `exit` step requires voluntary provider exit and a particular c
 
 Windows file-handle release can lag process exit. Temporary-directory removal uses Node's three bounded retries, waiting at most 300 ms cumulatively (less for short cleanup budgets). Exhaustion still explicitly reports `cleanup_failed` rather than ignoring remaining files.
 
+The ownership layer receives launch configuration only after an explicit readiness handshake. The Windows guardian uses fixed ASCII control frames, independent of console text encoding. Startup timeouts report fixed stage names only, never raw system output or machine paths.
+
 ## 5. Transcript and safety
 
 JSONL is the sole event artifact format. Each line has `schemaVersion: 1`, increasing `sequence`, `timestamp`, `direction`, `kind`, and safe facts. `timestamp` is **logical time**, starting at Unix epoch and advancing 1 ms per event, not latency measurement; `sequence` defines order.

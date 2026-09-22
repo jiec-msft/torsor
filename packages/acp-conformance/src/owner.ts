@@ -15,10 +15,12 @@ process.once("disconnect", () => {
 process.once("message", async (configuration: {
   command: string; args: string[]; cwd: string; environment: Record<string, string>; mock: boolean;
 }) => {
+  send("ownership-starting");
   if (process.platform === "win32") {
-    try { await createWindowsJob(); }
+    try { await createWindowsJob((stage) => send(stage)); }
     catch { send("ownership-error"); return; }
   }
+  send("ownership-ready");
   const child = spawn(configuration.command, configuration.args, {
     cwd: configuration.cwd, env: configuration.environment,
     shell: false, windowsHide: true,
@@ -60,3 +62,5 @@ process.once("message", async (configuration: {
   child.stdout!.pipe(process.stdout, { end: false });
   child.stderr!.pipe(process.stderr, { end: false });
 });
+
+send("owner-ready");

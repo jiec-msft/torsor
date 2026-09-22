@@ -46,6 +46,7 @@ export class OwnedProcess {
   #stdoutTarget: number | undefined;
   #stderrTarget: number | undefined;
   stderrBytes = 0;
+  startupStage = "owner initialization";
 
   constructor(launch: Launch, workspace: string, limits: Limits, mock = false) {
     this.#owner = fork(fileURLToPath(new URL("./owner.js", import.meta.url)), [], {
@@ -77,6 +78,17 @@ export class OwnedProcess {
     this.#owner.on("message", (message: unknown) => {
       if (!record(message)) return;
       switch (message.type) {
+        case "owner-ready":
+          this.startupStage = "owner configuration";
+          this.#owner.send({
+            ...launch, args: [...launch.args], cwd: workspace, mock,
+            environment: { ...isolatedEnvironment(workspace), ...launch.environment },
+          }, (error) => { if (error) this.fail("spawn_failed", "Could not configure the owned process."); });
+          break;
+        case "ownership-starting": this.startupStage = "process ownership setup"; break;
+        case "guardian": this.startupStage = "job guardian compilation"; break;
+        case "compiled": this.startupStage = "job assignment"; break;
+        case "ownership-ready": this.startupStage = "provider spawn"; break;
         case "started": this.#started.resolve(); break;
         case "spawn-error": this.fail("spawn_failed", "Could not start the configured provider command."); break;
         case "ownership-error": this.fail("cleanup_failed", "Could not establish process ownership; provider was not started."); break;
@@ -95,10 +107,6 @@ export class OwnedProcess {
           break;
       }
     });
-    this.#owner.send({
-      ...launch, args: [...launch.args], cwd: workspace, mock,
-      environment: { ...isolatedEnvironment(workspace), ...launch.environment },
-    }, (error) => { if (error) this.fail("spawn_failed", "Could not configure the owned process."); });
   }
 
   fail(code: string, message: string): void {
