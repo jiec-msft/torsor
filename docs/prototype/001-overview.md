@@ -680,7 +680,30 @@ Failed
 Unknown
 ```
 
-Record adapter/version, capability snapshot, Activation, input RunInput IDs, request idempotency key, start/end time, and result or Unknown reason.
+Record adapter/version, capability snapshot, Activation, input RunInput IDs,
+request idempotency key, start/end time, and result or Unknown reason.
+
+Persisted and public provider-failure diagnostics use an allowlisted
+projection. Run, Activation, ProviderAttempt, Timeline, HTTP, and Web may
+contain only a stable error code, outcome, and a bounded generic summary
+explicitly defined by the Runtime. Provider stderr, raw process errors, launch
+commands and environments, machine paths, credentials, prompts, model output,
+arbitrary provider error text, and nested cause messages must not enter those
+fields. The Runtime maps error types to fixed diagnostics before persistence;
+secret-pattern replacement is not the primary boundary, and failures are not
+silently swallowed. Unless a private diagnostic channel has explicit
+ownership and opt-in, raw diagnostics may exist only briefly in bounded memory
+and are discarded when execution ends.
+
+The current stable codes are `provider_process_start_failed`,
+`provider_process_exited`, `provider_protocol_error`,
+`provider_policy_violation`, `provider_output_limit`,
+`provider_stderr_limit`, `provider_io_error`, `provider_timeout`,
+`provider_cancelled`, `provider_cleanup_failed`,
+`provider_runtime_monitor_failed`, `provider_not_started`,
+`provider_recovered_failed`, `provider_recovered_unknown`, and
+`provider_execution_failed`. Public detail uses
+`<code>: <generic summary>` and is at most 160 characters.
 
 ### 20.3 Provider capabilities
 
@@ -950,6 +973,11 @@ result
 ```
 
 Sensitive Prompt content and hidden reasoning are not stored by default.
+
+Provider and process diagnostics likewise do not enter public audit or durable
+projections by default. Public diagnostics retain only stable error codes,
+outcomes, and allowlisted generic summaries; local developer logs must not
+implicitly print credentials or complete environments.
 
 ### 28.2 Base metrics
 

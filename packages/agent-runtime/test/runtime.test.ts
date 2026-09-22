@@ -4016,9 +4016,9 @@ describe("AgentRuntime", () => {
         createFixtureAcpAdapter("tool-activity"),
       );
 
-      await expect(runtime.runOnce()).rejects.toThrow(
-        "deny-by-default tool policy",
-      );
+      await expect(runtime.runOnce()).rejects.toMatchObject({
+        diagnosticCode: "provider_policy_violation",
+      });
       const run = await getOnlyRun(kernel);
       expect(run.run.state).toBe("Waiting");
       expect(run.providerAttempts.at(-1)?.status).toBe("Failed");
@@ -4036,9 +4036,9 @@ describe("AgentRuntime", () => {
         createFixtureAcpAdapter("trailing-tool"),
       );
 
-      await expect(runtime.runOnce()).rejects.toThrow(
-        "deny-by-default tool policy",
-      );
+      await expect(runtime.runOnce()).rejects.toMatchObject({
+        diagnosticCode: "provider_policy_violation",
+      });
       const run = await getOnlyRun(kernel);
       expect(run.run.state).toBe("Waiting");
       expect(run.providerAttempts.at(-1)?.status).toBe("Failed");
@@ -4056,9 +4056,9 @@ describe("AgentRuntime", () => {
         createFixtureAcpAdapter("delayed-trailing-tool"),
       );
 
-      await expect(runtime.runOnce()).rejects.toThrow(
-        "deny-by-default tool policy",
-      );
+      await expect(runtime.runOnce()).rejects.toMatchObject({
+        diagnosticCode: "provider_policy_violation",
+      });
       const run = await getOnlyRun(kernel);
       expect(run.run.state).toBe("Waiting");
       expect(run.providerAttempts.at(-1)?.status).toBe("Failed");
@@ -4076,9 +4076,9 @@ describe("AgentRuntime", () => {
         createFixtureAcpAdapter("artifact"),
       );
 
-      await expect(runtime.runOnce()).rejects.toThrow(
-        "Unsupported action type publish_artifact",
-      );
+      await expect(runtime.runOnce()).rejects.toMatchObject({
+        diagnosticCode: "provider_protocol_error",
+      });
       const events = await kernel.readEvents(null, 500);
       expect(events.some((event) => event.type === "ArtifactPublished")).toBe(
         false,
@@ -4101,7 +4101,9 @@ describe("AgentRuntime", () => {
       await prepareAcpRun(kernel, `acp-${mode}`);
       const runtime = createRuntime(kernel, createFixtureAcpAdapter(mode));
       if (mode === "forged-report") {
-        await expect(runtime.runOnce()).rejects.toThrow("publish_report accepts only");
+        await expect(runtime.runOnce()).rejects.toMatchObject({
+          diagnosticCode: "provider_protocol_error",
+        });
         expect((await getOnlyRun(kernel)).artifacts).toEqual([]);
       } else {
         await runtime.drainUntilIdle();
@@ -4123,7 +4125,7 @@ describe("AgentRuntime", () => {
     try {
       await prepareAcpRun(kernel, "report-disabled");
       await expect(createRuntime(kernel, createFixtureAcpAdapter("report")).runOnce())
-        .rejects.toThrow("Report Artifact storage is not configured");
+        .rejects.toMatchObject({ diagnosticCode: "provider_protocol_error" });
       expect((await getOnlyRun(kernel)).artifacts).toEqual([]);
     } finally {
       kernel.close();
@@ -4136,14 +4138,14 @@ describe("AgentRuntime", () => {
       mode: "oversized-frame",
       parameter: 65,
       limits: { maxFrameBytes: 64 },
-      message: "ACP frame exceeded 64 bytes",
+      code: "provider_output_limit",
     },
     {
       name: "stream bytes",
       mode: "long-field",
       parameter: 512,
       limits: { maxStreamBytes: 128, maxFieldLength: 1024 },
-      message: "ACP output stream exceeded 128 bytes",
+      code: "provider_output_limit",
     },
     {
       name: "activity bytes",
@@ -4154,46 +4156,46 @@ describe("AgentRuntime", () => {
         maxActivityBytes: 128,
         maxFieldLength: 1024,
       },
-      message: "persisted ACP activity exceeded 128 bytes",
+      code: "provider_output_limit",
     },
     {
       name: "pending persistence operations",
       mode: "split-actions",
       parameter: 8,
       limits: { maxPendingPersistenceOperations: 1 },
-      message: "ACP persistence exceeded 1 pending operations",
+      code: "provider_protocol_error",
     },
     {
       name: "JSON depth",
       mode: "deep-json",
       parameter: 12,
       limits: { maxJsonDepth: 6 },
-      message: "action envelope exceeded JSON depth 6",
+      code: "provider_protocol_error",
     },
     {
       name: "action count",
       mode: "many-actions",
       parameter: 3,
       limits: { maxActionCount: 2 },
-      message: "action envelope exceeded 2 actions",
+      code: "provider_protocol_error",
     },
     {
       name: "target count",
       mode: "many-targets",
       parameter: 3,
       limits: { maxTargetCount: 2 },
-      message: "targetAgentIds exceeded 2 entries",
+      code: "provider_protocol_error",
     },
     {
       name: "field length",
       mode: "long-field",
       parameter: 65,
       limits: { maxFieldLength: 64 },
-      message: "action.status exceeded 64 characters",
+      code: "provider_protocol_error",
     },
   ])(
     "rejects ACP output beyond the $name limit",
-    async ({ mode, parameter, limits, message }) => {
+    async ({ mode, parameter, limits, code }) => {
       const kernel = openKernel(":memory:");
       try {
         await prepareAcpRun(kernel, `limit-${mode}`);
@@ -4202,19 +4204,165 @@ describe("AgentRuntime", () => {
           createFixtureAcpAdapter(mode, parameter, limits),
         );
 
-        await expect(runtime.runOnce()).rejects.toThrow(message);
+        await expect(runtime.runOnce()).rejects.toMatchObject({
+          diagnosticCode: code,
+        });
         const run = await getOnlyRun(kernel);
         expect(run.run.state).toBe("Waiting");
         expect(run.providerAttempts.at(-1)?.status).toBe("Failed");
+        expect(run.providerAttempts.at(-1)?.detail).toMatch(
+          new RegExp(`^${code}: `),
+        );
       } finally {
         kernel.close();
       }
     },
   );
 
-  it.each(["malformed", "prompt-error", "exit"])(
+  it.each([
+    {
+      name: "aggregate stdout",
+      mode: "oversized-stdout",
+      parameter: 1024,
+      limits: { maxStdoutBytes: 256 },
+      code: "provider_output_limit",
+    },
+    {
+      name: "stderr",
+      mode: "oversized-stderr",
+      parameter: 1024,
+      limits: { maxStderrBytes: 256 },
+      code: "provider_stderr_limit",
+    },
+  ] as const)(
+    "bounds real ACP child $name without publishing its bytes",
+    async ({ mode, parameter, limits, code }) => {
+      const kernel = openKernel(":memory:");
+      try {
+        await prepareAcpRun(kernel, `process-limit-${mode}`);
+        const runtime = createRuntime(
+          kernel,
+          createFixtureAcpAdapter(mode, parameter, limits),
+        );
+
+        await expect(runtime.runOnce()).rejects.toMatchObject({
+          diagnosticCode: code,
+        });
+        const run = await getOnlyRun(kernel);
+        expect(run.providerAttempts.at(-1)).toMatchObject({
+          status: "Failed",
+          detail: expect.stringMatching(new RegExp(`^${code}: `)),
+        });
+        expect(JSON.stringify(run)).not.toContain("SYNTHETIC_PRIVATE_STDERR");
+      } finally {
+        kernel.close();
+      }
+    },
+  );
+
+  it("classifies a provider startup failure without publishing its command path", async () => {
+    const kernel = openKernel(":memory:");
+    const privateCommand = join(
+      tmpdir(),
+      "SYNTHETIC_PRIVATE_START_PATH",
+      "missing-provider",
+    );
+    try {
+      await prepareAcpRun(kernel, "provider-startup-failure");
+      const runtime = createRuntime(
+        kernel,
+        new CopilotAcpAdapter({
+          command: privateCommand,
+          cwd: process.cwd(),
+        }),
+      );
+
+      await expect(runtime.runOnce()).rejects.toMatchObject({
+        diagnosticCode: "provider_process_start_failed",
+        outcome: "Failed",
+      });
+      const run = await getOnlyRun(kernel);
+      expect(run.providerAttempts.at(-1)?.detail).toBe(
+        "provider_process_start_failed: Provider process could not be started.",
+      );
+      expect(JSON.stringify(run)).not.toContain(privateCommand);
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("uses a typed nested cause without publishing wrapper messages", async () => {
+    const kernel = openKernel(":memory:");
+    const privateMarker = "SYNTHETIC_PRIVATE_NESTED_CAUSE";
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+        return;
+      }
+      throw new Error(privateMarker, {
+        cause: new ProviderExecutionError("provider_io_error", "Unknown"),
+      });
+    });
+    try {
+      await mentionAgent(kernel, "nested-provider-cause");
+      const runtime = createRuntime(kernel, adapter);
+
+      await expect(runtime.drainUntilIdle()).rejects.toMatchObject({
+        diagnosticCode: "provider_io_error",
+        outcome: "Unknown",
+      });
+      const run = await getOnlyRun(kernel);
+      expect(run.providerAttempts.at(-1)?.detail).toBe(
+        "provider_io_error: Provider process I/O failed.",
+      );
+      expect(JSON.stringify(run)).not.toContain(privateMarker);
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("uses the generic code for an untyped nested cause chain", async () => {
+    const kernel = openKernel(":memory:");
+    const privateMarkers = [
+      "SYNTHETIC_PRIVATE_OUTER_CAUSE",
+      "SYNTHETIC_PRIVATE_INNER_CAUSE",
+    ];
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+        return;
+      }
+      throw new Error(privateMarkers[0], {
+        cause: new Error(privateMarkers[1]),
+      });
+    });
+    try {
+      await mentionAgent(kernel, "untyped-nested-provider-cause");
+      const runtime = createRuntime(kernel, adapter);
+
+      await expect(runtime.drainUntilIdle()).rejects.toMatchObject({
+        diagnosticCode: "provider_execution_failed",
+        outcome: "Failed",
+      });
+      const run = await getOnlyRun(kernel);
+      expect(run.providerAttempts.at(-1)?.detail).toBe(
+        "provider_execution_failed: Provider execution failed.",
+      );
+      for (const marker of privateMarkers) {
+        expect(JSON.stringify(run)).not.toContain(marker);
+      }
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it.each([
+    ["malformed", "provider_protocol_error"],
+    ["prompt-error", "provider_protocol_error"],
+    ["exit", "provider_process_exited"],
+  ] as const)(
     "settles ACP writes and process state after %s failure",
-    async (mode) => {
+    async (mode, diagnosticCode) => {
       const kernel = openKernel(":memory:");
       try {
         await prepareAcpRun(kernel, `cleanup-${mode}`);
@@ -4223,14 +4371,25 @@ describe("AgentRuntime", () => {
           createFixtureAcpAdapter(mode),
         );
 
-        await expect(runtime.runOnce()).rejects.toBeInstanceOf(
-          ProviderExecutionError,
-        );
+        await expect(runtime.runOnce()).rejects.toMatchObject({
+          diagnosticCode,
+        });
         const run = await getOnlyRun(kernel);
         expect(run.run.state).toBe("Waiting");
         expect(["Failed", "Unknown"]).toContain(
           run.providerAttempts.at(-1)?.status,
         );
+        expect(run.providerAttempts.at(-1)?.detail).toMatch(
+          new RegExp(`^${diagnosticCode}: `),
+        );
+        if (mode === "prompt-error") {
+          expect(JSON.stringify(run)).not.toContain(
+            "SYNTHETIC_PRIVATE_PROVIDER_ERROR",
+          );
+          expect(JSON.stringify(run)).not.toContain(
+            "synthetic private model output",
+          );
+        }
       } finally {
         kernel.close();
       }
@@ -4365,6 +4524,9 @@ describe("AgentRuntime", () => {
       const after = await getOnlyRun(kernel);
       expect(after.run.state).toBe("Cancelled");
       expect(after.providerAttempts.at(-1)?.status).toBe("Unknown");
+      expect(after.providerAttempts.at(-1)?.detail).toBe(
+        "provider_cancelled: Provider execution was cancelled.",
+      );
     } finally {
       process.off("unhandledRejection", onUnhandled);
       kernel.close();
@@ -4403,6 +4565,9 @@ describe("AgentRuntime", () => {
       );
       expect(run.run.state).toBe("Waiting");
       expect(run.providerAttempts.at(-1)?.status).toBe("Unknown");
+      expect(run.providerAttempts.at(-1)?.detail).toBe(
+        "provider_timeout: Provider execution exceeded its allowed time.",
+      );
     } finally {
       kernel.close();
     }
@@ -4437,6 +4602,9 @@ describe("AgentRuntime", () => {
       );
       expect(run.run.state).toBe("Waiting");
       expect(run.providerAttempts.at(-1)?.status).toBe("Unknown");
+      expect(run.providerAttempts.at(-1)?.detail).toBe(
+        "provider_timeout: Provider execution exceeded its allowed time.",
+      );
     } finally {
       kernel.close();
     }

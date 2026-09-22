@@ -902,6 +902,25 @@ Unknown
 - 开始和结束时间
 - 结果或 Unknown 原因
 
+Provider 失败诊断的持久化和公开边界采用白名单投影。Run、Activation、
+ProviderAttempt、Timeline、HTTP 和 Web 只能包含稳定错误码、结果状态，以及
+由 Runtime 明确定义且有长度上限的通用摘要。Provider stderr、原始进程错误、
+启动命令和环境、机器路径、Credential、Prompt、模型输出、任意 Provider
+错误文本及嵌套 cause 消息不得进入这些字段。Runtime 必须在持久化前按错误类型
+映射到固定诊断；不能以正则替换 Secret 作为主要边界，也不能静默吞掉失败。
+若没有具备明确所有权和显式 opt-in 的私有诊断通道，原始诊断只可在有界内存中
+短暂存在并在执行结束后丢弃。
+
+当前稳定错误码为：`provider_process_start_failed`、
+`provider_process_exited`、`provider_protocol_error`、
+`provider_policy_violation`、`provider_output_limit`、
+`provider_stderr_limit`、`provider_io_error`、`provider_timeout`、
+`provider_cancelled`、`provider_cleanup_failed`、
+`provider_runtime_monitor_failed`、`provider_not_started`、
+`provider_recovered_failed`、`provider_recovered_unknown` 和
+`provider_execution_failed`。公开详情采用 `<code>: <generic summary>`
+格式，总长度不超过 160 个字符。
+
 ### 20.3 Provider 能力
 
 Adapter 暴露带版本的 capability profile，例如：
@@ -1302,6 +1321,10 @@ result
 ```
 
 敏感 Prompt 和隐藏思维不默认写入审计日志。
+
+Provider 或进程诊断同样不默认进入公开审计或持久投影。公开诊断只保留稳定
+错误码、结果状态和白名单通用摘要；本地开发日志不得隐式打印 Credential 或
+完整环境。
 
 ### 28.2 基础指标
 

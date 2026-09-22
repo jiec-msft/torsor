@@ -99,6 +99,11 @@ Message、Attention、Run、RunInput、ProviderAttempt、Worktree generation、T
 
 Streaming output 不会自动成为公开 Message。Run composer 是显式桥梁：它发布一条 Thread Message，并将该 Message 的确切 revision 分配给所选 Run。
 
+Provider 失败诊断在进入这些投影前必须转换为白名单公开形式：稳定错误码和
+结果状态，加上有界的通用摘要。原始 stderr、进程或启动错误、环境、
+Credential、机器路径、Prompt、模型输出、Provider 自由文本和嵌套 cause
+消息不属于公开 Timeline 或 HTTP/Web 状态。
+
 ## 有序证据
 
 证据集同时包含完整桌面视图和较窄的局部截图，使 Tool Call 和 Composer 文本在手机上仍然可读。
