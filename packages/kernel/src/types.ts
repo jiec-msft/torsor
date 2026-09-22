@@ -312,11 +312,79 @@ export interface AcquireWorktreeWriterLeaseCommand extends IdempotentCommand {
   readonly leaseDurationMs: number;
 }
 
-interface WorktreeWriterLeaseAuthorityCommand extends IdempotentCommand {
+export interface WorktreeLeaseAuthority {
   readonly worktreeId: string;
   readonly generation: number;
   readonly fencingToken: number;
   readonly leaseToken: string;
+}
+
+interface WorktreeWriterLeaseAuthorityCommand extends IdempotentCommand, WorktreeLeaseAuthority {}
+
+export interface PhysicalWorktreeBinding {
+  readonly worktreeId: string;
+  readonly runId: string;
+  readonly repositoryId: string;
+  readonly repositoryPath: string;
+  readonly baseRevision: string;
+  readonly directoryPath: string;
+  readonly directoryIdentity: string;
+}
+
+export interface RegisterPhysicalWorktreeCommand extends IdempotentCommand, PhysicalWorktreeBinding {
+  readonly type: "RegisterPhysicalWorktree";
+}
+
+export interface StartWorktreeExecutionCommand extends WorktreeWriterLeaseAuthorityCommand {
+  readonly type: "StartWorktreeExecution";
+  readonly activationId: string;
+  readonly executorId: string;
+}
+
+export interface WorktreeExecutionReceipt {
+  readonly executionId: string;
+  readonly executorId: string;
+  readonly executionToken: string;
+}
+
+export interface WorktreeMutationAuthority extends WorktreeLeaseAuthority, WorktreeExecutionReceipt {}
+
+export type WorktreeExecutionState =
+  | "Starting" | "Running" | "StopRequested"
+  | "StopConfirmed" | "ForceTerminated" | "Uncertain";
+
+export interface RecordWorktreeExecutionCommand extends IdempotentCommand, WorktreeExecutionReceipt {
+  readonly type: "RecordWorktreeExecution";
+  readonly state: Exclude<WorktreeExecutionState, "Starting">;
+  readonly pid?: number;
+  readonly evidence: string;
+}
+
+export interface RecoverWorktreeExecutionCommand extends IdempotentCommand {
+  readonly type: "RecoverWorktreeExecution";
+  readonly executionId: string;
+  readonly reason: string;
+}
+
+export interface WorktreeExecutionView {
+  readonly id: string;
+  readonly activationId: string;
+  readonly executorId: string;
+  readonly runtimePrincipalId: string;
+  readonly generation: number;
+  readonly fencingToken: number;
+  readonly state: WorktreeExecutionState;
+  readonly pid: number | null;
+  readonly events: readonly {
+    readonly state: WorktreeExecutionState;
+    readonly evidence: string;
+    readonly occurredAt: string;
+  }[];
+}
+
+export interface PhysicalWorktreeView extends PhysicalWorktreeBinding {
+  readonly state: "Ready" | "Quarantined";
+  readonly latestExecution: WorktreeExecutionView | null;
 }
 
 export interface RenewWorktreeWriterLeaseCommand
@@ -376,6 +444,10 @@ export type KernelCommand =
   | WaitRunCommand
   | FailRunCommand
   | RecordLateOutputCommand
+  | RegisterPhysicalWorktreeCommand
+  | StartWorktreeExecutionCommand
+  | RecordWorktreeExecutionCommand
+  | RecoverWorktreeExecutionCommand
   | AcquireWorktreeWriterLeaseCommand
   | RenewWorktreeWriterLeaseCommand
   | ReleaseWorktreeWriterLeaseCommand
@@ -491,6 +563,9 @@ export interface ListWorktreeWriterLeaseEventsQuery {
 }
 
 export type KernelQuery =
+  | { readonly type: "GetWorktreeStorageIdentity" }
+  | { readonly type: "ListPhysicalWorktrees"; readonly afterWorktreeId?: string; readonly limit?: number }
+  | { readonly type: "GetPhysicalWorktree"; readonly worktreeId: string }
   | GetBootstrapQuery
   | GetThreadProjectionQuery
   | GetRunProjectionQuery
@@ -814,6 +889,9 @@ export interface WorktreeWriterLeaseEventPage {
 }
 
 export interface QueryResultMap {
+  readonly GetWorktreeStorageIdentity: { readonly identity: string };
+  readonly ListPhysicalWorktrees: { readonly items: readonly PhysicalWorktreeView[]; readonly hasMore: boolean };
+  readonly GetPhysicalWorktree: PhysicalWorktreeView;
   readonly GetBootstrap: BootstrapProjection;
   readonly GetThreadProjection: ThreadProjection;
   readonly GetRunProjection: RunProjection;
@@ -846,5 +924,6 @@ export interface CommandResult {
   readonly leaseGeneration?: number;
   readonly fencingToken?: number;
   readonly quarantineToken?: string;
+  readonly executionToken?: string;
   readonly worktreeWriterLease?: WorktreeWriterLeaseView;
 }

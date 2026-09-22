@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 
 import * as db from "./database.js";
 import { DurableKernelError, KernelError } from "./errors.js";
+import { assertPhysicalWorktreeIdle } from "./physical-worktrees.js";
 import {
   mapWorktreeWriterLease,
   mapWorktreeWriterLeaseEvent,
@@ -13,6 +14,7 @@ import type {
   WorktreeWriterLeaseEventPage,
   WorktreeWriterLeaseEventType,
   WorktreeWriterLeaseView,
+  WorktreeLeaseAuthority,
 } from "./types.js";
 import {
   boundedDuration,
@@ -54,13 +56,16 @@ export function acquireWorktreeWriterLease(
   requireNonEmpty(command.worktreeId, "worktreeId");
   const durationMs = boundedDuration(command.leaseDurationMs, "leaseDurationMs");
   const observedAt = db.now(kernel);
+  const previous = getLease(kernel, command.worktreeId);
   const existing = expireIfNeeded(
     kernel,
-    getLease(kernel, command.worktreeId),
+    previous,
     text(principal.id),
     correlationId,
     observedAt,
   );
+  assertPhysicalWorktreeIdle(kernel, command.worktreeId,
+    previous?.status === "Active" && existing?.status === "Expired");
   if (existing && text(existing.status) === "Active") {
     throw new KernelError(
       "DomainBusy",
@@ -191,6 +196,7 @@ export function releaseWorktreeWriterLease(
     observedAt,
     correlationId,
   );
+  assertPhysicalWorktreeIdle(kernel, command.worktreeId);
   db.run(
     kernel,
     `UPDATE worktree_writer_leases
@@ -334,6 +340,7 @@ export function resolveWorktreeWriterLeaseQuarantine(
   correlationId: string,
 ): CommandResult {
   requireRuntime(principal);
+  assertPhysicalWorktreeIdle(kernel, command.worktreeId);
   requireNonEmpty(command.worktreeId, "worktreeId");
   requireNonEmpty(command.quarantineToken, "quarantineToken");
   requireNonEmpty(command.resolution, "resolution");
@@ -581,9 +588,9 @@ function requireQuarantineAuthority(
   }
 }
 
-function requireLiveAuthority(
+export function requireLiveAuthority(
   kernel: db.KernelContext,
-  command: RenewCommand | ReleaseCommand,
+  command: WorktreeLeaseAuthority,
   principal: Row,
   observedAt: string,
   correlationId: string,

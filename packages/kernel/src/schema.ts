@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 13;
+export const CURRENT_SCHEMA_VERSION = 14;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -491,6 +491,59 @@ CREATE TABLE IF NOT EXISTS worktree_writer_lease_events (
 
 CREATE INDEX IF NOT EXISTS worktree_writer_lease_events_worktree_idx
   ON worktree_writer_lease_events(worktree_id, sequence);
+
+CREATE TABLE IF NOT EXISTS physical_worktrees (
+  worktree_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  repository_id TEXT NOT NULL,
+  repository_path TEXT NOT NULL,
+  base_revision TEXT NOT NULL,
+  directory_path TEXT NOT NULL UNIQUE,
+  directory_identity TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK (state IN ('Ready', 'Quarantined')),
+  created_at TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS worktree_storage_identity (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  identity TEXT NOT NULL
+) STRICT;
+INSERT OR IGNORE INTO worktree_storage_identity VALUES (1, lower(hex(randomblob(32))));
+
+CREATE TABLE IF NOT EXISTS worktree_executions (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  worktree_id TEXT NOT NULL REFERENCES physical_worktrees(worktree_id),
+  activation_id TEXT NOT NULL REFERENCES activation_attempts(id),
+  runtime_principal_id TEXT NOT NULL REFERENCES principals(id),
+  executor_id TEXT NOT NULL,
+  execution_token TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation > 0),
+  fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+  operation TEXT NOT NULL CHECK (operation = 'write-probe-v1'),
+  state TEXT NOT NULL CHECK (state IN
+    ('Starting', 'Running', 'StopRequested', 'StopConfirmed', 'ForceTerminated', 'Uncertain')),
+  pid INTEGER CHECK (pid > 0),
+  created_at TEXT NOT NULL
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS worktree_unsettled_execution_idx
+  ON worktree_executions(worktree_id)
+  WHERE state NOT IN ('StopConfirmed', 'ForceTerminated');
+
+CREATE INDEX IF NOT EXISTS worktree_execution_history_idx
+  ON worktree_executions(worktree_id, sequence);
+
+CREATE TABLE IF NOT EXISTS worktree_execution_events (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  execution_id TEXT NOT NULL REFERENCES worktree_executions(id),
+  state TEXT NOT NULL,
+  evidence TEXT NOT NULL,
+  occurred_at TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS worktree_execution_events_idx
+  ON worktree_execution_events(execution_id, sequence);
 
 CREATE TABLE IF NOT EXISTS public_events (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -77,6 +77,10 @@ import {
 } from "./runs.js";
 import { mapPublicEvent } from "./mappings.js";
 import {
+  assertWorktreeMutation, getPhysicalWorktree, physicalWorktreeCommand,
+  resolveCachedWorktreeExecution,
+} from "./physical-worktrees.js";
+import {
   acquireWorktreeWriterLease,
   getWorktreeWriterLease,
   listWorktreeWriterLeaseEvents,
@@ -95,6 +99,7 @@ import type {
   PrincipalContext,
   PublicEventEnvelope,
   QueryResult,
+  WorktreeMutationAuthority,
 } from "./types.js";
 import {
   assertNever,
@@ -133,6 +138,31 @@ export class TorsorKernel {
     if (!this.#closed) {
       this.#context.database.close();
       this.#closed = true;
+    }
+  }
+
+  /**
+   * Trusted executor only. The durable execution intent must already exist.
+   * Never await or perform unbounded work while holding this local write lock.
+   */
+  performWorktreeMutation(
+    authority: WorktreeMutationAuthority,
+    context: PrincipalContext,
+    effect: () => undefined,
+  ): void {
+    this.#assertOpen();
+    const principal = requirePrincipal(this.#context, context.principalId);
+    this.#context.database.exec("BEGIN IMMEDIATE");
+    try {
+      assertWorktreeMutation(this.#context, authority, principal);
+      const result = effect();
+      if (result !== undefined) {
+        throw new Error("Worktree mutations must be synchronous and return undefined.");
+      }
+      this.#context.database.exec("COMMIT");
+    } catch (error) {
+      this.#context.database.exec(error instanceof DurableKernelError ? "COMMIT" : "ROLLBACK");
+      throw translateError(error);
     }
   }
 
@@ -176,6 +206,11 @@ export class TorsorKernel {
           );
         }
         const result = JSON.parse(text(cached.result_json)) as CommandResult;
+        if (command.type === "StartWorktreeExecution") {
+          const current = resolveCachedWorktreeExecution(this.#context, command, result, principal);
+          this.#context.database.exec("COMMIT");
+          return current;
+        }
         if (command.type === "ClaimAttention") {
           const current = resolveCachedAttentionClaim(
             this.#context,
@@ -370,6 +405,25 @@ export class TorsorKernel {
     try {
       let result: unknown;
       switch (query.type) {
+        case "GetWorktreeStorageIdentity":
+          requireKind(this.#context, principal, "runtime");
+          result = { identity: text(getRow(this.#context, "SELECT identity FROM worktree_storage_identity")!.identity) };
+          break;
+        case "ListPhysicalWorktrees": {
+          requireKind(this.#context, principal, "runtime");
+          const limit = boundedLimit(query.limit);
+          const rows = allRows(this.#context,
+            "SELECT worktree_id FROM physical_worktrees WHERE worktree_id > ? ORDER BY worktree_id LIMIT ?",
+            query.afterWorktreeId ?? "", limit + 1);
+          result = {
+            items: rows.slice(0, limit).map((row) => getPhysicalWorktree(this.#context, text(row.worktree_id), principal)),
+            hasMore: rows.length > limit,
+          };
+          break;
+        }
+        case "GetPhysicalWorktree":
+          result = getPhysicalWorktree(this.#context, query.worktreeId, principal);
+          break;
         case "GetBootstrap": {
           assertProjectAccess(this.#context, principal, query.projectId);
           const agent =
@@ -912,6 +966,11 @@ export class TorsorKernel {
           principal,
           correlationId,
         );
+      case "RegisterPhysicalWorktree":
+      case "StartWorktreeExecution":
+      case "RecordWorktreeExecution":
+      case "RecoverWorktreeExecution":
+        return physicalWorktreeCommand(this.#context, command, principal, correlationId);
       case "RenewWorktreeWriterLease":
         return renewWorktreeWriterLease(
           this.#context,

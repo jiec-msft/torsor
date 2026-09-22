@@ -14,6 +14,7 @@ import {
 } from "@torsor/kernel";
 
 import { KernelActivationCapabilityBridge } from "./capability-bridge.js";
+import type { WorktreeExecutor } from "./worktree-executor.js";
 import {
   ProviderExecutionError,
   ProviderProtocolError,
@@ -78,6 +79,7 @@ export interface AgentRuntimeOptions {
   readonly leaseSafetyMs?: number;
   readonly clock?: () => Date;
   readonly hooks?: AgentRuntimeHooks;
+  readonly worktreeExecutor?: WorktreeExecutor;
 }
 
 export interface RuntimePassResult {
@@ -123,6 +125,7 @@ export class AgentRuntime {
   readonly #leaseSafetyMs: number;
   readonly #clock: () => Date;
   readonly #hooks: AgentRuntimeHooks;
+  readonly #worktreeExecutor: WorktreeExecutor | undefined;
   readonly #agents = new Map<string, BootstrapAgent>();
   readonly #attentionProjectDiscoveryContinuations = new Map<
     string,
@@ -148,6 +151,7 @@ export class AgentRuntime {
     this.#leaseSafetyMs = options.leaseSafetyMs ?? 1_000;
     this.#clock = options.clock ?? (() => new Date());
     this.#hooks = options.hooks ?? {};
+    this.#worktreeExecutor = options.worktreeExecutor;
     requireIntegerAtLeast(
       this.#attentionLeaseMs,
       1,
@@ -990,6 +994,7 @@ export class AgentRuntime {
       return false;
     }
     const controller = new AbortController();
+    let worktreeScopeOpen = true;
     const stopMonitor = this.#monitorExecution(
       input.cause,
       input.activationId,
@@ -1007,6 +1012,18 @@ export class AgentRuntime {
           cause: input.cause,
           capabilities: bridge,
           signal: controller.signal,
+          ...(input.cause.type === "run" && this.#worktreeExecutor ? {
+            worktree: {
+              probe: (worktreeId: string) => {
+                if (!worktreeScopeOpen || controller.signal.aborted) {
+                  return Promise.reject(new Error("Worktree execution scope is closed."));
+                }
+                return this.#worktreeExecutor!.probe({
+                  worktreeId, activationId: input.activationId, signal: controller.signal,
+                });
+              },
+            },
+          } : {}),
         }),
         controller.signal,
       );
@@ -1109,7 +1126,9 @@ export class AgentRuntime {
       }
       throw providerError;
     } finally {
+      worktreeScopeOpen = false;
       stopMonitor();
+      await this.#worktreeExecutor?.stopActivation(input.activationId);
     }
   }
 

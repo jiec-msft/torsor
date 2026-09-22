@@ -501,7 +501,7 @@ describe("SQLite persistence", () => {
       const metadata = new DatabaseSync(databasePath, { readOnly: true });
       try {
         expect(metadata.prepare("PRAGMA user_version").get()).toMatchObject({
-          user_version: 13,
+          user_version: 14,
         });
       } finally {
         metadata.close();

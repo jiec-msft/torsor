@@ -1,5 +1,34 @@
 # `@torsor/kernel`
 
+## Physical execution records (schema 14)
+
+`RegisterPhysicalWorktree`, `StartWorktreeExecution`, `RecordWorktreeExecution`,
+and `RecoverWorktreeExecution` are trusted Runtime-only commands.
+`GetPhysicalWorktree`, `ListPhysicalWorktrees`, and `GetWorktreeStorageIdentity`
+are likewise local Runtime-only queries; their paths, process receipts, and
+storage identity are not public Thread events or HTTP resources.
+
+`physical_worktrees` binds an immutable repository/base/Run/directory identity.
+`worktree_executions` and append-only `worktree_execution_events` retain source
+Activation, executor incarnation, lease generation, process identity, and stop
+evidence. `worktree_storage_identity` binds managed roots to this database.
+Unsettled physical execution independently blocks the existing lease
+acquire/release/quarantine-resolution commands. Expiry alone cannot unblock it.
+Physical `Ready` means the binding is not quarantined, not that it is idle:
+an unsettled execution still blocks reuse independently.
+
+The trusted synchronous `performWorktreeMutation` boundary checks live lease,
+receipt, Activation, and Run under `BEGIN IMMEDIATE`. Its callback must return
+`undefined` without awaiting; it is not a general capability or an OS
+transaction. A previously committed intent survives OS or transaction failure.
+Only the local executor checks paths and attests original-handle stop evidence;
+Kernel never interprets a PID or increasing generation as physical safety.
+
+Schema 13 databases intentionally fail to open. Stop old processes and recreate
+the disposable database **and use a fresh managed root**; no migration or
+automatic deletion is performed. The normative contracts are MVP §§22, 24, 38,
+and 43.1 in both languages.
+
 `@torsor/kernel` is the durable local state boundary for the first Torsor
 implementation slice. It stores collaboration and execution facts in SQLite
 while keeping SQL and provider details behind three consumer operations:
@@ -245,7 +274,8 @@ clock-derived expiry, and
 release, expiry, quarantine, and reconciliation ledger. These primitives do
 not perform filesystem mutation, process execution, or shell execution.
 
-The current direct schema version is 13. Version 13 adds durable Worktree
+The current direct schema version is 14. Version 14 adds the physical records
+described above. Version 13 added durable Worktree
 writer lease state and its independent event ledger. It retains version 12's
 bounded Attention recovery expiry horizon. Version 12 gives unfinished and
 finished-unsettled Attention recovery one bounded expiry-horizon index, so
@@ -256,4 +286,4 @@ normalized recovery state, ordered page indexes, count-only expiry promotion,
 recovery mutation revision, incremental provider/domain counters, and durable
 Agent/Project/Channel/Thread execution fences.
 This pre-release schema is intentionally breaking: stop old processes and
-recreate disposable databases rather than migrating version 8 through 12.
+recreate disposable databases rather than migrating version 8 through 13.

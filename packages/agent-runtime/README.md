@@ -1,5 +1,38 @@
 # `@torsor/agent-runtime`
 
+## Controlled physical Worktree tracer
+
+The optional `LocalWorktreeExecutor` implements only `write-probe-v1`, governed by
+MVP §§22.1–22.4, 24.2–24.3, 38.1–38.4, and 43.1. It registers a trusted,
+pre-provisioned detached Git worktree under a private managed root, exclusively
+creates `torsor-probe.txt`, and runs a fixed Node child to digest the content.
+It does not provision Git worktrees, execute repository code, run arbitrary
+commands, or grant ACP native shell/write tools.
+
+`register` binds immutable physical/repository/Run facts; `start` and `probe`
+require a live Run Activation. Every mediated mutation is checked under the
+Kernel write lock after a durable execution intent. `stopActivation`, `recover`,
+and `close` bound the lifecycle. Runtime gives explicitly enabled trusted
+adapters only `context.worktree.probe(worktreeId)`, never a path or executable.
+Attention contexts have no such capability.
+
+Logical lease expiry is not process exit. An unsettled execution blocks lease
+release and reacquisition. Unconfirmed stop quarantines the directory; only
+original-handle close evidence permits local reconciliation. A restart that
+loses that handle leaves quarantine in place even when the old PID disappears.
+There is no manual text-based physical quarantine override.
+
+The managed root is bound to one database storage identity by `.torsor-owner`.
+Use a fresh root after recreating the database. Do not concurrently run copied
+databases against it. The private root must exclude concurrent external path
+replacement; path checks are not a same-user OS sandbox. General process-tree
+containment, cross-restart stop proof, Pause/Resume, Terminal, Files UI, GC, and
+external integration remain out of scope.
+
+`controlled-process.ts` is an isolated trusted process-driver seam. Synthetic
+fixtures exercise stop uncertainty and crashes without adding another Provider
+conformance engine.
+
 `@torsor/agent-runtime` consumes durable Kernel work and runs one provider
 process for each Activation. The Kernel remains authoritative for Attention,
 Run, RunInput, provenance, revisions, terminal state, and outbox delivery.

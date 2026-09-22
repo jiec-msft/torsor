@@ -3,6 +3,7 @@ import {
   type AgentRuntimeHooks,
   type ProviderAdapter,
   type RuntimePassResult,
+  type WorktreeExecutor,
 } from "@torsor/agent-runtime";
 import {
   TorsorKernel,
@@ -41,6 +42,7 @@ export interface LocalRuntimeHostOptions {
   readonly runtimeHooks?: AgentRuntimeHooks;
   readonly clock?: () => Date;
   readonly idFactory?: (prefix: string) => string;
+  readonly worktreeExecutorFactory?: (kernel: TorsorKernel) => WorktreeExecutor;
 }
 
 export interface LocalRuntimeHost {
@@ -55,6 +57,7 @@ class Host implements LocalRuntimeHost {
   readonly #service: TorsorHttpService;
   readonly #runtime: AgentRuntime;
   readonly #runtimePollIntervalMs: number;
+  readonly #worktreeExecutor: WorktreeExecutor | undefined;
   readonly #started = deferred<string>();
   readonly #finished = deferred<void>();
   readonly #stopController = new AbortController();
@@ -69,10 +72,12 @@ class Host implements LocalRuntimeHost {
     service: TorsorHttpService,
     runtime: AgentRuntime,
     runtimePollIntervalMs: number,
+    worktreeExecutor?: WorktreeExecutor,
   ) {
     this.#kernel = kernel;
     this.#service = service;
     this.#runtime = runtime;
+    this.#worktreeExecutor = worktreeExecutor;
     this.#runtimePollIntervalMs = positiveInteger(
       runtimePollIntervalMs,
       "runtimePollIntervalMs",
@@ -122,10 +127,15 @@ class Host implements LocalRuntimeHost {
   async #runLifecycle(): Promise<void> {
     let failure: { readonly error: unknown } | null = null;
     try {
-      const origin = await this.#service.listen();
-      this.#state = "running";
-      this.#started.resolve(origin);
-      await this.#runRuntimeLoop();
+      if (this.#worktreeExecutor) await this.#worktreeExecutor.recover();
+      if (this.#stopController.signal.aborted) {
+        this.#started.reject(new Error("The local runtime host closed during recovery."));
+      } else {
+        const origin = await this.#service.listen();
+        this.#state = "running";
+        this.#started.resolve(origin);
+        await this.#runRuntimeLoop();
+      }
     } catch (error) {
       failure = { error };
       this.#started.reject(error);
@@ -134,6 +144,11 @@ class Host implements LocalRuntimeHost {
       this.#requestStop();
       try {
         await this.#beginServiceClose();
+      } catch (error) {
+        failure ??= { error };
+      }
+      try {
+        await this.#worktreeExecutor?.close();
       } catch (error) {
         failure ??= { error };
       }
@@ -173,6 +188,11 @@ class Host implements LocalRuntimeHost {
       await this.#beginServiceClose();
     } catch (error) {
       failure = { error };
+    }
+    try {
+      await this.#worktreeExecutor?.close();
+    } catch (error) {
+      failure ??= { error };
     }
     try {
       this.#kernel.close();
@@ -220,6 +240,7 @@ export function createLocalRuntimeHost(
   };
   const kernel = TorsorKernel.open(kernelOptions);
   try {
+    const worktreeExecutor = options.worktreeExecutorFactory?.(kernel);
     const service = createTorsorHttpService({
       kernel,
       credentials: options.credentials,
@@ -246,6 +267,7 @@ export function createLocalRuntimeHost(
       runtimePrincipalId: options.runtimePrincipalId,
       projectIds: options.projectIds,
       adapter: options.adapter,
+      ...(worktreeExecutor ? { worktreeExecutor } : {}),
       ...(options.attentionLeaseMs
         ? { attentionLeaseMs: options.attentionLeaseMs }
         : {}),
@@ -275,6 +297,7 @@ export function createLocalRuntimeHost(
       service,
       runtime,
       runtimePollIntervalMs,
+      worktreeExecutor,
     );
   } catch (error) {
     kernel.close();

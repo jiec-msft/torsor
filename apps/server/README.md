@@ -51,6 +51,13 @@ production composition path. `createTorsorHttpService` remains available for
 HTTP-only embedding; when passed a shared Kernel, the caller retains Kernel
 shutdown ownership.
 
+An embedding Host may explicitly supply `worktreeExecutorFactory(kernel)` to
+enable the fixed controlled Worktree tracer. The Host recovers physical
+execution intents before listening and stops or quarantines admitted work before
+closing Kernel. No environment flag, HTTP route, or ACP native tool enables
+arbitrary Worktree execution. See the agent-runtime implementation reference and
+MVP §§22, 24, 38, and 43.1 for the private-root and process-handle limitations.
+
 Clients authenticate with `Authorization: Bearer <local-secret>`. Browsers can
 exchange that credential at `POST /api/v1/session` for an HttpOnly,
 SameSite-strict cookie that native `EventSource` sends automatically. The

@@ -10,6 +10,7 @@ import type {
   RunView,
   ThreadProjection,
 } from "@torsor/kernel";
+import type { WorktreeExecutor } from "./worktree-executor.js";
 
 export interface ProviderCapabilityProfile {
   readonly acceptsInputWhileRunning: boolean;
@@ -84,6 +85,9 @@ export interface ProviderExecutionContext {
   readonly cause: ProviderCause;
   readonly capabilities: ActivationCapabilityBridge;
   readonly signal: AbortSignal;
+  readonly worktree?: {
+    probe(worktreeId: string): ReturnType<WorktreeExecutor["probe"]>;
+  };
 }
 
 export interface ProviderExecutionResult {

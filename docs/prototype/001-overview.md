@@ -766,15 +766,77 @@ The Runtime Host must bound consecutive recovery passes, yield to the event loop
 3. One Worktree has one platform-recognized Writer Authority; a Human may force takeover, but risk from an unstopped old process must be reported.
 4. Lease carries a monotonically increasing fencing token.
 
+The first physical execution slice further requires:
+
+5. Kernel persists an immutable `PhysicalWorktree` runtime record: repository identity,
+   canonical repository path, full base commit, source Run, opaque worktree ID,
+   canonical directory path, and filesystem identity. Paths are local Runtime handles,
+   not public Thread events or Provider context. Different Runs cannot register the same
+   directory, path alias, or filesystem identity; this slice never transfers an old directory
+   to another Run.
+   Registered directories cannot be ancestors/descendants of one another either,
+   preventing implicit nested sharing.
+6. Before external effects, persist an execution intent binding source Activation,
+   Runtime Principal, executor incarnation, lease generation, fencing token, and a private
+   execution receipt. A PID is diagnostic information, not recoverable process authority.
+7. Lease generation is a logical authority sequence, not physical isolation evidence.
+   Only a trusted executor converts authority into file/process operations; Agents, HTTP,
+   and ACP receive no general write entry point.
+
 ### 22.2 Creation
 
 1. A writable Run need not create a Worktree immediately.
 2. Create it lazily on first write.
 3. Pin repository identity, base commit/content revision, Run, and Worktree generation.
 
+The first slice does not implement general provisioning. A trusted local Host supplies a
+detached Git worktree pinned to a full commit under a dedicated root; the executor validates
+real paths, directory identity, Git common directory, and detached HEAD before registration.
+Git hooks, filters, repository scripts, checkout, networking, and arbitrary commands are
+outside its capabilities.
+
+An exclusive-create local owner marker binds the managed root to one Kernel storage identity.
+Another database cannot reuse it. Concurrent operation of database copies is unsupported;
+recreating a development database requires a fresh root, never automatic marker deletion or
+takeover of old directories.
+This marker is Host storage-ownership metadata outside the Worktree, not Run write authority.
+
+The sole controlled tracer is `write-probe-v1`: exclusively create a fixed probe file, then
+start a fixed Node child to process its content and return a digest. Use an exact executable
+and argument vector, `shell: false`, no inherited code-injection settings such as
+`NODE_OPTIONS`, and no execution of repository content. The child creates no descendants;
+this audited fixed protocol is the precondition for direct-child stop confirmation, not a
+claim of arbitrary process-tree isolation. Test process drivers/fixtures stay behind a narrow
+isolated seam for later Provider Conformance Harness adoption, not another Provider engine.
+
+Before every platform-mediated file creation inside a Worktree or spawn, recheck lease token, generation,
+fencing token, current Activation/Run, execution receipt, and directory identity.
+Authorization and synchronous effect initiation share a Kernel write transaction lock;
+the previously committed intent must survive file/process failure. SQLite and the OS do not
+form one atomic transaction: crash windows remain uncertain, with no arbitrary external
+effect exactly-once promise.
+
 ### 22.3 Lease expiry
 
-Expiry does not prove the old process stopped. Never hand the same directory to a new Writer solely because a Lease timed out. Confirm process stop, or mark the old directory `Suspect/Quarantined` and create a new generation from a known base/checkpoint.
+Expiry does not prove the old process stopped. Never hand the same directory to a new Writer
+solely because a Lease timed out:
+
+1. Only exact stop evidence permits the same Run to reuse its directory; otherwise
+2. mark the directory `Quarantined`, rejecting new platform writes and Writer acquisition.
+3. A later slice may create a **different physical directory** from a known base/checkpoint.
+   Increasing generation, renaming, replacing a token, or copying a suspect directory is
+   not isolation evidence.
+
+`Starting` intents, running processes, `StopRequested`, and `Uncertain` block lease release
+and reassignment even after expiry, including competing acquisition through independent
+Kernel connections. Startup recovery quarantines unfinished intents from an old executor
+incarnation. PID presence/absence, cached exit codes, or Host restart cannot clear quarantine.
+
+This slice accepts only `close` observed by the executor retaining the original child handle
+(or definite evidence that spawn never happened) as direct-child stop evidence. Late
+confirmation conditionally updates its own execution using the original receipt, never a
+successor. Losing the handle leaves quarantine in place; cross-restart OS containment proof
+and manual clearance are not implemented and cannot be bypassed with resolution text.
 
 ### 22.4 Pause, Cancel, and GC
 
@@ -783,6 +845,13 @@ Expiry does not prove the old process stopped. Never hand the same directory to 
 3. Cancel does not immediately delete Worktree.
 4. Stop processes and preserve required patch/log before retention.
 5. GC only after terminal Run, no active/suspect Writer, required Artifacts finalized, retention elapsed, and no investigation/hold requirement.
+
+In this slice Host shutdown waits for admitted controlled operations to stop or persist
+quarantine before closing Kernel. A shutdown request during recovery must prevent subsequent
+HTTP listener startup and new Runtime admission. Stop control is safety authority over an existing process
+handle and does not require an expired write lease to remain live. Unconfirmed stop never
+deletes the directory or releases it for reuse. Pause/Resume, Human Terminal, controller lease,
+Files UI, retention policy, and GC are outside this slice.
 
 ## 23. Artifact and integration
 
@@ -835,9 +904,28 @@ MVP adds no `ArtifactInput`. Reference an Artifact in a Thread Message/card and 
 3. Request Provider stop asynchronously.
 4. UI displays logical state separately from Provider execution state.
 
+Physical execution records independent facts, not new Run states:
+
+| Fact | Meaning |
+|---|---|
+| `Starting` / `Running` | Durable intent / observed child start; neither means completion |
+| `StopRequested` | Further writes prohibited and stop requested; not stop evidence |
+| `StopConfirmed` | Original handle confirms exit (not success), or definite no-spawn evidence |
+| `ForceTerminated` | Force termination requested and original handle subsequently confirms exit; successful kill alone is insufficient |
+| `Uncertain` | No confirmation by deadline, lost handle, or crash in the spawn window; quarantine is mandatory |
+
+Record request and observation times, PID when available, reason, stop evidence, and transition
+history. Provider timeout, AbortSignal, protocol cancel acknowledgement, terminal Run state,
+and lease expiry never imply `StopConfirmed`. Controlled-child exit never completes a Run.
+
 ### 24.3 Provider without Cancel
 
 The Run may still cancel immediately: reject old capabilities, isolate Worktree, show termination as pending/unknown, and prevent late output from publishing or changing Run/RunInput automatically.
+
+The same applies to Providers claiming Cancel support without physical confirmation. The first
+slice does not grant such Providers native Worktree shell/write tools. Until general descendant
+control and OS isolation exist, only the controlled tracer is permitted; logical fencing is
+not a security sandbox against hostile same-user processes.
 
 ### 24.4 Retrying Unknown
 
@@ -1206,13 +1294,32 @@ It may include user-visible assistant delta, tool start/completion/failure/cance
 
 Files Tab is a Worktree read projection, not a File domain object.
 
-1. Root it at the current Run Worktree or read-only Project snapshot.
-2. Do not expose arbitrary Host filesystem paths.
-3. Human may inspect files and diffs while an Agent works.
-4. Reads carry Worktree generation, path, and content hash.
-5. Client may report change and refresh.
-6. MVP Files Tab is read-only by default.
-7. Human edits require current Writer Lease or a separate derived Worktree.
+### 38.1 Root and identity
+
+Root it at the current Run Worktree or read-only Project snapshot; never expose arbitrary Host
+paths. Runtime uses a registered opaque handle, not a Provider-supplied cwd.
+
+### 38.2 Path safety
+
+Platform file operations reject absolute paths, `..`, traversal using either separator,
+symlink/junction/reparse aliases, and escapes. Validate canonical containment and directory
+identities along the path. Exclusive creation of the fixed probe file never follows an existing
+symlink or overwrites a file or hard link. Path checks are not an OS sandbox: this slice
+requires a trusted Host-controlled private root without concurrent external renames or link
+replacement; do not enable the executor without that precondition. Hostile same-user TOCTOU
+protection requires later OS handle-relative/containment support.
+
+### 38.3 Read projection
+
+Humans may inspect files and diffs during Agent work. Reads carry Worktree generation, path,
+and content hash; Clients may report changes and refresh. This slice adds no Files API/UI.
+
+### 38.4 Write authority
+
+MVP Files Tab is read-only by default. Human edits require current Writer Authority or a separate
+derived Worktree. Platform-mediated writes follow §22: stale tokens/generations, stop-requested
+executions, and quarantined directories must fail. File contents neither grant execution
+authority nor automatically confirm Run completion.
 
 ## 39. TerminalSession
 
@@ -1460,6 +1567,13 @@ GitHub etc.       external hosting, CI, protection, final resource state
 Torsor does not decide whether a Message deserves action, whether to continue/create/Fork/replace/Ignore, whether another Review is needed, when work is semantically complete, or whether to Reply, publish, create a PR, or ask a Human.
 
 Torsor guarantees unforgeable identity/capability, provenance to Message/Run/Worktree, one automated Writer per Worktree, revision/idempotency/Lease/fencing/terminal protection, durable failure/conflict/late/external-operation facts, and Human observation/guidance/takeover/stop.
+
+These are platform contracts, not claims that OS containment already exists. The first
+lease-backed physical execution slice connects only Kernel, Runtime, and a controlled Worktree
+executor; physical identity and stop evidence exist independently of logical leases. This
+optional tracer is disabled by default. It exposes no ACP native shell/write tools and implements
+no Human Terminal/controller lease, Files UI, GC, or GitHub integration. Without safe isolation
+evidence, retain an unusable quarantined directory instead of widening execution authority.
 
 ### 43.2 PR and real integration
 
