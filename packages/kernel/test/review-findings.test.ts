@@ -972,6 +972,41 @@ describe("independent review regressions", () => {
       expect(first.hasMore).toBe(true);
       expect(second.items).toHaveLength(5);
       expect(second.hasMore).toBe(false);
+
+      // MVP sections 37.2-37.3: bounded backward history and fixed catch-up bounds.
+      const older = await kernel.query(
+        { type: "ListActivity", runId: setup.runId, beforeSequence: 106, limit: 100 },
+        humanContext,
+      );
+      expect(older.items.map((item) => item.sequence)).toEqual(
+        Array.from({ length: 100 }, (_, index) => index + 6),
+      );
+      expect(older.nextCursor).toBe(6);
+      expect(older.hasMore).toBe(true);
+      const oldest = await kernel.query(
+        { type: "ListActivity", runId: setup.runId, beforeSequence: older.nextCursor!, limit: 100 },
+        humanContext,
+      );
+      expect(oldest.items.map((item) => item.sequence)).toEqual([1, 2, 3, 4, 5]);
+      expect(oldest.hasMore).toBe(false);
+      expect(oldest.nextCursor).toBeNull();
+      const bounded = await kernel.query(
+        { type: "ListActivity", runId: setup.runId, afterSequence: 2, beforeSequence: 6, limit: 2 },
+        humanContext,
+      );
+      expect(bounded.items.map((item) => item.sequence)).toEqual([3, 4]);
+      expect(bounded.nextCursor).toBe(4);
+      for (const bounds of [
+        { beforeSequence: 0 },
+        { beforeSequence: 1.5 },
+        { afterSequence: -1 },
+        { afterSequence: 6, beforeSequence: 6 },
+      ]) {
+        await expect(kernel.query(
+          { type: "ListActivity", runId: setup.runId, ...bounds },
+          humanContext,
+        )).rejects.toMatchObject({ code: "InvalidCommand" });
+      }
     } finally {
       kernel.close();
     }

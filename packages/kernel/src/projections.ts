@@ -706,16 +706,43 @@ export function getProjectAgentStatus(
   };
 }
 
-export function listActivity(kernel: db.KernelContext, runId: string, afterSequence: number, limit: number): ActivityPage {
+export function listActivity(
+  kernel: db.KernelContext,
+  runId: string,
+  afterSequence: number | undefined,
+  limit: number,
+  beforeSequence?: number,
+): ActivityPage {
+  if (
+    (afterSequence !== undefined &&
+      (!Number.isSafeInteger(afterSequence) || afterSequence < 0)) ||
+    (beforeSequence !== undefined &&
+      (!Number.isSafeInteger(beforeSequence) || beforeSequence < 1)) ||
+    (afterSequence !== undefined && beforeSequence !== undefined &&
+      afterSequence >= beforeSequence)
+  ) {
+    throw new KernelError("InvalidCommand", "Activity sequence bounds must be ordered nonnegative safe integers; beforeSequence must be positive.");
+  }
+  const backwards = beforeSequence !== undefined && afterSequence === undefined;
+  const parameters: SQLInputValue[] = [runId, afterSequence ?? 0];
+  if (beforeSequence !== undefined) {
+    parameters.push(beforeSequence);
+  }
+  parameters.push(limit + 1);
   const rows = db.allRows(kernel, `SELECT * FROM run_activity_events
         WHERE run_id = ? AND sequence > ?
-        ORDER BY sequence
-        LIMIT ?`, runId, afterSequence, limit + 1);
+          ${beforeSequence === undefined ? "" : "AND sequence < ?"}
+        ORDER BY sequence ${backwards ? "DESC" : "ASC"}
+        LIMIT ?`, ...parameters);
   const hasMore = rows.length > limit;
   const items = rows.slice(0, limit).map(mapActivity);
+  const nextCursor = hasMore ? items.at(-1)?.sequence ?? null : null;
+  if (backwards) {
+    items.reverse();
+  }
   return {
     items,
-    nextCursor: hasMore ? items.at(-1)?.sequence ?? null : null,
+    nextCursor,
     hasMore,
   };
 }
