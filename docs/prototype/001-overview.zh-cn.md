@@ -1115,6 +1115,10 @@ reconciliation 说明，再确认已恢复的 outbox delivery。保留已提交�
 ProviderAttempt、Reply、Artifact、activity 和因果容量事实，不重发 Provider、不重发
 成功、不把已完成 Run 改成失败。已有 Failed/Unknown、Waiting 和旧 generation 的
 恢复仍遵守各自状态规则；已终结 Activation 不重复结束。第二次重启不产生重复事实。
+若 authority-lost 的 `Expired` settlement 因另一个 Host 并发结束同一 Activation
+而发生 `Conflict`，只在重新读取权威 Run projection 确认该 Activation 已有
+`finishedAt` 后接受其既有终态并继续确认 delivery，不覆盖 outcome。
+Activation 仍未结束、读取失败或其他冲突必须继续报错，不能泛化为吞掉 `Conflict`。
 
 正常 `probe` 只在固定 digest 匹配、正常退出已确认、写权限仍有效时返回成功。
 正常 drain 不提前释放 lease：保留到该 Activation 的公开结果/状态提交结束后，
@@ -1179,6 +1183,19 @@ spawn 未发生）作为直接 child 停止证据。晚到确认使用原 execut
 有界等待及必要的强制停止；不得等待 SQLite 写锁、revocation 或 `StopRequested`
 持久化成功才发停止请求。正常 drain 也先执行物理停止，再持久化证据。数据库忙、
 启动失败、取消、超时、输出超限和关闭均遵守此顺序。
+
+`DatabaseSync` 即使位于 Promise API 内也会同步阻塞调用线程；不能让 authority
+monitor、其他 Kernel 命令或清理重试的 SQLite busy wait 占用执行 deadline、
+AbortSignal 和关闭回调的事件循环。首次物理副作用之前，该 Kernel 实例进入保守的
+nonblocking supervision 模式，直到实例关闭：每个同步数据库操作作用域使用
+no-wait lock admission，并在 `finally` 恢复配置的 busy timeout（生产默认 5000ms）；
+作用域内不跨 `await`。竞争明确失败，持久化可按原幂等协议重试，不降低 Writer 校验。
+monitor 使用只回滚的短 snapshot 观察，不能凭观察结果发起 mutation/publication；
+实际副作用仍在 `BEGIN IMMEDIATE` 内重新验证完整授权。持有原 handle 的 deadline
+及停止链独立运行；一个执行的持久化重试也不能阻塞其他执行的停止。
+验收使用未缩短的生产 timeout、独立连接持续 6500ms 的写锁及独立进程存活观察，
+证明 1000ms lease 的停止请求在 deadline 附近发出，并在解锁后持久化收敛；
+同时覆盖排队的取消/显式停止、executor/Host 关闭和多个 handle。
 
 本地停止/证据与 durable revocation、quarantine/stop disposition、lease release
 分别幂等：同一个 handle 不重复成功发送停止/强制信号；保留原始 close 证据。

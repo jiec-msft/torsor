@@ -4,12 +4,90 @@ import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { TorsorKernel } from "../src/index.js";
 import { bootstrap, createRun, runtimeContext } from "./helpers.js";
 
 describe("physical Worktree SQLite fencing (§22.3)", () => {
+  it("uses no-wait supervision scopes without weakening transactions or changing the configured timeout", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "torsor-physical-no-wait-"));
+    const databasePath = join(directory, "kernel.sqlite");
+    let clock = new Date("2026-09-23T00:00:00Z");
+    const put = vi.fn(async () => {});
+    const kernel = TorsorKernel.open({
+      databasePath, bootstrap, clock: () => clock,
+      artifactStorage: { put, read: async () => Buffer.from("Synthetic report.") },
+    });
+    const holder = new DatabaseSync(databasePath);
+    let sql: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const run = await createRun(kernel);
+      await kernel.execute({
+        type: "RegisterPhysicalWorktree", idempotencyKey: "physical", worktreeId: "tree", runId: run.runId,
+        repositoryId: "synthetic", repositoryPath: "synthetic-repository", baseRevision: "a".repeat(40),
+        directoryPath: "synthetic-private-tree", directoryIdentity: "1:2",
+      }, runtimeContext);
+      const lease = await kernel.execute({
+        type: "AcquireWorktreeWriterLease", idempotencyKey: "lease", worktreeId: "tree", leaseDurationMs: 1000,
+      }, runtimeContext);
+      const binding = {
+        worktreeId: "tree", generation: lease.leaseGeneration!, fencingToken: lease.fencingToken!,
+        leaseToken: lease.leaseToken!, executorId: "synthetic-host",
+      };
+      const intent = await kernel.execute({
+        type: "StartWorktreeExecution", idempotencyKey: "intent", ...binding, activationId: run.activationId,
+      }, runtimeContext);
+      const authority = { ...binding, executionId: intent.entityId, executionToken: intent.executionToken! };
+      const effect = vi.fn(() => undefined);
+      kernel.performWorktreeMutation(authority, runtimeContext, effect);
+      holder.exec("BEGIN IMMEDIATE");
+      const statements = vi.spyOn(DatabaseSync.prototype, "exec");
+      sql = statements;
+      const restored = () => expect(statements.mock.calls.at(-1)).toEqual(["PRAGMA busy_timeout = 5000"]);
+      const before = performance.now();
+      kernel.checkWorktreeAuthority(authority, runtimeContext);
+      restored();
+      expect(() => kernel.performWorktreeMutation(authority, runtimeContext, effect)).toThrow(/locked/);
+      restored();
+      expect(effect).toHaveBeenCalledTimes(1);
+      expect(() => kernel.checkWorktreePublication(authority, runtimeContext)).toThrow(/locked/);
+      restored();
+      await expect(kernel.execute({
+        type: "RevokeWorktreeExecutionAuthority", idempotencyKey: "revoke", ...authority, reason: "Synthetic stop.",
+      }, runtimeContext)).rejects.toThrow(/locked/);
+      restored();
+      await expect(kernel.query({ type: "GetWorktreeWriterLease", worktreeId: "tree" }, runtimeContext))
+        .rejects.toThrow(/locked/);
+      restored();
+      await expect(kernel.finalizeReport({
+        idempotencyKey: "blocked-report", runId: run.runId, expectedRunRevision: 1, content: Buffer.from("Synthetic report."),
+      }, run.agentContext)).rejects.toThrow(/locked/);
+      restored();
+      expect(put).not.toHaveBeenCalled();
+      expect(performance.now() - before).toBeLessThan(500);
+      clock = new Date("2026-09-23T00:00:01Z");
+      expect(() => kernel.checkWorktreeAuthority(authority, runtimeContext)).toThrow();
+      restored();
+      holder.exec("ROLLBACK");
+      expect(holder.prepare("SELECT authority_revoked_at FROM worktree_executions").get()?.authority_revoked_at).toBeNull();
+      expect(holder.prepare("SELECT status FROM worktree_writer_leases").get()?.status).toBe("Active");
+      expect(() => kernel.checkWorktreeAuthority(authority, runtimeContext)).toThrow();
+      restored();
+      expect(holder.prepare("SELECT authority_revoked_at FROM worktree_executions").get()?.authority_revoked_at).toBeNull();
+      expect(() => kernel.performWorktreeMutation(authority, runtimeContext, effect))
+        .toThrow(expect.objectContaining({ code: "WriterAuthorityLost" }));
+      restored();
+      expect(effect).toHaveBeenCalledTimes(1);
+      expect(holder.prepare("SELECT authority_revoked_at FROM worktree_executions").get()?.authority_revoked_at).not.toBeNull();
+    } finally {
+      sql?.mockRestore();
+      holder.close();
+      kernel.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("persists the pre-spawn intent across restart and refuses schema 13 without changing it", async () => {
     const directory = mkdtempSync(join(tmpdir(), "torsor-physical-intent-"));
     const databasePath = join(directory, "kernel.sqlite");

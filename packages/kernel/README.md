@@ -36,6 +36,17 @@ and Runtime identity. It adds a process-local denial without touching SQLite, so
 stopping an owned child never waits for a writer lock. It grants no authority and
 does not replace durable revocation or conservative restart recovery.
 
+The first `performWorktreeMutation` opts this Kernel instance into nonblocking
+supervision until close. All synchronous database scopes then use no-wait lock
+admission and restore the configured busy timeout in `finally`; none crosses an
+`await`. This includes ordinary commands, queries and Artifact Writer checks, so
+their contention cannot starve physical deadlines on the shared event loop.
+Contention is an explicit failure, not mutation permission. `checkWorktreeAuthority`
+uses a short rollback-only snapshot for monitoring, discarding even tentative
+expiry/revocation writes. Real mutations and publications retain their write
+transactions and full fences. Durable stop/revocation retries remain the executor's
+responsibility; production's configured 5000ms timeout and schema are unchanged.
+
 Earlier schemas, including versions 14 and 15, intentionally fail to open. Stop old processes and recreate
 the disposable database **and use a fresh managed root**; no migration or
 automatic deletion is performed. The normative contracts are MVP §§22, 24, 38,

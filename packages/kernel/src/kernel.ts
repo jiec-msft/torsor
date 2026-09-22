@@ -121,6 +121,7 @@ import {
   assertNever,
   boundedLimit,
   hashPayload,
+  integer,
   text,
   type Row,
 } from "./values.js";
@@ -145,6 +146,7 @@ export class TorsorKernel {
     readonly principalId: string; readonly activationId: string;
   }>();
   #closed = false;
+  #supervisesWorktrees = false;
 
   private constructor(options: KernelOpenOptions) {
     this.#context = openKernelContext(options);
@@ -171,20 +173,28 @@ export class TorsorKernel {
     context: PrincipalContext,
     effect: () => undefined,
   ): void {
-    this.#assertOpen();
-    const principal = requirePrincipal(this.#context, context.principalId);
-    this.#context.database.exec("BEGIN IMMEDIATE");
-    try {
+    this.#supervisesWorktrees = true;
+    this.#writerCheck(() => {
+      const principal = requirePrincipal(this.#context, context.principalId);
       assertWorktreeMutation(this.#context, authority, principal);
       const result = effect();
       if (result !== undefined) {
         throw new Error("Worktree mutations must be synchronous and return undefined.");
       }
-      this.#context.database.exec("COMMIT");
-    } catch (error) {
-      this.#context.database.exec(error instanceof DurableKernelError ? "COMMIT" : "ROLLBACK");
-      throw translateError(error);
-    }
+    });
+  }
+
+  /** A rollback-only observation, never authorization for a later external effect. */
+  checkWorktreeAuthority(authority: WorktreeMutationAuthority, context: PrincipalContext): void {
+    this.#withDatabaseAccess(() => {
+      this.#context.database.exec("BEGIN");
+      try {
+        assertWorktreeMutation(this.#context, authority, requirePrincipal(this.#context, context.principalId));
+      } finally {
+        // Validation can tentatively record expiry/revocation; only the stop path persists it.
+        this.#context.database.exec("ROLLBACK");
+      }
+    });
   }
 
   async execute<C extends KernelCommand>(
@@ -217,19 +227,34 @@ export class TorsorKernel {
   }
 
   checkWorktreePublication(authority: WorktreeMutationAuthority, context: PrincipalContext): void {
-    this.#assertOpen();
-    const principal = requirePrincipal(this.#context, context.principalId);
-    this.#writerCheck(() => assertWorktreePublication(this.#context, authority, principal));
+    this.#writerCheck(() => assertWorktreePublication(
+      this.#context, authority, requirePrincipal(this.#context, context.principalId),
+    ));
   }
 
   #writerCheck(check: () => void): void {
-    this.#context.database.exec("BEGIN IMMEDIATE");
+    this.#withDatabaseAccess(() => {
+      this.#context.database.exec("BEGIN IMMEDIATE");
+      try {
+        check();
+        this.#context.database.exec("COMMIT");
+      } catch (error) {
+        this.#context.database.exec(error instanceof DurableKernelError ? "COMMIT" : "ROLLBACK");
+        throw translateError(error);
+      }
+    });
+  }
+
+  #withDatabaseAccess<T>(operation: () => T): T {
+    this.#assertOpen();
+    if (!this.#supervisesWorktrees) return operation();
+    const timeout = integer(getRow(this.#context, "PRAGMA busy_timeout")!.timeout);
+    this.#context.database.exec("PRAGMA busy_timeout = 0");
     try {
-      check();
-      this.#context.database.exec("COMMIT");
-    } catch (error) {
-      this.#context.database.exec(error instanceof DurableKernelError ? "COMMIT" : "ROLLBACK");
-      throw translateError(error);
+      // These scopes never cross await: DatabaseSync must not starve owned-child timers.
+      return operation();
+    } finally {
+      this.#context.database.exec(`PRAGMA busy_timeout = ${timeout}`);
     }
   }
 
@@ -251,11 +276,11 @@ export class TorsorKernel {
       this.#context, requirePrincipal(this.#context, actor.principalId), actor,
     );
     this.#writerCheck(checkWriter);
-    authorizeReport(this.#context, runId, actor);
+    this.#withDatabaseAccess(() => authorizeReport(this.#context, runId, actor));
     const content = await collectReport(input.content);
     const contentDigest = artifactDigest(content);
     this.#writerCheck(checkWriter);
-    authorizeReport(this.#context, runId, actor);
+    this.#withDatabaseAccess(() => authorizeReport(this.#context, runId, actor));
     await storage.put(contentDigest, content);
     return this.#execute(
       {
@@ -296,6 +321,10 @@ export class TorsorKernel {
     command: KernelCommand,
     principalContext: PrincipalContext,
   ): Promise<CommandResult> {
+    return this.#withDatabaseAccess(() => this.#executeTransaction(command, principalContext));
+  }
+
+  #executeTransaction(command: KernelCommand, principalContext: PrincipalContext): CommandResult {
     this.#assertOpen();
     const principal = requirePrincipal(
       this.#context,
@@ -521,6 +550,10 @@ export class TorsorKernel {
     query: Q,
     principalContext: PrincipalContext,
   ): Promise<QueryResult<Q>> {
+    return this.#withDatabaseAccess(() => this.#queryTransaction(query, principalContext));
+  }
+
+  #queryTransaction<Q extends KernelQuery>(query: Q, principalContext: PrincipalContext): QueryResult<Q> {
     this.#assertOpen();
     const principal = requirePrincipal(
       this.#context,
@@ -889,6 +922,10 @@ export class TorsorKernel {
     afterEventId: string | null,
     limit: number,
   ): Promise<readonly PublicEventEnvelope[]> {
+    return this.#withDatabaseAccess(() => this.#readEvents(afterEventId, limit));
+  }
+
+  #readEvents(afterEventId: string | null, limit: number): readonly PublicEventEnvelope[] {
     this.#assertOpen();
     const afterSequence = afterEventId
       ? eventSequence(this.#context, afterEventId)

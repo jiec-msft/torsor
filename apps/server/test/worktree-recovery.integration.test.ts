@@ -3,12 +3,12 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { DeterministicFakeAdapter, LocalWorktreeExecutor } from "@torsor/agent-runtime";
-import { LocalArtifactStorage, TorsorKernel } from "@torsor/kernel";
+import { KernelError, LocalArtifactStorage, TorsorKernel } from "@torsor/kernel";
 import { describe, expect, it, vi } from "vitest";
 
 import { createLocalRuntimeHost } from "../src/index.js";
 import { activeRun, bootstrap, runtimeContext, syntheticRepository } from "../../../packages/agent-runtime/test/fixtures/worktree-fixture.js";
-import { holdSqliteWriter } from "../../../packages/agent-runtime/test/fixtures/sqlite-lock.js";
+import { observeLockedChildren } from "../../../packages/agent-runtime/test/fixtures/sqlite-lock.js";
 import { nodeProbeDriver, type ControlledChild } from "../../../packages/agent-runtime/src/controlled-process.js";
 
 describe("orphaned physical Writer Host recovery (MVP 22.2)", () => {
@@ -18,9 +18,11 @@ describe("orphaned physical Writer Host recovery (MVP 22.2)", () => {
     let kernel!: TorsorKernel;
     let executor!: LocalWorktreeExecutor;
     let actual!: ControlledChild;
-    const requests = vi.fn(() => actual.requestStop());
-    const timeoutKey = Symbol.for("torsor.kernel.test-sqlite-busy-timeout-ms");
-    Reflect.set(globalThis, timeoutKey, 100);
+    const stops = new BigInt64Array(new SharedArrayBuffer(8));
+    const requests = vi.fn(() => {
+      Atomics.compareExchange(stops, 0, 0n, BigInt(Date.now()));
+      actual.requestStop();
+    });
     const host = createLocalRuntimeHost({
       databasePath: repo.databasePath, bootstrap,
       credentials: [{ token: "synthetic-human", principalContext: { principalId: "human" } }],
@@ -37,8 +39,8 @@ describe("orphaned physical Writer Host recovery (MVP 22.2)", () => {
         return executor;
       },
     });
-    Reflect.deleteProperty(globalThis, timeoutKey);
-    let release: (() => Promise<void>) | undefined;
+    let lock: Awaited<ReturnType<typeof observeLockedChildren>> | undefined;
+    let queued: NodeJS.Timeout | undefined;
     try {
       const run = await activeRun(kernel, "host-close-retry");
       await executor.register({
@@ -46,12 +48,19 @@ describe("orphaned physical Writer Host recovery (MVP 22.2)", () => {
       });
       const child = await executor.start({ worktreeId: "first", activationId: run.activationId });
       await child.result;
-      release = await holdSqliteWriter(repo.databasePath);
-      await expect(host.close()).rejects.toThrow();
+      lock = await observeLockedChildren(repo.databasePath, [actual.pid!], stops);
+      const closing = new Promise<unknown>((resolve) => {
+        queued = setTimeout(() => { void host.close().then(resolve, resolve); }, 300);
+      });
+      const observed = await lock.observation;
+      expect(observed.alive).toEqual([false]);
+      expect(observed.stopRequestedAt[0]! - lock.lockedAt).toBeLessThan(700);
+      expect(await closing).toBeInstanceOf(Error);
       await actual.closed;
       expect(requests).toHaveBeenCalledTimes(1);
       await expect(host.start()).rejects.toThrow(/closed/);
-      await release();
+      await lock.released;
+      expect(Date.now() - lock.lockedAt).toBeGreaterThanOrEqual(6500);
       await host.close();
       await host.close();
       const reopened = TorsorKernel.open({ databasePath: repo.databasePath });
@@ -62,13 +71,149 @@ describe("orphaned physical Writer Host recovery (MVP 22.2)", () => {
           } });
       } finally { reopened.close(); }
     } finally {
-      await release?.();
+      clearTimeout(queued);
+      await lock?.release();
       actual?.forceStop();
       if (actual) await actual.closed;
       await host.close();
       repo.dispose();
     }
-  });
+  }, 20_000);
+
+  it.each(["terminal-winner", "unrelated-conflict", "unfinished-conflict"] as const)(
+    "conditionally settles recovery during a two-Host interleaving: %s",
+    async (mode) => {
+      const repo = syntheticRepository();
+      repo.addWorktree("first");
+      const committed = gate();
+      const resumeOriginal = gate();
+      const fallback = gate();
+      const resumeReplacement = gate();
+      const failed = gate();
+      let source = "";
+      let runId = "";
+      let originalKernel!: TorsorKernel;
+      let originalExecutor!: LocalWorktreeExecutor;
+      const options = {
+        databasePath: repo.databasePath, bootstrap,
+        credentials: [{ token: "synthetic-human", principalContext: { principalId: "human" } }],
+        runtimePrincipalId: "runtime", projectIds: ["project"], port: 0, runtimePollIntervalMs: 5,
+      };
+      const original = createLocalRuntimeHost({
+        ...options,
+        artifactStorage: await LocalArtifactStorage.open(join(repo.directory, "artifacts")),
+        adapter: new DeterministicFakeAdapter(async (context) => {
+          if (context.cause.type === "attention") {
+            runId = await context.capabilities.createRunFromAttention();
+            await originalExecutor.register({
+              worktreeId: "first", directoryName: "first", baseRevision: repo.baseRevision, runId,
+            });
+            return;
+          }
+          source = context.activationId;
+          await context.worktree!.probe("first");
+          await context.capabilities.publishReport({ idempotencyKey: "race-report", text: "Synthetic report." });
+          await context.capabilities.publishReply({ body: "Synthetic committed reply." });
+          await context.capabilities.appendActivity("status", { text: "Synthetic committed activity." });
+          await context.capabilities.complete({ incorporatedThroughInputSequence: 1 });
+        }),
+        worktreeExecutorFactory(kernel) {
+          originalKernel = kernel;
+          const execute = kernel.execute.bind(kernel);
+          vi.spyOn(kernel, "execute").mockImplementation(async (command, context) => {
+            const result = await execute(command, context);
+            if (source && command.type === "FinishProviderAttempt" && command.status === "Completed") {
+              committed.resolve();
+              await resumeOriginal.promise;
+            }
+            if (command.type === "FinishActivation" && command.activationId === source && command.outcome === "Failed") {
+              failed.resolve();
+            }
+            return result;
+          });
+          originalExecutor = new LocalWorktreeExecutor({ kernel, runtimePrincipalId: "runtime", ...repo });
+          return originalExecutor;
+        },
+      });
+      let replacement: ReturnType<typeof createLocalRuntimeHost> | undefined;
+      try {
+        const thread = await originalKernel.execute({
+          type: "StartThread", idempotencyKey: "two-host-race", projectId: "project", channelId: "channel",
+          body: "Synthetic concurrent recovery.", targetAgentIds: ["orbit"],
+        }, { principalId: "human" });
+        await original.start();
+        await committed.promise;
+        const before = facts(repo.databasePath);
+        expect((await originalKernel.query({ type: "GetRunProjection", runId }, runtimeContext)).run.state)
+          .toBe("Completed");
+        const clock = () => new Date(Date.now() + 60_000);
+        replacement = createLocalRuntimeHost({
+          ...options, clock,
+          adapter: new DeterministicFakeAdapter(async () => { throw new Error("Committed work must not rerun."); }),
+          worktreeExecutorFactory(kernel) {
+            const execute = kernel.execute.bind(kernel);
+            vi.spyOn(kernel, "execute").mockImplementation(async (command, context) => {
+              if (command.type === "FinishActivation" && command.idempotencyKey === `${source}:reconciled-authority-lost`) {
+                fallback.resolve();
+                await resumeReplacement.promise;
+                if (mode !== "terminal-winner") {
+                  throw new KernelError("Conflict", mode === "unfinished-conflict"
+                    ? "The Activation is already finished." : "Synthetic unrelated conflict.");
+                }
+              }
+              return execute(command, context);
+            });
+            return new LocalWorktreeExecutor({ kernel, runtimePrincipalId: "runtime", ...repo });
+          },
+        });
+        const origin = await replacement.start();
+        await Promise.race([fallback.promise, replacement.finished]);
+        if (mode !== "unfinished-conflict") {
+          resumeOriginal.resolve();
+          await failed.promise;
+        }
+        resumeReplacement.resolve();
+        if (mode === "terminal-winner") {
+          await Promise.race([
+            waitForSettlement(repo.databasePath, source),
+            replacement.finished.then(() => { throw new Error("Replacement stopped during settlement."); }),
+          ]);
+          const response = await fetch(`${origin}/api/v1/threads/${thread.entityId}`, {
+            headers: { Authorization: "Bearer synthetic-human" },
+          });
+          expect(response.status).toBe(200);
+          expect(facts(repo.databasePath)).toEqual(before);
+          const inspection = new DatabaseSync(repo.databasePath, { readOnly: true });
+          try {
+            expect(inspection.prepare("SELECT outcome FROM activation_attempts WHERE id = ?").get(source)?.outcome)
+              .toBe("Failed");
+            expect(inspection.prepare("SELECT count(*) AS count FROM public_events WHERE type = 'ActivationFinished' AND entity_id = ?")
+              .get(source)?.count).toBe(1);
+          } finally { inspection.close(); }
+          await replacement.close();
+          for (let restart = 0; restart < 2; restart++) {
+            const restarted = createLocalRuntimeHost({
+              ...options, clock,
+              adapter: new DeterministicFakeAdapter(async () => { throw new Error("Must not rerun committed work."); }),
+              worktreeExecutorFactory: (kernel) => new LocalWorktreeExecutor({ kernel, runtimePrincipalId: "runtime", ...repo }),
+            });
+            try {
+              await restarted.start();
+              await Promise.race([waitForSettlement(repo.databasePath, source), restarted.finished]);
+              expect(facts(repo.databasePath)).toEqual(before);
+            } finally { await restarted.close(); }
+          }
+        } else {
+          await expect(replacement.finished).rejects.toMatchObject({ code: "Conflict" });
+        }
+      } finally {
+        resumeOriginal.resolve();
+        resumeReplacement.resolve();
+        await Promise.allSettled([original.close(), replacement?.close()]);
+        repo.dispose();
+      }
+    }, 20_000,
+  );
 
   it.each(["Completed", "Failed", "Unknown", "Waiting", "Waiting-stale"])(
     "survives repeated Host restart after committed %s without duplicating work",
@@ -145,6 +290,12 @@ describe("orphaned physical Writer Host recovery (MVP 22.2)", () => {
     },
   );
 });
+
+function gate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
 
 function facts(path: string) {
   const database = new DatabaseSync(path, { readOnly: true });

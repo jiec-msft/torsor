@@ -856,6 +856,11 @@ activity and causal-capacity facts: do not rerun the Provider, republish success
 a completed Run into failure. Existing Failed/Unknown, Waiting and stale-generation
 recovery follows its respective state rules; finished Activations are not finished again.
 A second restart produces no duplicate facts.
+If the authority-lost `Expired` settlement conflicts because another Host concurrently
+finished the same Activation, reread its authoritative Run projection. Only an existing
+`finishedAt` permits preserving that terminal outcome and acknowledging delivery without
+overwriting it. An unfinished Activation, failed read or other conflict still fails;
+this is not blanket suppression of `Conflict`.
 
 A normal `probe` succeeds only with the expected fixed digest, confirmed normal exit and
 still-current write authority. Normal drain retains the lease through the Activation's
@@ -916,6 +921,22 @@ original handle to request stop, wait within bounds and force stop if necessary.
 for a SQLite write lock, durable revocation or `StopRequested` persistence before requesting
 physical stop. Normal drain also stops physically before persisting evidence. Database
 contention, startup failure, cancellation, timeout, output limits and shutdown follow this order.
+
+`DatabaseSync` blocks its calling thread even behind a Promise API. SQLite busy waits in
+the authority monitor, other Kernel commands or cleanup retries must not occupy the event
+loop responsible for deadlines, AbortSignal and shutdown callbacks. Before the first
+physical effect, that Kernel instance enters conservative nonblocking supervision until
+it closes: each synchronous database operation scope uses no-wait lock admission and
+restores the configured busy timeout (5000ms in production) in `finally`, without crossing
+an `await`. Contention fails explicitly; persistence can retry with existing idempotency
+without weakening Writer checks. Monitoring uses a short rollback-only snapshot, never
+authority to initiate mutation/publication; real effects still revalidate full authority
+inside `BEGIN IMMEDIATE`. Original-handle deadlines and stop remain independent, including
+when another execution retries persistence. Acceptance uses the unshortened production
+timeout, an independent connection holding a writer lock for 6500ms and independent
+process-liveness observation: a 1000ms lease requests stop near its deadline and converges
+durably after unlock. Cover queued cancellation/explicit stop, executor/Host shutdown
+and multiple handles as well.
 
 Local stop/evidence and durable revocation, quarantine/stop disposition and lease release
 are separately idempotent: do not resend successful stop/force signals on the same handle;

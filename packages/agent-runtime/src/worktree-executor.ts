@@ -346,7 +346,7 @@ export class ControlledWorktreeProcess {
     }
     this.#monitor = setInterval(() => {
       try {
-        this.#options.kernel.performWorktreeMutation(this.#options.authority, this.#options, () => {});
+        this.#options.kernel.checkWorktreeAuthority(this.#options.authority, this.#options);
       } catch (error) {
         // A failed authority check can stop work, never grant a replacement writer.
         void this.stop(`Authority monitor failed: ${error instanceof Error ? error.message : String(error)}`)

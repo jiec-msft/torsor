@@ -40,6 +40,17 @@ without resending successful signals. Host keeps Kernel open on cleanup failure
 until a later close succeeds. Recovery of already committed Provider completion
 uses an `Expired` Activation settlement if Writer authority is lost, preserves
 the committed result, and acknowledges the recovered outbox without rerunning work.
+If another Host wins that settlement, only the specific already-finished conflict
+plus a fresh authoritative terminal Activation permits acknowledging delivery;
+unrelated conflicts and unfinished Activations remain errors.
+
+The monitor uses Kernel's rollback-only authority observation, not a write lock.
+Before the first physical effect, the Kernel instance opts into no-wait synchronous
+database scopes for the rest of its lifetime, restoring the configured production
+busy timeout after each call. This covers commands, publications and cleanup
+retries as well as monitoring, so SQLite contention cannot starve another handle's
+deadline, queued cancellation or shutdown. Every actual mutation still rechecks
+authority transactionally; observational snapshots grant no effect permission.
 
 The managed root is bound to one database storage identity by `.torsor-owner`.
 Use a fresh root after recreating the database. Do not concurrently run copied

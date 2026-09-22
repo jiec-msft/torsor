@@ -827,6 +827,7 @@ export class AgentRuntime {
     );
     if (deliveryInputIds.length === 0) {
       await this.#finishRecoveredActivation(
+        currentProjection.run.id,
         {
           type: "FinishActivation",
           idempotencyKey: `${activationView.id}:no-pending-input`,
@@ -1441,6 +1442,7 @@ export class AgentRuntime {
         detail = "Recovered an uncertain ProviderAttempt.";
       }
       await this.#finishRecoveredActivation(
+        projection.run.id,
         {
           type: "FinishActivation",
           idempotencyKey: `${activation.id}:reconciled-${outcome.toLowerCase()}`,
@@ -1452,7 +1454,7 @@ export class AgentRuntime {
     }
   }
 
-  async #finishRecoveredActivation(command: {
+  async #finishRecoveredActivation(runId: string, command: {
     readonly type: "FinishActivation";
     readonly idempotencyKey: string;
     readonly activationId: string;
@@ -1465,13 +1467,22 @@ export class AgentRuntime {
       if (!(error instanceof KernelError && error.code === "WriterAuthorityLost") ||
           command.outcome !== "Completed") throw error;
       // A committed result survives its Writer; recovery must not republish success.
-      await this.#kernel.execute({
-        type: "FinishActivation",
-        idempotencyKey: `${command.activationId}:reconciled-authority-lost`,
-        activationId: command.activationId,
-        outcome: "Expired",
-        detail: "Recovered orphaned Activation after Worktree authority was lost; committed results were preserved.",
-      }, this.#runtimeContext);
+      try {
+        await this.#kernel.execute({
+          type: "FinishActivation",
+          idempotencyKey: `${command.activationId}:reconciled-authority-lost`,
+          activationId: command.activationId,
+          outcome: "Expired",
+          detail: "Recovered orphaned Activation after Worktree authority was lost; committed results were preserved.",
+        }, this.#runtimeContext);
+      } catch (settlementError) {
+        if (!(settlementError instanceof KernelError && settlementError.code === "Conflict" &&
+            settlementError.message === "The Activation is already finished.")) throw settlementError;
+        const current = await this.#kernel.query({ type: "GetRunProjection", runId }, this.#runtimeContext);
+        const activation = current.activations.find((candidate) => candidate.id === command.activationId);
+        if (!activation || activation.finishedAt === null) throw settlementError;
+        // Another Host won settlement. Preserve its outcome; only delivery acknowledgement remains.
+      }
     }
   }
 
