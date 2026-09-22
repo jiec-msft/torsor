@@ -352,6 +352,7 @@ export class WebController {
 
   async loadThread(threadId: string): Promise<boolean> {
     const sessionGeneration = this.#sessionGeneration;
+    const csrfRevision = this.#csrfRevision;
     const requestGeneration = ++this.#threadRequestGeneration;
     const projectionKey = `thread:${threadId}`;
     const previousThreadId = this.#threadId;
@@ -389,10 +390,20 @@ export class WebController {
         }
         return this.#replacementResult(projectionKey, request);
       } catch (error) {
-        if (
+        const stillCurrent =
           this.#sessionGeneration === sessionGeneration &&
-          this.#threadRequestGeneration === requestGeneration
+          this.#threadRequestGeneration === requestGeneration &&
+          this.#threadId === threadId;
+        if (
+          stillCurrent &&
+          error instanceof ApiError &&
+          error.status === 401 &&
+          this.#csrfRevision !== csrfRevision &&
+          this.#csrfToken
         ) {
+          return this.loadThread(threadId);
+        }
+        if (stillCurrent) {
           this.#projectionFailed(projectionKey, error, {
             loadingThread: false,
           });
@@ -536,6 +547,7 @@ export class WebController {
       }
       if (
         this.#pendingStartThreads.get(fingerprint) === pending &&
+        pending.activeAttempts === 0 &&
         !isUncertainCommandError(error) &&
         !(pending.uncertain && isAuthenticationCommandError(error))
       ) {
@@ -600,6 +612,7 @@ export class WebController {
       }
       if (
         this.#pendingReplies.get(fingerprint) === pending &&
+        pending.activeAttempts === 0 &&
         !isUncertainCommandError(error) &&
         !(pending.uncertain && isAuthenticationCommandError(error))
       ) {

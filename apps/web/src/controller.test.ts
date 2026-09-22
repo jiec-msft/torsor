@@ -1900,6 +1900,73 @@ describe("WebController", () => {
     expect(FakeEventSource.instances.at(-1)?.closed).toBe(false);
   });
 
+  it("settles a selected Thread error when fenced 401 recovery fails", async () => {
+    let resolveOldThread: ((response: Response) => void) | undefined;
+    let threadCalls = 0;
+    const first = createHarness({
+      csrfToken: "csrf-first",
+      threadResponse: () => {
+        threadCalls += 1;
+        if (threadCalls === 1) {
+          return new Promise((resolve) => {
+            resolveOldThread = resolve;
+          });
+        }
+        return Promise.resolve(
+          json(
+            {
+              error: {
+                code: "projection_unavailable",
+                message: "Replacement Thread projection failed.",
+              },
+            },
+            503,
+          ),
+        );
+      },
+    });
+    const second = createHarness({ csrfToken: "csrf-second" });
+    await first.controller.exchangeSession(
+      "first-secret",
+      "project-sample",
+    );
+    const selectedThread = first.controller.loadThread("thread-1");
+    await waitFor(() => expect(first.counts.thread).toBe(1));
+
+    await second.controller.exchangeSession(
+      "replacement-secret",
+      "project-sample",
+    );
+    const replacementSession = second.broadcasts[0]?.posted.find(
+      (message) =>
+        typeof message === "object" &&
+        message !== null &&
+        "kind" in message &&
+        message.kind === "session",
+    );
+    first.broadcasts[0]?.receive(replacementSession);
+    resolveOldThread?.(
+      json(
+        {
+          error: {
+            code: "unauthorized",
+            message: "The replaced browser session was revoked.",
+          },
+        },
+        401,
+      ),
+    );
+
+    await expect(selectedThread).resolves.toBe(false);
+    expect(first.controller.getSnapshot()).toMatchObject({
+      session: "ready",
+      thread: null,
+      loadingThread: false,
+      queryError: "Replacement Thread projection failed.",
+    });
+    expect(first.counts.thread).toBe(2);
+  });
+
   it("keeps a newer command pending after an obsolete CSRF retry succeeds", async () => {
     let resolveOldRetry: ((response: Response) => void) | undefined;
     let resolveNewCommand: ((response: Response) => void) | undefined;

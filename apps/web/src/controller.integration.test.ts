@@ -161,6 +161,168 @@ describe("WebController production HTTP path", () => {
     expect(projection.attentions).toHaveLength(3);
   });
 
+  it("retains an acknowledged Start identity through an overlapping authentication failure", async () => {
+    const server = await startServer();
+    const browser = new BrowserTransport();
+    const window = createWindowController(server.origin, browser);
+    await window.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    await window.controller.loadThreads("channel-general");
+    const heldRefresh = browser.holdNext((url) =>
+      url.includes("/api/v1/channels/channel-general/threads"),
+    );
+    const input = {
+      channelId: "channel-general",
+      body: "Keep this overlapping Start singular.",
+      targetAgentIds: ["agent-orbit"],
+    } as const;
+
+    const acknowledged = window.controller.startThread(input);
+    await heldRefresh.observed;
+    await window.controller.signOut();
+    await window.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    await window.controller.loadThreads("channel-general");
+    await revokeBrowserSession(server.origin, browser);
+    await expect(window.controller.startThread(input)).rejects.toMatchObject({
+      status: 401,
+      code: "unauthorized",
+    });
+    await window.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    await window.controller.loadThreads("channel-general");
+    await window.controller.startThread(input);
+    heldRefresh.release();
+    await acknowledged;
+
+    await window.controller.startThread({
+      ...input,
+      body: "Allow a fresh Start after overlap.",
+    });
+    await window.controller.loadThreads("channel-general");
+    const operationKeys = browser.commandRequests
+      .slice(0, 3)
+      .map((request) => request.idempotencyKey);
+    expect(new Set(operationKeys).size).toBe(1);
+    expect(browser.commandRequests[3]?.idempotencyKey).not.toBe(
+      operationKeys[0],
+    );
+    const threads = window.controller.getSnapshot().threads;
+    const original = threads.filter(
+      (candidate) =>
+        candidate.messages[0]?.revisions[0]?.body === input.body,
+    );
+    const fresh = threads.filter(
+      (candidate) =>
+        candidate.messages[0]?.revisions[0]?.body ===
+        "Allow a fresh Start after overlap.",
+    );
+    expect(original).toHaveLength(1);
+    expect(original[0]?.attentions).toHaveLength(1);
+    expect(fresh).toHaveLength(1);
+    expect(fresh[0]?.attentions).toHaveLength(1);
+  });
+
+  it("retains an acknowledged Reply identity and cursor through an overlapping authentication failure", async () => {
+    const server = await startServer();
+    const browser = new BrowserTransport();
+    const window = createWindowController(server.origin, browser);
+    await window.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    await window.controller.startThread({
+      channelId: "channel-general",
+      body: "Root message for overlapping Reply coverage.",
+      targetAgentIds: ["agent-orbit"],
+    });
+    await window.controller.loadThreads("channel-general");
+    const threadId = window.controller.getSnapshot().threads[0]!.threadRootId;
+    await window.controller.loadThread(threadId);
+    const heldRefresh = browser.holdNext((url) =>
+      url.includes(`/api/v1/threads/${threadId}`),
+    );
+    const input = {
+      threadRootId: threadId,
+      expectedThreadCursor: 1,
+      body: "Keep this overlapping Reply singular.",
+      targetAgentIds: ["agent-orbit"],
+    } as const;
+
+    const acknowledged = window.controller.replyToThread(input);
+    await heldRefresh.observed;
+    await window.controller.signOut();
+    await window.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    await window.controller.loadThread(threadId);
+    await revokeBrowserSession(server.origin, browser);
+    await expect(
+      window.controller.replyToThread({
+        ...input,
+        expectedThreadCursor: 2,
+      }),
+    ).rejects.toMatchObject({
+      status: 401,
+      code: "unauthorized",
+    });
+    await window.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    await window.controller.loadThread(threadId);
+    await window.controller.replyToThread({
+      ...input,
+      expectedThreadCursor: 2,
+    });
+    heldRefresh.release();
+    await acknowledged;
+
+    await window.controller.replyToThread({
+      ...input,
+      expectedThreadCursor: 2,
+      body: "Allow a fresh Reply after overlap.",
+    });
+    await window.controller.loadThread(threadId);
+    const replyRequests = browser.commandRequests.slice(1);
+    const operationKeys = replyRequests
+      .slice(0, 3)
+      .map((request) => request.idempotencyKey);
+    expect(new Set(operationKeys).size).toBe(1);
+    expect(
+      replyRequests.slice(0, 3).map((request) => request.expectedThreadCursor),
+    ).toEqual([1, 1, 1]);
+    expect(
+      replyRequests.slice(0, 3).map((request) => request.targetAgentIds),
+    ).toEqual([
+      ["agent-orbit"],
+      ["agent-orbit"],
+      ["agent-orbit"],
+    ]);
+    expect(replyRequests[3]?.idempotencyKey).not.toBe(operationKeys[0]);
+    const projection = window.controller.getSnapshot().thread!;
+    expect(
+      projection.messages.filter(
+        (message) => message.revisions[0]?.body === input.body,
+      ),
+    ).toHaveLength(1);
+    expect(
+      projection.messages.filter(
+        (message) =>
+          message.revisions[0]?.body ===
+          "Allow a fresh Reply after overlap.",
+      ),
+    ).toHaveLength(1);
+    expect(projection.attentions).toHaveLength(3);
+  });
+
   it("ignores a held real 401 after another window replaces the shared-cookie session", async () => {
     const server = await startServer();
     const browser = new BrowserTransport();
@@ -210,6 +372,56 @@ describe("WebController production HTTP path", () => {
     expect(second.controller.getSnapshot().session).toBe("ready");
     expect(second.eventSources.at(-1)?.closed).toBe(false);
   });
+
+  it("recovers a selected Thread after a fenced shared-cookie 401", async () => {
+    const server = await startServer();
+    const browser = new BrowserTransport();
+    const broadcasts = new BroadcastHub();
+    const first = createWindowController(
+      server.origin,
+      browser,
+      broadcasts,
+    );
+    const second = createWindowController(
+      server.origin,
+      browser,
+      broadcasts,
+    );
+    await first.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    await first.controller.startThread({
+      channelId: "channel-general",
+      body: "Thread recovered after credential replacement.",
+    });
+    await first.controller.loadThreads("channel-general");
+    const threadId = first.controller.getSnapshot().threads[0]!.threadRootId;
+    await revokeBrowserSession(server.origin, browser);
+    const heldUnauthorized = browser.holdNext((url) =>
+      url.includes(`/api/v1/threads/${threadId}`),
+    );
+    const selectedThread = first.controller.loadThread(threadId);
+    await heldUnauthorized.observed;
+
+    await second.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    heldUnauthorized.release();
+    await expect(selectedThread).resolves.toBe(true);
+
+    expect(first.controller.getSnapshot()).toMatchObject({
+      session: "ready",
+      connection: "live",
+      loadingThread: false,
+      queryError: null,
+    });
+    expect(first.controller.getSnapshot().thread?.threadRootId).toBe(
+      threadId,
+    );
+    expect(second.eventSources.at(-1)?.closed).toBe(false);
+  });
 });
 
 class MemoryStorage {
@@ -233,7 +445,9 @@ class TestEventSource {
   onerror: ((event: Event) => void) | null = null;
   closed = false;
 
-  constructor(readonly url: string) {}
+  constructor(readonly url: string) {
+    queueMicrotask(() => this.onopen?.(new Event("open")));
+  }
 
   addEventListener(): void {}
 
@@ -272,6 +486,7 @@ class TestBroadcastChannel {
 
 class BrowserTransport {
   readonly #nativeFetch = globalThis.fetch.bind(globalThis);
+  readonly commandRequests: Array<Record<string, unknown>> = [];
   #cookie = "";
   #hold:
     | {
@@ -289,6 +504,12 @@ class BrowserTransport {
     input: RequestInfo | URL,
     init?: RequestInit,
   ): Promise<Response> => {
+    const url = String(input);
+    if (url.includes("/api/v1/commands/") && typeof init?.body === "string") {
+      this.commandRequests.push(
+        JSON.parse(init.body) as Record<string, unknown>,
+      );
+    }
     const headers = new Headers(init?.headers);
     if (this.#cookie) {
       headers.set("Cookie", this.#cookie);
@@ -299,7 +520,6 @@ class BrowserTransport {
       const pair = setCookie.split(";", 1)[0]!;
       this.#cookie = pair.endsWith("=") ? "" : pair;
     }
-    const url = String(input);
     const hold = this.#hold;
     if (hold?.predicate(url)) {
       this.#hold = null;
@@ -327,6 +547,17 @@ class BrowserTransport {
     this.#hold = { predicate, gate, observed };
     return { observed: observedPromise, release };
   }
+}
+
+async function revokeBrowserSession(
+  origin: string,
+  browser: BrowserTransport,
+): Promise<void> {
+  const response = await fetch(`${origin}/api/v1/session`, {
+    method: "DELETE",
+    headers: { Cookie: browser.cookie },
+  });
+  expect(response.status).toBe(204);
 }
 
 function createWindowController(
