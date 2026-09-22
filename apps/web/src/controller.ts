@@ -671,6 +671,7 @@ export class WebController {
 
   async #bootstrap(projectId: string): Promise<void> {
     const sessionGeneration = ++this.#sessionGeneration;
+    const csrfRevision = this.#csrfRevision;
     this.#clearLivenessRefresh();
     this.#clearPendingInvalidations();
     this.#clearCoalescedRefreshes();
@@ -740,6 +741,15 @@ export class WebController {
     } catch (error) {
       if (this.#sessionGeneration !== sessionGeneration) {
         return;
+      }
+      if (
+        error instanceof ApiError &&
+        error.status === 401 &&
+        this.#csrfRevision !== csrfRevision &&
+        this.#csrfToken &&
+        this.#projectId === projectId
+      ) {
+        return this.#bootstrap(projectId);
       }
       if (!(error instanceof ApiError && error.status === 401)) {
         this.#setState({

@@ -374,6 +374,108 @@ describe("WebController production HTTP path", () => {
     expect(second.eventSources.at(-1)?.closed).toBe(false);
   });
 
+  it("recovers a resumed bootstrap after a fenced shared-cookie 401", async () => {
+    const server = await startServer();
+    const scenario = await prepareRevokedResume(server.origin);
+    const originalCsrf = scenario.storage.values.get("torsor.session.csrf");
+    const baselineBootstrapRequests = countBootstrapRequests(scenario.browser);
+    const heldUnauthorized = scenario.browser.holdNext((url) =>
+      url.includes("/api/v1/projects/project-sample/bootstrap"),
+    );
+    const resumed = scenario.first.controller.resume("project-sample");
+    await heldUnauthorized.observed;
+
+    await scenario.second.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    expect(scenario.storage.values.get("torsor.session.csrf")).not.toBe(
+      originalCsrf,
+    );
+    heldUnauthorized.release();
+    await expect(resumed).resolves.toBeUndefined();
+
+    expect(scenario.first.controller.getSnapshot()).toMatchObject({
+      session: "ready",
+      connection: "live",
+      authError: null,
+    });
+    expect(scenario.first.controller.getSnapshot().bootstrap?.project.id).toBe(
+      "project-sample",
+    );
+    expect(scenario.second.controller.getSnapshot().session).toBe("ready");
+    expect(countBootstrapRequests(scenario.browser)).toBe(
+      baselineBootstrapRequests + 3,
+    );
+    expect(scenario.first.eventSources).toHaveLength(1);
+    expect(scenario.first.eventSources[0]?.closed).toBe(false);
+  });
+
+  it("settles a resumed bootstrap when replacement credentials fail", async () => {
+    const server = await startServer();
+    const scenario = await prepareRevokedResume(server.origin);
+    const originalCsrf = scenario.storage.values.get("torsor.session.csrf");
+    const baselineBootstrapRequests = countBootstrapRequests(scenario.browser);
+    const heldUnauthorized = scenario.browser.holdNext((url) =>
+      url.includes("/api/v1/projects/project-sample/bootstrap"),
+    );
+    const resumed = scenario.first.controller.resume("project-sample");
+    await heldUnauthorized.observed;
+
+    await scenario.second.controller.exchangeSession(
+      "human-token",
+      "project-sample",
+    );
+    const replacementCsrf = scenario.storage.values.get(
+      "torsor.session.csrf",
+    );
+    expect(replacementCsrf).not.toBe(originalCsrf);
+    scenario.browser.failNext(
+      (url) => url.includes("/api/v1/projects/project-sample/bootstrap"),
+      "Replacement project bootstrap failed.",
+    );
+    heldUnauthorized.release();
+    await expect(resumed).rejects.toMatchObject({
+      status: 503,
+      code: "projection_unavailable",
+    });
+
+    expect(scenario.first.controller.getSnapshot()).toMatchObject({
+      session: "signed-out",
+      connection: "offline",
+      authError: "Replacement project bootstrap failed.",
+    });
+    expect(scenario.storage.values.get("torsor.session.csrf")).toBe(
+      replacementCsrf,
+    );
+    expect(scenario.second.controller.getSnapshot().session).toBe("ready");
+    expect(countBootstrapRequests(scenario.browser)).toBe(
+      baselineBootstrapRequests + 3,
+    );
+    expect(scenario.first.eventSources).toHaveLength(0);
+  });
+
+  it("expires a resumed bootstrap on a current-credential 401", async () => {
+    const server = await startServer();
+    const scenario = await prepareRevokedResume(server.origin);
+    const baselineBootstrapRequests = countBootstrapRequests(scenario.browser);
+
+    await expect(
+      scenario.first.controller.resume("project-sample"),
+    ).resolves.toBeUndefined();
+
+    expect(scenario.first.controller.getSnapshot()).toMatchObject({
+      session: "expired",
+      connection: "offline",
+      authError: null,
+    });
+    expect(scenario.storage.values.size).toBe(0);
+    expect(countBootstrapRequests(scenario.browser)).toBe(
+      baselineBootstrapRequests + 1,
+    );
+    expect(scenario.first.eventSources).toHaveLength(0);
+  });
+
   it("recovers a selected Thread after a fenced shared-cookie 401", async () => {
     const server = await startServer();
     const browser = new BrowserTransport();
@@ -791,15 +893,17 @@ function createWindowController(
   origin: string,
   browser: BrowserTransport,
   broadcasts = new BroadcastHub(),
+  storage = new MemoryStorage(),
 ): {
   readonly controller: WebController;
   readonly eventSources: TestEventSource[];
+  readonly storage: MemoryStorage;
 } {
   const eventSources: TestEventSource[] = [];
   const controller = new WebController({
     apiBase: origin,
     fetch: browser.fetch as typeof fetch,
-    sessionStorage: new MemoryStorage(),
+    sessionStorage: storage,
     eventSourceFactory: (url) => {
       const events = new TestEventSource(url);
       eventSources.push(events);
@@ -808,7 +912,47 @@ function createWindowController(
     broadcastChannelFactory: broadcasts.create,
   });
   cleanup.push(async () => controller.dispose());
-  return { controller, eventSources };
+  return { controller, eventSources, storage };
+}
+
+async function prepareRevokedResume(origin: string): Promise<{
+  readonly browser: BrowserTransport;
+  readonly first: ReturnType<typeof createWindowController>;
+  readonly second: ReturnType<typeof createWindowController>;
+  readonly storage: MemoryStorage;
+}> {
+  const browser = new BrowserTransport();
+  const broadcasts = new BroadcastHub();
+  const authenticated = createWindowController(
+    origin,
+    browser,
+    broadcasts,
+  );
+  await authenticated.controller.exchangeSession(
+    "human-token",
+    "project-sample",
+  );
+  authenticated.controller.dispose();
+  await revokeBrowserSession(origin, browser);
+  const first = createWindowController(
+    origin,
+    browser,
+    broadcasts,
+    authenticated.storage,
+  );
+  const second = createWindowController(origin, browser, broadcasts);
+  return {
+    browser,
+    first,
+    second,
+    storage: authenticated.storage,
+  };
+}
+
+function countBootstrapRequests(browser: BrowserTransport): number {
+  return browser.requests.filter((url) =>
+    url.includes("/api/v1/projects/project-sample/bootstrap"),
+  ).length;
 }
 
 async function startServer(
