@@ -63,6 +63,20 @@ export function historyWindow(page: ActivityPage): ActivityWindow {
   };
 }
 
+export function mergeRunTimeline(
+  current: RunProjection | null,
+  incoming: RunProjection,
+): RunProjection {
+  const previous = current?.run.id === incoming.run.id ? current : null;
+  return {
+    ...(previous && previous.run.revision > incoming.run.revision ? previous : incoming),
+    activity: mergeActivity(incoming.run.id, [
+      ...(previous ? [previous.activity] : []),
+      incoming.activity,
+    ]),
+  };
+}
+
 export function validateActivityPage(
   page: ActivityPage,
   runId: string,

@@ -261,6 +261,96 @@ function createHarness(
   return { controller, storage, calls, counts, broadcasts };
 }
 
+describe("Human Run Composer controller boundaries", () => {
+  const receipt = {
+    result: {
+      commandType: "SendToRun", entityId: "message-new", revision: 3, threadCursor: 4,
+      relatedIds: { runId: "run-1", messageRevisionId: "revision-new", runInputId: "input-new" },
+    },
+  };
+
+  it.each(["network", "server", "unreadable", "incomplete", "intermediary"])(
+    "retains an immutable request for an uncertain %s response",
+    async (kind) => {
+      const harness = createHarness({
+        commandResponse: async (call) => {
+          if (call > 1) return json(receipt);
+          if (kind === "network") throw new TypeError("Connection lost.");
+          if (kind === "server") return json({ error: { code: "internal_error" } }, 500);
+          if (kind === "unreadable") return new Response("unreadable", { status: 200 });
+          if (kind === "intermediary") return new Response("intermediary rejected", { status: 409 });
+          return json({ result: { entityId: "message-only" } });
+        },
+      });
+      try {
+        await harness.controller.exchangeSession("synthetic-token", "project-sample");
+        await harness.controller.loadRun("run-1");
+        harness.controller.runComposer.edit("run-1", "Keep the same logical submission.");
+        await harness.controller.sendToRun("run-1");
+        expect(harness.controller.runComposer.getSnapshot()["run-1"]?.status).toBe("unknown");
+        await harness.controller.sendToRun("run-1");
+        const posts = harness.calls.filter((call) => call.url.includes("/commands/"));
+        expect(posts[1]?.init?.body).toBe(posts[0]?.init?.body);
+        expect(harness.controller.runComposer.getSnapshot()["run-1"]?.status).toBe("submitted");
+      } finally {
+        harness.controller.dispose();
+      }
+    },
+  );
+
+  it("does not resolve a prior unknown outcome from an authorization rejection", async () => {
+    const harness = createHarness({
+      commandResponse: async (call) => {
+        if (call === 1) throw new TypeError("Lost response.");
+        if (call === 2) return json({
+          error: { code: "forbidden", message: "Authorization denied.", requestId: "request-denied" },
+        }, 403);
+        return json(receipt);
+      },
+    });
+    try {
+      await harness.controller.exchangeSession("synthetic-token", "project-sample");
+      await harness.controller.loadRun("run-1");
+      harness.controller.runComposer.edit("run-1", "Uncertain authorized input.");
+      await harness.controller.sendToRun("run-1");
+      await harness.controller.sendToRun("run-1");
+      expect(harness.controller.runComposer.getSnapshot()["run-1"]).toMatchObject({
+        status: "unknown", error: "Authorization denied.",
+      });
+      await harness.controller.sendToRun("run-1");
+      const bodies = harness.calls.filter((call) => call.url.includes("/commands/")).map((call) => call.init?.body);
+      expect(new Set(bodies).size).toBe(1);
+    } finally {
+      harness.controller.dispose();
+    }
+  });
+
+  it("never retries an uncertain identity as another Human Principal", async () => {
+    const options = {
+      principalId: "principal-human",
+      commandResponse: async () => { throw new TypeError("Lost response."); },
+    };
+    const harness = createHarness(options);
+    try {
+      await harness.controller.exchangeSession("synthetic-token", "project-sample");
+      await harness.controller.loadRun("run-1");
+      harness.controller.runComposer.edit("run-1", "Original Human instruction.");
+      await harness.controller.sendToRun("run-1");
+      options.principalId = "principal-other-human";
+      await harness.controller.exchangeSession("other-synthetic-token", "project-sample");
+      await harness.controller.loadRun("run-1");
+      await harness.controller.sendToRun("run-1");
+      expect(harness.counts.commands).toBe(1);
+      expect(harness.controller.runComposer.getSnapshot()["run-1"]).toMatchObject({
+        status: "unknown", principalId: "principal-human",
+        error: "Reconnect as the original Human to recover this submission.",
+      });
+    } finally {
+      harness.controller.dispose();
+    }
+  });
+});
+
 function publicEvent(overrides: Partial<PublicEvent> = {}): PublicEvent {
   return {
     eventId: "event-8",

@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TorsorApp } from "./App";
 import type { WebController, WebState } from "./controller";
+import { RunComposerModel } from "./run-composer-model";
 import {
   agent,
   attention,
@@ -42,6 +43,7 @@ function readyState(overrides: Partial<WebState> = {}): WebState {
 
 function stubController(state: WebState = readyState()) {
   const controller = {
+    runComposer: new RunComposerModel(),
     getSnapshot: () => state,
     subscribe: () => () => undefined,
     resume: vi.fn(async () => undefined),
@@ -72,6 +74,7 @@ function mutableController(initialState: WebState) {
   let state = initialState;
   const listeners = new Set<() => void>();
   const controller = {
+    runComposer: new RunComposerModel(),
     getSnapshot: () => state,
     subscribe: (listener: () => void) => {
       listeners.add(listener);
@@ -168,11 +171,13 @@ describe("TorsorApp", () => {
     await waitFor(() => expect(drawer).toHaveFocus());
     const diagnostics = within(drawer).getByText("Run diagnostics");
     await user.keyboard("{Shift>}{Tab}{/Shift}");
-    expect(diagnostics).toHaveFocus();
+    expect(within(drawer).getByRole("button", { name: "Refresh Run and Thread" })).toHaveFocus();
+    await user.keyboard("{Tab}");
+    expect(within(drawer).getByRole("button", { name: "Collapse detail panel" })).toHaveFocus();
     await user.click(diagnostics);
     expect(diagnostics.parentElement).toHaveAttribute("open");
     await user.keyboard("{Tab}");
-    expect(within(drawer).getByRole("button", { name: "Collapse detail panel" })).toHaveFocus();
+    expect(within(drawer).getByRole("button", { name: /Also published/ })).toHaveFocus();
     await user.click(within(drawer).getByRole("button", { name: "Load earlier activity" }));
     expect(controller.loadEarlierRunActivity).toHaveBeenCalledOnce();
     expect(getComputedStyle(drawer.querySelector(".run-detail")!).overflowY).toBe("auto");
