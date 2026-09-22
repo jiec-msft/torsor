@@ -15,6 +15,8 @@ import type {
   RunInputView,
   RunState,
   RunView,
+  WorktreeWriterLeaseEventView,
+  WorktreeWriterLeaseView,
 } from "./types.js";
 import {
   integer,
@@ -245,6 +247,52 @@ export function mapPublicEvent(row: Row): PublicEventEnvelope {
     causationId: optionalText(row.causation_id),
     correlationId: text(row.correlation_id),
     payload: parseJson(row.payload_json),
+    occurredAt: text(row.occurred_at),
+  };
+}
+
+export function mapWorktreeWriterLease(row: Row): WorktreeWriterLeaseView {
+  return {
+    worktreeId: text(row.worktree_id),
+    revision: integer(row.revision),
+    generation: integer(row.generation),
+    fencingToken: integer(row.fencing_token),
+    status: text(row.status) as WorktreeWriterLeaseView["status"],
+    holderPrincipalId: optionalText(row.holder_principal_id),
+    acquiredAt: optionalText(row.acquired_at),
+    renewedAt: optionalText(row.renewed_at),
+    expiresAt: optionalText(row.expires_at),
+    releasedAt: optionalText(row.released_at),
+    quarantineReason: optionalText(row.quarantine_reason),
+    quarantineEvidence:
+      row.quarantine_evidence_json === null
+        ? null
+        : parseJson(row.quarantine_evidence_json),
+    quarantinedAt: optionalText(row.quarantined_at),
+    quarantineResolvedAt: optionalText(row.quarantine_resolved_at),
+    quarantineResolution: optionalText(row.quarantine_resolution),
+    updatedAt: text(row.updated_at),
+  };
+}
+
+export function mapWorktreeWriterLeaseEvent(
+  row: Row,
+): WorktreeWriterLeaseEventView {
+  return {
+    cursor: integer(row.sequence),
+    id: text(row.id),
+    worktreeId: text(row.worktree_id),
+    type: text(row.type) as WorktreeWriterLeaseEventView["type"],
+    revision: integer(row.revision),
+    generation: integer(row.generation),
+    fencingToken: integer(row.fencing_token),
+    actorPrincipalId: text(row.actor_principal_id),
+    holderPrincipalId: optionalText(row.holder_principal_id),
+    expiresAt: optionalText(row.expires_at),
+    reason: optionalText(row.reason),
+    evidence:
+      row.evidence_json === null ? null : parseJson(row.evidence_json),
+    correlationId: text(row.correlation_id),
     occurredAt: text(row.occurred_at),
   };
 }
