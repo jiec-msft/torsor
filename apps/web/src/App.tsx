@@ -33,6 +33,7 @@ import {
 } from "react";
 
 import type { WebController, WebState } from "./controller";
+import { RunComposer } from "./RunComposer";
 import {
   readRoute,
   type ViewName,
@@ -335,6 +336,7 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
       runId: null,
       detailPanel: "status",
       channelsOpen: window.innerWidth >= 1100 && route.channelsOpen,
+      detailOpen: window.innerWidth >= 1100 && route.detailOpen,
     });
   };
   const selectRun = (runId: string, threadId: string, channelId: string) => {
@@ -465,6 +467,7 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
         )}
       </main>
       <DetailPanel
+        controller={controller}
         panelRef={detailPanelRef}
         modal={compactPanels && route.detailOpen}
         route={route}
@@ -534,6 +537,8 @@ function SessionGate({
           <div className="session-notice" role="status">
             <Clock3 aria-hidden="true" size={16} />
             The browser session expired or was revoked. Connect again.
+            Run drafts and submission identities are retained in this window.
+            A lost response may have committed; reconnect to recover it.
           </div>
         ) : null}
         {state.authError ? (
@@ -1167,6 +1172,7 @@ function AgentOverview({
 }
 
 function DetailPanel({
+  controller,
   panelRef,
   modal,
   route,
@@ -1175,6 +1181,7 @@ function DetailPanel({
   onSelectRun,
   onSelectThread,
 }: {
+  readonly controller: WebController;
   readonly panelRef: Ref<HTMLElement>;
   readonly modal: boolean;
   readonly route: WindowRoute;
@@ -1204,7 +1211,16 @@ function DetailPanel({
         </IconButton>
       </div>
       {route.detailPanel === "run" && route.runId ? (
-        <RunDetail state={state} />
+        <>
+          <RunDetail state={state} />
+          <RunComposer
+            key={route.runId}
+            controller={controller}
+            state={state}
+            runId={route.runId}
+            onOpenThread={onSelectThread}
+          />
+        </>
       ) : (
         <StatusDetail
           state={state}
