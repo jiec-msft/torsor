@@ -847,6 +847,16 @@ only, never renewed Agent mutation authority. Executor restart revokes a leftove
 publication window even after confirmed physical stop; an old successful return value
 does not grant post-recovery write authority.
 
+Recovery must not derive post-restart Writer success authority from a committed
+`ProviderAttempt.Completed`. If `FinishActivation(Completed)` for an orphaned Activation
+is rejected with `WriterAuthorityLost`, Runtime submits `FinishActivation(Expired)` with
+a separate idempotency key and fixed authority-lost reconciliation detail, then acknowledges
+the recovered outbox delivery. Preserve committed Run, ProviderAttempt, Reply, Artifact,
+activity and causal-capacity facts: do not rerun the Provider, republish success or change
+a completed Run into failure. Existing Failed/Unknown, Waiting and stale-generation
+recovery follows its respective state rules; finished Activations are not finished again.
+A second restart produces no duplicate facts.
+
 A normal `probe` succeeds only with the expected fixed digest, confirmed normal exit and
 still-current write authority. Normal drain retains the lease through the Activation's
 public result/state commits; `stopActivation`/Host shutdown releases it afterward.
@@ -900,7 +910,26 @@ and manual clearance are not implemented and cannot be bypassed with resolution 
 In this slice Host shutdown waits for admitted controlled operations to stop or persist
 quarantine before closing Kernel. A shutdown request during recovery must prevent subsequent
 HTTP listener startup and new Runtime admission. Stop control is safety authority over an existing process
-handle and does not require an expired write lease to remain live. Unconfirmed stop never
+handle and does not require an expired write lease to remain live.
+Stop entry irreversibly revokes this executor's local authority and independently uses the
+original handle to request stop, wait within bounds and force stop if necessary. Never wait
+for a SQLite write lock, durable revocation or `StopRequested` persistence before requesting
+physical stop. Normal drain also stops physically before persisting evidence. Database
+contention, startup failure, cancellation, timeout, output limits and shutdown follow this order.
+
+Local stop/evidence and durable revocation, quarantine/stop disposition and lease release
+are separately idempotent: do not resend successful stop/force signals on the same handle;
+retain original close evidence. Cached promises coalesce in-flight persistence only;
+failures remain retryable, never completed cleanup. Replace the deadline only with an
+active cleanup retry path. Each failure explicitly returns an error and schedules retries
+at bounded intervals until revocation and stop disposition are durable. Missing stop
+confirmation persists Uncertain/quarantine; releasing a database lock is not stop evidence.
+Late original-handle close retains existing receipt-based reconciliation.
+Shutdown waits for all admitted handles' stop attempts. If persistence fails, Host retains
+Kernel for retries, stays closing and admits no work; later `close` retries instead of
+permanently caching failure. Unexpected process exit still relies on conservative startup
+recovery of old intents. Schema remains 16, with no migration or new Run state.
+Unconfirmed stop never
 deletes the directory or releases it for reuse. Pause/Resume, Human Terminal, controller lease,
 Files UI, retention policy, and GC are outside this slice.
 

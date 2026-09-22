@@ -189,7 +189,8 @@ export function assertActivationWriterAuthority(
     const worktree = requireWorktree(kernel, text(execution.worktree_id));
     const lease = db.getRow(kernel, "SELECT * FROM worktree_writer_leases WHERE worktree_id = ?", text(execution.worktree_id));
     try {
-      if (execution.authority_revoked_at !== null || text(worktree.state) !== "Ready" ||
+      if (kernel.localWorktreeRevocations.has(activationId) ||
+          execution.authority_revoked_at !== null || text(worktree.state) !== "Ready" ||
           !lease || !["Starting", "Running", "StopRequested", "StopConfirmed"].includes(text(execution.state)) ||
           (requireStopped && text(execution.state) !== "StopConfirmed")) {
         throw new KernelError("WriterAuthorityLost", "Controlled Worktree publication authority was lost.");

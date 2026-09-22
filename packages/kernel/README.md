@@ -31,6 +31,11 @@ returns `WriterAuthorityLost`; late close cannot restore publication. Stop/failu
 Unknown reconciliation remains available. A clean probe retains its lease through
 result publication, then scope cleanup releases it. Reads retain Artifact authorization.
 
+`revokeLocalWorktreeAuthority` accepts only the original locally retained receipt
+and Runtime identity. It adds a process-local denial without touching SQLite, so
+stopping an owned child never waits for a writer lock. It grants no authority and
+does not replace durable revocation or conservative restart recovery.
+
 Earlier schemas, including versions 14 and 15, intentionally fail to open. Stop old processes and recreate
 the disposable database **and use a fresh managed root**; no migration or
 automatic deletion is performed. The normative contracts are MVP §§22, 24, 38,

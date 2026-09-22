@@ -32,6 +32,15 @@ original-handle close evidence permits local reconciliation. A restart that
 loses that handle leaves quarantine in place even when the old PID disappears.
 There is no manual text-based physical quarantine override.
 
+Stopping an owned child does not wait for SQLite persistence. Local receipt-bound
+authority is revoked immediately; physical stop/force and retained close evidence
+are independent of durable revocation/disposition/release. Persistence failures
+surface to callers and retain a retry timer; repeated stop/close retries writes
+without resending successful signals. Host keeps Kernel open on cleanup failure
+until a later close succeeds. Recovery of already committed Provider completion
+uses an `Expired` Activation settlement if Writer authority is lost, preserves
+the committed result, and acknowledges the recovered outbox without rerunning work.
+
 The managed root is bound to one database storage identity by `.torsor-owner`.
 Use a fresh root after recreating the database. Do not concurrently run copied
 databases against it. The private root must exclude concurrent external path

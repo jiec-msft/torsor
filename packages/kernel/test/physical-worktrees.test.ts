@@ -41,6 +41,30 @@ async function setup(artifactStorage?: ArtifactStorage) {
 }
 
 describe("physical execution contracts (§22, §24, §38)", () => {
+  it("locally denies retained-receipt authority before persistence without granting any new authority", async () => {
+    const f = await setup();
+    try {
+      expect(() => f.kernel.revokeLocalWorktreeAuthority(
+        { ...f.receipt, executionToken: "forged" }, runtimeContext,
+      )).toThrow();
+      expect(() => f.kernel.revokeLocalWorktreeAuthority(f.receipt, humanContext)).toThrow();
+      f.kernel.performWorktreeMutation(f.mutation, runtimeContext, () => {});
+      f.kernel.revokeLocalWorktreeAuthority(f.receipt, runtimeContext);
+      expect((await f.kernel.query({ type: "GetPhysicalWorktree", worktreeId: "tree" }, runtimeContext))
+        .latestExecution?.authorityRevokedAt).toBeNull();
+      expect(() => f.kernel.performWorktreeMutation(f.mutation, runtimeContext, () => {}))
+        .toThrow(expect.objectContaining({ code: "WriterAuthorityLost" }));
+      await expect(f.kernel.execute({
+        type: "AppendRunActivity", idempotencyKey: "local-denial", runId: f.run.runId,
+        activationId: f.run.activationId, kind: "status", payload: "Must not publish.", retentionClass: "durable",
+      }, f.run.agentContext)).rejects.toMatchObject({ code: "WriterAuthorityLost" });
+      await f.kernel.execute({
+        type: "RecordWorktreeExecution", idempotencyKey: "local-stop", ...f.receipt,
+        state: "StopConfirmed", evidence: "No child was spawned.",
+      }, runtimeContext);
+    } finally { f.kernel.close(); }
+  });
+
   it("fences a stopped old generation while a replacement Activation recovers an authorized committed Artifact", async () => {
     const content = Buffer.from("Synthetic controlled report.\n");
     const f = await setup({ put: async () => {}, read: async () => content });

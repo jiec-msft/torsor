@@ -826,7 +826,7 @@ export class AgentRuntime {
       pendingInputIds.has(inputId),
     );
     if (deliveryInputIds.length === 0) {
-      await this.#kernel.execute(
+      await this.#finishRecoveredActivation(
         {
           type: "FinishActivation",
           idempotencyKey: `${activationView.id}:no-pending-input`,
@@ -834,7 +834,6 @@ export class AgentRuntime {
           outcome: "Completed",
           detail: "The outbox wake-up had no Pending RunInput to deliver.",
         },
-        this.#runtimeContext,
       );
       return true;
     }
@@ -1441,7 +1440,7 @@ export class AgentRuntime {
         );
         detail = "Recovered an uncertain ProviderAttempt.";
       }
-      await this.#kernel.execute(
+      await this.#finishRecoveredActivation(
         {
           type: "FinishActivation",
           idempotencyKey: `${activation.id}:reconciled-${outcome.toLowerCase()}`,
@@ -1449,8 +1448,30 @@ export class AgentRuntime {
           outcome,
           detail,
         },
-        this.#runtimeContext,
       );
+    }
+  }
+
+  async #finishRecoveredActivation(command: {
+    readonly type: "FinishActivation";
+    readonly idempotencyKey: string;
+    readonly activationId: string;
+    readonly outcome: "Completed" | "Failed" | "Expired";
+    readonly detail: string;
+  }): Promise<void> {
+    try {
+      await this.#kernel.execute(command, this.#runtimeContext);
+    } catch (error) {
+      if (!(error instanceof KernelError && error.code === "WriterAuthorityLost") ||
+          command.outcome !== "Completed") throw error;
+      // A committed result survives its Writer; recovery must not republish success.
+      await this.#kernel.execute({
+        type: "FinishActivation",
+        idempotencyKey: `${command.activationId}:reconciled-authority-lost`,
+        activationId: command.activationId,
+        outcome: "Expired",
+        detail: "Recovered orphaned Activation after Worktree authority was lost; committed results were preserved.",
+      }, this.#runtimeContext);
     }
   }
 

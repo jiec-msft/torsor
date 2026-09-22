@@ -2,9 +2,12 @@ import type { SpawnOptions } from "node:child_process";
 import { createHash } from "node:crypto";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { TorsorKernel } from "@torsor/kernel";
 
-import { nodeProbeDriver } from "../src/controlled-process.js";
-import { syntheticRepository } from "./fixtures/worktree-fixture.js";
+import { nodeProbeDriver, type ControlledChild } from "../src/controlled-process.js";
+import { LocalWorktreeExecutor } from "../src/worktree-executor.js";
+import { activeRun, bootstrap, runtimeContext, syntheticRepository } from "./fixtures/worktree-fixture.js";
+import { holdSqliteWriter } from "./fixtures/sqlite-lock.js";
 
 const fixture = vi.hoisted((): {
   source: string | undefined;
@@ -29,6 +32,54 @@ afterEach(() => {
 });
 
 describe("fixed probe transport bounds and privacy (MVP 22.2)", () => {
+  it("stops on real output overflow while SQLite is locked and retries revoked disposition", async () => {
+    const repo = syntheticRepository();
+    repo.addWorktree("first");
+    const timeoutKey = Symbol.for("torsor.kernel.test-sqlite-busy-timeout-ms");
+    Reflect.set(globalThis, timeoutKey, 100);
+    const kernel = TorsorKernel.open({ databasePath: repo.databasePath, bootstrap });
+    Reflect.deleteProperty(globalThis, timeoutKey);
+    const run = await activeRun(kernel, "overflow-lock");
+    let actual!: ControlledChild;
+    let release: (() => Promise<void>) | undefined;
+    fixture.source = `
+      const {createHash} = require("node:crypto");
+      const lines = require("node:readline").createInterface({input: process.stdin});
+      lines.once("line", line => process.stdout.write(createHash("sha256").update(JSON.parse(line).content).digest("hex")+"\\n"));
+      process.stdin.on("end", () => process.stdout.write("Synthetic excess output."));
+      setInterval(() => {}, 1000);
+    `;
+    const executor = new LocalWorktreeExecutor({
+      kernel, runtimePrincipalId: "runtime", ...repo,
+      driver: { start: (input) => {
+        actual = nodeProbeDriver.start(input);
+        return { ...actual, result: actual.result.then(async (digest) => {
+          release = await holdSqliteWriter(repo.databasePath);
+          return digest;
+        }) };
+      } },
+    });
+    try {
+      await executor.register({
+        worktreeId: "first", directoryName: "first", baseRevision: repo.baseRevision, runId: run.runId,
+      });
+      await expect(executor.probe({ worktreeId: "first", activationId: run.activationId }))
+        .rejects.toMatchObject({ outcome: "Unknown" });
+      expect((await actual.closed).error).toBe("Controlled child exceeded its output limit.");
+      await release!();
+      await executor.close();
+      expect((await kernel.query({ type: "GetPhysicalWorktree", worktreeId: "first" }, runtimeContext))
+        .latestExecution?.authorityRevokedAt).not.toBeNull();
+      expect(() => process.kill(actual.pid!, 0)).toThrow();
+    } finally {
+      await release?.();
+      actual?.forceStop();
+      if (actual) await actual.closed;
+      await executor.close();
+      kernel.close(); repo.dispose();
+    }
+  });
+
   it("uses exact executable/argv and a minimal environment, without inherited injection or credentials", async () => {
     const repo = syntheticRepository();
     vi.stubEnv("NODE_OPTIONS", "--require=synthetic-must-not-load");

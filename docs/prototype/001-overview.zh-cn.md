@@ -1108,6 +1108,14 @@ publication revocation。此例外只允许结束记录，不重新授予 Agent 
 即使物理停止已经确认，executor 重启也撤销遗留 publication window；不将旧成功
 返回值当作恢复后的写权限。
 
+恢复不得从已提交的 `ProviderAttempt.Completed` 推导出重启后的 Writer 成功权限。
+若孤立 Activation 的 `FinishActivation(Completed)` 被 `WriterAuthorityLost` 拒绝，
+Runtime 以独立幂等键提交 `FinishActivation(Expired)` 和固定的 authority-lost
+reconciliation 说明，再确认已恢复的 outbox delivery。保留已提交的 Run、
+ProviderAttempt、Reply、Artifact、activity 和因果容量事实，不重发 Provider、不重发
+成功、不把已完成 Run 改成失败。已有 Failed/Unknown、Waiting 和旧 generation 的
+恢复仍遵守各自状态规则；已终结 Activation 不重复结束。第二次重启不产生重复事实。
+
 正常 `probe` 只在固定 digest 匹配、正常退出已确认、写权限仍有效时返回成功。
 正常 drain 不提前释放 lease：保留到该 Activation 的公开结果/状态提交结束后，
 由 `stopActivation`/Host 关闭释放；因此 publication 与另一 Writer acquisition
@@ -1167,6 +1175,20 @@ spawn 未发生）作为直接 child 停止证据。晚到确认使用原 execut
 本切片的 Host 关闭必须等待已接纳的受控操作停止或持久化隔离，再关闭 Kernel。
 恢复期间收到关闭请求后，不得再打开 HTTP listener 或接纳新的 Runtime 执行。
 停止控制属于已有进程 handle 的安全权限，不要求已经失效的写 lease 仍然有效。
+停止入口必须先不可逆地撤销本 executor 的本地权限，并独立使用原 handle 发起停止、
+有界等待及必要的强制停止；不得等待 SQLite 写锁、revocation 或 `StopRequested`
+持久化成功才发停止请求。正常 drain 也先执行物理停止，再持久化证据。数据库忙、
+启动失败、取消、超时、输出超限和关闭均遵守此顺序。
+
+本地停止/证据与 durable revocation、quarantine/stop disposition、lease release
+分别幂等：同一个 handle 不重复成功发送停止/强制信号；保留原始 close 证据。
+缓存只合并进行中的持久化尝试，失败后必须允许重试，不把 rejected promise 当作清理完成。
+deadline 只能由仍有效的清理重试路径替代；每次失败显式返回错误并安排有界间隔的重试，
+直到撤权及停止 disposition 持久化。无法确认停止则持久化 Uncertain/quarantine，
+不根据锁释放推断停止。原 handle 晚到的 close 可按既有 receipt reconciliation。
+关闭清理必须等待所有已接纳 handle 的停止尝试；持久化失败时 Host 保留 Kernel
+供重试且保持关闭、不再接纳工作，后续 `close` 必须重试，不永久缓存失败。进程意外退出
+仍依赖启动时对旧 intent 的保守恢复。schema 保持 16，不增加迁移或新的 Run 状态。
 未确认停止时不删除目录、不释放为可复用资源。Pause/Resume、Human Terminal、
 controller lease、Files UI、保留策略和 GC 均不在本切片内。
 

@@ -115,6 +115,7 @@ import type {
   PublicEventEnvelope,
   QueryResult,
   WorktreeMutationAuthority,
+  WorktreeExecutionReceipt,
 } from "./types.js";
 import {
   assertNever,
@@ -140,6 +141,9 @@ export { KernelError } from "./errors.js";
 export class TorsorKernel {
   readonly #context: KernelContext;
   readonly #artifactStorage: ArtifactStorage | undefined;
+  readonly #localWorktreeExecutions = new Map<string, WorktreeExecutionReceipt & {
+    readonly principalId: string; readonly activationId: string;
+  }>();
   #closed = false;
 
   private constructor(options: KernelOpenOptions) {
@@ -190,7 +194,26 @@ export class TorsorKernel {
     if (command.type === "PublishArtifact") {
       throw new KernelError("Forbidden", "Artifact descriptors require trusted byte finalization.");
     }
-    return this.#execute(command, principalContext);
+    const localBinding = command.type === "StartWorktreeExecution"
+      ? { principalId: principalContext.principalId, activationId: command.activationId, executorId: command.executorId }
+      : undefined;
+    const result = await this.#execute(command, principalContext);
+    if (localBinding && result.executionToken) {
+      this.#localWorktreeExecutions.set(result.entityId, {
+        ...localBinding, executionId: result.entityId, executionToken: result.executionToken,
+      });
+    }
+    return result;
+  }
+
+  revokeLocalWorktreeAuthority(receipt: WorktreeExecutionReceipt, context: PrincipalContext): void {
+    const binding = this.#localWorktreeExecutions.get(receipt.executionId);
+    if (!binding || binding.principalId !== context.principalId ||
+        binding.executorId !== receipt.executorId || binding.executionToken !== receipt.executionToken) {
+      throw new KernelError("Forbidden", "Original local execution receipt is required.");
+    }
+    // Denial only: never consult a contended database before stopping an owned child.
+    this.#context.localWorktreeRevocations.add(binding.activationId);
   }
 
   checkWorktreePublication(authority: WorktreeMutationAuthority, context: PrincipalContext): void {

@@ -37,6 +37,7 @@ export interface LocalWorktreeExecutorOptions {
 
 const probeContent = "Torsor controlled Worktree probe v1.\n";
 const stoppedStates = new Set<WorktreeExecutionState>(["StopConfirmed", "ForceTerminated"]);
+type StopDisposition = "StopConfirmed" | "ForceTerminated" | "Uncertain";
 
 export class LocalWorktreeExecutor implements WorktreeExecutor {
   readonly #kernel: TorsorKernel;
@@ -65,7 +66,10 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
   }
 
   recover(): Promise<void> {
-    return this.#recovery ??= this.#recover();
+    return this.#recovery ??= this.#recover().catch((error: unknown) => {
+      this.#recovery = undefined;
+      throw error;
+    });
   }
 
   async #recover(): Promise<void> {
@@ -200,15 +204,26 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
   }
 
   async stopActivation(activationId: string): Promise<void> {
-    await Promise.allSettled([...this.#starts].filter(([, id]) => id === activationId).map(([start]) => start));
-    await Promise.all([...this.#handles.values()]
-      .filter((handle) => handle.activationId === activationId).map((handle) => handle.stop("Activation scope ended.")));
+    await this.#stopHandles(activationId);
   }
 
   async close(): Promise<void> {
     this.#closed = true;
-    await Promise.allSettled(this.#starts.keys());
-    await Promise.all([...this.#handles.values()].map((handle) => handle.stop("Local executor closing.")));
+    await this.#stopHandles();
+  }
+
+  async #stopHandles(activationId?: string): Promise<void> {
+    const pending = [...this.#starts].filter(([, id]) => !activationId || id === activationId).map(([start]) => start);
+    const stopping = [...this.#handles.values()]
+      .filter((handle) => !activationId || handle.activationId === activationId)
+      .map((handle) => handle.stop("Execution scope closed."));
+    // Start all physical stops before waiting on any pending start or persistence.
+    await Promise.allSettled([...pending, ...stopping]);
+    const results = await Promise.allSettled([...this.#handles.values()]
+      .filter((handle) => !activationId || handle.activationId === activationId)
+      .map((handle) => handle.stop("Execution scope closed.")));
+    const failed = results.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
   }
 
   #checkRoots(): void {
@@ -248,14 +263,22 @@ export class ControlledWorktreeProcess {
   readonly activationId: string;
   readonly #options: ProcessOptions;
   #child: ControlledChild | undefined;
-  #stop: Promise<WorktreeExecutionState> | undefined;
-  #cancel: Promise<WorktreeExecutionState> | undefined;
+  #physicalStop: Promise<StopDisposition> | undefined;
+  #settlement: Promise<WorktreeExecutionState> | undefined;
   #closeEvidence: ChildCloseEvidence | undefined;
+  #closeObservation: Promise<ChildCloseEvidence | undefined> | undefined;
   #state: WorktreeExecutionState = "Starting";
+  #revocationReason: string | undefined;
+  #durablyRevoked = false;
+  #durablySettled = false;
+  #stopSent = false;
+  #forceSent = false;
+  #stopErrors: string[] = [];
   #forced = false;
   #spawnAttempted = false;
   #monitor: NodeJS.Timeout | undefined;
   #deadline: NodeJS.Timeout | undefined;
+  #retry: NodeJS.Timeout | undefined;
   #removeAbort: (() => void) | undefined;
   readonly #finished: Promise<WorktreeExecutionState>;
   #resolveFinished!: (state: WorktreeExecutionState) => void;
@@ -272,6 +295,7 @@ export class ControlledWorktreeProcess {
   }
 
   get result(): Promise<string> {
+    if (this.#revocationReason) return Promise.reject(new Error("Controlled execution authority was revoked."));
     if (!this.#child) return Promise.reject(new Error("Controlled child has not started."));
     return Promise.race([
       this.#child.result,
@@ -280,6 +304,7 @@ export class ControlledWorktreeProcess {
   }
 
   assertTimeBudget(): void {
+    if (this.#revocationReason) throw new Error("Controlled execution authority was revoked.");
     if (performance.now() >= this.#options.leaseDeadlineAt) {
       throw new Error("Writer lease wall-clock budget exhausted.");
     }
@@ -295,6 +320,13 @@ export class ControlledWorktreeProcess {
       throw new Error("An original child handle cannot be replaced.");
     }
     this.#child = child;
+    this.#closeObservation = child.closed.then((evidence) => {
+      this.#closeEvidence = evidence;
+      return evidence;
+    }, () => {
+      this.#stopErrors.push("Original child close observation failed.");
+      return undefined;
+    });
   }
 
   async running(): Promise<void> {
@@ -327,24 +359,23 @@ export class ControlledWorktreeProcess {
   }
 
   stop(reason: string): Promise<WorktreeExecutionState> {
-    return this.#cancel ??= this.#stopAndRevoke(reason);
+    this.#revoke(reason);
+    return this.#drain();
   }
 
-  async #stopAndRevoke(reason: string): Promise<WorktreeExecutionState> {
+  #revoke(reason: string): void {
+    if (this.#revocationReason) return;
+    this.#revocationReason = reason;
+    this.#options.kernel.revokeLocalWorktreeAuthority(this.#options.authority, this.#options);
+    this.#rejectFinished(new Error("Controlled execution authority was revoked."));
     clearTimeout(this.#deadline);
+    clearInterval(this.#monitor);
     this.#removeAbort?.();
-    await this.#options.kernel.execute({
-      type: "RevokeWorktreeExecutionAuthority",
-      idempotencyKey: `${this.#options.authority.executionId}:revoke`,
-      ...this.#options.authority, reason,
-    }, this.#options);
-    const state = await this.#drain(reason, false);
-    if (stoppedStates.has(state)) await this.#release();
-    return state;
   }
 
   async finish(): Promise<WorktreeExecutionState> {
-    const state = await this.#drain("Controlled probe completed.", true);
+    this.assertTimeBudget();
+    const state = await this.#drain();
     if (state !== "StopConfirmed" || this.#closeEvidence?.code !== 0 ||
         this.#closeEvidence.signal !== null || this.#closeEvidence.error !== null) {
       throw new Error("Controlled child did not exit normally.");
@@ -355,59 +386,95 @@ export class ControlledWorktreeProcess {
     return state;
   }
 
-  #drain(reason: string, preservePublicationAuthority: boolean): Promise<WorktreeExecutionState> {
-    if (!this.#stop) {
-      this.#stop = this.#stopProcess(reason, preservePublicationAuthority);
-      void this.#stop.then(this.#resolveFinished, this.#rejectFinished);
-    }
-    return this.#stop;
+  #drain(): Promise<WorktreeExecutionState> {
+    clearTimeout(this.#retry);
+    // This promise contains OS operations only, never a Kernel read or write.
+    this.#physicalStop ??= this.#stopProcess();
+    return this.#settlement ??= this.#persistStop().then((state) => {
+      this.#settlement = undefined;
+      return state;
+    }, (error: unknown) => {
+      this.#settlement = undefined;
+      this.#revoke("Controlled stop persistence failed.");
+      this.#retry = setTimeout(() => {
+        // Each failed attempt rearms this retry; explicit stop/close also returns the error.
+        void this.#drain().catch(() => undefined);
+      }, 100);
+      throw error;
+    });
   }
 
-  async #stopProcess(reason: string, preservePublicationAuthority: boolean): Promise<WorktreeExecutionState> {
+  async #stopProcess(): Promise<StopDisposition> {
     clearInterval(this.#monitor);
     if (!this.#child) {
-      await this.#record(this.#spawnAttempted ? "Uncertain" : "StopConfirmed",
-        this.#spawnAttempted ? `${reason} Spawn was attempted but no handle returned.` : `${reason} No child was spawned.`);
-      return this.#state;
+      return this.#spawnAttempted ? "Uncertain" : "StopConfirmed";
     }
-    const tree = await this.#options.kernel.query({
-      type: "GetPhysicalWorktree", worktreeId: this.#options.authority.worktreeId,
-    }, this.#options);
-    if (tree.latestExecution?.state !== "Uncertain") {
-      await this.#record("StopRequested", reason, preservePublicationAuthority);
-    } else {
-      this.#state = "Uncertain";
+    if (!this.#closeEvidence && !this.#stopSent) {
+      this.#stopSent = true;
+      try { this.#child.requestStop(); } catch (error) { this.#stopErrors.push(String(error)); }
     }
-    const requestErrors: string[] = [];
-    try { this.#child.requestStop(); } catch (error) { requestErrors.push(String(error)); }
-    let evidence = await within(this.#child.closed, this.#options.stopMs);
+    let evidence = this.#closeEvidence ?? await within(this.#closeObservation!, this.#options.stopMs);
     if (!evidence) {
-      try { this.#forced = this.#child.forceStop(); } catch (error) { requestErrors.push(String(error)); }
-      evidence = await within(this.#child.closed, this.#options.forceMs);
+      if (!this.#forceSent) {
+        this.#forceSent = true;
+        try { this.#forced = this.#child.forceStop(); } catch (error) { this.#stopErrors.push(String(error)); }
+      }
+      evidence = await within(this.#closeObservation!, this.#options.forceMs);
     }
-    if (evidence) return this.#confirm(evidence);
-    if (this.#state !== "Uncertain") {
-      await this.#record("Uncertain", `${reason} No original-handle close confirmation by deadline. ${requestErrors.join("; ")}`);
-    }
-    return this.#state;
+    if (evidence) this.#closeEvidence = evidence;
+    return evidence ? this.#observedStopState() : "Uncertain";
   }
 
   async reconcile(): Promise<WorktreeExecutionState> {
-    await this.stop("Reconciliation requested.");
-    if (this.#state !== "Uncertain" || !this.#child) return this.#state;
-    const evidence = await within(this.#child.closed, 0);
-    if (evidence) {
-      await this.#confirm(evidence);
-      await this.#release();
+    return this.stop("Reconciliation requested.");
+  }
+
+  #observedStopState(): "StopConfirmed" | "ForceTerminated" {
+    return this.#forced || this.#closeEvidence?.signal != null ? "ForceTerminated" : "StopConfirmed";
+  }
+
+  async #persistStop(): Promise<WorktreeExecutionState> {
+    const initial = await this.#physicalStop!;
+    const state = this.#closeEvidence ? this.#observedStopState() : initial;
+    if (state === "Uncertain" || state === "ForceTerminated") {
+      this.#revoke("Controlled physical stop did not confirm normal completion.");
     }
+    await this.#persistRevocation();
+    if (!this.#durablySettled || this.#state !== state) {
+      const tree = await this.#options.kernel.query({
+        type: "GetPhysicalWorktree", worktreeId: this.#options.authority.worktreeId,
+      }, this.#options);
+      if (tree.latestExecution?.id !== this.#options.authority.executionId) {
+        throw new Error("Physical stop receipt does not match the current execution.");
+      }
+      this.#state = tree.latestExecution.state;
+      if (!stoppedStates.has(this.#state) && this.#state !== state) {
+        if (this.#child && !["StopRequested", "Uncertain"].includes(this.#state)) {
+          await this.#record("StopRequested", "Original-handle stop requested.", true);
+        }
+        await this.#record(state, this.#closeEvidence
+          ? `Original child close: ${JSON.stringify(this.#closeEvidence)}`
+          : this.#spawnAttempted
+            ? `No original-handle close confirmation. ${this.#stopErrors.join("; ")}`
+            : "No child was spawned.");
+      }
+      this.#durablySettled = true;
+      this.#resolveFinished(this.#state);
+    }
+    // Cancellation may have arrived while a normal drain awaited persistence.
+    await this.#persistRevocation();
+    if (this.#revocationReason && stoppedStates.has(this.#state)) await this.#release();
     return this.#state;
   }
 
-  async #confirm(evidence: ChildCloseEvidence): Promise<WorktreeExecutionState> {
-    this.#closeEvidence = evidence;
-    await this.#record(this.#forced || evidence.signal !== null ? "ForceTerminated" : "StopConfirmed",
-      `Original child close: ${JSON.stringify(evidence)}`);
-    return this.#state;
+  async #persistRevocation(): Promise<void> {
+    if (!this.#revocationReason || this.#durablyRevoked) return;
+    await this.#options.kernel.execute({
+      type: "RevokeWorktreeExecutionAuthority",
+      idempotencyKey: `${this.#options.authority.executionId}:revoke`,
+      ...this.#options.authority, reason: this.#revocationReason,
+    }, this.#options);
+    this.#durablyRevoked = true;
   }
 
   async #record(

@@ -68,6 +68,9 @@ class Host implements LocalRuntimeHost {
   #lifecyclePromise: Promise<void> | null = null;
   #closeBeforeStartPromise: Promise<void> | null = null;
   #serviceClosePromise: Promise<void> | null = null;
+  #cleanupPromise: Promise<void> | null = null;
+  #cleanupFailed = false;
+  #cleanupRetried = false;
 
   constructor(
     kernel: TorsorKernel,
@@ -108,6 +111,10 @@ class Host implements LocalRuntimeHost {
   }
 
   async close(): Promise<void> {
+    if (this.#cleanupFailed || this.#cleanupRetried) {
+      this.#cleanupRetried = true;
+      return this.#closeResources();
+    }
     if (this.#state === "created") {
       if (!this.#closeBeforeStartPromise) {
         this.#state = "closing";
@@ -145,21 +152,10 @@ class Host implements LocalRuntimeHost {
       this.#state = "closing";
       this.#requestStop();
       try {
-        await this.#beginServiceClose();
+        await this.#closeResources();
       } catch (error) {
         failure ??= { error };
       }
-      try {
-        await this.#worktreeExecutor?.close();
-      } catch (error) {
-        failure ??= { error };
-      }
-      try {
-        this.#kernel.close();
-      } catch (error) {
-        failure ??= { error };
-      }
-      this.#state = "closed";
     }
     if (failure) {
       this.#finished.reject(failure.error);
@@ -184,29 +180,35 @@ class Host implements LocalRuntimeHost {
   }
 
   async #closeBeforeStart(): Promise<void> {
-    let failure: { readonly error: unknown } | null = null;
     this.#requestStop();
     try {
-      await this.#beginServiceClose();
+      await this.#closeResources();
     } catch (error) {
-      failure = { error };
-    }
-    try {
-      await this.#worktreeExecutor?.close();
-    } catch (error) {
-      failure ??= { error };
-    }
-    try {
-      this.#kernel.close();
-    } catch (error) {
-      failure ??= { error };
-    }
-    this.#state = "closed";
-    if (failure) {
-      this.#finished.reject(failure.error);
-      throw failure.error;
+      this.#finished.reject(error);
+      throw error;
     }
     this.#finished.resolve();
+  }
+
+  #closeResources(): Promise<void> {
+    return this.#cleanupPromise ??= this.#tryCloseResources().catch((error: unknown) => {
+      this.#cleanupPromise = null;
+      this.#cleanupFailed = true;
+      throw error;
+    });
+  }
+
+  async #tryCloseResources(): Promise<void> {
+    this.#state = "closing";
+    const results = await Promise.allSettled([
+      this.#beginServiceClose(),
+      this.#worktreeExecutor?.close(),
+    ]);
+    const failed = results.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+    this.#kernel.close();
+    this.#cleanupFailed = false;
+    this.#state = "closed";
   }
 
   #requestStop(): void {
@@ -217,7 +219,10 @@ class Host implements LocalRuntimeHost {
 
   #beginServiceClose(): Promise<void> {
     if (!this.#serviceClosePromise) {
-      this.#serviceClosePromise = this.#service.close();
+      this.#serviceClosePromise = this.#service.close().catch((error: unknown) => {
+        this.#serviceClosePromise = null;
+        throw error;
+      });
       void this.#serviceClosePromise.catch(() => undefined);
     }
     return this.#serviceClosePromise;
