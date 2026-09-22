@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 
 import { KernelError } from "./errors.js";
 import { CURRENT_SCHEMA_VERSION, schemaSql } from "./schema.js";
+import { validateSchemaContract } from "./schema-contract.js";
 import type { CausalLimits, KernelBootstrap, KernelOpenOptions } from "./types.js";
 import { boundedDuration, integer, type Row } from "./values.js";
 
@@ -21,7 +23,7 @@ const sqliteBusyTimeoutOverrideSymbol = Symbol.for(
 );
 
 export function openKernelContext(options: KernelOpenOptions): KernelContext {
-  const context: KernelContext = {
+  const configuration = {
     clock: options.clock ?? (() => new Date()),
     idFactory:
       options.idFactory ?? ((prefix) => `${prefix}_${randomUUID()}`),
@@ -29,13 +31,27 @@ export function openKernelContext(options: KernelOpenOptions): KernelContext {
       options.activationDurationMs ?? 300_000,
       "activationDurationMs",
     ),
-    database: new DatabaseSync(options.databasePath),
+  };
+  if (options.databasePath !== ":memory:" && existsSync(options.databasePath)) {
+    const probe = { ...configuration, database: new DatabaseSync(options.databasePath, { readOnly: true }) };
+    try {
+      probe.database.exec(`PRAGMA busy_timeout = ${sqliteBusyTimeoutMs()}; BEGIN;`);
+      const version = integer(getRow(probe, "PRAGMA user_version")!.user_version);
+      if (version === 0) assertEmptySchema(getRow(probe, "SELECT name FROM sqlite_master LIMIT 1"));
+      else validateExistingSchema(probe, version, options.causalLimits);
+      probe.database.exec("COMMIT");
+    } finally {
+      probe.database.close();
+    }
+  }
+  const context: KernelContext = {
+    ...configuration, database: new DatabaseSync(options.databasePath),
   };
   try {
     context.database.exec(
       `PRAGMA foreign_keys = ON; PRAGMA busy_timeout = ${sqliteBusyTimeoutMs()};`,
     );
-    initializeSchema(context, options.causalLimits);
+    initializeSchema(context, options.causalLimits, options.bootstrap);
     context.database.exec(
       `CREATE TEMP TABLE IF NOT EXISTS projection_activation_changes (
          activation_id TEXT PRIMARY KEY
@@ -44,7 +60,6 @@ export function openKernelContext(options: KernelOpenOptions): KernelContext {
     if (options.databasePath !== ":memory:") {
       context.database.exec("PRAGMA journal_mode = WAL;");
     }
-    applyBootstrap(context, options.bootstrap);
     return context;
   } catch (error) {
     context.database.close();
@@ -94,44 +109,52 @@ export function translateError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-function initializeSchema(context: KernelContext, causalLimits?: CausalLimits): void {
+function initializeSchema(context: KernelContext, causalLimits?: CausalLimits, bootstrap?: KernelBootstrap): void {
   initializeSchemaExec(context, "BEGIN IMMEDIATE");
   try {
     const versionRow = initializeSchemaGet(context, "PRAGMA user_version");
     const version = versionRow ? integer(versionRow.user_version) : 0;
-    if (version === CURRENT_SCHEMA_VERSION) {
-      context.database.exec(schemaSql);
-      initializeCausalLimits(context, causalLimits, false);
+    if (version !== 0) {
+      // Revalidate under the writer lock; the read-only preflight is not a
+      // substitute for serialization against concurrent schema initialization.
+      validateExistingSchema(context, version, causalLimits);
       context.database.exec("COMMIT");
       return;
     }
-    if (version !== 0) {
-      throw new KernelError(
-        "Conflict",
-        `Incompatible development database schema version ${version}; expected ${CURRENT_SCHEMA_VERSION}. Stop old Torsor processes and recreate the disposable local database.`,
-      );
-    }
     const existing = initializeSchemaGet(
       context,
-      `SELECT name
-         FROM sqlite_master
-        WHERE name NOT LIKE 'sqlite_%'
-        LIMIT 1`,
+      "SELECT name FROM sqlite_master LIMIT 1",
     );
-    if (existing) {
-      throw new KernelError(
-        "Conflict",
-        "The database uses an incompatible unversioned development schema. Stop old Torsor processes and recreate the disposable local database.",
-      );
-    }
+    assertEmptySchema(existing);
     context.database.exec(schemaSql);
     initializeCausalLimits(context, causalLimits, true);
+    applyBootstrap(context, bootstrap);
     context.database.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
     context.database.exec("COMMIT");
   } catch (error) {
     context.database.exec("ROLLBACK");
     throw translateError(error);
   }
+}
+
+function assertEmptySchema(existing: Row | undefined): void {
+  if (existing) {
+    throw new KernelError(
+      "Conflict",
+      "The database uses an incompatible unversioned development schema. Stop old Torsor processes and recreate the disposable local database.",
+    );
+  }
+}
+
+function validateExistingSchema(context: KernelContext, version: number, causalLimits?: CausalLimits): void {
+  if (version !== CURRENT_SCHEMA_VERSION) {
+    throw new KernelError(
+      "Conflict",
+      `Incompatible development database schema version ${version}; expected ${CURRENT_SCHEMA_VERSION}. Stop old Torsor processes and recreate the disposable local database.`,
+    );
+  }
+  validateSchemaContract(context.database);
+  initializeCausalLimits(context, causalLimits, false);
 }
 
 function initializeCausalLimits(
@@ -192,61 +215,54 @@ function applyBootstrap(
   if (!bootstrap) {
     return;
   }
-  context.database.exec("BEGIN IMMEDIATE");
-  try {
-    for (const principal of bootstrap.principals ?? []) {
-      run(
-        context,
-        "INSERT OR IGNORE INTO principals (id, kind, display_name) VALUES (?, ?, ?)",
-        principal.id,
-        principal.kind,
-        principal.displayName,
-      );
-    }
-    for (const project of bootstrap.projects ?? []) {
-      run(
-        context,
-        "INSERT OR IGNORE INTO projects (id, name) VALUES (?, ?)",
-        project.id,
-        project.name,
-      );
-    }
-    for (const channel of bootstrap.channels ?? []) {
-      run(
-        context,
-        "INSERT OR IGNORE INTO channels (id, project_id, name) VALUES (?, ?, ?)",
-        channel.id,
-        channel.projectId,
-        channel.name,
-      );
-    }
-    for (const agent of bootstrap.agents ?? []) {
-      run(
-        context,
-        `INSERT OR IGNORE INTO agents
-          (id, principal_id, project_id, name, current_config_revision)
-         VALUES (?, ?, ?, ?, ?)`,
-        agent.id,
-        agent.principalId,
-        agent.projectId,
-        agent.name,
-        agent.configRevision,
-      );
-      run(
-        context,
-        `INSERT OR IGNORE INTO agent_config_revisions
-          (agent_id, revision, config_json, created_at)
-         VALUES (?, ?, ?, ?)`,
-        agent.id,
-        agent.configRevision,
-        JSON.stringify(agent.config),
-        now(context),
-      );
-    }
-    context.database.exec("COMMIT");
-  } catch (error) {
-    context.database.exec("ROLLBACK");
-    throw translateError(error);
+  for (const principal of bootstrap.principals ?? []) {
+    run(
+      context,
+      "INSERT OR IGNORE INTO principals (id, kind, display_name) VALUES (?, ?, ?)",
+      principal.id,
+      principal.kind,
+      principal.displayName,
+    );
+  }
+  for (const project of bootstrap.projects ?? []) {
+    run(
+      context,
+      "INSERT OR IGNORE INTO projects (id, name) VALUES (?, ?)",
+      project.id,
+      project.name,
+    );
+  }
+  for (const channel of bootstrap.channels ?? []) {
+    run(
+      context,
+      "INSERT OR IGNORE INTO channels (id, project_id, name) VALUES (?, ?, ?)",
+      channel.id,
+      channel.projectId,
+      channel.name,
+    );
+  }
+  for (const agent of bootstrap.agents ?? []) {
+    run(
+      context,
+      `INSERT OR IGNORE INTO agents
+        (id, principal_id, project_id, name, current_config_revision)
+       VALUES (?, ?, ?, ?, ?)`,
+      agent.id,
+      agent.principalId,
+      agent.projectId,
+      agent.name,
+      agent.configRevision,
+    );
+    run(
+      context,
+      `INSERT OR IGNORE INTO agent_config_revisions
+        (agent_id, revision, config_json, created_at)
+       VALUES (?, ?, ?, ?)`,
+      agent.id,
+      agent.configRevision,
+      JSON.stringify(agent.config),
+      now(context),
+    );
   }
 }
 

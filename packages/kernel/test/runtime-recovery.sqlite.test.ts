@@ -31,6 +31,13 @@ interface RecordedPromotion {
   readonly changes: number;
 }
 
+function suspendFixtureTrigger(database: DatabaseSync, name: string): () => void {
+  const sql = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?").get(name)?.sql;
+  if (typeof sql !== "string") throw new Error(`Expected fixture trigger ${name}.`);
+  database.exec(`DROP TRIGGER "${name.replaceAll('"', '""')}"`);
+  return () => database.exec(sql);
+}
+
 function expectIndexedRecoverablePlan(planDetails: readonly string[]): void {
   expect(
     planDetails.some(
@@ -1455,13 +1462,26 @@ describe("Runtime recovery with SQLite", () => {
            VALUES (?, ?, 'deterministic-fake', '1', '{}', '[]', ?,
                    'Completed', ?, ?)`,
         );
-        historyDatabase.exec(
-          `DROP TRIGGER attention_recovery_activation_insert;
-           DROP TRIGGER attention_recovery_activation_update;
-           DROP TRIGGER attention_recovery_provider_insert;
-           DROP TRIGGER attention_domain_provider_insert;`,
-        );
+        const restoreTriggers = [
+          "attention_recovery_activation_insert",
+          "attention_recovery_activation_update",
+          "attention_recovery_provider_insert",
+          "attention_domain_provider_insert",
+        ].map((name) => suspendFixtureTrigger(historyDatabase, name));
         historyDatabase.exec("BEGIN");
+        historyDatabase.exec(
+          `WITH RECURSIVE sequence(value) AS (
+             VALUES (0)
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < 99999
+           )
+           INSERT INTO threads (root_message_id, project_id, channel_id)
+           SELECT 'thread-history-' || printf('%06d', value),
+                  'project-sample', 'channel-general'
+             FROM sequence;
+           INSERT INTO threads (root_message_id, project_id, channel_id)
+           VALUES ('thread-expired-recoverable', 'project-sample', 'channel-general');`,
+        );
         historyDatabase.prepare(
           `WITH RECURSIVE sequence(value) AS (
              VALUES (0)
@@ -1719,6 +1739,8 @@ describe("Runtime recovery with SQLite", () => {
             WHERE entity_type IN ('ActivationAttempt', 'ProviderAttempt')`,
         ).run();
         historyDatabase.exec("ANALYZE");
+        for (const restore of restoreTriggers) restore();
+        expect(historyDatabase.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
       } finally {
         historyDatabase.close();
       }
@@ -1934,9 +1956,7 @@ describe("Runtime recovery with SQLite", () => {
         expect(domainTriggerSql).not.toMatch(
           /activation_id\s+IN\s*\(\s*SELECT/i,
         );
-        database.exec(
-          "DROP TRIGGER attention_recovery_activation_update;",
-        );
+        const restoreTrigger = suspendFixtureTrigger(database, "attention_recovery_activation_update");
         database.prepare(
           `UPDATE activation_attempts
               SET finished_at = '2026-09-21T08:02:00.000Z',
@@ -1974,6 +1994,7 @@ describe("Runtime recovery with SQLite", () => {
           ).get(),
         ).toMatchObject({ count: 0 });
         database.exec("ANALYZE");
+        restoreTrigger();
       } finally {
         database.close();
       }
@@ -2012,9 +2033,7 @@ describe("Runtime recovery with SQLite", () => {
           }>;
           recordedPlans.push(noRowsPlan.map((row) => row.detail));
         }
-        settledDatabase.exec(
-          "DROP TRIGGER attention_recovery_activation_update;",
-        );
+        const restoreTrigger = suspendFixtureTrigger(settledDatabase, "attention_recovery_activation_update");
         settledDatabase.prepare(
           `UPDATE activation_attempts
               SET expires_at = '2099-01-01T00:00:00.000Z',
@@ -2038,6 +2057,7 @@ describe("Runtime recovery with SQLite", () => {
                     attention_recovery_revision + 1
             WHERE singleton = 1`,
         ).run();
+        restoreTrigger();
       } finally {
         settledDatabase.close();
       }

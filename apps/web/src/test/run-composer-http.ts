@@ -71,26 +71,47 @@ export class ControlledBrowser {
   };
 }
 
+interface SseFrame {
+  readonly type: "torsor" | "checkpoint";
+  readonly data: string;
+}
+
 /** Receives the production SSE bytes; only delivery timing is controlled by tests. */
 export class HttpEvents extends EventTarget {
   onopen: ((event: Event) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
   readonly received: PublicEvent[] = [];
+  readonly checkpoints: string[] = [];
+  readonly connections: string[] = [];
   readonly ready = deferred();
-  readonly done: Promise<void>;
+  done: Promise<void>;
   error: unknown = null;
   paused = false;
   #closed = false;
   #reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-  #queued: PublicEvent[] = [];
+  #queued: SseFrame[] = [];
 
-  constructor(url: string, browser: ControlledBrowser) {
+  constructor(readonly url: string, readonly browser: ControlledBrowser) {
     super();
-    this.done = this.#pump(url, browser).catch((error: unknown) => {
+    this.done = this.#connect(url);
+  }
+
+  #connect(url: string): Promise<void> {
+    return this.#pump(url, this.browser).catch((error: unknown) => {
       this.error = error;
       this.ready.resolve();
       this.onerror?.(new Event("error"));
     });
+  }
+
+  async reconnect(cursor: string | null): Promise<void> {
+    this.onerror?.(new Event("error"));
+    this.close();
+    await this.done;
+    this.#closed = false;
+    const url = new URL(this.url);
+    if (cursor) url.searchParams.set("cursor", cursor);
+    this.done = this.#connect(url.toString());
   }
 
   close(): void {
@@ -103,13 +124,14 @@ export class HttpEvents extends EventTarget {
     for (const event of this.#queued.splice(0)) this.#deliver(event);
   }
 
-  #deliver(event: PublicEvent): void {
+  #deliver(event: SseFrame): void {
     if (!this.#closed) {
-      this.dispatchEvent(new MessageEvent("torsor", { data: JSON.stringify(event) }));
+      this.dispatchEvent(new MessageEvent(event.type, { data: event.data }));
     }
   }
 
   async #pump(url: string, browser: ControlledBrowser): Promise<void> {
+    this.connections.push(url);
     const response = await browser.stream(url);
     if (!response.ok || !response.body) throw new Error(`SSE failed: ${response.status}`);
     this.#reader = response.body.getReader();
@@ -130,11 +152,13 @@ export class HttpEvents extends EventTarget {
       while ((boundary = buffer.indexOf("\n\n")) >= 0) {
         const frame = buffer.slice(0, boundary);
         buffer = buffer.slice(boundary + 2);
-        if (!frame.split("\n").includes("event: torsor")) continue;
+        const type = frame.split("\n").find((line) => line.startsWith("event: "))?.slice(7);
+        if (type !== "torsor" && type !== "checkpoint") continue;
         const data = frame.split("\n").find((line) => line.startsWith("data: "));
         if (!data) throw new Error("SSE event has no data.");
-        const event = JSON.parse(data.slice(6)) as PublicEvent;
-        this.received.push(event);
+        if (type === "torsor") this.received.push(JSON.parse(data.slice(6)) as PublicEvent);
+        else this.checkpoints.push((JSON.parse(data.slice(6)) as { cursor: string }).cursor);
+        const event: SseFrame = { type, data: data.slice(6) };
         if (this.paused) this.#queued.push(event);
         else this.#deliver(event);
       }

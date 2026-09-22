@@ -57,6 +57,7 @@ interface RpcRequest {
 }
 
 type CopilotAction =
+  | { readonly type: "publish_report"; readonly idempotencyKey: string; readonly text: string }
   | { readonly type: "create_run" }
   | { readonly type: "continue_run"; readonly runId: string }
   | { readonly type: "ignore_attention"; readonly reason: string }
@@ -119,7 +120,7 @@ const secureCopilotArgs = [
 
 export class CopilotAcpAdapter implements ProviderAdapter {
   readonly name = "github-copilot-cli-acp";
-  readonly version = "2";
+  readonly version = "3";
   readonly capabilities = {
     acceptsInputWhileRunning: false,
     supportsCancel: true,
@@ -356,6 +357,9 @@ export class CopilotAcpAdapter implements ProviderAdapter {
       }
       const actions = parseActions(outputChunks.join(""), this.#limits);
       validateActionPlan(actions, context.cause.type);
+      if (actions.some((action) => action.type === "publish_report") && !context.capabilities.reportArtifactsEnabled) {
+        throw new ProviderProtocolError("Report Artifact storage is not configured.");
+      }
       await applyActions(actions, context);
       executionResult = {
         detail: `Copilot ACP completed session ${sessionId}.`,
@@ -779,7 +783,9 @@ function buildPrompt(context: ProviderExecutionContext): string {
   const allowed =
     context.cause.type === "attention"
       ? "Allowed actions: ignore_attention, continue_run, create_run."
-      : "Allowed actions: append_activity, publish_reply, report_status, complete, fail, wait. Artifact publication is disabled until a trusted finalizer exists.";
+      : `Allowed actions: append_activity, publish_reply, report_status, complete, fail, wait.${context.capabilities.reportArtifactsEnabled
+        ? " publish_report(idempotencyKey, text) may finalize a plain-text report; reuse the stable key on retries."
+        : " Report Artifact storage is not configured."} Arbitrary publish_artifact descriptors are forbidden.`;
   return [
     "You are executing one bounded Torsor Activation.",
     "The JSON below is rebuilt from durable Kernel state and is authoritative.",
@@ -834,6 +840,15 @@ function parseAction(
     64,
   );
   switch (type) {
+    case "publish_report":
+      if (Object.keys(action).some((key) => !["type", "idempotencyKey", "text"].includes(key))) {
+        throw new ProviderProtocolError("publish_report accepts only type, idempotencyKey and text.");
+      }
+      return {
+        type,
+        idempotencyKey: requireBoundedString(action.idempotencyKey, "action.idempotencyKey", 256),
+        text: requireBoundedString(action.text, "action.text", limits.maxFieldLength),
+      };
     case "create_run":
       return { type };
     case "continue_run":
@@ -970,6 +985,9 @@ async function applyActions(
         break;
       case "publish_reply":
         await context.capabilities.publishReply(action);
+        break;
+      case "publish_report":
+        await context.capabilities.publishReport({ idempotencyKey: action.idempotencyKey, text: action.text });
         break;
       case "report_status":
         await context.capabilities.reportStatus(action.status, action.detail);

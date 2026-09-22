@@ -746,6 +746,8 @@ Activation is a runtime record, not a primary user object.
 
 One database transaction covers Message plus Attention, RunInput plus delivery scheduling, Run state plus notifications, and Artifact descriptor plus upload-completion event. External Workers may consume Outbox repeatedly.
 
+The first trusted Artifact slice finalizes immutable report bytes only. Torsor must accept bounded bytes or a byte stream, compute SHA-256 itself, and confirm durable storage before atomically committing the descriptor, `ArtifactPublished`, `artifact.published` Outbox event, and complete idempotency result in the existing Kernel transaction. Storage failure publishes no descriptor; Outbox is not a promise to upload later while claiming the content is already downloadable.
+
 ### 21.4 Expired Activation
 
 1. Run changes require expected revision.
@@ -756,6 +758,14 @@ One database transaction covers Message plus Attention, RunInput plus delivery s
 ### 21.5 Reconciler
 
 Runtime periodically recovers unfinished Outbox work, expired Activation, Unknown ProviderAttempt, Open Attention, suspect Writer Lease, and incomplete Artifact finalization. Recovery continues to use idempotency keys.
+
+A report finalization request is identified by `(principal_id, run_id, idempotency_key)`. Reusing it requires identical bytes and expected Run revision, otherwise it conflicts. Retry after a lost commit response returns the original Artifact and provenance without duplicate events. A new Activation may retry only with current Run read authorization; retry does not revive old Activation authority.
+
+This slice uses caller-driven retry, not background replay of Provider output. A crash during staging leaves only an invisible temporary file; content publication before database commit leaves only an invisible content-addressed blob; a lost response after commit is recoverable from durable idempotency results and Run/Thread projections. Retry verifies and reuses the blob and rechecks current authorization, Activation, and Run revision in the transaction. Revocation or a terminal Run blocks new descriptors; currently authorized Humans/Runtime may still query committed descriptors. No automatic orphan/staging deletion is included: cleanup is offline maintenance, avoiding races with concurrent finalization.
+
+The integrated durable-causal-limit and trusted-Artifact database uses schema **15**. It retains section 25's Run root/parent/depth, immutable constraints, admission index and durable configuration alongside section 23's trusted report descriptors. Both the former causal-only schema 14 and the independently developed Artifact-only schema 14 are incompatible; equal version numbers must not authorize different layouts. Opening any older or unversioned nonempty development database must fail explicitly before applying DDL/bootstrap, without migration, version rewriting, or data deletion. Operators stop old processes and explicitly recreate disposable databases. Schema 15 reopen still validates durable causal configuration.
+
+`user_version = 15` is not layout proof. Before any DDL, bootstrap or configuration write, existing databases undergo read-only comparison against a complete schema fingerprint generated from trusted DDL in an isolated memory database: object sets, columns/types/nullability/defaults/PKs/FKs, indexes/uniqueness/partial predicates, triggers, CHECK and STRICT constraints. Compare SQLite-parsed metadata and SQL tokens that preserve literal/operator semantics; ignore only whitespace, comments and unquoted keyword/identifier case, never whitespace inside strings. Reject missing, extra-incompatible, partial, corrupt, predecessor-shaped or future layouts without changing file bytes or logical state; never repair with `CREATE IF NOT EXISTS`. SQLite-owned statistics objects are outside the application layout. Only version 0 with no persistent objects may execute DDL, initial configuration and bootstrap in one transaction, with complete rollback on failure. Valid schema 15 reopen does not reapply bootstrap or modify durable causal configuration.
 
 The Runtime Host must bound consecutive recovery passes, yield to the event loop before continuing, and recheck shutdown. Backlog processing must not starve HTTP, timers, signals, or shutdown handling. Idle polling waits must be interruptible by shutdown and must remove their listener and cancel any no-longer-needed timer regardless of which side completes first.
 
@@ -798,15 +808,29 @@ producer_run_id
 producer_activation_id
 base_revision
 media_type
-storage_location
+byte_length
+producer_thread_root_id
 visibility_scope
 ```
+
+Reports use `sha256:<lowercase hex>`, fixed `text/plain; charset=utf-8`, and a Torsor-generated `base_revision` of `run:<id>@<expected revision>`, not a claimed Git commit. Source Run, Activation, Thread, and home Channel derive from trusted context. Provider-supplied digests, descriptors, paths, and `file://` URLs are not authoritative. Ordinary `PublishArtifact` commands must be rejected; only the trusted byte finalizer may enter the publication transaction.
+
+Reports are limited to 1 MiB and streams to 4096 chunks. The finalizer copies input bytes before hashing; storage adapters receive no Provider paths. The narrow interface provides immutable writes and reads by digest/length only, is statically configured by the trusted Host, and is not exposed to Providers. One descriptor is retained per Run/digest; publishing identical content under another key conflicts rather than rewriting provenance.
+
+Parent and child Runs may finalize identical bytes and share one content-addressed blob, but retain separate descriptors, source Run/Activation/Thread, and idempotency scopes. An Artifact traces through `producer_run_id` to its Run's immutable causal root, parent Attention/Run, and depth rather than duplicating mutable causal fields. Neither ancestry nor an identical digest grants cross-Run read access. Finalization, download, failure and replay do not allocate/release Run slots, rewrite causality, dispose RunInput, or implicitly complete a Run. After restart, Run/Thread and paginated projections must retain both causal fields and Artifact references.
+
+The development/test local layout is `sha256/<64 hex>` and `staging/<random>.tmp` under a private root. Exclusively create, write, and flush a staging file, then atomically hard-link without replacing the destination. Existing destinations must match length, digest, and all bytes, never be overwritten. Reads also verify length and digest. Reject invalid digests, traversal, symlinks/junctions, and non-regular files. The root and ancestors must be trusted Host-controlled and outside Provider/Worktree write scope; this adapter is not a sandbox against hostile concurrent writes by the same OS user. POSIX also flushes directories; Windows supports process-crash/restart recovery but does not promise directory flush/power-loss durability unavailable in portable Node APIs. Production remote storage is a separate adapter.
 
 ### 23.2 Permission
 
 1. Artifact inherits home-Channel visibility by default.
-2. Download reauthorizes.
-3. Storage URLs use short-lived signatures.
+2. Every descriptor query and download rechecks current Principal, Project, home Channel, and Run/Activation scope, including after asynchronous storage reads and before returning bytes.
+3. The public contract exposes Artifact IDs and descriptors, not internal paths or direct storage URLs. HTTP uses `GET /api/v1/artifacts/:id` and `GET /api/v1/artifacts/:id/content`. Possession of an ID/digest is not authorization. Responses disable caching; content is returned as a plain-text attachment.
+4. In the current local permission model, Humans/Runtime have global read authority and Agents are limited by live Activation Project/Channel/Thread/Run scope. This slice adds no ACL administration system. Future short-lived signed URLs must not bypass current authorization checks.
+5. Agents see platform Artifact metadata only when `producer_run_id = scope.runId`; Attention scope has no Run and therefore no Artifacts. Apply this to current/historical Thread and Run projections, lists/pages, conditional-command catch-up errors, events/SSE, and Runtime context delivered to Providers. A shared Thread, ancestry or identical content does not widen authorization. Do not return filtered Artifact items, counts, digests, provenance or event payloads. Explicit public Message text remains Channel/Thread communication, not a descriptor or read grant.
+6. Validate Principal and current Activation/scope before looking up an Artifact ID. For authorized callers, absent and inaccessible IDs produce identical generic `NotFound` (HTTP 404), message and response headers without existence, storage or provenance details; never read an inaccessible blob. Unauthenticated calls remain 401. Deterministic stale/revoked-scope errors occur before lookup regardless of ID existence.
+7. Filtering does not stall bounded scans: `scannedThroughEventId` advances as an opaque high-water mark, not a hidden-report count or identity. SSE emits a `checkpoint` event containing only the opaque `cursor` and sets `id` for filtered tails. Native reconnects and Client replacement connections use this watermark without synthesizing Artifact timeline items, exposing filtered payloads, clearing loaded history or disturbing Composer state.
+   Conditional-command catch-up scans at most 100 events and returns `scannedThroughEventId` and `hasMore`, filtering after scanning. Artifact events are neither forwarded nor accepted through cross-window BroadcastChannel; each window consumes its own authenticated stream, and an old connection cannot overwrite a new scope's cursor.
 
 ### 23.3 Integration
 
@@ -823,6 +847,8 @@ visibility_scope
 ### 23.4 Artifact input
 
 MVP adds no `ArtifactInput`. Reference an Artifact in a Thread Message/card and assign that Message revision as RunInput.
+
+References use finalized Artifact IDs only. References, report text, and Provider output do not automatically grant read access, create RunInput, or complete a Run. The optional Runtime `publish_report` capability accepts only a stable request key and report text, never digest/location/provenance. Arbitrary ACP `publish_artifact` remains disabled.
 
 ## 24. Provider cancellation, Pause, and Resume
 
@@ -1124,7 +1150,13 @@ Artifacts     - commits, patches, reports, and logs
 Activity      - Run, ProviderAttempt, Lease, and state timeline
 ```
 
-Tabs are Client view state. `Live` is a chronological engineering record:
+Tabs are Client view state.
+
+This slice exposes finalized report digest, length, media type, and Run/Thread provenance through existing Run/Thread Artifact projections, with authorized HTTP downloads. Unfinalized Provider text, staging files, and orphan blobs must not appear as published Artifacts. Missing/tampered storage, permission changes, and download failures fail explicitly rather than returning an empty success. New Artifacts UI, a GitHub state machine, Worktree execution, a generic plugin marketplace, and ArtifactInput are outside this slice.
+
+Initial pages, historical backfill and live replacements obey the current scope in section 23.2; another Run's same-Thread reports must not enter an Agent's lists or counts. A filtered checkpoint advances only the recovery cursor, never synthesizing report items or resetting Timeline/Composer. Changing authenticated scope must not retain the previous scope's projections.
+
+`Live` is a chronological engineering record:
 
 ```text
 Human RunInput

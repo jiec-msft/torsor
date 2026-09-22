@@ -1,12 +1,16 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { DeterministicFakeAdapter } from "@torsor/agent-runtime";
+import { AgentRuntime, DeterministicFakeAdapter } from "@torsor/agent-runtime";
 import type { AgentRuntimeHooks } from "@torsor/agent-runtime";
 import {
+  LocalArtifactStorage,
   TorsorKernel,
+  type CommandResult,
   type KernelBootstrap,
+  type RunProjection,
   type ThreadProjection,
 } from "@torsor/kernel";
 import {
@@ -20,6 +24,7 @@ import {
 
 import {
   createLocalRuntimeHost,
+  createTorsorHttpService,
   type LocalRuntimeHost,
 } from "../src/index.js";
 
@@ -58,6 +63,216 @@ afterEach(async () => {
 });
 
 describe("Local runtime host", () => {
+  it("finalizes Runtime reports, downloads authorized real bytes and restores SQLite/HTTP after restart", async () => {
+    const directory = await temporaryDirectory();
+    const databasePath = join(directory, "reports.sqlite");
+    const root = join(directory, "content");
+    const storage = await LocalArtifactStorage.open(root);
+    const report = "Synthetic Host report.\n";
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+      } else {
+        const input = { idempotencyKey: "report", text: report };
+        const id = await context.capabilities.publishReport(input);
+        expect(await context.capabilities.publishReport(input)).toBe(id);
+        await context.capabilities.complete({ finalReply: { body: `Report Artifact: ${id}` } });
+      }
+    });
+    const host = createLocalRuntimeHost({
+      databasePath, bootstrap, artifactStorage: storage, adapter, port: 0,
+      credentials: [{ token: "human-token", principalContext: { principalId: "principal-human" } }],
+      runtimePrincipalId: "principal-runtime", projectIds: ["project-sample"],
+      runtimePollIntervalMs: 5,
+    });
+    cleanup.push(() => host.close());
+    const origin = await host.start();
+    const response = await fetch(`${origin}/api/v1/commands/start-thread`, {
+      method: "POST", headers: { ...authorization(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        idempotencyKey: "report-thread", projectId: "project-sample", channelId: "channel-general",
+        body: "Produce a synthetic report.", targetAgentIds: ["agent-orbit"],
+      }),
+    });
+    expect(response.status).toBe(200);
+    const { result } = await response.json() as { result: { entityId: string } };
+    const thread = await waitForCompletedThread(origin, result.entityId);
+    expect(thread.artifacts).toHaveLength(1);
+    const artifact = thread.artifacts[0]!;
+    const digest = createHash("sha256").update(report).digest("hex");
+    expect(artifact.contentDigest).toBe(`sha256:${digest}`);
+    expect(artifact.producerThreadRootId).toBe(thread.threadRootId);
+    const contentPath = `/api/v1/artifacts/${artifact.id}/content`;
+    expect((await fetch(`${origin}${contentPath}`)).status).toBe(401);
+    const download = await fetch(`${origin}${contentPath}`, { headers: authorization() });
+    expect(download.status).toBe(200);
+    expect(download.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(download.headers.get("content-disposition")).toBe('attachment; filename="report.txt"');
+    expect(download.headers.get("cache-control")).toBe("no-store");
+    expect(download.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(await download.text()).toBe(report);
+    await host.close();
+
+    const reopenedStorage = await LocalArtifactStorage.open(root);
+    let onRead: (() => Promise<void>) | undefined;
+    const kernel = TorsorKernel.open({
+      databasePath,
+      artifactStorage: {
+        put: reopenedStorage.put.bind(reopenedStorage),
+        async read(digest, size) {
+          const content = await reopenedStorage.read(digest, size);
+          await onRead?.();
+          return content;
+        },
+      },
+    });
+    cleanup.push(async () => kernel.close());
+    const service = createTorsorHttpService({
+      kernel, port: 0,
+      credentials: [
+        { token: "human-token", principalContext: { principalId: "principal-human" } },
+        { token: "expired-agent", principalContext: { principalId: "principal-orbit", activationId: artifact.producerActivationId } },
+      ],
+    });
+    cleanup.push(() => service.close());
+    const restarted = await service.listen();
+    const descriptor = await fetch(`${restarted}/api/v1/artifacts/${artifact.id}`, { headers: authorization() });
+    expect(await descriptor.json()).toEqual({ artifact });
+    expect(JSON.stringify(artifact)).not.toContain(root);
+    expect(artifact).not.toHaveProperty("storageLocation");
+    expect((await fetch(`${restarted}${contentPath}`, { headers: { Authorization: "Bearer expired-agent" } })).status).toBe(409);
+    expect(await (await fetch(`${restarted}${contentPath}`, { headers: authorization() })).text()).toBe(report);
+    const session = await fetch(`${restarted}/api/v1/session`, { method: "POST", headers: authorization() });
+    const cookie = session.headers.get("set-cookie")!.split(";")[0]!;
+    await session.json();
+    onRead = async () => {
+      const logout = await fetch(`${restarted}/api/v1/session`, { method: "DELETE", headers: { Cookie: cookie } });
+      expect(logout.status).toBe(204);
+    };
+    const revoked = await fetch(`${restarted}${contentPath}`, { headers: { Cookie: cookie } });
+    expect(revoked.status).toBe(401);
+    onRead = undefined;
+    expect((await fetch(`${restarted}/api/v1/commands/publish-artifact`, {
+      method: "POST", headers: { ...authorization(), "Content-Type": "application/json" },
+      body: JSON.stringify({ contentDigest: `sha256:${digest}`, storageLocation: "file:///private" }),
+    })).status).toBe(404);
+    const blob = join(root, "sha256", digest);
+    await chmod(blob, 0o600);
+    await writeFile(blob, "tampered");
+    const failed = await fetch(`${restarted}${contentPath}`, { headers: authorization() });
+    expect(failed.status).toBe(500);
+    expect(await failed.text()).not.toContain(root);
+  });
+
+  it("keeps causal parent/child reports and Live history through Host restart and HTTP command replay", async () => {
+    const directory = await temporaryDirectory();
+    const databasePath = join(directory, "causal-reports.sqlite");
+    const root = join(directory, "content");
+    const storage = await LocalArtifactStorage.open(root);
+    const report = "Shared synthetic delegated report.\n";
+    const graphBootstrap: KernelBootstrap = {
+      ...bootstrap,
+      principals: [...bootstrap.principals!, { id: "principal-keel", kind: "agent", displayName: "Keel" }],
+      agents: [...bootstrap.agents!, {
+        id: "agent-keel", principalId: "principal-keel", projectId: "project-sample",
+        name: "Keel", configRevision: 1, config: { provider: "deterministic-fake" },
+      }],
+    };
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+        return;
+      }
+      await context.capabilities.reportStatus("processing-report");
+      const input = { idempotencyKey: "shared-report", text: report };
+      const artifactId = await context.capabilities.publishReport(input);
+      expect(await context.capabilities.publishReport(input)).toBe(artifactId);
+      await context.capabilities.reportStatus("report-ready");
+      if (context.cause.run.run.delegationDepth === 0) {
+        await context.capabilities.publishReply({
+          body: `Follow up report ${artifactId}.`, targetAgentIds: ["agent-keel"],
+        });
+      }
+      await context.capabilities.complete({ finalReply: { body: `Report ${artifactId} is available.` } });
+    });
+    const host = createLocalRuntimeHost({
+      databasePath, bootstrap: graphBootstrap, artifactStorage: storage, adapter, port: 0,
+      credentials: [{ token: "human-token", principalContext: { principalId: "principal-human" } }],
+      runtimePrincipalId: "principal-runtime", projectIds: ["project-sample"], runtimePollIntervalMs: 5,
+    });
+    cleanup.push(() => host.close());
+    const origin = await host.start();
+    const command = {
+      idempotencyKey: "causal-report-thread", projectId: "project-sample", channelId: "channel-general",
+      body: "Produce and delegate a synthetic report.", targetAgentIds: ["agent-orbit"],
+    };
+    const request = {
+      method: "POST", headers: { ...authorization(), "Content-Type": "application/json" },
+      body: JSON.stringify(command),
+    };
+    const response = await fetch(`${origin}/api/v1/commands/start-thread`, request);
+    expect(response.status).toBe(200);
+    const created = await response.json() as { result: CommandResult };
+    const thread = await waitForCompletedThread(origin, created.result.entityId, 2);
+    expect(adapter.invocationCount).toBe(4);
+    const parent = thread.runs.find((run) => run.delegationDepth === 0)!;
+    const child = thread.runs.find((run) => run.delegationDepth === 1)!;
+    expect(parent).toMatchObject({ causalRootId: thread.threadRootId, parentRunId: null });
+    expect(child).toMatchObject({ causalRootId: thread.threadRootId, parentRunId: parent.id });
+    expect(thread.artifacts).toHaveLength(2);
+    expect(new Set(thread.artifacts.map((artifact) => artifact.id)).size).toBe(2);
+    const digest = createHash("sha256").update(report).digest("hex");
+    expect(await readdir(join(root, "sha256"))).toEqual([digest]);
+    const runResponse = await fetch(`${origin}/api/v1/runs/${child.id}`, { headers: authorization() });
+    const { run } = await runResponse.json() as { run: RunProjection };
+    expect(run.run).toEqual(child);
+    expect(run.artifacts).toHaveLength(1);
+    expect(run.activity.items.some((item) => item.kind === "status")).toBe(true);
+    const historyPath = `/api/v1/runs/${child.id}/activity?beforeSequence=${run.activity.items.at(-1)!.sequence}&limit=1`;
+    const history = await (await fetch(`${origin}${historyPath}`, { headers: authorization() })).json();
+    await host.close();
+
+    const kernel = TorsorKernel.open({
+      databasePath, artifactStorage: await LocalArtifactStorage.open(root),
+    });
+    cleanup.push(async () => kernel.close());
+    const retryAdapter = new DeterministicFakeAdapter();
+    await new AgentRuntime({
+      kernel, adapter: retryAdapter, runtimePrincipalId: "principal-runtime", projectIds: ["project-sample"],
+    }).drainUntilIdle();
+    expect(retryAdapter.invocationCount).toBe(0);
+    const service = createTorsorHttpService({
+      kernel, port: 0,
+      credentials: [{ token: "human-token", principalContext: { principalId: "principal-human" } }],
+    });
+    cleanup.push(() => service.close());
+    const restarted = await service.listen();
+    const replay = await fetch(`${restarted}/api/v1/commands/start-thread`, request);
+    expect(await replay.json()).toEqual(created);
+    const restored = await fetch(`${restarted}/api/v1/threads/${thread.threadRootId}`, { headers: authorization() });
+    expect(await restored.json()).toEqual({ thread });
+    expect(await (await fetch(`${restarted}${historyPath}`, { headers: authorization() })).json()).toEqual(history);
+    for (const artifact of thread.artifacts) {
+      expect(artifact).toMatchObject({
+        contentDigest: `sha256:${digest}`, producerThreadRootId: thread.threadRootId,
+      });
+      const download = await fetch(`${restarted}/api/v1/artifacts/${artifact.id}/content`, { headers: authorization() });
+      expect(download.status).toBe(200);
+      expect(await download.text()).toBe(report);
+    }
+    const rejected = await fetch(`${restarted}/api/v1/commands/send-to-run`, {
+      method: "POST", headers: { ...authorization(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        idempotencyKey: "terminal-followup", runId: child.id, expectedRunRevision: child.revision,
+        body: "This must not silently become a Reply.",
+      }),
+    });
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toMatchObject({ error: { code: "terminal_run", requestId: expect.any(String) } });
+    expect(await (await fetch(`${restarted}/api/v1/threads/${thread.threadRootId}`, { headers: authorization() })).json())
+      .toEqual({ thread });
+  });
+
   it("runs an HTTP request through the production host composition", async () => {
     const directory = await temporaryDirectory();
     const databasePath = join(directory, "torsor.sqlite");
@@ -274,6 +489,7 @@ async function seedOutboxBacklog(
 async function waitForCompletedThread(
   origin: string,
   threadRootId: string,
+  expectedRunCount = 1,
 ): Promise<ThreadProjection> {
   const deadline = Date.now() + 3_000;
   while (Date.now() < deadline) {
@@ -283,7 +499,10 @@ async function waitForCompletedThread(
     );
     expect(response.status).toBe(200);
     const body = (await response.json()) as { thread: ThreadProjection };
-    if (body.thread.runs.some((run) => run.state === "Completed")) {
+    if (
+      body.thread.runs.length === expectedRunCount &&
+      body.thread.runs.every((run) => run.state === "Completed")
+    ) {
       return body.thread;
     }
     await new Promise((resolve) => setTimeout(resolve, 10));

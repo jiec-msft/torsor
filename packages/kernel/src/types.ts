@@ -1,3 +1,5 @@
+import type { ArtifactStorage } from "./artifact-storage.js";
+
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue =
   | JsonPrimitive
@@ -92,6 +94,8 @@ export interface CausalLimits {
 
 export interface KernelOpenOptions {
   readonly databasePath: string;
+  readonly artifactStorage?: ArtifactStorage;
+  /** Applied atomically only when initializing an empty version-0 database. */
   readonly bootstrap?: KernelBootstrap;
   readonly clock?: () => Date;
   readonly idFactory?: (prefix: string) => string;
@@ -263,10 +267,18 @@ export interface PublishArtifactCommand extends IdempotentCommand {
   readonly runId: string;
   readonly expectedRunRevision: number;
   readonly contentDigest: string;
-  readonly baseRevision: string;
-  readonly mediaType: string;
-  readonly storageLocation: string;
-  readonly metadata?: JsonValue;
+  readonly byteLength: number;
+}
+
+export interface FinalizeReportInput extends IdempotentCommand {
+  readonly runId: string;
+  readonly expectedRunRevision: number;
+  readonly content: Uint8Array | AsyncIterable<Uint8Array>;
+}
+
+export interface ArtifactContent {
+  readonly artifact: ArtifactView;
+  readonly content: Uint8Array;
 }
 
 export interface CompletionException {
@@ -403,6 +415,11 @@ export interface GetRunProjectionQuery {
   readonly runId: string;
 }
 
+export interface GetArtifactQuery {
+  readonly type: "GetArtifact";
+  readonly artifactId: string;
+}
+
 export interface ListActivityQuery {
   readonly type: "ListActivity";
   readonly runId: string;
@@ -498,6 +515,7 @@ export interface ListWorktreeWriterLeaseEventsQuery {
 }
 
 export type KernelQuery =
+  | GetArtifactQuery
   | GetBootstrapQuery
   | GetThreadProjectionQuery
   | GetRunProjectionQuery
@@ -693,9 +711,10 @@ export interface ArtifactView {
   readonly contentDigest: string;
   readonly producerRunId: string;
   readonly producerActivationId: string;
+  readonly producerThreadRootId: string;
   readonly baseRevision: string;
   readonly mediaType: string;
-  readonly storageLocation: string;
+  readonly byteLength: number;
   readonly visibilityChannelId: string;
   readonly metadata: JsonValue | null;
   readonly createdAt: string;
@@ -825,6 +844,7 @@ export interface WorktreeWriterLeaseEventPage {
 }
 
 export interface QueryResultMap {
+  readonly GetArtifact: ArtifactView;
   readonly GetBootstrap: BootstrapProjection;
   readonly GetThreadProjection: ThreadProjection;
   readonly GetRunProjection: RunProjection;

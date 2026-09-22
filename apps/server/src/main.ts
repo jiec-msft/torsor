@@ -2,7 +2,7 @@ import { mkdir, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 import { CopilotAcpAdapter } from "@torsor/agent-runtime";
-import type { KernelBootstrap, PrincipalContext } from "@torsor/kernel";
+import { LocalArtifactStorage, type KernelBootstrap, type PrincipalContext } from "@torsor/kernel";
 
 import { createLocalRuntimeHost } from "./local-runtime-host.js";
 
@@ -20,9 +20,13 @@ async function main(): Promise<void> {
     ? await loadBootstrap(resolve(process.env.TORSOR_BOOTSTRAP_PATH))
     : undefined;
   await mkdir(dirname(databasePath), { recursive: true });
+  const artifactStorage = process.env.TORSOR_ARTIFACT_ROOT
+    ? await LocalArtifactStorage.open(resolve(process.env.TORSOR_ARTIFACT_ROOT))
+    : undefined;
 
   const host = createLocalRuntimeHost({
     databasePath,
+    ...(artifactStorage ? { artifactStorage } : {}),
     credentials: [
       {
         token: requiredEnvironment("TORSOR_AUTH_TOKEN"),

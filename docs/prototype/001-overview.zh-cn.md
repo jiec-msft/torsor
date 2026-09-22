@@ -979,6 +979,11 @@ Activation 是运行记录，不是主要用户对象。
 
 外部 Worker 可以重复消费 Outbox。
 
+首个可信 Artifact 切片只固化不可变报告字节。Torsor 必须先接收有界字节或字节流、
+自行计算 SHA-256、确认内容已持久落盘，再在现有 Kernel 事务中原子写入
+descriptor、`ArtifactPublished`、`artifact.published` Outbox 和完整幂等结果。
+存储失败不得发布 descriptor；Outbox 不是“将来再上传”却已可下载的承诺。
+
 ### 21.4 过期 Activation
 
 1. 所有 Run 变更要求 expected revision。
@@ -998,6 +1003,35 @@ Runtime 定期恢复：
 - 未完成 Artifact 固化
 
 所有恢复操作继续使用幂等键。
+
+报告固化以 `(principal_id, run_id, idempotency_key)` 标识一次请求。相同请求的
+字节、expected Run revision 必须相同，否则冲突。提交响应丢失后，重试返回原
+Artifact 和原始 provenance，不重复发布事件。新 Activation 只有在当前授权允许
+读取该 Run 时才可重试；重试不是重新使用旧 Activation 权限的途径。
+
+首片采用调用方重试恢复，不后台重放 Provider 输出：临时写入期间崩溃只留下不可见
+临时文件；内容已发布但数据库未提交只留下不可见的内容寻址 blob；数据库提交后
+响应丢失可通过持久幂等结果和 Run/Thread 投影恢复。重试复用并核对既有 blob，
+在事务中再次检查当前权限、Activation 和 Run revision。权限撤销或 Run 终态
+阻止新 descriptor；已提交 descriptor 仍由当前获授权的 Human/Runtime 查询。
+首片不自动删除 orphan 或 staging 文件，避免与并发固化竞争；清理留给停机维护。
+
+持久因果限制与可信 Artifact 的整合数据库使用 schema **15**，同时保留第 25 节的
+Run root/parent/depth、不可变约束、准入索引及持久配置，以及第 23 节的可信报告
+descriptor。此前 causal-only schema 14 和独立开发的 Artifact-only schema 14
+均不兼容；不得因版本数字相同而接受另一套布局。打开任何旧版或未版本化的非空
+开发数据库必须在应用 DDL/Bootstrap 前明确拒绝，不迁移、不改写版本、不删除数据。
+停止旧进程后由操作者显式重建可丢弃数据库。schema 15 重开仍校验持久 causal 配置。
+
+`user_version = 15` 不是布局证明。已有数据库必须在任何 DDL、Bootstrap 或配置写入
+之前，以只读方式对照由可信 DDL 在隔离内存库生成的完整 schema 指纹：对象集合、
+列/type/not-null/default/PK/FK、索引/唯一性/partial predicate、trigger、CHECK
+和 STRICT 等约束。比较 SQLite 解析后的 metadata 与保留 literal/operator 语义的
+SQL token；只忽略空白、注释和未引用 keyword/identifier 大小写，不删除字符串内空白。
+缺失、额外不兼容、部分、损坏、前驱形状或未来布局必须拒绝，保持原文件字节及逻辑
+状态不变，不用 `CREATE IF NOT EXISTS` 修补。SQLite 自有统计对象不属于应用布局。
+只有没有持久对象的 version 0 数据库可在同一事务内执行 DDL、初始配置及 Bootstrap；
+失败完整回滚。有效 schema 15 重开不重新应用 Bootstrap，也不修改持久 causal 配置。
 
 Runtime Host 调度恢复 pass 时，连续执行的 pass 数量必须有界，并在继续前让出事件循环并重新检查关闭请求。积压处理不得饿死 HTTP、timer、signal 或关闭处理。空闲轮询等待必须可被关闭请求中断；无论等待还是关闭先完成，都必须移除对应 listener 并取消不再需要的 timer。
 
@@ -1070,15 +1104,65 @@ producer_run_id
 producer_activation_id
 base_revision
 media_type
-storage_location
+byte_length
+producer_thread_root_id
 visibility_scope
 ```
+
+首片报告使用 `sha256:<lowercase hex>`，固定 `text/plain; charset=utf-8`，
+`base_revision` 为 Torsor 生成的 `run:<id>@<expected revision>`，不声称是 Git
+commit。来源 Run、Activation、Thread 和 home Channel 从可信上下文推导。
+Provider 提供的 digest、descriptor、文件路径或 `file://` URL 均不具有权威性。
+普通 `PublishArtifact` 命令必须拒绝；只有接收字节的可信 finalizer 可进入发布事务。
+
+报告上限为 1 MiB；流还限制为最多 4096 个 chunk。finalizer 复制输入字节后计算
+digest，存储适配器不接收 Provider 路径。窄接口只有不可变写入与按 digest/长度读取；
+适配器由可信 Host 静态配置，不向 Provider 暴露。相同 Run/digest 保留一个
+descriptor；其他 key 重复发布同一内容返回冲突，不改写 provenance。
+
+父子 Run 可以固化相同字节并复用一个内容寻址 blob，但必须各有独立 descriptor、
+来源 Run/Activation/Thread 和幂等作用域。Artifact 通过 `producer_run_id` 追溯到
+Run 的不可变 causal root、parent Attention/Run 和 depth，不另存可漂移的因果副本。
+父子关系和相同 digest 均不授予跨 Run 读取权。固化、下载、失败和重放都不创建或
+释放 Run 名额、不重写因果来源，也不处置 RunInput 或隐式完成 Run；重启后的
+Run/Thread 及分页投影必须同时保留 causal 字段和 Artifact 引用。
+
+开发/测试本地布局为私有 root 下 `sha256/<64 hex>` 和 `staging/<random>.tmp`。
+先独占创建临时文件、写入并 flush，再用不覆盖目标的原子 hard-link 发布；同名目标
+必须核对长度、digest 和全部字节，不得覆盖。读取同样核对长度和 digest。
+拒绝非法 digest、路径穿越、符号链接/目录联接和非普通文件。root 及其祖先必须由
+可信 Host 控制，不可放在 Provider/Worktree 可写范围；此适配器不是对同一 OS 用户
+恶意并发改写的沙箱。POSIX 同时 flush 目录；Windows 支持进程崩溃/重启恢复，但不
+承诺 portable Node API 无法提供的目录 flush/断电持久性。生产远端存储另行实现接口。
 
 ### 23.2 权限
 
 1. Artifact 默认继承 Run 的 home Channel 可见性。
-2. 下载时再次授权。
-3. 存储 URL 使用短期签名。
+2. 每次 descriptor 查询和下载重新检查当前 Principal、Project、home Channel、
+   Run/Activation scope；读取异步存储之后、返回字节之前再次检查。
+3. 首片公开契约只有 Artifact ID 和 descriptor，不暴露内部路径或直接存储 URL。
+   HTTP 使用 `GET /api/v1/artifacts/:id` 和 `GET /api/v1/artifacts/:id/content`；
+   持有 ID/digest 不是授权。响应禁用缓存，内容按 attachment/plain text 返回。
+4. 当前本地权限模型中 Human/Runtime 拥有全局读取权，Agent 受实时 Activation
+   的 Project/Channel/Thread/Run scope 限制；不在本片新增 ACL 管理系统。
+   如后续使用短期签名 URL，它不能绕过当前权限复核。
+5. Agent 只能读取 `producer_run_id = scope.runId` 的平台 Artifact metadata；
+   Attention scope 没有 Run，因此不含任何 Artifact。此规则同时适用于当前/历史
+   Thread 与 Run 投影、列表、分页、条件提交的 catch-up 错误、事件和 SSE，以及
+   Runtime 提供给 Provider 的上下文；同 Thread、亲属关系或相同内容不扩大授权。
+   不返回被过滤 Artifact 的列表项、数量、digest、来源或事件 payload。显式公开
+   Message 的正文仍是 Channel/Thread 沟通，不因此变成 descriptor 或读取授权。
+6. 查找 Artifact ID 前先校验 Principal 和当前 Activation/scope。已授权调用者的
+   不存在及不可见 ID 均返回相同的 `NotFound`（HTTP 404）、通用 message 和响应
+   headers，不附带存在性、存储或来源详情，不读取不可见 blob。未认证仍为 401；
+   stale/revoked scope 的确定性错误在查找前产生，与 ID 是否存在无关。
+7. 过滤不阻断有界扫描：`scannedThroughEventId` 继续推进，它是 opaque 高水位而非
+   隐藏报告的数量或身份。SSE 对过滤尾部发送只含 opaque `cursor` 的 `checkpoint`
+   事件并设置 `id`；Client 的原生重连及替换连接采用该高水位，不合成 Artifact
+   timeline 条目、不暴露过滤 payload，也不清空已加载历史或 Composer 状态。
+   条件提交的 catch-up 最多扫描 100 个事件，同时返回 `scannedThroughEventId`
+   和 `hasMore`，过滤发生在扫描之后。Artifact 事件不通过跨窗口 BroadcastChannel
+   转发或接收；每个窗口只消费自己的已认证流，旧连接不能覆盖新 scope 的游标。
 
 ### 23.3 集成
 
@@ -1097,6 +1181,11 @@ visibility_scope
 MVP 不新增 `ArtifactInput`。
 
 Artifact 通过 Thread 中的 Message 或卡片引用，再将该 Message revision 分配为 RunInput。
+
+引用只使用已固化 Artifact ID；引用、报告文本和 Provider 输出都不自动授予读取权、
+创建 RunInput 或完成 Run。Runtime 的可选 `publish_report` capability 只接受稳定
+请求 key 和报告文本，不接受 digest/location/provenance；任意 ACP
+`publish_artifact` 仍禁用。
 
 ## 24. Provider 取消、暂停和 Resume
 
@@ -1432,6 +1521,16 @@ Activity      - Run、ProviderAttempt、Lease 和状态时间线
 ```
 
 这些 Tab 是 Client view state，不是领域对象。
+
+首片通过既有 Run/Thread 的 Artifact 投影提供已固化报告的 digest、长度、media
+type 和 Run/Thread 来源，并通过授权 HTTP 接口下载。尚未固化的 Provider 文本、
+临时文件和 orphan blob 不得显示为已发布 Artifact。存储缺失、篡改、权限变化或
+下载失败必须显式失败，不能显示空白成功。新增 Artifacts UI、GitHub 状态机、
+Worktree 执行、通用插件市场和 ArtifactInput 均不属于本片。
+
+初始页面、历史回填和实时替换均遵循 §23.2 的当前 scope，不能把同 Thread 的
+其他 Run 报告混入 Agent 的列表或计数。过滤 checkpoint 只更新恢复游标，不构造
+报告条目或重置 Timeline/Composer；切换认证 scope 后不得保留前一 scope 的投影。
 
 `Live` 不应是静态 Run Dashboard。推荐按时间顺序投影：
 

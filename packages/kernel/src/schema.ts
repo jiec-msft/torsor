@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 14;
+export const CURRENT_SCHEMA_VERSION = 15;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -388,9 +388,10 @@ CREATE TABLE IF NOT EXISTS artifacts (
   content_digest TEXT NOT NULL,
   producer_run_id TEXT NOT NULL REFERENCES runs(id),
   producer_activation_id TEXT NOT NULL REFERENCES activation_attempts(id),
+  producer_thread_root_id TEXT NOT NULL REFERENCES threads(root_message_id),
   base_revision TEXT NOT NULL,
   media_type TEXT NOT NULL,
-  storage_location TEXT NOT NULL,
+  byte_length INTEGER NOT NULL CHECK (byte_length >= 0 AND byte_length <= 1048576),
   visibility_channel_id TEXT NOT NULL REFERENCES channels(id),
   metadata_json TEXT,
   created_event_sequence INTEGER REFERENCES public_events(sequence),
