@@ -617,6 +617,8 @@ disposition_revision
 6. One Message revision may be assigned to different Runs.
 7. Creation atomically assigns monotonic `run_input_sequence`.
 8. Creation increments Run revision.
+9. Human `send_to_run` requires the observed `expected_run_revision`; it is not optional. The revision check, public Message, Human-assigned RunInput, revision increment, and delivery Outbox commit in one transaction.
+10. Client submission state is separate from the RunInput `Pending` disposition. A definite transaction rejection creates neither Message nor RunInput; a lost response leaves the commit outcome unknown and cannot establish that neither committed.
 
 ### 19.3 Semantic disposition
 
@@ -1134,7 +1136,7 @@ The Workbench composer is not private Provider input. It performs:
 send_to_run(
   run_id,
   message_body,
-  expected_run_revision?
+  expected_run_revision
 )
 
 → create a Human Message in the Run's home Thread
@@ -1150,6 +1152,10 @@ send_to_run(
 5. Terminal Runs reject Send-to-Run and offer Successor creation.
 6. Without real-time Steer, RunInput remains Pending while UI immediately shows it was added.
 7. Message and RunInput succeed or fail together.
+8. Web uses the existing `POST /api/v1/commands/send-to-run` with `idempotencyKey`, `runId`, `body`, and required `expectedRunRevision`. The Run determines the destination Thread and Agent; do not substitute ordinary Reply or direct Provider input.
+9. One submission identity fixes the Human Principal, Run, body, revision, and idempotency key. Preserve it across lost responses, network errors, unreadable responses, or uncertain server outcomes. Recover by retrying the identical request, never guessing with a new revision or key. Idempotent replay returns the original result even after the Run advances or becomes terminal.
+10. Current-credential failure requires reauthentication while preserving the draft and submission identity; recovery requires the original Human Principal. A delayed `401` from obsolete credentials must not clear a replacement session and may retry the original request with replacement credentials for the same Principal. Authentication/authorization rejection during recovery cannot prove that an earlier unknown submission did not commit.
+11. Definite stale-revision or terminal-Run transaction rejection creates neither half. Preserve the draft and refresh facts for Human judgment; never automatically change revision and resubmit. Terminal Runs disallow new submissions. If Successor creation is not implemented in the Client, explicitly mark it unavailable and direct the Human to request follow-up in the public Thread rather than offering a false action.
 
 ```text
 @Agent
@@ -1552,13 +1558,18 @@ Send to Sable · R184
 Also published in #torsor-core / current Thread
 ```
 
-It uses atomic `send_to_run`. Client may optimistically show the Human item and update:
+It uses atomic `send_to_run` from section 36 independently of Live Timeline implementation.
 
-```text
-Pending → Delivered → Accepted
-```
-
-Delivery state does not replace semantic disposition. On send failure, restore the draft and state that neither Message nor RunInput committed; never show a half-success.
+1. Show target Agent name and ID, full Run ID, observed revision, and the explicit public home Channel/Thread destination with a return action.
+2. Show `Submitting` and prevent duplicate submission. Do not insert optimistic Message or RunInput into committed projections. Success confirms both committed and refreshes Thread and RunInput facts; a read failure only means projections need refreshing, not that the acknowledged commit failed.
+3. A definite transaction rejection reports the reason and that neither committed. A structured `413/payload_too_large` with `requestId` received before command execution on the initial attempt, with no prior unknown outcome, is also a definite rejection: release the recovery request identity, retain an editable draft, and let the Human shorten or replace the body and send again with a new idempotency key. Revision conflict preserves the draft and requires refresh and another Human send; terminal rejection must not fall back to ordinary Reply.
+4. Lost responses and other uncertain outcomes show `Submission outcome unknown`, never `Not submitted`. Freeze the original request and offer `Retry same submission`. If the prior outcome is unknown, authentication/authorization failures or `413/payload_too_large` during retry preserve uncertainty and the original request identity until same-identity idempotent replay confirms the outcome. Rejecting a later request before command execution cannot establish that the earlier request did not commit.
+5. Retain per-Run drafts and recovery identities as local state of the current Client Window across panel closure, Run selection, background refresh, and reauthentication. Late results update only their own Run's submission, never clear another Run's draft or navigate back. This slice does not promise draft recovery after browser reload or process exit.
+6. Committed does not mean the Provider received, accepted, or incorporated the input. Do not show `Delivered` or `Accepted` without public delivery evidence; display RunInput disposition separately. Unknown real-time Steer capability must explicitly disclaim immediate delivery without disabling durable RunInput submission.
+7. Provide labels, perceivable pending/success/error states, visible focus, and keyboard submission/recovery. Enter inserts a newline; Ctrl/Cmd+Enter explicitly submits without interfering with IME. Async outcomes must not steal focus from another Run or control. On narrow viewports, destination, body, status, and actions must wrap/scroll and remain keyboard-accessible.
+8. Explicitly explain absent/mismatched Run projections, unavailable authentication, terminal state, and unimplemented Successor/real-time control capabilities. Never present clickable no-op actions.
+9. Thread and Run reads own their replacement, loading, and error state independently. A paired refresh must not discard a still-current half through a shared freshness predicate. A single or paired replacement takes over only its own projection; the remaining current half must complete or explicitly fail. Replacement failure propagates to waiters; old responses must not clear loading, errors, or facts for a newer selection, Session, or Project. Publish both halves together when both remain current and succeed; if both remain current but either read fails, retain the original projections, settle loading, and allow read retry.
+10. Failure of either projection read after an acknowledged commit must expose a perceivable `Committed; projections could not be refreshed` inside that Run's Composer, including narrow-screen modals, not only in inert content outside the modal. The existing Composer refresh action retries reads only, never the command. Retain the acknowledged request's idempotency identity and receipt separately from unconfirmed recovery identity; refresh failure must not turn a committed submission into unknown or a retryable command. Scope refresh state by Run and attempt and retain it across pane remounts; older refresh results must not overwrite newer refreshes or steal Human focus.
 
 ### 44.3 Tool Call expansion and failure
 

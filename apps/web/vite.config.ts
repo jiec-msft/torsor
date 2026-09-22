@@ -12,6 +12,10 @@ export default defineConfig({
   },
   test: {
     environment: "jsdom",
+    server: {
+      // Keep SQLite in native Node when jsdom tests use the real HTTP service.
+      deps: { external: [/\/packages\/kernel\/dist\//] },
+    },
     setupFiles: "./src/test/setup.ts",
     css: true,
   },
