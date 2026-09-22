@@ -2,7 +2,7 @@ import { waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { WebController } from "./controller";
-import type { PublicEvent } from "./types";
+import type { ActivityEvent, PublicEvent, RunProjection } from "./types";
 import {
   agent,
   attention,
@@ -106,6 +106,7 @@ function createHarness(
     threadResponse?: (url: string) => Promise<Response>;
     runsResponse?: (callNumber: number) => Promise<Response>;
     runResponse?: (url: string) => Promise<Response>;
+    activityResponse?: (url: string) => Promise<Response>;
     commandResponse?: (
       callNumber: number,
       init?: RequestInit,
@@ -189,6 +190,12 @@ function createHarness(
         snapshotEventId: "event-7",
       });
     }
+    if (url.includes("/activity?")) {
+      if (options.activityResponse) {
+        return options.activityResponse(url);
+      }
+      throw new Error(`Unexpected history request: ${url}`);
+    }
     if (url.endsWith("/runs/run-1")) {
       counts.run += 1;
       if (options.runResponse) {
@@ -201,12 +208,7 @@ function createHarness(
       if (options.runResponse) {
         return options.runResponse(url);
       }
-      return json({
-        run: {
-          ...runProjection,
-          run: { ...runProjection.run, id: "run-2" },
-        },
-      });
+      return json({ run: activityProjection(1, 1, "run-2") });
     }
     if (url.endsWith("/projects/project-sample/agents")) {
       counts.agents += 1;
@@ -279,7 +281,250 @@ function publicEvent(overrides: Partial<PublicEvent> = {}): PublicEvent {
   };
 }
 
+function activityProjection(first: number, last: number, runId = "run-1"): RunProjection {
+  const items: ActivityEvent[] = Array.from({ length: Math.max(0, last - first + 1) }, (_, index) => ({
+    ...runProjection.activity.items[0]!,
+    id: `${runId}-activity-${first + index}`,
+    runId,
+    sequence: first + index,
+    kind: "agent_message_chunk",
+    payload: { text: `Visible delta ${first + index}` },
+  }));
+  return {
+    ...runProjection,
+    run: { ...runProjection.run, id: runId },
+    activity: {
+      items, hasEarlier: first > 1,
+      earliestSequence: items[0]?.sequence ?? null,
+      latestSequence: items.at(-1)?.sequence ?? null,
+    },
+  };
+}
+
 describe("WebController", () => {
+  it("retains >100 activity events across backfill, reconnect, duplicate and reordered invalidations", async () => {
+    let current = activityProjection(151, 250);
+    const historyRequests: URL[] = [];
+    const harness = createHarness({
+      runResponse: async () => json({ run: current }),
+      activityResponse: async (path) => {
+        const url = new URL(path, "http://localhost");
+        historyRequests.push(url);
+        const after = Number(url.searchParams.get("afterSequence") ?? 0);
+        const before = Number(url.searchParams.get("beforeSequence"));
+        const forward = url.searchParams.has("afterSequence");
+        const all = activityProjection(after + 1, before - 1).activity.items;
+        const items = forward ? all.slice(0, 100) : all.slice(-100);
+        return json({
+          items,
+          hasMore: all.length > 100,
+          nextCursor: all.length > 100
+            ? (forward ? items.at(-1)!.sequence : items[0]!.sequence)
+            : null,
+        });
+      },
+    });
+    try {
+      await harness.controller.exchangeSession("human-token", "project-sample");
+      await harness.controller.loadRun("run-1");
+      await harness.controller.loadEarlierRunActivity();
+      expect(harness.controller.getSnapshot().run?.activity.items).toHaveLength(200);
+      await harness.controller.loadEarlierRunActivity();
+      expect(harness.controller.getSnapshot().run?.activity.hasEarlier).toBe(false);
+
+      const source = FakeEventSource.instances[0]!;
+      source.open();
+      source.fail();
+      current = activityProjection(401, 500);
+      source.open();
+      await waitFor(() => expect(
+        harness.controller.getSnapshot().run?.activity.latestSequence,
+      ).toBe(500));
+      const event = publicEvent({
+        eventId: "activity-event-500",
+        entityType: "RunActivityEvent",
+        payload: { runId: "run-1", sequence: 500 },
+      });
+      source.emit(event);
+      source.emit(event);
+      source.emit({ ...event, eventId: "activity-event-499", payload: { runId: "run-1", sequence: 499 } });
+      await waitFor(() => expect(harness.controller.getSnapshot().loadingRun).toBe(false));
+      expect(harness.controller.getSnapshot().run?.activity.items.map((item) => item.sequence))
+        .toEqual(Array.from({ length: 500 }, (_, index) => index + 1));
+      expect(historyRequests.map((url) => url.searchParams.get("limit"))).toEqual(["100", "100", "100", "100"]);
+      expect(historyRequests.slice(2).map((url) => url.searchParams.get("beforeSequence"))).toEqual(["401", "401"]);
+      expect(harness.counts.commands).toBe(0);
+    } finally {
+      harness.controller.dispose();
+    }
+  });
+
+  it("keeps history on a failed backfill and exposes a retry", async () => {
+    let fail = true;
+    const harness = createHarness({
+      runResponse: async () => json({ run: activityProjection(6, 105) }),
+      activityResponse: async () => fail
+        ? json({ error: { message: "History unavailable" } }, 503)
+        : json({ items: activityProjection(1, 5).activity.items, hasMore: false, nextCursor: null }),
+    });
+    try {
+      await harness.controller.exchangeSession("human-token", "project-sample");
+      await harness.controller.loadRun("run-1");
+      expect(await harness.controller.loadEarlierRunActivity()).toBe(false);
+      expect(harness.controller.getSnapshot()).toMatchObject({
+        loadingRunHistory: false, runHistoryError: "History unavailable",
+        run: { activity: { hasEarlier: true, earliestSequence: 6 } },
+      });
+      fail = false;
+      await harness.controller.loadEarlierRunActivity();
+      expect(harness.controller.getSnapshot().run?.activity.items).toHaveLength(105);
+      expect(harness.controller.getSnapshot().runHistoryError).toBeNull();
+    } finally {
+      harness.controller.dispose();
+    }
+  });
+
+  it("merges a held history page with newly refreshed live events without dropping either", async () => {
+    let current = activityProjection(151, 250);
+    let release!: (response: Response) => void;
+    const harness = createHarness({
+      runResponse: async () => json({ run: current }),
+      activityResponse: () => new Promise((resolve) => { release = resolve; }),
+    });
+    try {
+      await harness.controller.exchangeSession("human-token", "project-sample");
+      await harness.controller.loadRun("run-1");
+      const history = harness.controller.loadEarlierRunActivity();
+      current = activityProjection(251, 350);
+      await harness.controller.loadRun("run-1");
+      release(json({ items: activityProjection(51, 150).activity.items, hasMore: true, nextCursor: 51 }));
+      await history;
+      expect(harness.controller.getSnapshot().run?.activity.items.map((event) => event.sequence))
+        .toEqual(Array.from({ length: 300 }, (_, index) => index + 51));
+      expect(harness.controller.getSnapshot().run?.activity.hasEarlier).toBe(true);
+    } finally {
+      harness.controller.dispose();
+    }
+  });
+
+  it("surfaces a nonadvancing catch-up page without losing history and recovers on retry", async () => {
+    let current = activityProjection(1, 100);
+    let broken = true;
+    const harness = createHarness({
+      runResponse: async () => json({ run: current }),
+      activityResponse: async () => broken
+        ? json({ items: [], hasMore: true, nextCursor: 100 })
+        : json({ items: activityProjection(101, 150).activity.items, hasMore: false, nextCursor: null }),
+    });
+    try {
+      await harness.controller.exchangeSession("human-token", "project-sample");
+      await harness.controller.loadRun("run-1");
+      current = activityProjection(151, 250);
+      expect(await harness.controller.loadRun("run-1")).toBe(false);
+      expect(harness.controller.getSnapshot().queryError).toMatch(/cursor/);
+      expect(harness.controller.getSnapshot().runRefreshError).toMatch(/cursor/);
+      expect(harness.controller.getSnapshot().run?.activity.latestSequence).toBe(100);
+      broken = false;
+      await harness.controller.loadRun("run-1");
+      expect(harness.controller.getSnapshot().run?.activity.items).toHaveLength(250);
+      expect(harness.controller.getSnapshot().queryError).toBeNull();
+      expect(harness.controller.getSnapshot().runRefreshError).toBeNull();
+    } finally {
+      harness.controller.dispose();
+    }
+  });
+
+  it("fences catch-up on selection changes and preserves newer terminal Run revisions", async () => {
+    let current = activityProjection(1, 100);
+    let release!: (response: Response) => void;
+    let activityCalls = 0;
+    const harness = createHarness({
+      runResponse: async () => json({ run: current }),
+      activityResponse: () => {
+        activityCalls += 1;
+        return new Promise((resolve) => { release = resolve; });
+      },
+    });
+    try {
+      await harness.controller.exchangeSession("human-token", "project-sample");
+      await harness.controller.loadRun("run-1");
+      current = activityProjection(401, 500);
+      const catchUp = harness.controller.loadRun("run-1");
+      await waitFor(() => expect(activityCalls).toBe(1));
+      harness.controller.clearRun();
+      release(json({ items: activityProjection(101, 200).activity.items, hasMore: true, nextCursor: 200 }));
+      await catchUp;
+      expect(activityCalls).toBe(1);
+      expect(harness.controller.getSnapshot().run).toBeNull();
+
+      current = {
+        ...activityProjection(1, 100),
+        run: { ...runProjection.run, revision: 4, state: "Cancelled" },
+      };
+      await harness.controller.loadRun("run-1");
+      current = activityProjection(2, 101);
+      await harness.controller.loadRun("run-1");
+      expect(harness.controller.getSnapshot().run?.run).toMatchObject({ revision: 4, state: "Cancelled" });
+      expect(harness.controller.getSnapshot().run?.activity.items).toHaveLength(101);
+    } finally {
+      harness.controller.dispose();
+    }
+  });
+
+  it("fences a late history response across Run switches and session clearing", async () => {
+    let release!: (response: Response) => void;
+    const harness = createHarness({
+      runResponse: async (url) => json({ run: activityProjection(6, 105, url.endsWith("run-2") ? "run-2" : "run-1") }),
+      activityResponse: () => new Promise((resolve) => { release = resolve; }),
+    });
+    try {
+      await harness.controller.exchangeSession("human-token", "project-sample");
+      await harness.controller.loadRun("run-1");
+      const oldHistory = harness.controller.loadEarlierRunActivity();
+      await harness.controller.loadRun("run-2");
+      await harness.controller.loadRun("run-1");
+      release(json({ items: activityProjection(1, 5).activity.items, hasMore: false, nextCursor: null }));
+      await oldHistory;
+      expect(harness.controller.getSnapshot().run?.activity.earliestSequence).toBe(6);
+      const signedOutHistory = harness.controller.loadEarlierRunActivity();
+      await harness.controller.signOut();
+      release(json({ items: activityProjection(1, 5).activity.items, hasMore: false, nextCursor: null }));
+      await signedOutHistory;
+      expect(harness.controller.getSnapshot()).toMatchObject({
+        run: null, loadingRunHistory: false, runHistoryError: null,
+      });
+    } finally {
+      harness.controller.dispose();
+    }
+  });
+
+  it("retries history after another window rotates credentials without expiring the session", async () => {
+    let release!: (response: Response) => void;
+    let calls = 0;
+    const harness = createHarness({
+      runResponse: async () => json({ run: activityProjection(6, 105) }),
+      activityResponse: async () => {
+        calls += 1;
+        return calls === 1
+          ? new Promise<Response>((resolve) => { release = resolve; })
+          : json({ items: activityProjection(1, 5).activity.items, hasMore: false, nextCursor: null });
+      },
+    });
+    try {
+      await harness.controller.exchangeSession("human-token", "project-sample");
+      await harness.controller.loadRun("run-1");
+      const history = harness.controller.loadEarlierRunActivity();
+      harness.broadcasts[0]!.receive({ kind: "session", principalId: "principal-human", csrfToken: "rotated" });
+      release(json({ error: { message: "Old credentials" } }, 401));
+      await history;
+      expect(calls).toBe(2);
+      expect(harness.controller.getSnapshot().session).toBe("ready");
+      expect(harness.controller.getSnapshot().run?.activity.items).toHaveLength(105);
+    } finally {
+      harness.controller.dispose();
+    }
+  });
+
   it("binds the browser fetch receiver when no custom transport is supplied", async () => {
     FakeEventSource.instances = [];
     const storage = new MemoryStorage();
@@ -332,6 +577,7 @@ describe("WebController", () => {
       }
       throw new Error(`Unhandled fetch: ${url}`);
     });
+
     vi.stubGlobal("fetch", nativeLikeFetch);
     const controller = new WebController({
       sessionStorage: storage,
@@ -984,7 +1230,7 @@ describe("WebController", () => {
     expect(durableAttentions).toBe(2);
   });
 
-  it("marks reconnection stale and refetches only event-affected projections", async () => {
+  it("refreshes selected Run history on reconnect and otherwise only event-affected projections", async () => {
     const harness = createHarness();
     await harness.controller.exchangeSession("local-secret", "project-sample");
     await harness.controller.loadThreads("channel-general");
@@ -1003,7 +1249,7 @@ describe("WebController", () => {
       expect(harness.counts.threads).toBe(baseline.threads + 1);
       expect(harness.counts.thread).toBe(baseline.thread + 1);
     });
-    expect(harness.counts.run).toBe(baseline.run);
+    expect(harness.counts.run).toBe(baseline.run + 1);
     expect(harness.counts.runs).toBe(baseline.runs);
     expect(harness.counts.agents).toBe(baseline.agents);
     expect(
@@ -1161,10 +1407,7 @@ describe("WebController", () => {
   it("cancels a queued Run refresh after navigation changes selection", async () => {
     let blockRunA = false;
     let resolveRunA: ((response: Response) => void) | undefined;
-    const runB = {
-      ...runProjection,
-      run: { ...runProjection.run, id: "run-2" },
-    };
+    const runB = activityProjection(1, 1, "run-2");
     const harness = createHarness({
       runResponse: (url) => {
         if (url.endsWith("/run-2")) {

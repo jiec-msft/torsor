@@ -3,7 +3,8 @@
 > 简体中文（主要版本） | [English](001-overview.md)
 
 > 状态：工作笔记  
-> 更新时间：2026-09-21  
+> 更新时间：2026-09-22
+>
 > 目的：记录当前已经达成的设计共识、仍未解决的问题，以及下一轮推导入口。  
 > 注意：本文只记录当前讨论结论，不代表最终产品规格。
 >
@@ -1440,6 +1441,11 @@ Run completion
 Run 状态、Worktree generation、Pending inputs、child Runs 和 diff stat
 压缩到 Header 或可展开的摘要，不应长期占据主要阅读区域。
 
+生产 Web 的 Live Agent Timeline 首先投影已经存在的持久事实：可见 delta、
+公开 status、RunInput、ProviderAttempt 和显式 Run 终态。Timeline 是主要阅读区，
+Activation 等诊断信息可折叠；保留来源 Thread、窄视口导航和键盘可访问性。
+本切片不改变 Human Run Composer，也不伪造尚无 Producer 的 Tool Call 或文件事件。
+
 ## 36. Human 直接 Send-to-Run
 
 Run Workbench 中的输入框不是绕过 Channel 的私有 Provider 输入。
@@ -1493,6 +1499,10 @@ Provider token/delta
 
 只有 Agent显式调用 `reply`，或 Adapter 有明确的 final-public-response 映射时，才创建持久 Message。
 
+当前 ACP Adapter 的 `agent_message_chunk` 经 capability bridge 的
+`AppendRunActivity` 持久化后才进入 Timeline。delta、status、Provider 回合结束、
+HTTP 读取和 SSE 重放都不得自动发布 Message、处置 RunInput 或完成 Run。
+
 ### 37.2 RunActivityEvent
 
 它是运行记录，不是新的协作领域对象。
@@ -1522,6 +1532,14 @@ retention class
 - delivery retry
 - terminal output reference
 
+活动身份和顺序以服务端分配的 `id` 和 Run 内单调 `sequence` 为准，不以
+timestamp、HTTP 返回顺序或 SSE 到达顺序为准。SQLite 写入活动、分配 sequence
+和公开 invalidation event 必须原子提交。Run projection 默认仅含最近 100 条；
+这不是完整历史。`ListActivity` / HTTP activity API 每页有界，支持 exclusive
+`afterSequence` 向前续读和 exclusive `beforeSequence` 向后回填；向后页仍按
+sequence 升序返回，`nextCursor` 指向该页最早 sequence。同时提供两个边界时，
+在有限区间内向前读取。Client 每次显式加载较早历史最多读取 100 条。
+
 ### 37.3 安全边界
 
 1. 不展示或持久化隐藏 chain-of-thought。
@@ -1534,6 +1552,14 @@ retention class
 8. Client 只有在 Human 仍位于时间线底部时自动跟随新输出；Human 向上滚动后停止强制滚动，并显示“回到最新”。
 9. Tool Call 默认折叠，运行状态始终可见；Human 按需展开参数、命令、输出、diff 或错误。
 10. UI 不展示隐藏 chain-of-thought。可展示的是 Agent 明确公开的计划、状态说明和 Provider 标记为 user-visible 的 reasoning summary。
+11. SSE 只使投影失效，不是活动正文或状态权威。Client 从认证 HTTP 读取持久事实；
+    重放、重复、乱序通知和重连必须按活动身份去重并按 sequence 排序，保留已加载历史。
+    新窗口与已加载末尾之间的缺口以每页最多 100 条、固定读取上界补齐，不追逐无限增长的 head。
+12. 后台刷新不得卸载 Timeline 或夺走焦点。向前追加时，Human 向上滚动后保持阅读位置；
+    向前部插入历史时保持可见条目及其相对位置。`Back to latest` 显式恢复跟随。
+    切换 Run 重置该视图的历史、错误和跟随状态；旧 Run/旧 session 的迟到响应不得写入新视图。
+13. 历史读取失败必须可见、可重试，且不得清空已有条目或把未知历史显示成完整历史。
+    认证、跨窗口 session 更新、授权范围及 revision fencing 继续适用于所有补读请求。
 
 ## 38. Files
 
@@ -2069,6 +2095,15 @@ Run source
 Timeline item 必须显示其来源类型，但不需要把每种显示节点升级为领域对象。
 稳定历史和活跃 streaming head 可以分开传输，Client 再组合成一条连续时间线。
 
+每个活动显示来源类型、原始 kind、Run 内 sequence、timestamp，以及可用的
+Activation/ProviderAttempt 来源。已知可见 delta 和 status 使用聚焦的纯文本呈现；
+未知 kind 只显示通用活动标记和来源元数据，不执行 HTML，也不猜测或展开未知 payload。
+RunInput 和 ProviderAttempt 使用已有投影的当前事实、时间和各自身份；不得伪造
+RunActivityEvent sequence。RunInput 的语义 disposition 与 Provider delivery 分开显示。
+Run `Active` 不等于 Provider 正在运行，Provider `Completed` 不等于 Run 完成；
+Run `Completed`、`Failed`、`Cancelled` 以服务端 Run 状态和 revision 为准。
+取消后 Provider 仍为 `Started` / `Acknowledged` / `Unknown` 时，明确显示停止未确认。
+
 ### 44.2 Run Composer
 
 每个 Agent Run Pane 底部固定一个 Composer。它明确显示目标 Agent 和 Run：
@@ -2108,6 +2143,11 @@ Human 展开后才看到：
 - ProviderAttempt 或 TerminalSession 来源。
 
 运行、失败和取消必须在折叠状态下也能区分。展开状态属于 Client view state。
+
+以上 Tool Call 生命周期是后续 Producer 能力的要求，不是本次 Live Timeline
+启用 ACP native tools 的授权。当前 Adapter 保持 deny-by-default；不把文本 delta
+解析为工具执行，不生成假 Tool Call。当前已存在的 Provider 运行/失败/Unknown 与
+Run 失败/取消事实无需展开即可区分，细节按需展开。
 
 ### 44.4 外部能力和插件边界
 

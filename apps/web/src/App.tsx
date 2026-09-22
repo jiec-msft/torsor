@@ -33,6 +33,7 @@ import {
 } from "react";
 
 import type { WebController, WebState } from "./controller";
+import { LiveTimeline } from "./LiveTimeline";
 import {
   readRoute,
   type ViewName,
@@ -470,6 +471,8 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
         route={route}
         state={state}
         onClose={() => updateRoute(setRoute, { ...route, detailOpen: false })}
+        onLoadEarlier={() => { void controller.loadEarlierRunActivity(); }}
+        onRefreshRun={() => { if (route.runId) void controller.loadRun(route.runId); }}
         onSelectRun={selectRun}
         onSelectThread={selectThread}
       />
@@ -1172,6 +1175,8 @@ function DetailPanel({
   route,
   state,
   onClose,
+  onLoadEarlier,
+  onRefreshRun,
   onSelectRun,
   onSelectThread,
 }: {
@@ -1180,6 +1185,8 @@ function DetailPanel({
   readonly route: WindowRoute;
   readonly state: WebState;
   readonly onClose: () => void;
+  readonly onLoadEarlier: () => void;
+  readonly onRefreshRun: () => void;
   readonly onSelectRun: (runId: string, threadId: string, channelId: string) => void;
   readonly onSelectThread: (threadId: string, channelId: string) => void;
 }) {
@@ -1204,7 +1211,7 @@ function DetailPanel({
         </IconButton>
       </div>
       {route.detailPanel === "run" && route.runId ? (
-        <RunDetail state={state} />
+        <RunDetail state={state} onLoadEarlier={onLoadEarlier} onRefresh={onRefreshRun} />
       ) : (
         <StatusDetail
           state={state}
@@ -1329,8 +1336,12 @@ function StatusDetail({
   );
 }
 
-function RunDetail({ state }: { readonly state: WebState }) {
-  if (state.loadingRun) {
+function RunDetail({ state, onLoadEarlier, onRefresh }: {
+  readonly state: WebState;
+  readonly onLoadEarlier: () => void;
+  readonly onRefresh: () => void;
+}) {
+  if (state.loadingRun && !state.run) {
     return <FullLoading label="Loading atomic Run projection" />;
   }
   const projection = state.run;
@@ -1366,6 +1377,18 @@ function RunDetail({ state }: { readonly state: WebState }) {
           <p className="terminal-reason">{projection.run.terminalReason}</p>
         ) : null}
       </section>
+      <LiveTimeline
+        projection={projection}
+        connection={state.connection}
+        loadingHistory={state.loadingRunHistory}
+        historyError={state.runHistoryError}
+        refreshError={state.runRefreshError}
+        refreshing={state.loadingRun}
+        onLoadEarlier={onLoadEarlier}
+        onRefresh={onRefresh}
+      />
+      <details className="run-diagnostics">
+        <summary>Run diagnostics</summary>
       <DetailSection title="RunInputs" count={projection.inputs.length}>
         {projection.inputs.length ? (
           projection.inputs.map((input) => (
@@ -1426,24 +1449,7 @@ function RunDetail({ state }: { readonly state: WebState }) {
           <p className="compact-empty">No Provider attempts.</p>
         )}
       </DetailSection>
-      <DetailSection title="Activity" count={projection.activity.items.length}>
-        {projection.activity.items.length ? (
-          projection.activity.items.map((event) => (
-            <div className="activity-event" key={event.id}>
-              <StatusDot tone="active" />
-              <span>
-                <strong>{event.kind}</strong>
-                <small>
-                  sequence {event.sequence} · {formatTime(event.createdAt)}
-                </small>
-                <code>{summarizePayload(event.payload)}</code>
-              </span>
-            </div>
-          ))
-        ) : (
-          <p className="compact-empty">No visible Run activity.</p>
-        )}
-      </DetailSection>
+      </details>
     </div>
   );
 }
@@ -1865,7 +1871,7 @@ function trapDrawerFocus(event: ReactKeyboardEvent<HTMLElement>): void {
   }
   const focusable = Array.from(
     event.currentTarget.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+      'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], summary, [tabindex]:not([tabindex="-1"])',
     ),
   ).filter((element) => !element.hasAttribute("inert"));
   if (focusable.length === 0) {
@@ -2012,12 +2018,4 @@ function formatActivationTimeRange(
         ? `expired ${formatTime(activation.expiresAt)}`
         : status.toLowerCase();
   return `${formatTime(activation.startedAt)} → ${end}`;
-}
-
-function summarizePayload(payload: unknown): string {
-  const text = JSON.stringify(payload);
-  if (!text) {
-    return "No payload";
-  }
-  return text.length > 160 ? `${text.slice(0, 157)}…` : text;
 }

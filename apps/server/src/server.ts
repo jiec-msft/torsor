@@ -647,6 +647,7 @@ class Service implements TorsorHttpService {
             type: "ListActivity",
             runId: segments[3],
             ...optionalNumber(url, "afterSequence"),
+            ...optionalNumber(url, "beforeSequence"),
             limit: pageSize(url),
           },
           authenticated.context,
