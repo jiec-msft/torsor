@@ -1,23 +1,51 @@
 # `@torsor/server`
 
-`@torsor/server` exposes the public `@torsor/kernel` boundary through a local
-HTTP API and durable Server-Sent Events stream. It opens one SQLite database
-for the process lifetime and closes it on `SIGINT` or `SIGTERM`.
+`@torsor/server` provides the production local host for Torsor. The host owns
+one `@torsor/kernel` SQLite connection, exposes it through the local HTTP and
+durable Server-Sent Events service, and runs `@torsor/agent-runtime` against
+that same Kernel.
 
-Build the workspace, then start the service with a local Human principal:
+Startup binds the HTTP listener only after configuration and the database have
+opened successfully. Shutdown stops accepting HTTP work, waits for the current
+bounded Runtime pass, and then closes the Kernel. Startup, Runtime-loop, and
+shutdown failures reject the host lifecycle and make the executable exit
+unsuccessfully.
+
+Build the workspace, then start the host with a local Human credential and a
+Runtime principal:
 
 ```powershell
 $env:TORSOR_DATABASE_PATH = ".torsor\torsor.sqlite"
 $env:TORSOR_BOOTSTRAP_PATH = ".torsor\bootstrap.json"
 $env:TORSOR_AUTH_TOKEN = "replace-with-a-local-secret"
 $env:TORSOR_PRINCIPAL_ID = "principal-human"
+$env:TORSOR_RUNTIME_PRINCIPAL_ID = "principal-runtime"
+$env:TORSOR_PROJECT_IDS = "project-sample"
 npm run build --workspace @torsor/server
 npm run start --workspace @torsor/server
 ```
 
+The production provider is the GitHub Copilot CLI ACP adapter. It launches the
+`copilot` command in the current directory by default. Set
+`TORSOR_COPILOT_COMMAND` to use another executable location and
+`TORSOR_PROVIDER_CWD` to set the provider working directory. The adapter keeps
+its deny-by-default tool and environment policy.
+
+`TORSOR_HOST` defaults to `127.0.0.1`, `TORSOR_PORT` defaults to `4317`, and
+`TORSOR_RUNTIME_POLL_INTERVAL_MS` defaults to `250`. `TORSOR_PROJECT_IDS` is a
+comma-separated list of Projects whose existing Attentions the Runtime scans
+at startup; Projects encountered through durable outbox work are loaded
+dynamically.
+
 The bootstrap file uses `KernelBootstrap` JSON. It is applied idempotently when
 the current-schema database opens. Incompatible development schemas fail
-clearly and must be recreated; the server does not migrate them.
+clearly and must be recreated; the host does not migrate them.
+
+Library callers can use `createLocalRuntimeHost` with any existing
+`ProviderAdapter`. Tests use the deterministic fake through this same
+production composition path. `createTorsorHttpService` remains available for
+HTTP-only embedding; when passed a shared Kernel, the caller retains Kernel
+shutdown ownership.
 
 Clients authenticate with `Authorization: Bearer <local-secret>`. Browsers can
 exchange that credential at `POST /api/v1/session` for an HttpOnly,

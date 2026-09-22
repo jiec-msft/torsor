@@ -1,15 +1,15 @@
 import { mkdir, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
+import { CopilotAcpAdapter } from "@torsor/agent-runtime";
 import type { KernelBootstrap, PrincipalContext } from "@torsor/kernel";
 
-import { createTorsorHttpService } from "./server.js";
+import { createLocalRuntimeHost } from "./local-runtime-host.js";
 
 async function main(): Promise<void> {
   const databasePath = resolve(
     process.env.TORSOR_DATABASE_PATH ?? ".torsor/torsor.sqlite",
   );
-  const token = requiredEnvironment("TORSOR_AUTH_TOKEN");
   const principalContext: PrincipalContext = {
     principalId: requiredEnvironment("TORSOR_PRINCIPAL_ID"),
     ...(process.env.TORSOR_ACTIVATION_ID
@@ -20,32 +20,49 @@ async function main(): Promise<void> {
     ? await loadBootstrap(resolve(process.env.TORSOR_BOOTSTRAP_PATH))
     : undefined;
   await mkdir(dirname(databasePath), { recursive: true });
-  const service = createTorsorHttpService({
+
+  const host = createLocalRuntimeHost({
     databasePath,
-    credentials: [{ token, principalContext }],
+    credentials: [
+      {
+        token: requiredEnvironment("TORSOR_AUTH_TOKEN"),
+        principalContext,
+      },
+    ],
+    runtimePrincipalId: requiredEnvironment("TORSOR_RUNTIME_PRINCIPAL_ID"),
+    projectIds: requiredListEnvironment("TORSOR_PROJECT_IDS"),
+    adapter: new CopilotAcpAdapter({
+      ...(process.env.TORSOR_COPILOT_COMMAND
+        ? { command: process.env.TORSOR_COPILOT_COMMAND }
+        : {}),
+      ...(process.env.TORSOR_PROVIDER_CWD
+        ? { cwd: resolve(process.env.TORSOR_PROVIDER_CWD) }
+        : {}),
+    }),
     ...(bootstrap ? { bootstrap } : {}),
     host: process.env.TORSOR_HOST ?? "127.0.0.1",
-    port: optionalPort(process.env.TORSOR_PORT),
+    port: optionalInteger(process.env.TORSOR_PORT, "TORSOR_PORT", 4317, 0),
+    runtimePollIntervalMs: optionalInteger(
+      process.env.TORSOR_RUNTIME_POLL_INTERVAL_MS,
+      "TORSOR_RUNTIME_POLL_INTERVAL_MS",
+      250,
+      1,
+    ),
   });
-  const origin = await service.listen();
-  process.stdout.write(`Torsor HTTP service listening at ${origin}\n`);
 
-  let closing = false;
   const close = () => {
-    if (closing) {
-      return;
-    }
-    closing = true;
-    void service.close().then(
-      () => process.exit(0),
-      (error: unknown) => {
-        process.stderr.write(`${formatError(error)}\n`);
-        process.exit(1);
-      },
-    );
+    void host.close().catch(() => undefined);
   };
   process.once("SIGINT", close);
   process.once("SIGTERM", close);
+  try {
+    const origin = await host.start();
+    process.stdout.write(`Torsor local runtime host listening at ${origin}\n`);
+    await host.finished;
+  } finally {
+    process.removeListener("SIGINT", close);
+    process.removeListener("SIGTERM", close);
+  }
 }
 
 async function loadBootstrap(path: string): Promise<KernelBootstrap> {
@@ -58,22 +75,40 @@ async function loadBootstrap(path: string): Promise<KernelBootstrap> {
 }
 
 function requiredEnvironment(name: string): string {
-  const value = process.env[name];
+  const value = process.env[name]?.trim();
   if (!value) {
     throw new Error(`${name} is required.`);
   }
   return value;
 }
 
-function optionalPort(value: string | undefined): number {
+function requiredListEnvironment(name: string): readonly string[] {
+  const values = requiredEnvironment(name)
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (values.length === 0) {
+    throw new Error(`${name} must contain at least one value.`);
+  }
+  return [...new Set(values)];
+}
+
+function optionalInteger(
+  value: string | undefined,
+  name: string,
+  fallback: number,
+  minimum: number,
+): number {
   if (value === undefined) {
-    return 4317;
+    return fallback;
   }
-  const port = Number(value);
-  if (!Number.isInteger(port) || port < 0 || port > 65_535) {
-    throw new Error("TORSOR_PORT must be an integer between 0 and 65535.");
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < minimum || parsed > 65_535) {
+    throw new Error(
+      `${name} must be an integer between ${minimum} and 65535.`,
+    );
   }
-  return port;
+  return parsed;
 }
 
 function formatError(error: unknown): string {
