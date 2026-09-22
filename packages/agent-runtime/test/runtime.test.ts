@@ -115,6 +115,69 @@ const runtimeContext = { principalId: "principal-runtime" } as const;
 let kernelInstance = 0;
 
 describe("AgentRuntime", () => {
+  it.each([
+    { maxDepth: 0, maxNonTerminalRunsPerRoot: 50, dimension: "depth" },
+    { maxDepth: 4, maxNonTerminalRunsPerRoot: 1, dimension: "nonTerminalRuns" },
+  ])("surfaces causal $dimension rejection through the production capability bridge", async (limits) => {
+    const directory = mkdtempSync(join(tmpdir(), "torsor-runtime-causal-"));
+    const kernel = TorsorKernel.open({
+      databasePath: join(directory, "kernel.sqlite"),
+      bootstrap: {
+        ...bootstrap,
+        agents: bootstrap.agents!.map((agent) => agent.id === "agent-keel"
+          ? { ...agent, projectId: "project-sample", config: {
+            provider: "deterministic-fake",
+            causalLimits: { maxDepth: 999, maxNonTerminalRunsPerRoot: 999 },
+          } }
+          : agent),
+      },
+      causalLimits: {
+        maxDepth: limits.maxDepth,
+        maxNonTerminalRunsPerRoot: limits.maxNonTerminalRunsPerRoot,
+      },
+      clock: () => new Date("2026-09-21T08:00:00.000Z"),
+    });
+    let refusals = 0;
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        if (context.cause.attention.targetAgentId === "agent-orbit") {
+          await context.capabilities.createRunFromAttention();
+        } else {
+          await expect(context.capabilities.createRunFromAttention())
+            .rejects.toMatchObject({
+              code: "CausalLimitExceeded", details: { dimension: limits.dimension },
+            });
+          refusals += 1;
+          await context.capabilities.ignoreAttention("Causal limit requires Human guidance.");
+        }
+        return;
+      }
+      expect(context.cause.run.run.delegationDepth).toBe(0);
+      await context.capabilities.publishReply({
+        body: "Ask Keel to inspect a separate component.",
+        targetAgentIds: ["agent-keel"],
+      });
+      await context.capabilities.wait("Await Human guidance.");
+    });
+    try {
+      const thread = await mentionAgent(kernel, "causal-bridge");
+      await createRuntime(kernel, adapter).drainUntilIdle();
+      expect(refusals).toBe(1);
+      const projection = await kernel.query({
+        type: "GetThreadProjection", threadRootId: thread.entityId,
+      }, humanContext);
+      expect(projection.runs).toHaveLength(1);
+      expect(projection.runs[0]).toMatchObject({
+        state: "Waiting", causalRootId: thread.entityId, delegationDepth: 0,
+      });
+      expect(projection.attentions.find((item) => item.targetAgentId === "agent-keel"))
+        .toMatchObject({ status: "Ignored" });
+    } finally {
+      kernel.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("drives Attention to durable Run result through a provider attempt", async () => {
     const kernel = openKernel(":memory:");
     const adapter = new DeterministicFakeAdapter();

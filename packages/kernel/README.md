@@ -129,6 +129,25 @@ revision to an eligible same-Project, same-Channel, same-Thread Run with
 `ResolveAttentionWithRun`. All three decisions consume the Attention exactly
 once and end its handler Activation.
 
+New Runs pass one write-transaction causal admission boundary (sections 25.1-25.2,
+28.2, 32.7 of the paired MVP specification). Kernel derives immutable
+`causalRootId`, `parentAttentionId`, `parentRunId`, and `delegationDepth` from
+the triggering Message and authenticated Attention. Initial Runs start at
+depth 0; Agent replies inherit the parent Run's Human Message root and add one
+depth. Continuing a Run never resets its origin.
+
+`KernelOpenOptions.causalLimits` is trusted server configuration with defaults
+`{ maxDepth: 4, maxNonTerminalRunsPerRoot: 50 }`. New databases persist it;
+reopen without an override uses that configuration, and an explicit mismatch
+fails. Agent configuration and command payloads cannot raise these limits.
+Admission counts durable nonterminal Runs under `BEGIN IMMEDIATE`, including
+Waiting. Only a committed Completed/Failed/Cancelled transition releases a
+slot, independently of Provider stop. Creation and terminal events carry
+capacity evidence; `CausalLimitExceeded` includes the exceeded dimension,
+effective limits, root, proposed depth, and current occupancy. Rejection
+leaves the Attention decision open, and idempotent replay allocates no slot.
+Provider cost, fan-out, per-Project/Agent quotas, and UI budgeting are deferred.
+
 Outbox consumers use `ClaimOutboxEvents`, `AcknowledgeOutboxEvents`, and
 `ListOutboxEvents`. Claims are ordered, leased, and recoverable after process
 restart or lease expiry. Successful non-empty claims return `leaseExpiresAt`,
@@ -275,8 +294,15 @@ clock-derived expiry, and
 release, expiry, quarantine, and reconciliation ledger. These primitives do
 not perform filesystem mutation, process execution, or shell execution.
 
-The current direct schema version is 14. Version 14 replaces caller-provided
-Artifact storage locations with bounded byte length and source Thread provenance.
+The current direct schema version is 15. It combines trusted Artifact byte
+length and source Thread provenance (replacing caller-provided storage
+locations) with durable server-owned causal limits, immutable Run root/parent/depth,
+and the root-scoped nonterminal admission index. Defaults remain inclusive depth
+4 and at most 50 nonterminal Runs per root. Both earlier schema 14 layouts
+(causal-only and independently developed Artifact-only) are rejected before
+DDL/bootstrap. There is no version-only compatibility shortcut or migration.
+Artifacts trace causality through their producer Run; equal content in parent
+and child Runs shares a blob, not descriptor identity, authorization or a Run slot.
 Version 13 adds durable Worktree
 writer lease state and its independent event ledger. It retains version 12's
 bounded Attention recovery expiry horizon. Version 12 gives unfinished and
@@ -288,4 +314,6 @@ normalized recovery state, ordered page indexes, count-only expiry promotion,
 recovery mutation revision, incremental provider/domain counters, and durable
 Agent/Project/Channel/Thread execution fences.
 This pre-release schema is intentionally breaking: stop old processes and
-recreate disposable databases rather than migrating earlier versions.
+explicitly recreate disposable databases rather than migrating earlier versions,
+including either schema 14 layout. Opening an older database fails without
+modifying its version, schema, or data.

@@ -74,6 +74,33 @@ afterEach(async () => {
 });
 
 describe("Torsor HTTP and SSE service", () => {
+  it.each([
+    { causalRootId: "forged-root" },
+    { parentRunId: "forged-parent" },
+    { delegationDepth: 0 },
+    { causalLimits: { maxDepth: 999, maxNonTerminalRunsPerRoot: 999 } },
+  ])("rejects causal overrides at the HTTP boundary: %j", async (forged) => {
+    const harness = await startHarness();
+    const response = await command(harness.origin, "start-thread", {
+      idempotencyKey: "forged-causal",
+      projectId: "project-sample",
+      channelId: "channel-general",
+      body: "This request must not publish.",
+      ...forged,
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: { code: "invalid_command" },
+    });
+    const retry = await command(harness.origin, "start-thread", {
+      idempotencyKey: "forged-causal",
+      projectId: "project-sample",
+      channelId: "channel-general",
+      body: "This request must not publish.",
+    });
+    expect(retry.status).toBe(200);
+  });
+
   it("maps authenticated commands and rejects caller-supplied provenance", async () => {
     const harness = await startHarness();
 
@@ -1067,11 +1094,11 @@ describe("Torsor HTTP and SSE service", () => {
     await reader.cancel().catch(() => undefined);
   });
 
-  it("rejects incompatible development schemas on service startup", async () => {
+  it.each([14, 99])("rejects incompatible development schema %i on service startup", async (version) => {
     const directory = await temporaryDirectory();
     const databasePath = join(directory, "torsor.sqlite");
     const database = new DatabaseSync(databasePath);
-    database.exec("PRAGMA user_version = 99;");
+    database.exec(`PRAGMA user_version = ${version};`);
     database.close();
 
     expect(() =>
@@ -1081,7 +1108,7 @@ describe("Torsor HTTP and SSE service", () => {
         credentials,
         port: 0,
       }),
-    ).toThrow(/Incompatible development database schema version 99/);
+    ).toThrow(`Incompatible development database schema version ${version}; expected 15.`);
   });
 
   it("closes promptly when a client leaves a command body incomplete", async () => {

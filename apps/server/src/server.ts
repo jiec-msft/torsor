@@ -676,6 +676,7 @@ class Service implements TorsorHttpService {
             type: "ListActivity",
             runId: segments[3],
             ...optionalNumber(url, "afterSequence"),
+            ...optionalNumber(url, "beforeSequence"),
             limit: pageSize(url),
           },
           authenticated.context,
@@ -1010,6 +1011,7 @@ function kernelStatus(code: KernelError["code"]): number {
       return 400;
     case "Conflict":
     case "DomainBusy":
+    case "CausalLimitExceeded":
     case "StaleRevision":
     case "ConditionalCheckFailed":
     case "TerminalRun":

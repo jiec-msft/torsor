@@ -3,7 +3,8 @@
 > 简体中文（主要版本） | [English](001-overview.md)
 
 > 状态：工作笔记  
-> 更新时间：2026-09-21  
+> 更新时间：2026-09-22
+>
 > 目的：记录当前已经达成的设计共识、仍未解决的问题，以及下一轮推导入口。  
 > 注意：本文只记录当前讨论结论，不代表最终产品规格。
 >
@@ -806,6 +807,8 @@ disposition_revision
 6. 同一 Message revision 可以分别加入不同 Run。
 7. RunInput 创建时原子分配单调递增的 `run_input_sequence`。
 8. RunInput 创建会增加 Run revision。
+9. Human `send_to_run` 必须携带观察到的 `expected_run_revision`；不是可选字段。revision 检查、公开 Message、Human-assigned RunInput、revision 增加和投递 Outbox 在同一事务内提交。
+10. Client 提交状态与 RunInput `Pending` disposition 分离。确定的事务拒绝不产生 Message 或 RunInput；响应丢失则提交结果未知，不能据此声称两者未提交。
 
 ### 19.3 语义 disposition
 
@@ -1013,6 +1016,13 @@ Artifact 和原始 provenance，不重复发布事件。新 Activation 只有在
 阻止新 descriptor；已提交 descriptor 仍由当前获授权的 Human/Runtime 查询。
 首片不自动删除 orphan 或 staging 文件，避免与并发固化竞争；清理留给停机维护。
 
+持久因果限制与可信 Artifact 的整合数据库使用 schema **15**，同时保留第 25 节的
+Run root/parent/depth、不可变约束、准入索引及持久配置，以及第 23 节的可信报告
+descriptor。此前 causal-only schema 14 和独立开发的 Artifact-only schema 14
+均不兼容；不得因版本数字相同而接受另一套布局。打开任何旧版或未版本化的非空
+开发数据库必须在应用 DDL/Bootstrap 前明确拒绝，不迁移、不改写版本、不删除数据。
+停止旧进程后由操作者显式重建可丢弃数据库。schema 15 重开仍校验持久 causal 配置。
+
 Runtime Host 调度恢复 pass 时，连续执行的 pass 数量必须有界，并在继续前让出事件循环并重新检查关闭请求。积压处理不得饿死 HTTP、timer、signal 或关闭处理。空闲轮询等待必须可被关闭请求中断；无论等待还是关闭先完成，都必须移除对应 listener 并取消不再需要的 timer。
 
 ## 22. Worktree 和 Writer Lease
@@ -1100,6 +1110,13 @@ digest，存储适配器不接收 Provider 路径。窄接口只有不可变写�
 适配器由可信 Host 静态配置，不向 Provider 暴露。相同 Run/digest 保留一个
 descriptor；其他 key 重复发布同一内容返回冲突，不改写 provenance。
 
+父子 Run 可以固化相同字节并复用一个内容寻址 blob，但必须各有独立 descriptor、
+来源 Run/Activation/Thread 和幂等作用域。Artifact 通过 `producer_run_id` 追溯到
+Run 的不可变 causal root、parent Attention/Run 和 depth，不另存可漂移的因果副本。
+父子关系和相同 digest 均不授予跨 Run 读取权。固化、下载、失败和重放都不创建或
+释放 Run 名额、不重写因果来源，也不处置 RunInput 或隐式完成 Run；重启后的
+Run/Thread 及分页投影必须同时保留 causal 字段和 Artifact 引用。
+
 开发/测试本地布局为私有 root 下 `sha256/<64 hex>` 和 `staging/<random>.tmp`。
 先独占创建临时文件、写入并 flush，再用不覆盖目标的原子 hard-link 发布；同名目标
 必须核对长度、digest 和全部字节，不得覆盖。读取同样核对长度和 digest。
@@ -1179,7 +1196,7 @@ Run仍可立即逻辑 Cancel：
 
 ### 25.1 因果链
 
-Agent生成的 Attention 和 Run 记录：
+首个持久因果限制切片使用以下不可变 Run 来源：
 
 ```text
 causal_root_id
@@ -1188,27 +1205,30 @@ parent_run_id
 delegation_depth
 ```
 
-Human 新请求开启新的 causal root。
+1. `causal_root_id` 是发起请求的 Human Message ID，而不是 Thread ID 或 Provider Session。Human 的 `StartThread`、`ReplyToThread` 和 `SendToRun` 所发布的新 Message 各自开启新 root；同一 Message 的多个 Mention 共享 root。
+2. 当前所有新 Run 都通过 `ResolveAttentionWithRun` 创建。Kernel 从已认证的 Attention Activation、Attention 的确切 Message revision 和该 Message 的服务端来源推导字段；`parent_attention_id` 是本次决议的 Attention ID。
+3. Human Message 直接触发的 Run 的 `parent_run_id = null`、`delegation_depth = 0`。Agent 的 `PublishRunReply` 或 `CompleteRun.finalReply` 触发的新 Run 使用 Message 的 `caused_by_run_id` 作为 parent，继承该 Run 的 root，并将 depth 加一。父 Run 已进入终态也不重置来源或深度。
+4. Attention 通过不可变 Message revision 和 Message 来源追溯因果链，不复制一套可漂移的预算字段。没有可信 Human 或 Run 来源时必须拒绝创建，不能退回到新 root。
+5. 将 Attention 接入已有 Run、Human Send-to-Run、Activation/Provider 重试均不重写已有 Run 来源，也不创建新的 Run 容量占用。已有 Run 后续发布的委派继续使用该 Run 的原始 root，而不是最新输入的 root。
+6. Agent/Provider payload 中的 root、parent、depth 或 limit 字段不能成为权威事实；Kernel 拒绝显式提交的这些服务端字段。当前切片不新增直接 Fork、Retry、Successor 或 Replacement 创建命令；未来创建路径必须复用同一准入边界。
 
 ### 25.2 预算 envelope
 
-1. 子 Run 和子 Attention 只能从调用方获得的预算中划分。
-2. Agent不能自行扩大总预算。
-3. 至少限制：
-   - Project/Agent 的并发非终态 Run
-   - 每个 causal root 的深度
-   - fan-out
-   - Provider 成本
-   - Attention 产生速率
-
-初始运行默认：
+首个切片只实施两个硬限制，已批准的初始默认值为：
 
 ```text
 delegation depth: 4
 max non-terminal Runs per causal root: 50
 ```
 
-数值配置化，不写死进领域模型。
+1. 最大 depth 为包含端点的 4（初始 Run 为 0）；同一 root 的非终态 Run 总数最多为 50，包含初始 Run，跨该 root 的所有 Agent 计数。
+2. 数值属于服务端 `KernelOpenOptions.causalLimits`，不是 Agent 配置或命令参数。创建新数据库时持久化默认值或显式配置；所有连接及重启从同一持久配置读取。重开时显式指定不同值必须明确失败。当前不提供在线改限额命令。
+3. Kernel 在同一 `BEGIN IMMEDIATE` 事务中推导来源、检查 depth、从持久 Run 状态计算占用、创建 Run/RunInput、决议 Attention、写入事件、Outbox 和幂等结果。多个 SQLite 连接竞争最后一个名额时最多一个成功。
+4. `Active` 和 `Waiting` 均占一个名额；Activation 数量、Provider 状态、Lease 过期和进程退出不释放名额。未来的 `Paused` 也属于非终态。
+5. 只有 `Completed`、`Failed`、`Cancelled` 的成功提交释放该 Run 的一个名额；不递归释放子 Run，也不表示 Provider 已停止。终态事件与容量证据原子提交。终态 parent 的待处理 Attention 仍可创建子 Run，但必须保留原 root/depth 并重新检查容量。
+6. 容量是当前非终态 Run 的计数，不是累计 Run 数或预付费余额。成功命令重放返回原幂等结果，不再次计数；新逻辑 Run 才占新名额。失败事务完整回滚，不留下 Run、输入、决议、事件、Outbox 或幂等结果。
+7. 超限返回 `CausalLimitExceeded`，包含 root、拟创建 depth、当前占用、有效限制和触发的维度。Attention 保持 Open，handler authority 不被该失败消费，Agent 可以显式 Ignore、继续已有 Run，或在条件改变后重试；不得静默丢弃或伪装成功。
+8. Project/Agent 并发配额、fan-out、Attention 速率、Provider 成本、预算划分和完整 policy language 均推迟；本切片不承诺这些维度已受限，也不增加 UI budgeting。
 
 ### 25.3 默认 Agent 策略
 
@@ -1267,6 +1287,8 @@ result
 - Run 终态延迟
 - 委派深度
 - 预算消耗
+
+本切片将后两项具体化为：Run 投影中的不可变 root、parent Attention/Run 和 depth；`RunCreated` 事件中的来源、有效限制及提交后非终态占用；`RunCompleted`、`RunFailed`、`RunCancelled` 事件中的 root 和释放后的占用；超限响应中的准入证据。占用以同一事务内的持久 Run 状态为准，可由创建/终态事件解释，不使用进程内计数器。拒绝创建不提交新的领域事件；重启保留已有来源、配置和事件。成本核算及其他预算指标仍推迟。
 
 ### 28.3 可解释性
 
@@ -1370,7 +1392,7 @@ GC 不得改变领域状态。
 6. **数据硬删除和保留期限**
    - 取决于部署和隐私承诺。
 7. **预算、深度和并发默认数值**
-   - 初始建议 depth 4、每个 causal root 50 个非终态 Run。
+   - 首个切片已批准最大 depth 4（root Run 为 0）、每个 causal root 最多 50 个非终态 Run；服务端持久配置及容量语义见 §25.1–25.2。成本、fan-out 和其他预算维度仍待后续设计。
 8. **Waiting、Paused、Failed、Cancelled Worktree 的物理保留期限**
    - 作为运行配置。
 9. **Human 是否需要直接 Send-to-Run**
@@ -1494,6 +1516,11 @@ Run completion
 Run 状态、Worktree generation、Pending inputs、child Runs 和 diff stat
 压缩到 Header 或可展开的摘要，不应长期占据主要阅读区域。
 
+生产 Web 的 Live Agent Timeline 首先投影已经存在的持久事实：可见 delta、
+公开 status、RunInput、ProviderAttempt 和显式 Run 终态。Timeline 是主要阅读区，
+Activation 等诊断信息可折叠；保留来源 Thread、窄视口导航和键盘可访问性。
+本切片不改变 Human Run Composer，也不伪造尚无 Producer 的 Tool Call 或文件事件。
+
 ## 36. Human 直接 Send-to-Run
 
 Run Workbench 中的输入框不是绕过 Channel 的私有 Provider 输入。
@@ -1504,7 +1531,7 @@ Run Workbench 中的输入框不是绕过 Channel 的私有 Provider 输入。
 send_to_run(
   run_id,
   message_body,
-  expected_run_revision?
+  expected_run_revision
 )
 
 → 在 Run 的 home Thread 创建 Human Message
@@ -1522,6 +1549,10 @@ send_to_run(
 5. 终态 Run 拒绝 Send-to-Run，并让 Client 提供创建 Successor 的操作。
 6. Provider 不支持实时 Steer 时，RunInput 保持 Pending，Human仍立即看到“已加入 Run”。
 7. Message 和 RunInput 必须一起成功或一起失败。
+8. Web 使用现有 `POST /api/v1/commands/send-to-run`，请求包含 `idempotencyKey`、`runId`、`body` 和必填 `expectedRunRevision`；目标 Thread 和 Agent 由 Run 决定，不能改走普通 Reply 或直接 Provider 输入。
+9. 一个提交身份固定 Human Principal、Run、正文、revision 和幂等键。响应丢失、网络错误、不可读响应或服务端结果不确定时，保留该身份；恢复必须重试同一请求，不能以新 revision 或新 key 猜测重发。幂等重放返回原结果，即使 Run 已推进或进入终态。
+10. 当前凭据失效时要求重新认证，并保留草稿和提交身份；恢复必须使用原 Human Principal。旧凭据请求的迟到 `401` 不得清除替代会话，可在同一 Principal 的替代凭据下重试原请求。恢复中的认证/权限拒绝不能证明之前的未知提交未发生。
+11. 明确的 stale revision 或 terminal Run 事务拒绝不创建任何一半；保留草稿，刷新事实供 Human 重新判断，不自动修改 revision 重发。终态不允许新发送；若 Client 尚无 Successor 创建能力，明确显示不可用并引导 Human 回到公开 Thread 请求后续工作，不提供虚假操作。
 
 这不是普通 `@Agent` 的替代：
 
@@ -1546,6 +1577,10 @@ Provider token/delta
 ```
 
 只有 Agent显式调用 `reply`，或 Adapter 有明确的 final-public-response 映射时，才创建持久 Message。
+
+当前 ACP Adapter 的 `agent_message_chunk` 经 capability bridge 的
+`AppendRunActivity` 持久化后才进入 Timeline。delta、status、Provider 回合结束、
+HTTP 读取和 SSE 重放都不得自动发布 Message、处置 RunInput 或完成 Run。
 
 ### 37.2 RunActivityEvent
 
@@ -1576,6 +1611,14 @@ retention class
 - delivery retry
 - terminal output reference
 
+活动身份和顺序以服务端分配的 `id` 和 Run 内单调 `sequence` 为准，不以
+timestamp、HTTP 返回顺序或 SSE 到达顺序为准。SQLite 写入活动、分配 sequence
+和公开 invalidation event 必须原子提交。Run projection 默认仅含最近 100 条；
+这不是完整历史。`ListActivity` / HTTP activity API 每页有界，支持 exclusive
+`afterSequence` 向前续读和 exclusive `beforeSequence` 向后回填；向后页仍按
+sequence 升序返回，`nextCursor` 指向该页最早 sequence。同时提供两个边界时，
+在有限区间内向前读取。Client 每次显式加载较早历史最多读取 100 条。
+
 ### 37.3 安全边界
 
 1. 不展示或持久化隐藏 chain-of-thought。
@@ -1588,6 +1631,19 @@ retention class
 8. Client 只有在 Human 仍位于时间线底部时自动跟随新输出；Human 向上滚动后停止强制滚动，并显示“回到最新”。
 9. Tool Call 默认折叠，运行状态始终可见；Human 按需展开参数、命令、输出、diff 或错误。
 10. UI 不展示隐藏 chain-of-thought。可展示的是 Agent 明确公开的计划、状态说明和 Provider 标记为 user-visible 的 reasoning summary。
+11. SSE 只使投影失效，不是活动正文或状态权威。Client 从认证 HTTP 读取持久事实；
+    重放、重复、乱序通知和重连必须按活动身份去重并按 sequence 排序，保留已加载历史。
+    新窗口与已加载末尾之间的缺口以每页最多 100 条、固定读取上界补齐，不追逐无限增长的 head。
+12. 后台刷新不得卸载 Timeline 或夺走焦点。向前追加时，Human 向上滚动后保持阅读位置；
+    向前部插入历史时保持可见条目及其相对位置。`Back to latest` 显式恢复跟随。
+    切换 Run 重置该视图的历史、错误和跟随状态；旧 Run/旧 session 的迟到响应不得写入新视图。
+    窄视口 Drawer 的延迟焦点操作必须在切换或卸载时撤销，且不能夺走 Human 已在 Drawer 内选择的焦点。
+13. 历史读取失败必须可见、可重试，且不得清空已有条目或把未知历史显示成完整历史。
+    认证、跨窗口 session 更新、授权范围及 revision fencing 继续适用于所有补读请求。
+14. Composer 的组合刷新和单独 Run 刷新必须使用同一 Timeline 历史合并规则；不能以最近 100 条替换已加载历史。
+    Run 的刷新归属包含有界的缺口补读；与 Thread 读取仍各自独立。
+    组合结果发布前完成的较早历史回填必须保留。补读失败遵循第 44.2 节的组合读取失败语义，
+    不改变已确认提交的回执、待恢复身份、另一 Run 的草稿、阅读锚点或跟随状态。
 
 ## 38. Files
 
@@ -2123,6 +2179,15 @@ Run source
 Timeline item 必须显示其来源类型，但不需要把每种显示节点升级为领域对象。
 稳定历史和活跃 streaming head 可以分开传输，Client 再组合成一条连续时间线。
 
+每个活动显示来源类型、原始 kind、Run 内 sequence、timestamp，以及可用的
+Activation/ProviderAttempt 来源。已知可见 delta 和 status 使用聚焦的纯文本呈现；
+未知 kind 只显示通用活动标记和来源元数据，不执行 HTML，也不猜测或展开未知 payload。
+RunInput 和 ProviderAttempt 使用已有投影的当前事实、时间和各自身份；不得伪造
+RunActivityEvent sequence。RunInput 的语义 disposition 与 Provider delivery 分开显示。
+Run `Active` 不等于 Provider 正在运行，Provider `Completed` 不等于 Run 完成；
+Run `Completed`、`Failed`、`Cancelled` 以服务端 Run 状态和 revision 为准。
+取消后 Provider 仍为 `Started` / `Acknowledged` / `Unknown` 时，明确显示停止未确认。
+
 ### 44.2 Run Composer
 
 每个 Agent Run Pane 底部固定一个 Composer。它明确显示目标 Agent 和 Run：
@@ -2132,16 +2197,18 @@ Send to Sable · R184
 Also published in #torsor-core / current Thread
 ```
 
-发送继续使用第 36 节的原子 `send_to_run`。Client 可以先乐观显示 Human item，
-随后根据服务端事件更新：
+发送继续使用第 36 节的原子 `send_to_run`，不依赖 Live Timeline 的实现。
 
-```text
-Pending → Delivered → Accepted
-```
-
-这些交付状态不能替代 RunInput 的语义 disposition。发送失败时，Composer 恢复
-草稿并明确显示 Message 和 RunInput 均未提交，不能制造“看起来已经进入 Thread”
-的半成功状态。
+1. Composer 显示目标 Agent 名称和 ID、完整 Run ID、观察到的 revision，以及公开 home Channel/Thread 的明确目的地与返回入口。
+2. 提交中显示 `Submitting`，禁止重复提交；未确认前不将乐观 Message 或 RunInput 插入已提交投影。成功显示两者已提交，刷新 Thread 与 RunInput 事实；读取失败只表示投影待刷新，不能撤销已确认的提交。
+3. 确定的事务拒绝显示原因及两者均未提交。首次尝试在命令执行前收到带 `requestId` 的结构化 `413/payload_too_large`，且此前没有未知结果时，也属于明确拒绝：释放待恢复请求身份，保留可编辑草稿，允许 Human 缩短或替换正文后以新幂等键再次发送。revision conflict 保留草稿，要求刷新并由 Human 再次发送；终态拒绝不能退化为普通 Reply。
+4. 丢失响应或其他不确定结果显示 `Submission outcome unknown`，绝不显示 `Not submitted`。冻结原请求并提供 `Retry same submission`；此前结果未知时，即使重试遭遇认证/权限失败或 `413/payload_too_large`，也继续保留未知状态及原请求身份，直到同一身份的幂等重放确认结果。后续请求在命令执行前被拒绝，不能证明先前请求未提交。
+5. 草稿和待恢复身份按 Run 保留为当前 Client Window 的本地状态，跨 Panel 关闭、Run 切换、后台刷新和重新认证保留。旧 Run 的迟到结果只更新该 Run 的提交状态，不清空另一 Run 的草稿或切回旧 Run。此切片不承诺浏览器重载或进程退出后的草稿恢复。
+6. 已提交不代表 Provider 已收到、接受或纳入工作。没有公开交付证据时不得显示 `Delivered` 或 `Accepted`；RunInput disposition 独立展示。实时 Steer 能力未知时明确说明不保证即时投递，不阻止持久 RunInput 提交。
+7. 提供 label、可感知的 Pending/成功/错误状态、可见焦点、键盘提交和恢复。Enter 在多行正文中换行，Ctrl/Cmd+Enter 显式提交且不能干扰 IME；异步结果不得抢走其他 Run 或控件的焦点。窄视口中目的地、正文、状态和按钮必须可换行/滚动并可通过键盘访问。
+8. 未选择/加载到匹配 Run、无可用认证、终态及未实现的 Successor/实时控制能力都有明确说明；不能呈现可点击但无效果的操作。
+9. Thread 与 Run 的投影读取各自拥有 replacement、loading 和错误归属，组合刷新不得以共享 freshness 条件丢弃仍有效的一半。某一半被单独刷新或另一组合刷新替代时，只交接该投影的归属；仍有效的一半必须完成或明确失败。替代失败必须传递给等待者；旧响应不得清除新选择、新 Session 或新 Project 的 loading、错误或事实。两半仍有效且成功时一起发布；两半仍有效但任一读取失败时保留原投影并结束 loading，允许重试读取。
+10. 已确认提交后的任一投影读取失败，必须在该 Run 的 Composer 内显示可感知的 `Committed; projections could not be refreshed`，包括窄屏 modal；不能只在 modal 外的 inert 主区域报告。Composer 内现有刷新操作只重试读取，不重新提交命令。保留已确认请求的幂等身份与回执，和未确认请求的恢复身份分开；刷新失败不把已提交状态变成未知或可重发命令。刷新状态按 Run 和刷新尝试隔离，跨 Pane 重新挂载保留；旧刷新结果不覆盖较新的刷新，异步状态不抢走 Human 焦点。
 
 ### 44.3 Tool Call 展开和失败
 
@@ -2162,6 +2229,11 @@ Human 展开后才看到：
 - ProviderAttempt 或 TerminalSession 来源。
 
 运行、失败和取消必须在折叠状态下也能区分。展开状态属于 Client view state。
+
+以上 Tool Call 生命周期是后续 Producer 能力的要求，不是本次 Live Timeline
+启用 ACP native tools 的授权。当前 Adapter 保持 deny-by-default；不把文本 delta
+解析为工具执行，不生成假 Tool Call。当前已存在的 Provider 运行/失败/Unknown 与
+Run 失败/取消事实无需展开即可区分，细节按需展开。
 
 ### 44.4 外部能力和插件边界
 

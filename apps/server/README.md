@@ -58,8 +58,10 @@ or to the owned Kernel options of `createTorsorHttpService`; shared-Kernel
 embedding configures the adapter on that Kernel. The executable uses
 `LocalArtifactStorage`, whose storage/crash boundary is documented in the
 Kernel package and paired MVP sections 21/23. Never expose this directory as
-a static web root. Schema 14 is breaking: stop old processes and recreate the
-disposable database, without migration or silent deletion.
+a static web root. Integrated schema 15 retains causal limits and trusted
+Artifact descriptors. Both prior schema 14 layouts are rejected before
+DDL/bootstrap: stop old processes and explicitly recreate the disposable
+database, without migration, version rewriting, or silent deletion.
 
 Clients authenticate with `Authorization: Bearer <local-secret>`. Browsers can
 exchange that credential at `POST /api/v1/session` for an HttpOnly,
@@ -80,12 +82,19 @@ revocation in one browser session does not revoke another.
 - `GET /api/v1/threads/:threadRootId`
 - `GET /api/v1/projects/:projectId/runs?after=...&snapshot=...&limit=...`
 - `GET /api/v1/runs/:runId`
-- `GET /api/v1/runs/:runId/activity?afterSequence=...&limit=...`
+- `GET /api/v1/runs/:runId/activity?afterSequence=...&beforeSequence=...&limit=...`
 - `GET /api/v1/artifacts/:artifactId`
 - `GET /api/v1/artifacts/:artifactId/content`
 - `GET /api/v1/projects/:projectId/agents`
 - `GET /api/v1/projects/:projectId/attentions`
 - `GET /api/v1/events?projectId=...&cursor=...&batchSize=...`
+
+Activity bounds are exclusive. `beforeSequence` alone retrieves the nearest
+older page, still returned in ascending sequence order; its `nextCursor` is the
+earliest returned sequence when more history exists. `afterSequence` reads
+forward, optionally capped by `beforeSequence` for finite reconnect catch-up.
+The Run projection contains only the latest 100 activity items. All activity
+pages use the same authentication and Run visibility rules as that projection.
 
 Command bodies contain Kernel command fields except `type`, which the route
 owns. Principal and author provenance are never accepted from the request

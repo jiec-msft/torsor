@@ -1,14 +1,16 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { DeterministicFakeAdapter } from "@torsor/agent-runtime";
+import { AgentRuntime, DeterministicFakeAdapter } from "@torsor/agent-runtime";
 import type { AgentRuntimeHooks } from "@torsor/agent-runtime";
 import {
   LocalArtifactStorage,
   TorsorKernel,
+  type CommandResult,
   type KernelBootstrap,
+  type RunProjection,
   type ThreadProjection,
 } from "@torsor/kernel";
 import {
@@ -160,6 +162,115 @@ describe("Local runtime host", () => {
     const failed = await fetch(`${restarted}${contentPath}`, { headers: authorization() });
     expect(failed.status).toBe(500);
     expect(await failed.text()).not.toContain(root);
+  });
+
+  it("keeps causal parent/child reports and Live history through Host restart and HTTP command replay", async () => {
+    const directory = await temporaryDirectory();
+    const databasePath = join(directory, "causal-reports.sqlite");
+    const root = join(directory, "content");
+    const storage = await LocalArtifactStorage.open(root);
+    const report = "Shared synthetic delegated report.\n";
+    const graphBootstrap: KernelBootstrap = {
+      ...bootstrap,
+      principals: [...bootstrap.principals!, { id: "principal-keel", kind: "agent", displayName: "Keel" }],
+      agents: [...bootstrap.agents!, {
+        id: "agent-keel", principalId: "principal-keel", projectId: "project-sample",
+        name: "Keel", configRevision: 1, config: { provider: "deterministic-fake" },
+      }],
+    };
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+        return;
+      }
+      await context.capabilities.reportStatus("processing-report");
+      const input = { idempotencyKey: "shared-report", text: report };
+      const artifactId = await context.capabilities.publishReport(input);
+      expect(await context.capabilities.publishReport(input)).toBe(artifactId);
+      await context.capabilities.reportStatus("report-ready");
+      if (context.cause.run.run.delegationDepth === 0) {
+        await context.capabilities.publishReply({
+          body: `Follow up report ${artifactId}.`, targetAgentIds: ["agent-keel"],
+        });
+      }
+      await context.capabilities.complete({ finalReply: { body: `Report ${artifactId} is available.` } });
+    });
+    const host = createLocalRuntimeHost({
+      databasePath, bootstrap: graphBootstrap, artifactStorage: storage, adapter, port: 0,
+      credentials: [{ token: "human-token", principalContext: { principalId: "principal-human" } }],
+      runtimePrincipalId: "principal-runtime", projectIds: ["project-sample"], runtimePollIntervalMs: 5,
+    });
+    cleanup.push(() => host.close());
+    const origin = await host.start();
+    const command = {
+      idempotencyKey: "causal-report-thread", projectId: "project-sample", channelId: "channel-general",
+      body: "Produce and delegate a synthetic report.", targetAgentIds: ["agent-orbit"],
+    };
+    const request = {
+      method: "POST", headers: { ...authorization(), "Content-Type": "application/json" },
+      body: JSON.stringify(command),
+    };
+    const response = await fetch(`${origin}/api/v1/commands/start-thread`, request);
+    expect(response.status).toBe(200);
+    const created = await response.json() as { result: CommandResult };
+    const thread = await waitForCompletedThread(origin, created.result.entityId, 2);
+    expect(adapter.invocationCount).toBe(4);
+    const parent = thread.runs.find((run) => run.delegationDepth === 0)!;
+    const child = thread.runs.find((run) => run.delegationDepth === 1)!;
+    expect(parent).toMatchObject({ causalRootId: thread.threadRootId, parentRunId: null });
+    expect(child).toMatchObject({ causalRootId: thread.threadRootId, parentRunId: parent.id });
+    expect(thread.artifacts).toHaveLength(2);
+    expect(new Set(thread.artifacts.map((artifact) => artifact.id)).size).toBe(2);
+    const digest = createHash("sha256").update(report).digest("hex");
+    expect(await readdir(join(root, "sha256"))).toEqual([digest]);
+    const runResponse = await fetch(`${origin}/api/v1/runs/${child.id}`, { headers: authorization() });
+    const { run } = await runResponse.json() as { run: RunProjection };
+    expect(run.run).toEqual(child);
+    expect(run.artifacts).toHaveLength(1);
+    expect(run.activity.items.some((item) => item.kind === "status")).toBe(true);
+    const historyPath = `/api/v1/runs/${child.id}/activity?beforeSequence=${run.activity.items.at(-1)!.sequence}&limit=1`;
+    const history = await (await fetch(`${origin}${historyPath}`, { headers: authorization() })).json();
+    await host.close();
+
+    const kernel = TorsorKernel.open({
+      databasePath, artifactStorage: await LocalArtifactStorage.open(root),
+    });
+    cleanup.push(async () => kernel.close());
+    const retryAdapter = new DeterministicFakeAdapter();
+    await new AgentRuntime({
+      kernel, adapter: retryAdapter, runtimePrincipalId: "principal-runtime", projectIds: ["project-sample"],
+    }).drainUntilIdle();
+    expect(retryAdapter.invocationCount).toBe(0);
+    const service = createTorsorHttpService({
+      kernel, port: 0,
+      credentials: [{ token: "human-token", principalContext: { principalId: "principal-human" } }],
+    });
+    cleanup.push(() => service.close());
+    const restarted = await service.listen();
+    const replay = await fetch(`${restarted}/api/v1/commands/start-thread`, request);
+    expect(await replay.json()).toEqual(created);
+    const restored = await fetch(`${restarted}/api/v1/threads/${thread.threadRootId}`, { headers: authorization() });
+    expect(await restored.json()).toEqual({ thread });
+    expect(await (await fetch(`${restarted}${historyPath}`, { headers: authorization() })).json()).toEqual(history);
+    for (const artifact of thread.artifacts) {
+      expect(artifact).toMatchObject({
+        contentDigest: `sha256:${digest}`, producerThreadRootId: thread.threadRootId,
+      });
+      const download = await fetch(`${restarted}/api/v1/artifacts/${artifact.id}/content`, { headers: authorization() });
+      expect(download.status).toBe(200);
+      expect(await download.text()).toBe(report);
+    }
+    const rejected = await fetch(`${restarted}/api/v1/commands/send-to-run`, {
+      method: "POST", headers: { ...authorization(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        idempotencyKey: "terminal-followup", runId: child.id, expectedRunRevision: child.revision,
+        body: "This must not silently become a Reply.",
+      }),
+    });
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toMatchObject({ error: { code: "terminal_run", requestId: expect.any(String) } });
+    expect(await (await fetch(`${restarted}/api/v1/threads/${thread.threadRootId}`, { headers: authorization() })).json())
+      .toEqual({ thread });
   });
 
   it("runs an HTTP request through the production host composition", async () => {
@@ -378,6 +489,7 @@ async function seedOutboxBacklog(
 async function waitForCompletedThread(
   origin: string,
   threadRootId: string,
+  expectedRunCount = 1,
 ): Promise<ThreadProjection> {
   const deadline = Date.now() + 3_000;
   while (Date.now() < deadline) {
@@ -387,7 +499,10 @@ async function waitForCompletedThread(
     );
     expect(response.status).toBe(200);
     const body = (await response.json()) as { thread: ThreadProjection };
-    if (body.thread.runs.some((run) => run.state === "Completed")) {
+    if (
+      body.thread.runs.length === expectedRunCount &&
+      body.thread.runs.every((run) => run.state === "Completed")
+    ) {
       return body.thread;
     }
     await new Promise((resolve) => setTimeout(resolve, 10));

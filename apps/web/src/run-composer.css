@@ -1,0 +1,58 @@
+.run-composer {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 65%;
+  overflow-y: auto;
+  border-top: 1px solid var(--line);
+  padding: 12px;
+  background: var(--panel);
+  overflow-wrap: anywhere;
+}
+
+.run-composer-destination {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.run-composer-source {
+  padding: 0;
+  text-align: left;
+  color: var(--mint);
+  overflow-wrap: anywhere;
+}
+
+.run-composer p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.run-composer textarea {
+  min-height: 64px;
+  max-height: 160px;
+}
+
+.run-composer-help {
+  color: var(--muted);
+}
+
+.run-composer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.run-composer-actions button {
+  min-height: 36px;
+  max-width: 100%;
+  white-space: normal;
+}
+
+@media (max-width: 600px) {
+  .run-composer-actions button {
+    flex: 1 1 100%;
+  }
+}
