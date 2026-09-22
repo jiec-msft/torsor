@@ -813,6 +813,177 @@ describe("WebController", () => {
     ).toHaveLength(1);
   });
 
+  it("retains an acknowledged Start identity until its projection refresh settles", async () => {
+    let resolveRefresh: ((response: Response) => void) | undefined;
+    const committedKeys = new Set<string>();
+    let durableThreads = 0;
+    let durableAttentions = 0;
+    const harness = createHarness({
+      threadsResponse: (callNumber) =>
+        callNumber === 2
+          ? new Promise((resolve) => {
+              resolveRefresh = resolve;
+            })
+          : Promise.resolve(
+              json({
+                items: [thread],
+                nextCursor: null,
+                hasMore: false,
+                snapshotEventId: "event-7",
+              }),
+            ),
+      commandResponse: (_callNumber, init) => {
+        const request = JSON.parse(String(init?.body)) as {
+          idempotencyKey: string;
+          targetAgentIds?: readonly string[];
+        };
+        if (!committedKeys.has(request.idempotencyKey)) {
+          committedKeys.add(request.idempotencyKey);
+          durableThreads += 1;
+          if (request.targetAgentIds?.length) {
+            durableAttentions += 1;
+          }
+        }
+        return Promise.resolve(
+          json({ result: { entityId: `thread-${durableThreads}` } }),
+        );
+      },
+    });
+    await harness.controller.exchangeSession(
+      "local-secret",
+      "project-sample",
+    );
+    await harness.controller.loadThreads("channel-general");
+    const input = {
+      channelId: "channel-general",
+      body: "Keep this acknowledged Start singular.",
+      targetAgentIds: ["agent-orbit"],
+    } as const;
+
+    const first = harness.controller.startThread(input);
+    await waitFor(() => {
+      expect(harness.counts.commands).toBe(1);
+      expect(harness.counts.threads).toBe(2);
+      expect(harness.controller.getSnapshot().commandPending).toBe(false);
+    });
+    await harness.controller.startThread(input);
+
+    const commands = harness.calls.filter((call) =>
+      call.url.includes("/commands/start-thread"),
+    );
+    expect(commands).toHaveLength(2);
+    expect(JSON.parse(String(commands[1]?.init?.body))).toEqual(
+      JSON.parse(String(commands[0]?.init?.body)),
+    );
+    expect(durableThreads).toBe(1);
+    expect(durableAttentions).toBe(1);
+
+    resolveRefresh?.(
+      json({
+        items: [thread],
+        nextCursor: null,
+        hasMore: false,
+        snapshotEventId: "event-7",
+      }),
+    );
+    await first;
+    await harness.controller.startThread({
+      ...input,
+      body: "Allow a later fresh Start.",
+    });
+    expect(durableThreads).toBe(2);
+    expect(durableAttentions).toBe(2);
+  });
+
+  it("retains an acknowledged Reply identity while live projection state advances", async () => {
+    let resolveRefresh: ((response: Response) => void) | undefined;
+    const committedKeys = new Set<string>();
+    let durableReplies = 0;
+    let durableAttentions = 0;
+    const projectedThread = { ...thread, cursor: 3 };
+    let threadCalls = 0;
+    const harness = createHarness({
+      threadResponse: () => {
+        threadCalls += 1;
+        if (threadCalls === 2) {
+          return new Promise((resolve) => {
+            resolveRefresh = resolve;
+          });
+        }
+        return Promise.resolve(
+          json({ thread: threadCalls >= 3 ? projectedThread : thread }),
+        );
+      },
+      commandResponse: (_callNumber, init) => {
+        const request = JSON.parse(String(init?.body)) as {
+          idempotencyKey: string;
+          targetAgentIds?: readonly string[];
+        };
+        if (!committedKeys.has(request.idempotencyKey)) {
+          committedKeys.add(request.idempotencyKey);
+          durableReplies += 1;
+          if (request.targetAgentIds?.length) {
+            durableAttentions += 1;
+          }
+        }
+        return Promise.resolve(
+          json({ result: { entityId: `message-${durableReplies}` } }),
+        );
+      },
+    });
+    await harness.controller.exchangeSession(
+      "local-secret",
+      "project-sample",
+    );
+    await harness.controller.loadThread("thread-1");
+    const input = {
+      threadRootId: "thread-1",
+      expectedThreadCursor: 2,
+      body: "Keep this acknowledged Reply singular.",
+      targetAgentIds: ["agent-orbit"],
+    } as const;
+
+    const first = harness.controller.replyToThread(input);
+    await waitFor(() => {
+      expect(harness.counts.commands).toBe(1);
+      expect(harness.counts.thread).toBe(2);
+      expect(harness.controller.getSnapshot().commandPending).toBe(false);
+    });
+    FakeEventSource.instances[0]!.emit(
+      publicEvent({
+        eventId: "event-acknowledged-reply",
+        threadCursor: 3,
+      }),
+    );
+    await waitFor(() =>
+      expect(harness.controller.getSnapshot().thread?.cursor).toBe(3),
+    );
+    await harness.controller.replyToThread({
+      ...input,
+      expectedThreadCursor: 3,
+    });
+
+    const commands = harness.calls.filter((call) =>
+      call.url.includes("/commands/reply-to-thread"),
+    );
+    expect(commands).toHaveLength(2);
+    expect(JSON.parse(String(commands[1]?.init?.body))).toEqual(
+      JSON.parse(String(commands[0]?.init?.body)),
+    );
+    expect(durableReplies).toBe(1);
+    expect(durableAttentions).toBe(1);
+
+    resolveRefresh?.(json({ thread: projectedThread }));
+    await first;
+    await harness.controller.replyToThread({
+      ...input,
+      expectedThreadCursor: 3,
+      body: "Allow a later fresh Reply.",
+    });
+    expect(durableReplies).toBe(2);
+    expect(durableAttentions).toBe(2);
+  });
+
   it("marks reconnection stale and refetches only event-affected projections", async () => {
     const harness = createHarness();
     await harness.controller.exchangeSession("local-secret", "project-sample");
@@ -1659,6 +1830,155 @@ describe("WebController", () => {
     expect(harness.controller.getSnapshot().connection).toBe("live");
     expect(oldEvents.closed).toBe(true);
     expect(replacementEvents.closed).toBe(false);
+  });
+
+  it("does not broadcast a delayed 401 after adopting a cross-window session", async () => {
+    let resolveOldCommand: ((response: Response) => void) | undefined;
+    const first = createHarness({
+      csrfToken: "csrf-first",
+      commandResponse: () =>
+        new Promise((resolve) => {
+          resolveOldCommand = resolve;
+        }),
+    });
+    const second = createHarness({ csrfToken: "csrf-second" });
+    await first.controller.exchangeSession(
+      "first-secret",
+      "project-sample",
+    );
+    const oldCommand = first.controller.replyToThread({
+      threadRootId: "thread-1",
+      expectedThreadCursor: 2,
+      body: "Ignore the obsolete shared-cookie rejection.",
+    });
+    await waitFor(() => expect(first.counts.commands).toBe(1));
+
+    await second.controller.exchangeSession(
+      "replacement-secret",
+      "project-sample",
+    );
+    const replacementSession = second.broadcasts[0]?.posted.find(
+      (message) =>
+        typeof message === "object" &&
+        message !== null &&
+        "kind" in message &&
+        message.kind === "session",
+    );
+    first.broadcasts[0]?.receive(replacementSession);
+    const postedBeforeResponse = first.broadcasts[0]!.posted.length;
+    resolveOldCommand?.(
+      json(
+        {
+          error: {
+            code: "unauthorized",
+            message: "The replaced browser session was revoked.",
+          },
+        },
+        401,
+      ),
+    );
+
+    await expect(oldCommand).rejects.toMatchObject({
+      status: 401,
+      code: "unauthorized",
+    });
+    const obsoleteBroadcast = first.broadcasts[0]!.posted
+      .slice(postedBeforeResponse)
+      .find(
+        (message) =>
+          typeof message === "object" &&
+          message !== null &&
+          "kind" in message &&
+          message.kind === "session-cleared",
+      );
+    if (obsoleteBroadcast) {
+      second.broadcasts[0]?.receive(obsoleteBroadcast);
+    }
+    expect(obsoleteBroadcast).toBeUndefined();
+    expect(first.controller.getSnapshot().session).toBe("ready");
+    expect(second.controller.getSnapshot().session).toBe("ready");
+    expect(FakeEventSource.instances.at(-1)?.closed).toBe(false);
+  });
+
+  it("keeps a newer command pending after an obsolete CSRF retry succeeds", async () => {
+    let resolveOldRetry: ((response: Response) => void) | undefined;
+    let resolveNewCommand: ((response: Response) => void) | undefined;
+    const first = createHarness({
+      csrfToken: "csrf-first",
+      commandResponse: (callNumber) => {
+        if (callNumber === 1) {
+          return Promise.resolve(
+            json(
+              {
+                error: {
+                  code: "invalid_csrf_token",
+                  message: "Rotate the browser session token.",
+                },
+              },
+              403,
+            ),
+          );
+        }
+        if (callNumber === 2) {
+          return new Promise((resolve) => {
+            resolveOldRetry = resolve;
+          });
+        }
+        return new Promise((resolve) => {
+          resolveNewCommand = resolve;
+        });
+      },
+    });
+    const second = createHarness({ csrfToken: "csrf-rotated" });
+    await first.controller.exchangeSession(
+      "first-secret",
+      "project-sample",
+    );
+    const oldCommand = first.controller.startThread({
+      channelId: "channel-general",
+      body: "Old command retry.",
+    });
+    await waitFor(() => expect(first.counts.commands).toBe(1));
+
+    await second.controller.exchangeSession(
+      "rotation-secret",
+      "project-sample",
+    );
+    const rotation = second.broadcasts[0]?.posted.find(
+      (message) =>
+        typeof message === "object" &&
+        message !== null &&
+        "kind" in message &&
+        message.kind === "session",
+    );
+    first.broadcasts[0]?.receive(rotation);
+    await waitFor(() => expect(first.counts.commands).toBe(2));
+
+    await first.controller.signOut();
+    await first.controller.exchangeSession(
+      "replacement-secret",
+      "project-sample",
+    );
+    const newCommand = first.controller.startThread({
+      channelId: "channel-general",
+      body: "New command remains pending.",
+    });
+    await waitFor(() => {
+      expect(first.counts.commands).toBe(3);
+      expect(first.controller.getSnapshot().commandPending).toBe(true);
+    });
+
+    resolveOldRetry?.(
+      json({ result: { entityId: "thread-old-retry" } }),
+    );
+    await oldCommand;
+    expect(first.controller.getSnapshot().commandPending).toBe(true);
+
+    resolveNewCommand?.(
+      json({ result: { entityId: "thread-new-command" } }),
+    );
+    await newCommand;
+    expect(first.controller.getSnapshot().commandPending).toBe(false);
   });
 
   it("discards an older same-projection response that arrives last", async () => {

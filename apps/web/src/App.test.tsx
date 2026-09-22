@@ -11,6 +11,7 @@ import {
   runProjection,
   thread,
 } from "./test/fixtures";
+import styles from "./styles.css?raw";
 
 function readyState(overrides: Partial<WebState> = {}): WebState {
   return {
@@ -104,6 +105,10 @@ beforeEach(() => {
   Object.defineProperty(window, "innerWidth", {
     configurable: true,
     value: 1440,
+  });
+  Object.defineProperty(window, "innerHeight", {
+    configurable: true,
+    value: 900,
   });
 });
 
@@ -394,6 +399,76 @@ describe("TorsorApp", () => {
     expect(notify).toHaveValue("");
   });
 
+  it.each([
+    {
+      name: "Start",
+      route:
+        "/?project=project-sample&channel=channel-general&panels=channels,detail",
+      label: "Start a thread",
+      button: "Start",
+      method: "startThread" as const,
+    },
+    {
+      name: "Reply",
+      route:
+        "/?project=project-sample&channel=channel-general&thread=thread-1&panels=channels,detail",
+      label: "Reply to thread",
+      button: "Reply",
+      method: "replyToThread" as const,
+    },
+  ])("keeps acknowledged $name content locked until refresh completion", async ({
+    route,
+    label,
+    button,
+    method,
+  }) => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", route);
+    const controller = mutableController(readyState());
+    let resolveRefresh!: () => void;
+    const refresh = new Promise<void>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    let calls = 0;
+    const send = async () => {
+      calls += 1;
+      if (calls === 1) {
+        controller.update(readyState({ commandPending: true }));
+        controller.update(
+          readyState({
+            ...(method === "replyToThread"
+              ? { thread: { ...thread, cursor: 3 } }
+              : {}),
+          }),
+        );
+        await refresh;
+      }
+    };
+    if (method === "startThread") {
+      vi.mocked(controller.startThread).mockImplementation(send);
+    } else {
+      vi.mocked(controller.replyToThread).mockImplementation(send);
+    }
+    render(<TorsorApp controller={controller} />);
+
+    const composer = screen.getByLabelText(label);
+    const form = composer.closest("form")!;
+    const submit = within(form).getByRole("button", { name: button });
+    await user.type(composer, "Acknowledged content.");
+    await user.click(submit);
+
+    await waitFor(() => expect(submit).toBeDisabled());
+    expect(composer).toHaveValue("Acknowledged content.");
+    await user.click(submit);
+    expect(calls).toBe(1);
+
+    await act(async () => resolveRefresh());
+    await waitFor(() => expect(composer).toHaveValue(""));
+    await user.type(composer, "Later fresh content.");
+    await user.click(submit);
+    expect(calls).toBe(2);
+  });
+
   it("shows authoritative Attention-only Agent activity", async () => {
     window.history.replaceState(
       {},
@@ -668,6 +743,47 @@ describe("TorsorApp", () => {
     );
 
     expect(screen.getAllByText("Stale · reconnecting")).not.toHaveLength(0);
+  });
+
+  it("keeps the authentication gate scrollable in a short landscape viewport", () => {
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 812,
+    });
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: 375,
+    });
+    render(
+      <>
+        <style>{styles}</style>
+        <TorsorApp
+          controller={stubController(
+            readyState({
+              session: "signed-out",
+              connection: "offline",
+              bootstrap: null,
+              threads: [],
+              threadsChannelId: null,
+              thread: null,
+              runs: [],
+              run: null,
+              agents: [],
+              attentions: [],
+              lastEventId: null,
+            }),
+          )}
+        />
+      </>,
+    );
+
+    const connect = screen.getByRole("button", { name: "Connect" });
+    const gate = connect.closest(".session-screen");
+    expect(gate).not.toBeNull();
+    expect(getComputedStyle(gate!).overflowY).toBe("auto");
+    expect(getComputedStyle(gate!).height).toBe("100dvh");
+    expect(getComputedStyle(document.body).overflow).toBe("hidden");
+    expect(gate).toContainElement(connect);
   });
 
   it.each([375, 768, 1024])(

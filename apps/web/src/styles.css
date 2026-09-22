@@ -1359,8 +1359,11 @@ button:disabled {
 
 .session-screen {
   display: grid;
+  height: 100dvh;
   min-height: 100dvh;
-  place-items: center;
+  overflow-y: auto;
+  align-items: safe center;
+  justify-items: center;
   background:
     linear-gradient(var(--line) 1px, transparent 1px),
     linear-gradient(90deg, var(--line) 1px, transparent 1px),

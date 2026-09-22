@@ -91,6 +91,7 @@ interface PendingStartThread {
     readonly targetAgentIds?: readonly string[];
   };
   uncertain: boolean;
+  activeAttempts: number;
 }
 
 interface PendingReply {
@@ -102,6 +103,7 @@ interface PendingReply {
     readonly targetAgentIds?: readonly string[];
   };
   uncertain: boolean;
+  activeAttempts: number;
 }
 
 interface DeferredBoolean {
@@ -163,6 +165,8 @@ export class WebController {
   #projectionErrors = new Map<string, string>();
   #pendingStartThreads = new Map<string, PendingStartThread>();
   #pendingReplies = new Map<string, PendingReply>();
+  #pendingCommandIds = new Set<number>();
+  #nextCommandId = 0;
   #sessionGeneration = 0;
   #threadsRequestGeneration = 0;
   #threadRequestGeneration = 0;
@@ -518,15 +522,15 @@ export class WebController {
             : {}),
         },
         uncertain: false,
+        activeAttempts: 0,
       } satisfies PendingStartThread);
     this.#pendingStartThreads.set(fingerprint, pending);
+    pending.activeAttempts += 1;
     const selectedChannelId = this.#channelId;
     try {
       await this.#command("start-thread", pending.request);
-      if (this.#pendingStartThreads.get(fingerprint) === pending) {
-        this.#pendingStartThreads.delete(fingerprint);
-      }
     } catch (error) {
+      pending.activeAttempts -= 1;
       if (isUncertainCommandError(error)) {
         pending.uncertain = true;
       }
@@ -539,12 +543,22 @@ export class WebController {
       }
       throw error;
     }
-    if (
-      selectedChannelId === pending.request.channelId &&
-      this.#channelId === pending.request.channelId &&
-      this.#projectId === pending.request.projectId
-    ) {
-      await this.loadThreads(pending.request.channelId);
+    try {
+      if (
+        selectedChannelId === pending.request.channelId &&
+        this.#channelId === pending.request.channelId &&
+        this.#projectId === pending.request.projectId
+      ) {
+        await this.loadThreads(pending.request.channelId);
+      }
+    } finally {
+      pending.activeAttempts -= 1;
+      if (
+        pending.activeAttempts === 0 &&
+        this.#pendingStartThreads.get(fingerprint) === pending
+      ) {
+        this.#pendingStartThreads.delete(fingerprint);
+      }
     }
   }
 
@@ -572,15 +586,15 @@ export class WebController {
             : {}),
         },
         uncertain: false,
+        activeAttempts: 0,
       } satisfies PendingReply);
     this.#pendingReplies.set(fingerprint, pending);
+    pending.activeAttempts += 1;
     const selectedThreadId = this.#threadId;
     try {
       await this.#command("reply-to-thread", pending.request);
-      if (this.#pendingReplies.get(fingerprint) === pending) {
-        this.#pendingReplies.delete(fingerprint);
-      }
     } catch (error) {
+      pending.activeAttempts -= 1;
       if (isUncertainCommandError(error)) {
         pending.uncertain = true;
       }
@@ -593,11 +607,21 @@ export class WebController {
       }
       throw error;
     }
-    if (
-      selectedThreadId === input.threadRootId &&
-      this.#threadId === input.threadRootId
-    ) {
-      await this.loadThread(input.threadRootId);
+    try {
+      if (
+        selectedThreadId === input.threadRootId &&
+        this.#threadId === input.threadRootId
+      ) {
+        await this.loadThread(input.threadRootId);
+      }
+    } finally {
+      pending.activeAttempts -= 1;
+      if (
+        pending.activeAttempts === 0 &&
+        this.#pendingReplies.get(fingerprint) === pending
+      ) {
+        this.#pendingReplies.delete(fingerprint);
+      }
     }
   }
 
@@ -625,6 +649,7 @@ export class WebController {
     this.#processingEventIds.clear();
     this.#latestProjectionRequests.clear();
     this.#projectionErrors.clear();
+    this.#pendingCommandIds.clear();
     this.#threadsRequestGeneration += 1;
     this.#threadRequestGeneration += 1;
     this.#runRequestGeneration += 1;
@@ -708,14 +733,20 @@ export class WebController {
         "The browser session has expired. Exchange the local credential again.",
       );
     }
+    const commandId = ++this.#nextCommandId;
+    this.#pendingCommandIds.add(commandId);
     this.#setState({ commandPending: true });
     const sessionGeneration = this.#sessionGeneration;
     const csrfRevision = this.#csrfRevision;
+    const csrfToken = this.#csrfToken;
     try {
-      await this.#sendCommand(slug, body, this.#csrfToken, sessionGeneration);
-      if (this.#sessionGeneration === sessionGeneration) {
-        this.#setState({ commandPending: false });
-      }
+      await this.#sendCommand(
+        slug,
+        body,
+        csrfToken,
+        sessionGeneration,
+        csrfRevision,
+      );
     } catch (error) {
       if (
         error instanceof ApiError &&
@@ -728,25 +759,26 @@ export class WebController {
           this.#csrfToken &&
           this.#sessionGeneration === sessionGeneration
         ) {
+          const retryCsrfToken = this.#csrfToken;
+          const retryCsrfRevision = this.#csrfRevision;
           try {
             await this.#sendCommand(
               slug,
               body,
-              this.#csrfToken,
+              retryCsrfToken,
               sessionGeneration,
+              retryCsrfRevision,
             );
-            this.#setState({ commandPending: false });
             return;
           } catch (retryError) {
             if (
               retryError instanceof ApiError &&
               retryError.status === 403 &&
               retryError.code === "invalid_csrf_token" &&
-              this.#sessionGeneration === sessionGeneration
+              this.#sessionGeneration === sessionGeneration &&
+              this.#csrfRevision === retryCsrfRevision
             ) {
               this.#clearSession("expired", false);
-            } else if (this.#sessionGeneration === sessionGeneration) {
-              this.#setState({ commandPending: false });
             }
             throw retryError;
           }
@@ -754,10 +786,14 @@ export class WebController {
         if (this.#sessionGeneration === sessionGeneration) {
           this.#clearSession("expired", false);
         }
-      } else if (this.#sessionGeneration === sessionGeneration) {
-        this.#setState({ commandPending: false });
       }
       throw error;
+    } finally {
+      if (this.#pendingCommandIds.delete(commandId)) {
+        this.#setState({
+          commandPending: this.#pendingCommandIds.size > 0,
+        });
+      }
     }
   }
 
@@ -766,6 +802,7 @@ export class WebController {
     body: Readonly<Record<string, unknown>>,
     csrfToken: string,
     sessionGeneration: number,
+    csrfRevision: number,
   ): Promise<void> {
     await this.#request(
       `/api/v1/commands/${slug}`,
@@ -778,6 +815,7 @@ export class WebController {
         body: JSON.stringify(body),
       },
       sessionGeneration,
+      csrfRevision,
     );
   }
 
@@ -785,6 +823,7 @@ export class WebController {
     path: string,
     init: RequestInit = {},
     sessionGeneration = this.#sessionGeneration,
+    csrfRevision = this.#csrfRevision,
   ): Promise<T> {
     const response = await this.#fetch(`${this.#apiBase}${path}`, {
       ...init,
@@ -792,7 +831,8 @@ export class WebController {
     });
     if (
       response.status === 401 &&
-      this.#sessionGeneration === sessionGeneration
+      this.#sessionGeneration === sessionGeneration &&
+      this.#csrfRevision === csrfRevision
     ) {
       this.#clearSession("expired");
     }
@@ -1492,6 +1532,7 @@ export class WebController {
     this.#seenEventIds = [];
     this.#latestProjectionRequests.clear();
     this.#projectionErrors.clear();
+    this.#pendingCommandIds.clear();
     if (broadcast) {
       this.#broadcastChannel?.postMessage({
         kind: "session-cleared",

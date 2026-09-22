@@ -1473,6 +1473,7 @@ function CommandComposer({
   ) => Promise<void>;
 }) {
   const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
 
   const submit = async (event: FormEvent) => {
@@ -1483,6 +1484,7 @@ function CommandComposer({
       return;
     }
     setError(null);
+    setSubmitting(true);
     const submittedDraft = value.draft;
     const submittedAgentId = value.agentId;
     try {
@@ -1500,6 +1502,8 @@ function CommandComposer({
           : "The message could not be sent.",
       );
       textAreaRef.current?.focus();
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -1543,9 +1547,9 @@ function CommandComposer({
         <button
           className="send-button"
           type="submit"
-          disabled={pending || !value.draft.trim()}
+          disabled={pending || submitting || !value.draft.trim()}
         >
-          {pending ? (
+          {pending || submitting ? (
             <RefreshCw className="spin" aria-hidden="true" size={15} />
           ) : (
             <Send aria-hidden="true" size={15} />
