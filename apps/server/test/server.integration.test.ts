@@ -183,6 +183,24 @@ describe("Torsor HTTP and SSE service", () => {
     const cookie = session.headers.get("set-cookie");
     expect(cookie).toContain("HttpOnly");
     expect(cookie).toContain("SameSite=Strict");
+    const sessionBody = (await session.json()) as {
+      principalId: string;
+      csrfToken: string;
+    };
+    expect(sessionBody.principalId).toBe("principal-human");
+
+    const reused = await fetch(`${harness.origin}/api/v1/session`, {
+      method: "POST",
+      headers: {
+        ...authorization(),
+        Cookie: cookie!,
+      },
+    });
+    expect(reused.status).toBe(201);
+    expect(await reused.json()).toEqual(sessionBody);
+    expect(reused.headers.get("set-cookie")?.split(";", 1)[0]).toBe(
+      cookie?.split(";", 1)[0],
+    );
 
     const snapshotResponse = await fetch(
       `${harness.origin}/api/v1/projects/project-sample/bootstrap`,
