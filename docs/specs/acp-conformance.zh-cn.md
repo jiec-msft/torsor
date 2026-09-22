@@ -25,6 +25,8 @@ Paseo 根 [LICENSE](https://github.com/getpaseo/paseo/blob/91d9cf1dbd0c095c8971d
 
 **复用决定：**直接依赖 Apache-2.0 的 `@agentclientprotocol/sdk` **1.4.0**，其公开源码 Commit 为 [`e6463f444093ed7c5f1cc937c3f32afb5853e906`](https://github.com/agentclientprotocol/typescript-sdk/tree/e6463f444093ed7c5f1cc937c3f32afb5853e906)。使用稳定 v1 `client()` / `agent()` / `ndJsonStream`，不使用弃用连接类、私有测试工具或 experimental v2。复用请求关联、双向方法派发和协议类型；Harness 只补充严格 Wire 观察、场景执行、断言、预算、进程所有权和公开 Artifact 策略。SDK 的未终止行缓冲和合作式取消不提供敌对输出/整体期限保证，因此必须在其外层限制。Zod（MIT）提供唯一配置 Schema，YAML（ISC）只负责解析；不引入第二套验证规则。
 
+Windows 原生边界复用 MIT 的 [`koffi` 3.2.0](https://www.npmjs.com/package/koffi/v/3.2.0) 公开 FFI / Struct API 绑定[文档化 Job Object API](https://learn.microsoft.com/windows/win32/procthread/job-objects)，不自行维护 Native Addon。其按平台发布的预编译包支持 Windows x86/x64/ARM64；仅 Windows 所有权子进程加载它。GitHub Windows 运行曾在 PowerShell `Add-Type` 编译阶段超时，因此不再依赖运行时编译或 PowerShell Guardian；原生绑定不可用时明确失败，不降级为可能遗漏孤儿进程的 PID 树遍历。
+
 ## 2. 公共接口和范围
 
 Package 遵循现有 ESM / TypeScript Workspace 约定，但不依赖任何 Torsor Package。
@@ -75,7 +77,7 @@ CLI 退出码：`0` 全部通过；`1` 场景失败；`2` 配置、用法或 Art
 4. 客户端仅声明版本 1 和空的可选 Capability 对象；场景不能启用 FS / Terminal，也不能为 Session 指定临时 Workspace 之外的 cwd、额外目录或 MCP Server。每个 `session/request_permission` 自动返回 `cancelled`；其他反向请求由 SDK 返回 Method Not Found，不执行本地工具。策略不可配置成允许。Tool Update 是可观察协议事实，不等同于本地执行授权，也不是通用 ACP 违规。
 5. 默认每帧 256 KiB、stdout 总量 1 MiB、stderr 总量 64 KiB、2048 个协议事件、启动期限 15 s（`startupMs`）、步骤期限 5 s、场景期限 30 s、清理期限 2 s。启动期限独立覆盖 OS 所有权建立和 Provider Spawn，不用放宽协议步骤期限来适配 Windows 冷启动。所有设置必须为有上限的正整数。包括 SDK 之前的原始流和 JSON 深度限制，拒绝超限而非截断成成功。stderr 被消费和计数，但内容从不保留。
 6. 无 Shell 插值；命令与参数分开，Windows `.cmd` / `.bat` 不隐式启动 Shell。命令只能是受信任的本地程序。默认环境只继承运行所需的 OS / PATH 值，HOME、配置、缓存和临时目录均重定向至本次合成 Workspace；凭据只可通过显式 Runtime 环境授权传递。
-7. 每次调用启动一个仍存活的 Node 进程所有权包装层，以便 Provider 提前退出时仍能终止其后代。Windows 在启动 Provider 前通过系统 PowerShell/.NET 建立 `KILL_ON_JOB_CLOSE` Job Object；精确 PID 的有界 `taskkill /T /F` 关闭所有权层时，Job 同时回收已孤立的成员。Job 设置失败时不启动 Provider。POSIX 使用该次创建的独立进程组。总是等待关闭并删除临时目录；失败明确报告。逃离进程组的恶意程序、OS Sandbox 和不受控外部副作用不在保证范围内。
+7. 每次调用启动一个仍存活的 Node 进程所有权包装层，以便 Provider 提前退出时仍能终止其后代。Windows 在启动 Provider 前建立 `KILL_ON_JOB_CLOSE` Job Object 并把所有权进程自身加入；不可继承的 Job Handle 由该进程持有，精确终止该进程会关闭 Handle 并回收包括孤儿在内的 Job 成员。Job 设置失败时不启动 Provider。POSIX 使用该次创建的独立进程组。总是等待关闭并删除临时目录；失败明确报告。逃离进程组的恶意程序、OS Sandbox 和不受控外部副作用不在保证范围内。
 8. 无真实 Provider 命令时只运行 Mock，不访问模型、网络或凭据。外部命令在未显式 `allowReal` 时返回 skipped，不启动进程。环境中存在 Token 不能开启真实测试。
 
 所有权层用内部字节计数 EOF 信号，确保消费最后一帧后才关闭 SDK 流。内置 Mock 的 `stdout-close` / `stdin-close` 使用专用控制通道确定性关闭方向，不依赖 Windows Node 自身标准句柄的销毁语义；这些故障只在 Harness 管理的 Mock 中提供，不接受真实 Provider 的同类控制信号。
@@ -84,7 +86,7 @@ CLI 退出码：`0` 全部通过；`1` 场景失败；`2` 配置、用法或 Art
 
 Windows 释放文件句柄可能晚于进程退出；临时目录删除使用 Node 的三次有界重试，累计等待不超过 300 ms（短清理预算下相应缩小）。重试耗尽仍明确报告 `cleanup_failed`，不忽略剩余文件。
 
-所有权层通过显式 Ready 握手后才接收启动配置；Windows Guardian 使用固定 ASCII 控制帧，不依赖控制台文本编码。启动超时只报告固定阶段名称，不披露原始系统输出或机器路径。
+所有权层通过显式 Ready 握手后才接收启动配置，不依赖运行时编译或控制台文本编码。启动超时只报告固定阶段名称，不披露原始系统输出或机器路径。
 
 ## 5. Transcript 与安全
 

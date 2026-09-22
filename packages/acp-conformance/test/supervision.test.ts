@@ -2,11 +2,27 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
 import { loadScenario, runScenario } from "@torsor/acp-conformance";
 
 describe("owned process lifetime (spec section 4)", () => {
+  it.runIf(process.platform === "win32")("establishes ownership without a runtime compiler or PowerShell on PATH", async () => {
+    const systemRoot = process.env.SystemRoot;
+    if (!systemRoot) throw new Error("Windows requires SystemRoot for the ownership test.");
+    const environment = { ...process.env };
+    for (const key of Object.keys(environment)) {
+      if (key.toUpperCase() === "PATH") environment[key] = join(systemRoot, "System32");
+    }
+    const { stdout } = await promisify(execFile)(process.execPath, [
+      fileURLToPath(new URL("../bin/acp-conformance.mjs", import.meta.url)), "run",
+      fileURLToPath(new URL("../examples/basic.json", import.meta.url)),
+    ], { env: environment, timeout: 40_000, maxBuffer: 65_536 });
+    expect(stdout).toContain("PASSED basic");
+  });
+
   it("uses a separately bounded startup budget before protocol steps", async () => {
     const data = JSON.parse(await readFile(new URL("../examples/basic.json", import.meta.url), "utf8"));
     const defaults = loadScenario(JSON.stringify(data), { format: "json" });

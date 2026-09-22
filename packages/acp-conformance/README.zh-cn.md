@@ -43,7 +43,7 @@ npm exec -- acp-conformance mock packages\acp-conformance\examples\basic.json
 
 该命令在 stdin/stdout 上提供标准 ACP 对端，其他 Client 可以直接启动它。正常协议关联和派发复用官方 SDK，不另造 JSON-RPC 引擎。
 
-`stdout-close` / `stdin-close` 故障要求 Runner 管理的 Mock 控制通道，独立 `mock` 命令不提供这两个故障。Windows 运行需要系统 PowerShell/.NET 建立 Job Object；所有权设置失败时不启动 Provider。POSIX 使用独立进程组。
+`stdout-close` / `stdin-close` 故障要求 Runner 管理的 Mock 控制通道，独立 `mock` 命令不提供这两个故障。Windows 使用 MIT 的 Koffi 预编译原生绑定建立 Job Object，不需要运行时编译或 PowerShell；所有权设置失败时不启动 Provider。安装时不要省略与平台匹配的原生可选包。POSIX 使用独立进程组。
 
 ## 结果与预算
 

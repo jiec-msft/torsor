@@ -1,109 +1,36 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import koffi from "koffi";
 
-// An external guardian keeps the job handle alive until the owner's stdin pipe closes.
-export function createWindowsJob(onStage: (stage: "guardian" | "compiled") => void): Promise<ChildProcessWithoutNullStreams> {
-  const script = `
-$ErrorActionPreference = 'Stop'
-$control = [Console]::OpenStandardOutput()
-function Signal([string] $message) {
-  $bytes = [Text.Encoding]::ASCII.GetBytes($message + [char]10)
-  $control.Write($bytes, 0, $bytes.Length)
-  $control.Flush()
-}
-Signal 'guardian'
-Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class OwnedJob {
-  [StructLayout(LayoutKind.Sequential)]
-  public struct BasicLimits {
-    public long ProcessTime, JobTime;
-    public uint Flags;
-    public UIntPtr MinWorkingSet, MaxWorkingSet;
-    public uint ActiveProcesses;
-    public UIntPtr Affinity;
-    public uint Priority, Scheduling;
-  }
-  [StructLayout(LayoutKind.Sequential)]
-  public struct IoCounters {
-    public ulong ReadOperations, WriteOperations, OtherOperations;
-    public ulong ReadBytes, WriteBytes, OtherBytes;
-  }
-  [StructLayout(LayoutKind.Sequential)]
-  public struct ExtendedLimits {
-    public BasicLimits Basic;
-    public IoCounters Io;
-    public UIntPtr ProcessMemory, JobMemory, PeakProcessMemory, PeakJobMemory;
-  }
-  [DllImport("kernel32.dll", SetLastError=true)]
-  public static extern IntPtr CreateJobObject(IntPtr attributes, string name);
-  [DllImport("kernel32.dll", SetLastError=true)]
-  public static extern bool SetInformationJobObject(IntPtr job, int kind, ref ExtendedLimits limits, uint size);
-  [DllImport("kernel32.dll", SetLastError=true)]
-  public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
-  [DllImport("kernel32.dll", SetLastError=true)]
-  public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
-  [DllImport("kernel32.dll")]
-  public static extern bool CloseHandle(IntPtr handle);
-  public static IntPtr Create(int ownerPid) {
-    IntPtr job = CreateJobObject(IntPtr.Zero, null);
-    if (job == IntPtr.Zero) throw new Exception("Job creation failed");
-    var limits = new ExtendedLimits();
-    limits.Basic.Flags = 0x2000;
-    if (!SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(limits))) {
-      CloseHandle(job); throw new Exception("Job limits failed");
-    }
-    IntPtr owner = OpenProcess(0x0101, false, ownerPid);
-    if (owner == IntPtr.Zero) { CloseHandle(job); throw new Exception("Owner handle failed"); }
-    bool assigned = AssignProcessToJobObject(job, owner);
-    CloseHandle(owner);
-    if (!assigned) { CloseHandle(job); throw new Exception("Job assignment failed"); }
-    return job;
-  }
-}
-'@
-Signal 'compiled'
-$job = [OwnedJob]::Create(${process.pid})
-try {
-  Signal 'ready'
-  $null = [Console]::In.ReadLine()
-} finally {
-  $null = [OwnedJob]::CloseHandle($job)
-}
-`;
-  return new Promise((resolve, reject) => {
-    const guardian = spawn("powershell.exe", [
-      "-NoLogo", "-NoProfile", "-NonInteractive",
-      "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64"),
-    ], { shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
-    let output = "";
-    let outputBytes = 0;
-    let errorBytes = 0;
-    let ready = false;
-    guardian.stdout.on("data", (chunk: Buffer) => {
-      if (ready) return;
-      outputBytes += chunk.length;
-      if (outputBytes > 32) {
-        reject(new Error("Invalid job guardian response."));
-        return;
-      }
-      output += chunk.toString("ascii");
-      let newline: number;
-      while ((newline = output.indexOf("\n")) >= 0) {
-        const message = output.slice(0, newline);
-        output = output.slice(newline + 1);
-        if (message === "guardian" || message === "compiled") onStage(message);
-        else if (message === "ready") { ready = true; resolve(guardian); }
-        else { reject(new Error("Invalid job guardian response.")); return; }
-      }
-    });
-    guardian.stderr.on("data", (chunk: Buffer) => {
-      errorBytes += chunk.length;
-      if (errorBytes > 16384) reject(new Error("Job guardian exceeded its output budget."));
-    });
-    guardian.once("error", () => reject(new Error("Could not start job guardian.")));
-    guardian.once("exit", () => {
-      if (!ready) reject(new Error("Job guardian exited before readiness."));
-    });
+export function createWindowsJob(): void {
+  const basic = koffi.struct({
+    ProcessTime: "int64_t", JobTime: "int64_t", Flags: "uint32_t",
+    MinWorkingSet: "size_t", MaxWorkingSet: "size_t", ActiveProcesses: "uint32_t",
+    Affinity: "uintptr_t", Priority: "uint32_t", Scheduling: "uint32_t",
   });
+  const io = koffi.struct({
+    ReadOperations: "uint64_t", WriteOperations: "uint64_t", OtherOperations: "uint64_t",
+    ReadBytes: "uint64_t", WriteBytes: "uint64_t", OtherBytes: "uint64_t",
+  });
+  const extended = koffi.struct({
+    Basic: basic, Io: io, ProcessMemory: "size_t", JobMemory: "size_t",
+    PeakProcessMemory: "size_t", PeakJobMemory: "size_t",
+  });
+  const kernel = koffi.load("kernel32.dll");
+  const createJob = kernel.func("void * __stdcall CreateJobObjectW(void *attributes, void *name)");
+  const setLimits = kernel.func("int __stdcall SetInformationJobObject(void *job, int kind, void *limits, uint32_t size)");
+  const assign = kernel.func("int __stdcall AssignProcessToJobObject(void *job, void *process)");
+  const currentProcess = kernel.func("void * __stdcall GetCurrentProcess()");
+  const close = kernel.func("int __stdcall CloseHandle(void *handle)");
+  const job = createJob(null, null);
+  if (!job) throw new Error("Job creation failed.");
+  const limits = Buffer.alloc(koffi.sizeof(extended));
+  limits.writeUInt32LE(0x2000, koffi.offsetof(extended, "Basic") + koffi.offsetof(basic, "Flags"));
+  if (!setLimits(job, 9, limits, limits.length)) {
+    close(job);
+    throw new Error("Job limits failed.");
+  }
+  if (!assign(job, currentProcess())) {
+    close(job);
+    throw new Error("Job assignment failed.");
+  }
+  // The OS closes this non-inheritable handle when the owner exits, killing all job members.
 }

@@ -1,7 +1,5 @@
 import { spawn } from "node:child_process";
 
-import { createWindowsJob } from "./windows-job.js";
-
 const send = (type: string, fields: Record<string, unknown> = {}) => {
   if (process.connected) process.send?.({ type, ...fields });
 };
@@ -17,7 +15,10 @@ process.once("message", async (configuration: {
 }) => {
   send("ownership-starting");
   if (process.platform === "win32") {
-    try { await createWindowsJob((stage) => send(stage)); }
+    try {
+      const { createWindowsJob } = await import("./windows-job.js");
+      createWindowsJob();
+    }
     catch { send("ownership-error"); return; }
   }
   send("ownership-ready");

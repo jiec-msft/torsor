@@ -1,4 +1,4 @@
-import { fork, spawn, type ChildProcess } from "node:child_process";
+import { fork, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { Writable } from "node:stream";
 
@@ -69,7 +69,10 @@ export class OwnedProcess {
     this.stdin.on("error", () => {
       if (!this.#ending) this.fail("stdin_closed", "Provider input pipe closed while writing.");
     });
-    this.#owner.on("error", () => this.fail("spawn_failed", "Could not start the owned provider process."));
+    this.#owner.on("error", () => {
+      if (this.#ending) this.fail("cleanup_failed", "Could not terminate the owned provider process.");
+      else this.fail("spawn_failed", "Could not start the owned provider process.");
+    });
     this.#owner.once("close", () => {
       this.#closedOwner = true;
       this.#closed.resolve();
@@ -86,8 +89,6 @@ export class OwnedProcess {
           }, (error) => { if (error) this.fail("spawn_failed", "Could not configure the owned process."); });
           break;
         case "ownership-starting": this.startupStage = "process ownership setup"; break;
-        case "guardian": this.startupStage = "job guardian compilation"; break;
-        case "compiled": this.startupStage = "job assignment"; break;
         case "ownership-ready": this.startupStage = "provider spawn"; break;
         case "started": this.#started.resolve(); break;
         case "spawn-error": this.fail("spawn_failed", "Could not start the configured provider command."); break;
@@ -147,24 +148,8 @@ export class OwnedProcess {
     const pid = this.#owner.pid;
     if (pid && !this.#closedOwner) {
       if (process.platform === "win32") {
-        await new Promise<void>((resolve, reject) => {
-          const killer = spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
-            shell: false, windowsHide: true, stdio: "ignore",
-          });
-          const timer = setTimeout(() => {
-            killer.kill();
-            reject(new HarnessError("cleanup_failed", "Owned process-tree termination exceeded its deadline."));
-          }, remaining());
-          killer.once("error", () => {
-            clearTimeout(timer);
-            reject(new HarnessError("cleanup_failed", "Could not start process-tree termination."));
-          });
-          killer.once("close", (code) => {
-            clearTimeout(timer);
-            if (code !== 0 && !this.#closedOwner) reject(new HarnessError("cleanup_failed", "Owned process-tree termination failed."));
-            else resolve();
-          });
-        });
+        try { this.#owner.kill("SIGKILL"); }
+        catch { throw new HarnessError("cleanup_failed", "Owned process termination failed."); }
       } else {
         try { process.kill(-pid, "SIGKILL"); }
         catch (error) {

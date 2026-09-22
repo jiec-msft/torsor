@@ -43,7 +43,7 @@ npm exec -- acp-conformance mock packages\acp-conformance\examples\basic.json
 
 This command exposes a standard ACP stdio peer that other clients can launch directly. Normal protocol correlation and dispatch reuse the official SDK, not a second JSON-RPC engine.
 
-`stdout-close` / `stdin-close` faults require the runner-owned mock control channel; the standalone `mock` command does not provide those two faults. Windows requires system PowerShell/.NET to establish a job object; failed ownership setup never launches a provider. POSIX uses a dedicated process group.
+`stdout-close` / `stdin-close` faults require the runner-owned mock control channel; the standalone `mock` command does not provide those two faults. Windows uses MIT-licensed Koffi prebuilt native bindings to establish a job object, without runtime compilation or PowerShell; failed ownership setup never launches a provider. Do not omit the matching native optional package during installation. POSIX uses a dedicated process group.
 
 ## Results and budgets
 
