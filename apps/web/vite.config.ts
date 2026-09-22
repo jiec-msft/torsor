@@ -10,6 +10,13 @@ export default defineConfig({
       "/health": "http://127.0.0.1:4317",
     },
   },
+  preview: {
+    port: 4174,
+    proxy: {
+      "/api": "http://127.0.0.1:4317",
+      "/health": "http://127.0.0.1:4317",
+    },
+  },
   test: {
     environment: "jsdom",
     server: {

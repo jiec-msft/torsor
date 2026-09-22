@@ -16,18 +16,29 @@ shutdown before continuing. Idle polling uses one interruptible timer whose
 shutdown listener and timer are removed as soon as either side completes.
 
 Build the workspace, then start the host with a local Human credential and a
-Runtime principal:
+Runtime principal. npm workspace scripts use `apps/server` as their current
+working directory, so relative environment paths are resolved from that
+directory, not the repository root. Capture the root and pass absolute paths:
 
 ```powershell
-$env:TORSOR_DATABASE_PATH = ".torsor\torsor.sqlite"
-$env:TORSOR_BOOTSTRAP_PATH = ".torsor\bootstrap.json"
-$env:TORSOR_AUTH_TOKEN = "replace-with-a-local-secret"
+$repoRoot = (Get-Location).Path
+New-Item -ItemType Directory -Force (Join-Path $repoRoot ".torsor") | Out-Null
+$env:TORSOR_DATABASE_PATH = Join-Path $repoRoot ".torsor\torsor.sqlite"
+$env:TORSOR_BOOTSTRAP_PATH = Join-Path $repoRoot "examples\working-quickstart\bootstrap.json"
+$env:TORSOR_AUTH_TOKEN = [guid]::NewGuid().ToString("N")
 $env:TORSOR_PRINCIPAL_ID = "principal-human"
 $env:TORSOR_RUNTIME_PRINCIPAL_ID = "principal-runtime"
 $env:TORSOR_PROJECT_IDS = "project-sample"
 npm run build --workspace @torsor/server
 npm run start --workspace @torsor/server
 ```
+
+The referenced bootstrap is complete and synthetic: it contains a Human
+Principal, Runtime Principal, Agent Principal and configuration, Project, and
+Channel. The production command above still uses the GitHub Copilot CLI ACP
+adapter and therefore requires that separately configured provider. For the
+credential-free deterministic path, use `npm run quickstart:host` from the
+repository root instead.
 
 The production provider is the GitHub Copilot CLI ACP adapter. It launches the
 `copilot` command in the current directory by default. Set
@@ -75,8 +86,81 @@ cookie whose principal context matches the bearer credential. Independent
 cookie jars receive distinct session and CSRF identities, so logout or SSE
 revocation in one browser session does not revoke another.
 
+## Minimum synthetic HTTP journey
+
+Start `npm run quickstart:host` from the repository root. The checked portable
+journey is:
+
+```powershell
+npm run quickstart:http
+```
+
+The equivalent PowerShell calls below show the actual cookie and CSRF
+semantics without hard-coding any generated Thread or Run ID:
+
+```powershell
+$origin = "http://127.0.0.1:4317"
+$token = "torsor-local-demo"
+
+Invoke-RestMethod "$origin/health"
+
+$sessionResponse = Invoke-RestMethod `
+  -Method Post `
+  -Uri "$origin/api/v1/session" `
+  -Headers @{ Authorization = "Bearer $token" } `
+  -SessionVariable torsorSession
+
+$bootstrap = Invoke-RestMethod `
+  -Uri "$origin/api/v1/projects/project-sample/bootstrap" `
+  -WebSession $torsorSession
+
+$request = @{
+  idempotencyKey = "powershell-$([guid]::NewGuid())"
+  projectId = "project-sample"
+  channelId = "channel-general"
+  body = "Orbit, complete this synthetic durable request."
+  targetAgentIds = @("agent-orbit")
+} | ConvertTo-Json
+
+$created = Invoke-RestMethod `
+  -Method Post `
+  -Uri "$origin/api/v1/commands/start-thread" `
+  -WebSession $torsorSession `
+  -Headers @{ "X-Torsor-CSRF" = $sessionResponse.csrfToken } `
+  -ContentType "application/json" `
+  -Body $request
+
+$threadId = $created.result.entityId
+do {
+  Start-Sleep -Milliseconds 50
+  $thread = Invoke-RestMethod `
+    -Uri "$origin/api/v1/threads/$threadId" `
+    -WebSession $torsorSession
+} until (
+  $thread.thread.runs.Count -gt 0 -and
+  @($thread.thread.runs | Where-Object state -ne "Completed").Count -eq 0
+)
+
+$runId = $thread.thread.runs[-1].id
+$run = Invoke-RestMethod `
+  -Uri "$origin/api/v1/runs/$runId" `
+  -WebSession $torsorSession
+$activity = Invoke-RestMethod `
+  -Uri "$origin/api/v1/runs/$runId/activity?limit=100" `
+  -WebSession $torsorSession
+
+$run.run.run | Select-Object id, state, revision
+$activity.items | Select-Object sequence, kind, payload
+```
+
+The root journey writes the dynamic IDs to
+`.torsor/quickstart/last-run.json`. Stop the Host normally, restart it with the
+same state directory, and run `npm run quickstart:http -- --verify` to read the
+same completed Thread, Run, and activity from SQLite.
+
 ## HTTP contract
 
+- `GET /health`
 - `POST /api/v1/commands/{start-thread|reply-to-thread|send-to-run|cancel-run|withdraw-run-input}`
 - `GET /api/v1/projects/:projectId/bootstrap`
 - `GET /api/v1/projects/:projectId/channels`

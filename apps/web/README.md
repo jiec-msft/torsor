@@ -24,22 +24,39 @@ Unknown activity kinds expose metadata only. See MVP sections
 
 ## Run locally
 
-Start `@torsor/server` on its default `http://127.0.0.1:4317`, then:
+From the repository root, start `@torsor/server` on its default
+`http://127.0.0.1:4317` (the credential-free path is
+`npm run quickstart:host`), then:
 
 ```powershell
 npm run dev:web
 ```
 
-Vite proxies `/api` to the local server. A production host should serve the
-built files from `apps/web/dist` and reverse proxy `/api` to `@torsor/server`
-on the same origin.
+Vite proxies `/api` and `/health` to the local server. A production host
+should serve the built files from `apps/web/dist` and reverse proxy `/api` to
+`@torsor/server` on the same origin, but this repository does not currently
+provide that production Web server or reverse-proxy configuration.
+
+For a concrete local static preview:
+
+```powershell
+npm run build --workspace @torsor/web
+npm run preview:web
+```
+
+The preview server proxies `/api` and `/health` to
+`http://127.0.0.1:4317`, matching development mode. This is a local static
+preview, not a production reverse proxy or deployment recipe.
 
 Optional build-time settings:
 
 ```text
-VITE_TORSOR_API_BASE       Absolute API origin when same-origin routing is unavailable
+VITE_TORSOR_API_BASE       API origin supplied by an externally configured browser-compatible deployment
 VITE_TORSOR_PROJECT_ID     Initial project ID (defaults to project-sample)
 ```
+
+The supported local paths leave `VITE_TORSOR_API_BASE` unset and use the Vite
+proxy. The local Server does not add a general cross-origin deployment policy.
 
 The bearer credential is used only for `POST /api/v1/session` and is cleared
 from the form before the request settles. The HttpOnly cookie is managed by the

@@ -1,0 +1,45 @@
+{
+  "principals": [
+    {
+      "id": "principal-human",
+      "kind": "human",
+      "displayName": "Avery Stone"
+    },
+    {
+      "id": "principal-runtime",
+      "kind": "runtime",
+      "displayName": "Local Runtime"
+    },
+    {
+      "id": "principal-orbit",
+      "kind": "agent",
+      "displayName": "Orbit"
+    }
+  ],
+  "projects": [
+    {
+      "id": "project-sample",
+      "name": "Synthetic Sample Project"
+    }
+  ],
+  "channels": [
+    {
+      "id": "channel-general",
+      "projectId": "project-sample",
+      "name": "general"
+    }
+  ],
+  "agents": [
+    {
+      "id": "agent-orbit",
+      "principalId": "principal-orbit",
+      "projectId": "project-sample",
+      "name": "Orbit",
+      "configRevision": 1,
+      "config": {
+        "provider": "deterministic-fake",
+        "mode": "synthetic"
+      }
+    }
+  ]
+}

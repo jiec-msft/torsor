@@ -1676,3 +1676,45 @@ The prototype and evidence cover at least:
 13. Activity Center aggregates across Threads and links back to source Thread/Run.
 14. One stable Agent identity owns independent concurrent Runs across Threads.
 15. Multiple Clients share server facts but keep independent Panels, Tabs, drafts, and scroll positions.
+
+## 45. Public working quick start
+
+The public repository must provide a repeatable minimum vertical path from a
+clean checkout so a first-time contributor on supported Node.js can verify the
+working MVP without model credentials or network access.
+
+1. The root README provides the supported Node.js version plus `npm ci`,
+   focused validation, full CI, synthetic Host, minimum HTTP journey, Web
+   development/static preview, and ACP mock commands. Commands are copied from
+   the repository root; Windows PowerShell is an explicitly verified
+   environment, with portable paths where practical.
+2. The quick-start bootstrap is a committed, complete, machine-independent
+   JSON file containing at least a Human Principal, Runtime Principal, Agent
+   Principal and matching Agent configuration, Project, and Channel, using
+   synthetic data only.
+3. The credential-free Host is a separate example/development entry point. It
+   uses the production composition path through public
+   `createLocalRuntimeHost` and `DeterministicFakeAdapter`, binds locally, does
+   not switch the production CLI through an environment flag, and does not
+   enable arbitrary adapters, commands, tools, or relaxed permissions.
+4. The minimum HTTP journey actually verifies `/health`, bearer exchange for
+   an HttpOnly session cookie, session CSRF, Project bootstrap, `start-thread`,
+   the resulting Run, Run activity, and terminal completion. A checked script
+   obtains dynamic IDs from responses instead of hard-coding them in prose.
+5. Normal Host shutdown closes HTTP, Runtime, and Kernel. Restarting with the
+   same state directory keeps the completed Thread, Run, and activity
+   readable. Tests use isolated temporary directories and dynamic ports and
+   leave no processes, ports, databases, or generated files behind.
+6. Server workspace commands run with `apps/server` as their current working
+   directory. Component documentation states that semantic explicitly and
+   uses bootstrap, database, and Artifact paths that resolve correctly from
+   that cwd; the root quick-start example resolves its own default state from
+   the repository root.
+7. The Web development server may explicitly proxy `/api` and `/health` to the
+   local Host. Static preview may provide the same local smoke proxy, but must
+   be described as local preview rather than a production reverse proxy or
+   deployment promise.
+8. Every consumable public package includes a byte-identical copy of the
+   repository Apache-2.0 `LICENSE` in `npm pack --dry-run`. Documentation and
+   quick-start tests cover example files, root commands, cwd semantics, the
+   end-to-end journey, restart durability, and package license contents.
