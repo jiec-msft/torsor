@@ -1,5 +1,7 @@
 # Torsor MVP 0.1 prototype
 
+> English | [简体中文](README.zh-cn.md)
+
 Static, dependency-free desktop prototype for Torsor's conversation-first,
 Agent-native collaboration model.
 

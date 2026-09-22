@@ -1,5 +1,7 @@
 # Product Definition
 
+> English | [简体中文](product.zh-cn.md)
+
 ## Promise
 
 Torsor helps one person lead multiple software agents without becoming their scheduler, watchdog, or memory.
