@@ -1,4 +1,13 @@
 import { ApiError, readApiResponse } from "./api";
+import {
+  activityPath,
+  historyWindow,
+  mergeActivity,
+  mergeRunTimeline,
+  readActivityGap,
+  validateActivityPage,
+  type ActivityPage,
+} from "./timeline-history";
 import { RunComposerModel } from "./run-composer-model";
 import type {
   AgentStatus,
@@ -37,6 +46,9 @@ export interface WebState {
   readonly loadingThreads: boolean;
   readonly loadingThread: boolean;
   readonly loadingRun: boolean;
+  readonly loadingRunHistory: boolean;
+  readonly runHistoryError: string | null;
+  readonly runRefreshError: string | null;
   readonly commandPending: boolean;
   readonly queryError: string | null;
   readonly lastEventId: string | null;
@@ -156,6 +168,9 @@ export class WebController {
     loadingThreads: false,
     loadingThread: false,
     loadingRun: false,
+    loadingRunHistory: false,
+    runHistoryError: null,
+    runRefreshError: null,
     commandPending: false,
     queryError: null,
     lastEventId: null,
@@ -186,6 +201,7 @@ export class WebController {
   #threadsRequestGeneration = 0;
   #threadRequestGeneration = 0;
   #runRequestGeneration = 0;
+  #runSelectionGeneration = 0;
   #runsRefreshGeneration = 0;
   #attentionRefreshGeneration = 0;
   #bootstrapRefreshGeneration = 0;
@@ -446,6 +462,7 @@ export class WebController {
   clearThread(): void {
     this.#threadRequestGeneration += 1;
     this.#runRequestGeneration += 1;
+    this.#runSelectionGeneration += 1;
     if (this.#threadId) {
       this.#abandonProjectionInvalidation(`thread:${this.#threadId}`);
     }
@@ -460,6 +477,9 @@ export class WebController {
       run: null,
       loadingThread: false,
       loadingRun: false,
+      loadingRunHistory: false,
+      runHistoryError: null,
+      runRefreshError: null,
       queryError: this.#currentProjectionError(),
     });
   }
@@ -472,6 +492,7 @@ export class WebController {
     const previousRunId = this.#runId;
     const changedRun = previousRunId !== runId;
     if (changedRun) {
+      this.#runSelectionGeneration += 1;
       if (previousRunId) {
         this.#abandonProjectionInvalidation(`run:${previousRunId}`);
       }
@@ -481,26 +502,29 @@ export class WebController {
     const inScope = () =>
       this.#sessionGeneration === sessionGeneration && this.#runId === runId;
     this.#setState({
-      ...(changedRun ? { run: null } : {}),
+      ...(changedRun ? {
+        run: null,
+        loadingRunHistory: false,
+        runHistoryError: null,
+        runRefreshError: null,
+      } : {}),
       loadingRun: true,
       queryError: this.#currentProjectionError(),
     });
     let request!: Promise<boolean>;
     request = (async () => {
       try {
-        const body = await this.#request<{ readonly run: RunProjection }>(
-          `/api/v1/runs/${encodeURIComponent(runId)}`,
-          {},
-          sessionGeneration,
-        );
-        if (
+        const isCurrent = () =>
+          !this.#disposed &&
           this.#sessionGeneration === sessionGeneration &&
           this.#runRequestGeneration === requestGeneration &&
-          this.#runId === runId
-        ) {
+          this.#runId === runId;
+        const run = await this.#readRunWithHistory(runId, sessionGeneration, isCurrent);
+        if (isCurrent()) {
           this.#projectionSucceeded(projectionKey, {
-            run: body.run,
+            run: mergeRunTimeline(this.#state.run, run),
             loadingRun: false,
+            runRefreshError: null,
           });
           return true;
         }
@@ -522,6 +546,8 @@ export class WebController {
         if (stillCurrent) {
           this.#projectionFailed(projectionKey, error, {
             loadingRun: false,
+            runRefreshError: error instanceof Error
+              ? error.message : "Live activity could not be refreshed.",
           });
           return false;
         }
@@ -532,8 +558,33 @@ export class WebController {
     return request;
   }
 
+  async #readRunWithHistory(
+    runId: string,
+    sessionGeneration: number,
+    isCurrent: () => boolean,
+  ): Promise<RunProjection> {
+    const csrfRevision = this.#csrfRevision;
+    const { run } = await this.#request<{ readonly run: RunProjection }>(
+      `/api/v1/runs/${encodeURIComponent(runId)}`, {}, sessionGeneration, csrfRevision,
+    );
+    const previous = this.#state.run?.run.id === runId ? this.#state.run.activity : undefined;
+    const gap = await readActivityGap(
+      runId, previous, run.activity,
+      (path) => this.#request<ActivityPage>(path, {}, sessionGeneration, csrfRevision),
+      isCurrent,
+    );
+    return mergeRunTimeline(this.#state.run, {
+      ...run,
+      activity: mergeActivity(runId, [
+        historyWindow({ items: gap, hasMore: previous?.hasEarlier ?? false, nextCursor: null }),
+        run.activity,
+      ]),
+    });
+  }
+
   clearRun(): void {
     this.#runRequestGeneration += 1;
+    this.#runSelectionGeneration += 1;
     if (this.#runId) {
       this.#abandonProjectionInvalidation(`run:${this.#runId}`);
     }
@@ -542,8 +593,67 @@ export class WebController {
     this.#setState({
       run: null,
       loadingRun: false,
+      loadingRunHistory: false,
+      runHistoryError: null,
+      runRefreshError: null,
       queryError: this.#currentProjectionError(),
     });
+  }
+
+  async loadEarlierRunActivity(): Promise<boolean> {
+    const run = this.#state.run;
+    if (!run || !run.activity.hasEarlier || this.#state.loadingRunHistory) {
+      return false;
+    }
+    const runId = run.run.id;
+    const before = run.activity.earliestSequence;
+    if (before === null) {
+      throw new Error("Earlier activity requires a sequence boundary.");
+    }
+    const sessionGeneration = this.#sessionGeneration;
+    const selectionGeneration = this.#runSelectionGeneration;
+    const csrfRevision = this.#csrfRevision;
+    const isCurrent = () =>
+      !this.#disposed &&
+      this.#sessionGeneration === sessionGeneration &&
+      this.#runSelectionGeneration === selectionGeneration &&
+      this.#runId === runId;
+    this.#setState({ loadingRunHistory: true, runHistoryError: null });
+    try {
+      const page = await this.#request<ActivityPage>(
+        activityPath(runId, before), {}, sessionGeneration, csrfRevision,
+      );
+      if (!isCurrent()) {
+        return false;
+      }
+      validateActivityPage(page, runId, before);
+      const current = this.#state.run!;
+      this.#setState({
+        run: {
+          ...current,
+          activity: {
+            ...mergeActivity(runId, [historyWindow(page), current.activity]),
+            hasEarlier: page.hasMore,
+          },
+        },
+        loadingRunHistory: false,
+      });
+      return true;
+    } catch (error) {
+      if (!isCurrent()) {
+        return false;
+      }
+      if (error instanceof ApiError && error.status === 401 &&
+        this.#csrfRevision !== csrfRevision && this.#csrfToken) {
+        this.#setState({ loadingRunHistory: false });
+        return this.loadEarlierRunActivity();
+      }
+      this.#setState({
+        loadingRunHistory: false,
+        runHistoryError: error instanceof Error ? error.message : "Run history could not be loaded.",
+      });
+      return false;
+    }
   }
 
   async startThread(input: {
@@ -716,11 +826,12 @@ export class WebController {
       current: () => runRefresh.inScope() && this.#runRequestGeneration === runGeneration,
       settled: { loadingRun: false },
       read: async () => {
-        const { run } = await this.#request<{ readonly run: RunProjection }>(
-          `/api/v1/runs/${encodeURIComponent(runId)}`, {}, sessionGeneration,
+        const run = await this.#readRunWithHistory(
+          runId, sessionGeneration, runRefresh.current,
         );
         return () => ({
-          run,
+          run: mergeRunTimeline(this.#state.run, run),
+          runRefreshError: null,
           runs: this.#state.runs.map((item) =>
             item.run.id === runId && item.run.revision <= run.run.revision ? run : item),
         });
@@ -867,6 +978,9 @@ export class WebController {
       loadingThreads: false,
       loadingThread: false,
       loadingRun: false,
+      loadingRunHistory: false,
+      runHistoryError: null,
+      runRefreshError: null,
       commandPending: false,
       lastEventId: null,
     });
@@ -1119,9 +1233,16 @@ export class WebController {
     this.#events = events;
     events.onopen = () => {
       if (this.#events === events) {
+        const reconnecting = this.#state.connection === "reconnecting";
         this.#clearProbe();
         this.#setState({ connection: "live" });
         this.#retryPendingInvalidations();
+        if (reconnecting && this.#runId) {
+          const runId = this.#runId;
+          void this.#coalesceProjectionRefresh(`run:${runId}`, () =>
+            this.#runId === runId ? this.loadRun(runId) : Promise.resolve(true),
+          );
+        }
       }
     };
     events.onerror = () => {
@@ -1774,6 +1895,9 @@ export class WebController {
       loadingThreads: false,
       loadingThread: false,
       loadingRun: false,
+      loadingRunHistory: false,
+      runHistoryError: null,
+      runRefreshError: null,
       commandPending: false,
       queryError: null,
       lastEventId: null,

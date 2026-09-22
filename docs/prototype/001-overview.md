@@ -4,7 +4,7 @@
 
 > Status: working notes
 >
-> Updated: 2026-09-21
+> Updated: 2026-09-22
 >
 > Purpose: record the current design consensus, unresolved questions, and the entry point for the next derivation round.
 >
@@ -1128,6 +1128,8 @@ Run completion
 
 Compress state, generation, Pending inputs, child Runs, and diff stats into header or expandable summary rather than occupying the main reading surface.
 
+The production Web Live Agent Timeline first projects existing durable facts: visible deltas, public status, RunInput, ProviderAttempt, and explicit terminal Run state. The timeline is the main reading surface; Activation diagnostics may collapse. Preserve source Thread navigation, narrow viewports, and keyboard accessibility. This slice does not change the Human Run Composer or fabricate Tool Call or file events without a producer.
+
 ## 36. Human direct Send-to-Run
 
 The Workbench composer is not private Provider input. It performs:
@@ -1179,6 +1181,8 @@ Provider token/delta
 
 Create a durable Message only when the Agent calls `reply` or an adapter has an explicit final-public-response mapping.
 
+The current ACP adapter persists `agent_message_chunk` through the capability bridge's `AppendRunActivity` before it enters the timeline. Deltas, status, Provider turn end, HTTP reads, and SSE replay must not automatically publish a Message, dispose RunInput, or complete a Run.
+
 ### 37.2 RunActivityEvent
 
 This is a runtime record, not a new collaboration object:
@@ -1195,6 +1199,8 @@ retention class
 
 It may include user-visible assistant delta, tool start/completion/failure/cancellation, public RunInput delivery update, file-change summary, Artifact/external reference publication, status, provider reconnect, delivery retry, and terminal output reference.
 
+Activity identity and order use server-assigned `id` and monotonic per-Run `sequence`, not timestamps, HTTP response order, or SSE arrival order. SQLite activity insertion, sequence allocation, and public invalidation events commit atomically. The Run projection defaults to the latest 100 items, not complete history. `ListActivity` / the HTTP activity API has bounded pages with exclusive `afterSequence` for forward reads and exclusive `beforeSequence` for historical backfill. Backward pages still return ascending sequence order, with `nextCursor` pointing to the page's earliest sequence. With both bounds, read forward within the finite interval. Each explicit client history load reads at most 100 items.
+
 ### 37.3 Safety boundary
 
 1. Do not display or persist hidden chain-of-thought.
@@ -1207,6 +1213,10 @@ It may include user-visible assistant delta, tool start/completion/failure/cance
 8. Auto-follow only while the Human remains at the bottom; otherwise show a return-to-latest control.
 9. Tool Calls default collapsed while status stays visible; details open on demand.
 10. UI may show explicit public plans, status explanations, and Provider-marked user-visible reasoning summaries, but not hidden chain-of-thought.
+11. SSE invalidates projections; it is not activity content or state authority. Clients read durable facts through authenticated HTTP, deduplicate activity identity, order by sequence, and retain loaded history across replay, duplicate/out-of-order notifications, and reconnect. Fill gaps between the loaded tail and a new window in pages of at most 100 with a fixed upper bound, never chasing an indefinitely growing head.
+12. Background refresh must not unmount the timeline or steal focus. Appends preserve the reading position after the Human scrolls upward; prepending history preserves the visible item and its relative position. `Back to latest` explicitly resumes following. Switching Runs resets that view's history, errors, and follow state; late responses from an old Run/session cannot populate the new view. Narrow-viewport drawers cancel deferred focus operations on transitions or unmount and must not steal focus already chosen by the Human inside the drawer.
+13. History failures are visible and retryable, without clearing loaded items or presenting unknown history as complete. Authentication, cross-window session updates, authorization scope, and revision fencing apply to every backfill request.
+14. Composer paired refreshes and standalone Run refreshes use the same timeline-history merge rules, never replacing loaded history with the latest 100 items. Run refresh ownership includes bounded gap reads and remains independent of the Thread read. Preserve earlier-history backfill completed before the paired result is published. A gap-read failure follows the paired-read failure semantics in section 44.2 without changing acknowledged receipts, recovery identities, another Run's draft, reading anchors, or follow state.
 
 ## 38. Files
 
@@ -1549,6 +1559,8 @@ Run source
 
 Timeline items expose source type without becoming domain objects. Stable history and active streaming head may use separate transport and compose into one timeline.
 
+Each activity shows source type, original kind, per-Run sequence, timestamp, and available Activation/ProviderAttempt provenance. Known visible deltas and status use focused plain-text presentation. Unknown kinds show only a generic activity marker and provenance metadata: never execute HTML or infer/expand an unknown payload. RunInput and ProviderAttempt use current projection facts, timestamps, and their own identities without fabricated RunActivityEvent sequences. Keep semantic input disposition separate from Provider delivery. Run `Active` is not Provider running; Provider `Completed` is not Run completion. Run `Completed`, `Failed`, and `Cancelled` come from authoritative Run state and revision. If a cancelled Run still has a `Started`, `Acknowledged`, or `Unknown` ProviderAttempt, explicitly show that stop is unconfirmed.
+
 ### 44.2 Run Composer
 
 Each Agent Run Pane has a fixed composer showing the target:
@@ -1582,6 +1594,8 @@ Shell npm test                 failed
 ```
 
 Expansion reveals arguments and cwd, truncated output, changed files or diff summary, error and retry/replace result, and ProviderAttempt or TerminalSession provenance. Running, failed, and cancelled remain distinguishable while collapsed. Expansion is Client view state.
+
+This Tool Call lifecycle is a requirement for a later producer capability, not permission to enable ACP native tools in this Live Timeline slice. The current adapter stays deny-by-default. Do not parse text deltas as tool execution or synthesize Tool Calls. Existing Provider running/failed/Unknown and Run failed/cancelled facts remain distinguishable without expansion, with details available on demand.
 
 ### 44.4 External capability and plugin boundary
 

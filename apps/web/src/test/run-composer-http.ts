@@ -188,7 +188,7 @@ async function seedRun(kernel: TorsorKernel, key: string) {
   return { id: result.entityId, threadId: root.entityId };
 }
 
-export async function runComposerHttp() {
+export async function runComposerHttp({ pauseEvents = false }: { readonly pauseEvents?: boolean } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "torsor-composer-races-"));
   const kernel = TorsorKernel.open({ databasePath: join(directory, "state.sqlite"), bootstrap });
   const first = await seedRun(kernel, "first");
@@ -210,6 +210,7 @@ export async function runComposerHttp() {
     },
     eventSourceFactory: (url) => {
       const source = new HttpEvents(url, browser);
+      source.paused = pauseEvents;
       sources.push(source);
       return source as unknown as EventSource;
     },
@@ -223,8 +224,44 @@ export async function runComposerHttp() {
   await sources[0]!.ready.promise;
   await controller.loadRun(first.id);
   await controller.loadThread(first.threadId);
+  let activityActivationId: string | null = null;
+  let activitySequence = 0;
   return {
     controller, browser, sources, first, second, origin,
+    async appendActivity(count: number) {
+      const runtime = { principalId: "principal-runtime" };
+      for (let index = 0; !activityActivationId; index += 1) {
+        const claimed = await kernel.execute({
+          type: "ClaimOutboxEvents", idempotencyKey: `timeline-outbox-${index}`,
+          limit: 1, leaseDurationMs: 300_000,
+        }, runtime);
+        const event = claimed.outboxEvents?.[0];
+        if (!event) throw new Error("Expected the first Run's activation event.");
+        if (event.aggregateId === first.id && event.topic === "run.activation-requested") {
+          const projection = await kernel.query({ type: "GetRunProjection", runId: first.id }, runtime);
+          const activation = await kernel.execute({
+            type: "StartActivation", idempotencyKey: "timeline-activation",
+            runId: first.id, expectedRunRevision: projection.run.revision,
+            outboxEventId: event.id, outboxLeaseToken: claimed.leaseToken!,
+            durationMs: 300_000,
+          }, runtime);
+          activityActivationId = activation.entityId;
+        }
+        await kernel.execute({
+          type: "AcknowledgeOutboxEvents", idempotencyKey: `timeline-ack-${index}`,
+          outboxEventIds: [event.id], leaseToken: claimed.leaseToken!,
+        }, runtime);
+      }
+      for (let index = 0; index < count; index += 1) {
+        activitySequence += 1;
+        await kernel.execute({
+          type: "AppendRunActivity", idempotencyKey: `timeline-${activitySequence}`,
+          runId: first.id, activationId: activityActivationId,
+          kind: "agent_message_chunk", payload: { text: `Synthetic output ${activitySequence}` },
+          retentionClass: "transient",
+        }, runtime);
+      }
+    },
     async reply(body: string) {
       const response = await fetch(`${origin}/api/v1/commands/reply-to-thread`, {
         method: "POST",

@@ -147,8 +147,12 @@ describe("Run Composer public UI and controller (§36, §44.2)", () => {
     const view = render(<harness.Surface />);
     await user.type(screen.getByLabelText("Run input"), "Run one instruction.");
     await user.click(screen.getByRole("button", { name: "Send to Run" }));
-    harness.setProjection({ ...runProjection, run: { ...runProjection.run, id: "run-2" } });
-    await act(async () => { await harness.controller.loadRun("run-2"); });
+    harness.setProjection({
+      ...runProjection,
+      run: { ...runProjection.run, id: "run-2" },
+      activity: { items: [], hasEarlier: false, earliestSequence: null, latestSequence: null },
+    });
+    await act(async () => { expect(await harness.controller.loadRun("run-2")).toBe(true); });
     view.rerender(<harness.Surface runId="run-2" />);
     const body = screen.getByLabelText("Run input");
     await user.type(body, "Run two draft.");
