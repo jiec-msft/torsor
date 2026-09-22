@@ -152,6 +152,29 @@ describe("TorsorApp", () => {
     expect(composer).toHaveValue("Keep this draft after failure.");
   });
 
+  it("preserves an unsent reply draft during a background Thread refresh", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(
+      {},
+      "",
+      "/?project=project-sample&channel=channel-general&thread=thread-1&panels=channels,detail",
+    );
+    const controller = mutableController(readyState());
+    render(<TorsorApp controller={controller} />);
+    const composer = screen.getByLabelText("Reply to thread");
+
+    await user.type(composer, "Keep this draft while live facts refresh.");
+    act(() => {
+      controller.update(readyState({ loadingThread: true }));
+    });
+
+    expect(screen.getByLabelText("Reply to thread")).toBe(composer);
+    expect(composer).toHaveValue("Keep this draft while live facts refresh.");
+    expect(
+      screen.queryByText("Loading atomic thread projection"),
+    ).not.toBeInTheDocument();
+  });
+
   it("shows authoritative Attention-only Agent activity", async () => {
     window.history.replaceState(
       {},
@@ -283,6 +306,44 @@ describe("TorsorApp", () => {
       expect(controller.loadThreads).toHaveBeenCalledWith("channel-general");
       expect(controller.loadThread).toHaveBeenCalledWith("thread-1");
       expect(controller.loadRun).toHaveBeenCalledWith("run-1");
+    });
+  });
+
+  it("re-bootstraps and resets projection loads when the URL Project changes", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/?project=project-b&channel=channel-general&thread=thread-1&run=run-1&panel=run&panels=detail",
+    );
+    const projectB = {
+      ...bootstrap,
+      project: { ...bootstrap.project, id: "project-b", name: "Project B" },
+      channels: bootstrap.channels.map((channel) => ({
+        ...channel,
+        projectId: "project-b",
+      })),
+    };
+    const controller = stubController(readyState({ bootstrap: projectB }));
+    render(<TorsorApp controller={controller} />);
+    await waitFor(() => {
+      expect(controller.resume).toHaveBeenCalledWith("project-b");
+    });
+    vi.mocked(controller.clearThread).mockClear();
+    vi.mocked(controller.clearRun).mockClear();
+
+    act(() => {
+      window.history.pushState(
+        {},
+        "",
+        "/?project=project-sample&channel=channel-general&thread=thread-1&panels=channels,detail",
+      );
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+
+    await waitFor(() => {
+      expect(controller.resume).toHaveBeenLastCalledWith("project-sample");
+      expect(controller.clearThread).toHaveBeenCalledTimes(1);
+      expect(controller.clearRun).toHaveBeenCalledTimes(1);
     });
   });
 

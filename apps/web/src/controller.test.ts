@@ -105,6 +105,9 @@ function createHarness(
       init?: RequestInit,
     ) => Promise<Response>;
     bootstrapResponse?: () => Promise<Response>;
+    agentResponse?: (callNumber: number) => Promise<Response>;
+    reconnectProbeDelayMs?: number;
+    agentLivenessRefreshMs?: number;
   } = {},
 ) {
   FakeEventSource.instances = [];
@@ -178,6 +181,9 @@ function createHarness(
     }
     if (url.endsWith("/projects/project-sample/agents")) {
       counts.agents += 1;
+      if (options.agentResponse) {
+        return options.agentResponse(counts.agents);
+      }
       return json({ items: [agent] });
     }
     if (url.includes("/projects/project-sample/attentions")) {
@@ -211,7 +217,10 @@ function createHarness(
       broadcasts.push(channel);
       return channel as unknown as BroadcastChannel;
     },
-    reconnectProbeDelayMs: 5,
+    reconnectProbeDelayMs: options.reconnectProbeDelayMs ?? 5,
+    ...(options.agentLivenessRefreshMs !== undefined
+      ? { agentLivenessRefreshMs: options.agentLivenessRefreshMs }
+      : {}),
   });
   return { controller, storage, calls, counts, broadcasts };
 }
@@ -367,6 +376,38 @@ describe("WebController", () => {
     });
   });
 
+  it("reuses the start-thread idempotency key after an uncertain response", async () => {
+    const harness = createHarness({
+      commandResponse: (callNumber) =>
+        callNumber === 1
+          ? Promise.reject(new TypeError("The response was lost."))
+          : Promise.resolve(json({ result: { entityId: "thread-new" } })),
+    });
+    await harness.controller.exchangeSession("local-secret", "project-sample");
+    const input = {
+      channelId: "channel-general",
+      body: "Start this work exactly once.",
+      targetAgentIds: ["agent-orbit"],
+    } as const;
+
+    await expect(harness.controller.startThread(input)).rejects.toThrow(
+      "The response was lost.",
+    );
+    await harness.controller.startThread(input);
+
+    const commands = harness.calls.filter((call) =>
+      call.url.includes("/commands/start-thread"),
+    );
+    expect(commands).toHaveLength(2);
+    const firstBody = JSON.parse(String(commands[0]?.init?.body)) as {
+      idempotencyKey: string;
+    };
+    const secondBody = JSON.parse(String(commands[1]?.init?.body)) as {
+      idempotencyKey: string;
+    };
+    expect(secondBody.idempotencyKey).toBe(firstBody.idempotencyKey);
+  });
+
   it("marks reconnection stale and refetches only event-affected projections", async () => {
     const harness = createHarness();
     await harness.controller.exchangeSession("local-secret", "project-sample");
@@ -398,6 +439,47 @@ describe("WebController", () => {
           message.kind === "event",
       ),
     ).toHaveLength(1);
+  });
+
+  it("retries a failed event invalidation before deduplicating the event", async () => {
+    let failNextThreadRefresh = false;
+    const harness = createHarness({
+      reconnectProbeDelayMs: 10_000,
+      threadResponse: () => {
+        if (failNextThreadRefresh) {
+          failNextThreadRefresh = false;
+          return Promise.reject(new Error("Thread refresh failed."));
+        }
+        return Promise.resolve(json({ thread }));
+      },
+    });
+    await harness.controller.exchangeSession("local-secret", "project-sample");
+    await harness.controller.loadThreads("channel-general");
+    await harness.controller.loadThread("thread-1");
+    const baseline = { ...harness.counts };
+    const events = FakeEventSource.instances[0]!;
+    const event = publicEvent({ eventId: "event-retry" });
+
+    failNextThreadRefresh = true;
+    events.emit(event);
+    await waitFor(() => {
+      expect(harness.counts.thread).toBe(baseline.thread + 1);
+      expect(harness.controller.getSnapshot().queryError).toContain(
+        "Thread refresh failed",
+      );
+    });
+    await Promise.resolve();
+
+    events.fail();
+    events.open();
+    await waitFor(() => {
+      expect(harness.counts.thread).toBe(baseline.thread + 2);
+      expect(harness.controller.getSnapshot().queryError).toBeNull();
+    });
+
+    events.emit(event);
+    await Promise.resolve();
+    expect(harness.counts.thread).toBe(baseline.thread + 2);
   });
 
   it("refreshes selected and global Run facts for activation completion", async () => {
@@ -718,6 +800,42 @@ describe("WebController", () => {
     resolvePending?.(json({ thread: { ...thread, threadRootId: "thread-2" } }));
     await pending;
     expect(harness.controller.getSnapshot().thread).toBeNull();
+  });
+
+  it("periodically refreshes authoritative Agent liveness without an event", async () => {
+    vi.useFakeTimers();
+    try {
+      const idleAgent = {
+        ...agent,
+        liveRunActivationCount: 0,
+        liveActivationCount: 0,
+        nonterminalRunCount: 0,
+        status: "idle" as const,
+      };
+      const harness = createHarness({
+        agentLivenessRefreshMs: 100,
+        agentResponse: (callNumber) =>
+          Promise.resolve(
+            json({ items: [callNumber === 1 ? agent : idleAgent] }),
+          ),
+      });
+      await harness.controller.exchangeSession("local-secret", "project-sample");
+      const baseline = {
+        agents: harness.counts.agents,
+        attentions: harness.counts.attentions,
+      };
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(harness.counts.agents).toBe(baseline.agents + 1);
+      expect(harness.counts.attentions).toBe(baseline.attentions + 1);
+      expect(harness.controller.getSnapshot().agents[0]?.status).toBe("idle");
+      harness.controller.dispose();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(harness.counts.agents).toBe(baseline.agents + 1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("cleans up EventSource and BroadcastChannel resources", async () => {

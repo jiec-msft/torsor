@@ -57,7 +57,7 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
     controller.getSnapshot,
   );
   const [route, setRoute] = useWindowRoute();
-  const resumed = useRef(false);
+  const resumedProject = useRef<string | null>(null);
   const loadedChannel = useRef<string | null>(null);
   const loadedThread = useRef<string | null>(null);
   const loadedRun = useRef<string | null>(null);
@@ -71,10 +71,18 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
     compactPanels && (route.channelsOpen || route.detailOpen);
 
   useEffect(() => {
-    if (resumed.current) {
+    if (resumedProject.current === route.projectId) {
       return;
     }
-    resumed.current = true;
+    const projectChanged = resumedProject.current !== null;
+    resumedProject.current = route.projectId;
+    loadedChannel.current = null;
+    loadedThread.current = null;
+    loadedRun.current = null;
+    if (projectChanged) {
+      controller.clearThread();
+      controller.clearRun();
+    }
     void controller.resume(route.projectId).catch(() => undefined);
   }, [controller, route.projectId]);
 
@@ -87,7 +95,11 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
   }, [state.session]);
 
   useEffect(() => {
-    if (state.session !== "ready" || !state.bootstrap) {
+    if (
+      state.session !== "ready" ||
+      !state.bootstrap ||
+      state.bootstrap.project.id !== route.projectId
+    ) {
       return;
     }
     const channelId =
@@ -108,6 +120,7 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
   useEffect(() => {
     if (
       state.session !== "ready" ||
+      state.bootstrap?.project.id !== route.projectId ||
       state.loadingThreads ||
       state.threadsChannelId !== route.channelId
     ) {
@@ -131,13 +144,17 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
     route,
     setRoute,
     state.loadingThreads,
+    state.bootstrap,
     state.session,
     state.threads,
     state.threadsChannelId,
   ]);
 
   useEffect(() => {
-    if (state.session !== "ready") {
+    if (
+      state.session !== "ready" ||
+      state.bootstrap?.project.id !== route.projectId
+    ) {
       return;
     }
     if (!route.threadId) {
@@ -151,10 +168,19 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
       loadedThread.current = route.threadId;
       void controller.loadThread(route.threadId);
     }
-  }, [controller, route.threadId, state.session]);
+  }, [
+    controller,
+    route.projectId,
+    route.threadId,
+    state.bootstrap,
+    state.session,
+  ]);
 
   useEffect(() => {
-    if (state.session !== "ready") {
+    if (
+      state.session !== "ready" ||
+      state.bootstrap?.project.id !== route.projectId
+    ) {
       return;
     }
     if (!route.runId) {
@@ -168,7 +194,13 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
       loadedRun.current = route.runId;
       void controller.loadRun(route.runId);
     }
-  }, [controller, route.runId, state.session]);
+  }, [
+    controller,
+    route.projectId,
+    route.runId,
+    state.bootstrap,
+    state.session,
+  ]);
 
   useEffect(() => {
     if (compactPanels && route.channelsOpen && route.detailOpen) {
@@ -792,14 +824,14 @@ function Conversation({
     targetAgentIds?: readonly string[],
   ) => Promise<void>;
 }) {
-  if (state.loadingThread) {
+  const selectedThread =
+    route.threadId && state.thread?.threadRootId === route.threadId
+      ? state.thread
+      : null;
+  if (state.loadingThread && !selectedThread) {
     return <FullLoading label="Loading atomic thread projection" />;
   }
-  if (
-    !route.threadId ||
-    !state.thread ||
-    state.thread.threadRootId !== route.threadId
-  ) {
+  if (!route.threadId || !selectedThread) {
     return (
       <EmptyState
         icon={<MessageSquareText aria-hidden="true" />}
@@ -808,7 +840,7 @@ function Conversation({
       />
     );
   }
-  const [root, ...replies] = state.thread.messages;
+  const [root, ...replies] = selectedThread.messages;
   if (!root) {
     return (
       <EmptyState
@@ -819,7 +851,7 @@ function Conversation({
     );
   }
   const runByCause = new Map(
-    state.thread.runs.map((run) => [run.id, run] as const),
+    selectedThread.runs.map((run) => [run.id, run] as const),
   );
   return (
     <div className="conversation">
@@ -828,9 +860,9 @@ function Conversation({
           <MessageHeader message={root} agents={state.agents} root />
           <p>{latestMessageBody(root)}</p>
           <div className="fact-row">
-            <Fact>{state.thread.cursor} thread cursor</Fact>
-            <Fact>{state.thread.attentions.length} attentions</Fact>
-            <Fact>{state.thread.runs.length} runs</Fact>
+            <Fact>{selectedThread.cursor} thread cursor</Fact>
+            <Fact>{selectedThread.attentions.length} attentions</Fact>
+            <Fact>{selectedThread.runs.length} runs</Fact>
           </div>
         </article>
         <ol className="reply-list" aria-label="Thread replies">
@@ -850,8 +882,8 @@ function Conversation({
                       onClick={() =>
                         onSelectRun(
                           causedRun.id,
-                          state.thread!.threadRootId,
-                          state.thread!.channelId,
+                          selectedThread.threadRootId,
+                          selectedThread.channelId,
                         )
                       }
                     />
@@ -864,18 +896,22 @@ function Conversation({
         {replies.length === 0 ? (
           <p className="reply-empty">No replies yet. Add the next public message below.</p>
         ) : null}
-        {state.thread.runs.length ? (
+        {selectedThread.runs.length ? (
           <section className="thread-runs" aria-labelledby="thread-runs-title">
             <div className="section-label" id="thread-runs-title">
               Runs from this thread
             </div>
-            {state.thread.runs.map((run) => (
+            {selectedThread.runs.map((run) => (
               <RunLink
                 key={run.id}
                 run={run}
                 agents={state.agents}
                 onClick={() =>
-                  onSelectRun(run.id, state.thread!.threadRootId, state.thread!.channelId)
+                  onSelectRun(
+                    run.id,
+                    selectedThread.threadRootId,
+                    selectedThread.channelId,
+                  )
                 }
               />
             ))}

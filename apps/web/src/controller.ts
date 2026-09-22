@@ -48,6 +48,7 @@ export interface WebControllerOptions {
   readonly broadcastChannelFactory?: BroadcastChannelFactory;
   readonly sessionStorage?: Pick<Storage, "getItem" | "setItem" | "removeItem">;
   readonly reconnectProbeDelayMs?: number;
+  readonly agentLivenessRefreshMs?: number;
 }
 
 interface ProjectionPage<T> {
@@ -69,6 +70,12 @@ type WindowMessage =
 const csrfStorageKey = "torsor.session.csrf";
 const principalStorageKey = "torsor.session.principal";
 
+interface PendingInvalidation {
+  readonly event: PublicEvent;
+  retryCount: number;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
 export class WebController {
   readonly #apiBase: string;
   readonly #fetch: Fetch;
@@ -76,6 +83,7 @@ export class WebController {
   readonly #broadcastChannel: BroadcastChannel | null;
   readonly #storage: Pick<Storage, "getItem" | "setItem" | "removeItem">;
   readonly #reconnectProbeDelayMs: number;
+  readonly #agentLivenessRefreshMs: number;
   readonly #listeners = new Set<() => void>();
   #state: WebState = {
     session: "signed-out",
@@ -106,7 +114,14 @@ export class WebController {
   #runId: string | null = null;
   #events: EventSource | null = null;
   #probeTimer: ReturnType<typeof setTimeout> | null = null;
+  #livenessTimer: ReturnType<typeof setTimeout> | null = null;
   #seenEventIds: string[] = [];
+  #processingEventIds = new Set<string>();
+  #pendingInvalidations = new Map<string, PendingInvalidation>();
+  #pendingStartThread: {
+    readonly fingerprint: string;
+    readonly idempotencyKey: string;
+  } | null = null;
   #sessionGeneration = 0;
   #threadsRequestGeneration = 0;
   #threadRequestGeneration = 0;
@@ -123,6 +138,13 @@ export class WebController {
       options.eventSourceFactory ?? ((url) => new EventSource(url));
     this.#storage = options.sessionStorage ?? sessionStorage;
     this.#reconnectProbeDelayMs = options.reconnectProbeDelayMs ?? 1_500;
+    this.#agentLivenessRefreshMs = options.agentLivenessRefreshMs ?? 30_000;
+    if (
+      !Number.isInteger(this.#agentLivenessRefreshMs) ||
+      this.#agentLivenessRefreshMs <= 0
+    ) {
+      throw new Error("agentLivenessRefreshMs must be a positive integer.");
+    }
     const createBroadcastChannel =
       options.broadcastChannelFactory ??
       (typeof BroadcastChannel === "undefined"
@@ -220,9 +242,9 @@ export class WebController {
     }
   }
 
-  async loadThreads(channelId: string): Promise<void> {
+  async loadThreads(channelId: string): Promise<boolean> {
     if (!this.#projectId) {
-      return;
+      return true;
     }
     const sessionGeneration = this.#sessionGeneration;
     const requestGeneration = ++this.#threadsRequestGeneration;
@@ -249,17 +271,20 @@ export class WebController {
           loadingThreads: false,
         });
       }
+      return true;
     } catch (error) {
       if (
         this.#sessionGeneration === sessionGeneration &&
         this.#threadsRequestGeneration === requestGeneration
       ) {
         this.#queryFailed(error, { loadingThreads: false });
+        return false;
       }
+      return true;
     }
   }
 
-  async loadThread(threadId: string): Promise<void> {
+  async loadThread(threadId: string): Promise<boolean> {
     const sessionGeneration = this.#sessionGeneration;
     const requestGeneration = ++this.#threadRequestGeneration;
     const changedThread = this.#threadId !== threadId;
@@ -282,13 +307,16 @@ export class WebController {
       ) {
         this.#setState({ thread: body.thread, loadingThread: false });
       }
+      return true;
     } catch (error) {
       if (
         this.#sessionGeneration === sessionGeneration &&
         this.#threadRequestGeneration === requestGeneration
       ) {
         this.#queryFailed(error, { loadingThread: false });
+        return false;
       }
+      return true;
     }
   }
 
@@ -305,7 +333,7 @@ export class WebController {
     });
   }
 
-  async loadRun(runId: string): Promise<void> {
+  async loadRun(runId: string): Promise<boolean> {
     const sessionGeneration = this.#sessionGeneration;
     const requestGeneration = ++this.#runRequestGeneration;
     const changedRun = this.#runId !== runId;
@@ -328,13 +356,16 @@ export class WebController {
       ) {
         this.#setState({ run: body.run, loadingRun: false });
       }
+      return true;
     } catch (error) {
       if (
         this.#sessionGeneration === sessionGeneration &&
         this.#runRequestGeneration === requestGeneration
       ) {
         this.#queryFailed(error, { loadingRun: false });
+        return false;
       }
+      return true;
     }
   }
 
@@ -352,16 +383,43 @@ export class WebController {
     if (!this.#projectId) {
       throw new Error("A project must be loaded before starting a thread.");
     }
-    const selectedChannelId = this.#channelId;
-    await this.#command("start-thread", {
-      idempotencyKey: crypto.randomUUID(),
+    const fingerprint = JSON.stringify({
       projectId: this.#projectId,
       channelId: input.channelId,
       body: input.body,
-      ...(input.targetAgentIds?.length
-        ? { targetAgentIds: input.targetAgentIds }
-        : {}),
+      targetAgentIds: input.targetAgentIds ?? [],
     });
+    const pending =
+      this.#pendingStartThread?.fingerprint === fingerprint
+        ? this.#pendingStartThread
+        : {
+            fingerprint,
+            idempotencyKey: crypto.randomUUID(),
+          };
+    this.#pendingStartThread = pending;
+    const selectedChannelId = this.#channelId;
+    try {
+      await this.#command("start-thread", {
+        idempotencyKey: pending.idempotencyKey,
+        projectId: this.#projectId,
+        channelId: input.channelId,
+        body: input.body,
+        ...(input.targetAgentIds?.length
+          ? { targetAgentIds: input.targetAgentIds }
+          : {}),
+      });
+      if (this.#pendingStartThread === pending) {
+        this.#pendingStartThread = null;
+      }
+    } catch (error) {
+      if (
+        this.#pendingStartThread === pending &&
+        !isUncertainCommandError(error)
+      ) {
+        this.#pendingStartThread = null;
+      }
+      throw error;
+    }
     if (
       selectedChannelId === input.channelId &&
       this.#channelId === input.channelId
@@ -396,6 +454,8 @@ export class WebController {
 
   dispose(): void {
     this.#disposed = true;
+    this.#clearLivenessRefresh();
+    this.#clearPendingInvalidations();
     this.#closeEvents();
     this.#broadcastChannel?.close();
     this.#listeners.clear();
@@ -403,12 +463,37 @@ export class WebController {
 
   async #bootstrap(projectId: string): Promise<void> {
     const sessionGeneration = ++this.#sessionGeneration;
+    this.#clearLivenessRefresh();
+    this.#clearPendingInvalidations();
+    this.#closeEvents();
     this.#projectId = projectId;
+    this.#channelId = null;
+    this.#threadId = null;
+    this.#runId = null;
+    this.#pendingStartThread = null;
+    this.#seenEventIds = [];
+    this.#processingEventIds.clear();
+    this.#threadsRequestGeneration += 1;
+    this.#threadRequestGeneration += 1;
+    this.#runRequestGeneration += 1;
     this.#setState({
       session: "loading",
       connection: "connecting",
       authError: null,
       queryError: null,
+      bootstrap: null,
+      threads: [],
+      threadsChannelId: null,
+      thread: null,
+      runs: [],
+      run: null,
+      agents: [],
+      attentions: [],
+      loadingThreads: false,
+      loadingThread: false,
+      loadingRun: false,
+      commandPending: false,
+      lastEventId: null,
     });
     try {
       const body = await this.#request<{ readonly bootstrap: Bootstrap }>(
@@ -440,6 +525,7 @@ export class WebController {
         lastEventId: body.bootstrap.latestEventId,
       });
       this.#connectEvents(projectId, body.bootstrap.latestEventId);
+      this.#scheduleLivenessRefresh();
     } catch (error) {
       if (this.#sessionGeneration !== sessionGeneration) {
         return;
@@ -623,6 +709,7 @@ export class WebController {
       if (this.#events === events) {
         this.#clearProbe();
         this.#setState({ connection: "live" });
+        this.#retryPendingInvalidations();
       }
     };
     events.onerror = () => {
@@ -648,25 +735,30 @@ export class WebController {
     if (this.#disposed || event.projectId !== this.#projectId) {
       return;
     }
-    if (this.#seenEventIds.includes(event.eventId)) {
+    if (
+      this.#seenEventIds.includes(event.eventId) ||
+      this.#processingEventIds.has(event.eventId)
+    ) {
       return;
     }
-    this.#seenEventIds.push(event.eventId);
-    if (this.#seenEventIds.length > 200) {
-      this.#seenEventIds = this.#seenEventIds.slice(-100);
+    const pending = this.#pendingInvalidations.get(event.eventId);
+    if (pending?.timer) {
+      clearTimeout(pending.timer);
+      pending.timer = null;
     }
+    this.#processingEventIds.add(event.eventId);
     this.#setState({
       lastEventId: event.eventId,
       ...(broadcast ? { connection: "live" as const } : {}),
     });
-    if (broadcast) {
+    if (broadcast && !pending) {
       this.#broadcastChannel?.postMessage({
         kind: "event",
         event,
       } satisfies WindowMessage);
     }
 
-    const work: Promise<void>[] = [];
+    const work: Promise<boolean>[] = [];
     if (event.channelId && event.channelId === this.#channelId) {
       work.push(this.loadThreads(event.channelId));
     }
@@ -695,15 +787,24 @@ export class WebController {
       work.push(this.#refreshBootstrap());
     }
     try {
-      await Promise.all(work);
+      const results = await Promise.all(work);
+      if (results.every(Boolean)) {
+        this.#pendingInvalidations.delete(event.eventId);
+        this.#rememberEvent(event.eventId);
+      } else {
+        this.#scheduleInvalidationRetry(event);
+      }
     } catch (error) {
       this.#queryFailed(error, {});
+      this.#scheduleInvalidationRetry(event);
+    } finally {
+      this.#processingEventIds.delete(event.eventId);
     }
   }
 
-  async #refreshRuns(): Promise<void> {
+  async #refreshRuns(): Promise<boolean> {
     if (!this.#projectId) {
-      return;
+      return true;
     }
     const projectId = this.#projectId;
     const sessionGeneration = this.#sessionGeneration;
@@ -718,21 +819,24 @@ export class WebController {
         this.#runsRefreshGeneration === requestGeneration &&
         this.#projectId === projectId
       ) {
-        this.#setState({ runs });
+        this.#setState({ runs, queryError: null });
       }
+      return true;
     } catch (error) {
       if (
         this.#sessionGeneration === sessionGeneration &&
         this.#runsRefreshGeneration === requestGeneration
       ) {
         this.#queryFailed(error, {});
+        return false;
       }
+      return true;
     }
   }
 
-  async #refreshAttentionAndAgents(): Promise<void> {
+  async #refreshAttentionAndAgents(): Promise<boolean> {
     if (!this.#projectId) {
-      return;
+      return true;
     }
     const projectId = this.#projectId;
     const sessionGeneration = this.#sessionGeneration;
@@ -754,21 +858,25 @@ export class WebController {
         this.#setState({
           agents: agents.items,
           attentions,
+          queryError: null,
         });
       }
+      return true;
     } catch (error) {
       if (
         this.#sessionGeneration === sessionGeneration &&
         this.#attentionRefreshGeneration === requestGeneration
       ) {
         this.#queryFailed(error, {});
+        return false;
       }
+      return true;
     }
   }
 
-  async #refreshBootstrap(): Promise<void> {
+  async #refreshBootstrap(): Promise<boolean> {
     if (!this.#projectId) {
-      return;
+      return true;
     }
     const projectId = this.#projectId;
     const sessionGeneration = this.#sessionGeneration;
@@ -784,15 +892,99 @@ export class WebController {
         this.#bootstrapRefreshGeneration === requestGeneration &&
         this.#projectId === projectId
       ) {
-        this.#setState({ bootstrap: body.bootstrap });
+        this.#setState({ bootstrap: body.bootstrap, queryError: null });
       }
+      return true;
     } catch (error) {
       if (
         this.#sessionGeneration === sessionGeneration &&
         this.#bootstrapRefreshGeneration === requestGeneration
       ) {
         this.#queryFailed(error, {});
+        return false;
       }
+      return true;
+    }
+  }
+
+  #rememberEvent(eventId: string): void {
+    this.#seenEventIds.push(eventId);
+    if (this.#seenEventIds.length > 200) {
+      this.#seenEventIds = this.#seenEventIds.slice(-100);
+    }
+  }
+
+  #scheduleInvalidationRetry(event: PublicEvent): void {
+    const existing = this.#pendingInvalidations.get(event.eventId);
+    const pending = existing ?? {
+      event,
+      retryCount: 0,
+      timer: null,
+    };
+    this.#pendingInvalidations.set(event.eventId, pending);
+    if (pending.retryCount > 0 || pending.timer) {
+      return;
+    }
+    pending.retryCount += 1;
+    pending.timer = setTimeout(() => {
+      pending.timer = null;
+      void this.#applyEvent(pending.event, false);
+    }, this.#reconnectProbeDelayMs);
+  }
+
+  #retryPendingInvalidations(): void {
+    for (const pending of this.#pendingInvalidations.values()) {
+      if (pending.timer) {
+        clearTimeout(pending.timer);
+        pending.timer = null;
+      }
+      void this.#applyEvent(pending.event, false);
+    }
+  }
+
+  #clearPendingInvalidations(): void {
+    for (const pending of this.#pendingInvalidations.values()) {
+      if (pending.timer) {
+        clearTimeout(pending.timer);
+      }
+    }
+    this.#pendingInvalidations.clear();
+    this.#processingEventIds.clear();
+  }
+
+  #scheduleLivenessRefresh(): void {
+    this.#clearLivenessRefresh();
+    const projectId = this.#projectId;
+    const sessionGeneration = this.#sessionGeneration;
+    if (!projectId || this.#state.session !== "ready") {
+      return;
+    }
+    this.#livenessTimer = setTimeout(async () => {
+      this.#livenessTimer = null;
+      if (
+        this.#disposed ||
+        this.#state.session !== "ready" ||
+        this.#projectId !== projectId ||
+        this.#sessionGeneration !== sessionGeneration
+      ) {
+        return;
+      }
+      await this.#refreshAttentionAndAgents();
+      if (
+        !this.#disposed &&
+        this.#state.session === "ready" &&
+        this.#projectId === projectId &&
+        this.#sessionGeneration === sessionGeneration
+      ) {
+        this.#scheduleLivenessRefresh();
+      }
+    }, this.#agentLivenessRefreshMs);
+  }
+
+  #clearLivenessRefresh(): void {
+    if (this.#livenessTimer) {
+      clearTimeout(this.#livenessTimer);
+      this.#livenessTimer = null;
     }
   }
 
@@ -844,11 +1036,14 @@ export class WebController {
     this.#resolveCsrfWaiters();
     this.#storage.removeItem(csrfStorageKey);
     this.#storage.removeItem(principalStorageKey);
+    this.#clearLivenessRefresh();
+    this.#clearPendingInvalidations();
     this.#closeEvents();
     this.#projectId = null;
     this.#channelId = null;
     this.#threadId = null;
     this.#runId = null;
+    this.#pendingStartThread = null;
     this.#seenEventIds = [];
     if (broadcast) {
       this.#broadcastChannel?.postMessage({
@@ -984,4 +1179,8 @@ function affectsSelectedRunDetail(event: PublicEvent): boolean {
     "RunActivityEvent",
     "Artifact",
   ].includes(event.entityType);
+}
+
+function isUncertainCommandError(error: unknown): boolean {
+  return !(error instanceof ApiError) || error.status >= 500;
 }
