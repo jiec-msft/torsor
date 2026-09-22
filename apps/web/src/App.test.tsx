@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TorsorApp } from "./App";
 import type { WebController, WebState } from "./controller";
+import { RunComposerModel } from "./run-composer-model";
 import {
   agent,
   attention,
@@ -12,6 +13,7 @@ import {
   thread,
 } from "./test/fixtures";
 import styles from "./styles.css?raw";
+import timelineStyles from "./timeline.css?raw";
 
 function readyState(overrides: Partial<WebState> = {}): WebState {
   return {
@@ -29,6 +31,9 @@ function readyState(overrides: Partial<WebState> = {}): WebState {
     loadingThreads: false,
     loadingThread: false,
     loadingRun: false,
+    loadingRunHistory: false,
+    runHistoryError: null,
+    runRefreshError: null,
     commandPending: false,
     queryError: null,
     lastEventId: "event-7",
@@ -38,6 +43,7 @@ function readyState(overrides: Partial<WebState> = {}): WebState {
 
 function stubController(state: WebState = readyState()) {
   const controller = {
+    runComposer: new RunComposerModel(),
     getSnapshot: () => state,
     subscribe: () => () => undefined,
     resume: vi.fn(async () => undefined),
@@ -47,6 +53,7 @@ function stubController(state: WebState = readyState()) {
     loadThread: vi.fn(async () => undefined),
     clearThread: vi.fn(),
     loadRun: vi.fn(async () => undefined),
+    loadEarlierRunActivity: vi.fn(async () => true),
     clearRun: vi.fn(),
     startThread: vi.fn(
       (
@@ -67,6 +74,7 @@ function mutableController(initialState: WebState) {
   let state = initialState;
   const listeners = new Set<() => void>();
   const controller = {
+    runComposer: new RunComposerModel(),
     getSnapshot: () => state,
     subscribe: (listener: () => void) => {
       listeners.add(listener);
@@ -79,6 +87,7 @@ function mutableController(initialState: WebState) {
     loadThread: vi.fn(async () => undefined),
     clearThread: vi.fn(),
     loadRun: vi.fn(async () => undefined),
+    loadEarlierRunActivity: vi.fn(async () => true),
     clearRun: vi.fn(),
     startThread: vi.fn(
       (
@@ -113,6 +122,68 @@ beforeEach(() => {
 });
 
 describe("TorsorApp", () => {
+  it("keeps the selected timeline mounted and focused during live refresh", () => {
+    window.history.replaceState(
+      {}, "", "/?project=project-sample&channel=channel-general&thread=thread-1&run=run-1&panel=run&panels=detail",
+    );
+    const controller = mutableController(readyState());
+    render(<TorsorApp controller={controller} />);
+    const timeline = screen.getByRole("region", { name: "Live Agent Timeline" });
+    timeline.focus();
+    act(() => controller.update(readyState({ loadingRun: true })));
+    expect(screen.getByRole("region", { name: "Live Agent Timeline" })).toBe(timeline);
+    expect(timeline).toHaveFocus();
+    expect(screen.queryByText("Loading atomic Run projection")).not.toBeInTheDocument();
+  });
+
+  it("does not let queued drawer focus steal the Human's timeline focus", () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 375 });
+    let frame!: FrameRequestCallback;
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frame = callback;
+      return 42;
+    });
+    const cancel = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
+    window.history.replaceState(
+      {}, "", "/?project=project-sample&channel=channel-general&thread=thread-1&run=run-1&panel=run&panels=detail",
+    );
+    const { unmount } = render(<TorsorApp controller={stubController()} />);
+    const timeline = screen.getByRole("region", { name: "Live Agent Timeline" });
+    timeline.focus();
+    act(() => frame(0));
+    expect(timeline).toHaveFocus();
+    unmount();
+    expect(cancel).toHaveBeenCalledWith(42);
+  });
+
+  it("keeps timeline history and disclosure controls reachable in a compact Run drawer", async () => {
+    const user = userEvent.setup();
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 375 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 375 });
+    window.history.replaceState(
+      {}, "", "/?project=project-sample&channel=channel-general&thread=thread-1&run=run-1&panel=run&panels=detail",
+    );
+    const controller = stubController(readyState({
+      run: { ...runProjection, activity: { ...runProjection.activity, hasEarlier: true } },
+    }));
+    render(<><style>{styles}{timelineStyles}</style><TorsorApp controller={controller} /></>);
+    const drawer = screen.getByRole("dialog", { name: "Status and detail" });
+    await waitFor(() => expect(drawer).toHaveFocus());
+    const diagnostics = within(drawer).getByText("Run diagnostics");
+    await user.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(within(drawer).getByRole("button", { name: "Refresh Run and Thread" })).toHaveFocus();
+    await user.keyboard("{Tab}");
+    expect(within(drawer).getByRole("button", { name: "Collapse detail panel" })).toHaveFocus();
+    await user.click(diagnostics);
+    expect(diagnostics.parentElement).toHaveAttribute("open");
+    await user.keyboard("{Tab}");
+    expect(within(drawer).getByRole("button", { name: /Also published/ })).toHaveFocus();
+    await user.click(within(drawer).getByRole("button", { name: "Load earlier activity" }));
+    expect(controller.loadEarlierRunActivity).toHaveBeenCalledOnce();
+    expect(getComputedStyle(drawer.querySelector(".run-detail")!).overflowY).toBe("auto");
+    expect(getComputedStyle(within(drawer).getByRole("region", { name: "Live Agent Timeline" })).overflowY).toBe("auto");
+  });
+
   it("restores thread, Run, and independent panel state from the URL", async () => {
     window.history.replaceState(
       {},

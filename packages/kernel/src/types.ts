@@ -407,6 +407,7 @@ export interface ListActivityQuery {
   readonly type: "ListActivity";
   readonly runId: string;
   readonly afterSequence?: number;
+  readonly beforeSequence?: number;
   readonly limit?: number;
 }
 

@@ -426,8 +426,9 @@ export class TorsorKernel {
           result = listActivity(
             this.#context,
             query.runId,
-            query.afterSequence ?? 0,
+            query.afterSequence,
             boundedLimit(query.limit),
+            query.beforeSequence,
           );
           break;
         }

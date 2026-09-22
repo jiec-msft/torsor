@@ -617,6 +617,8 @@ disposition_revision
 6. One Message revision may be assigned to different Runs.
 7. Creation atomically assigns monotonic `run_input_sequence`.
 8. Creation increments Run revision.
+9. Human `send_to_run` requires the observed `expected_run_revision`; it is not optional. The revision check, public Message, Human-assigned RunInput, revision increment, and delivery Outbox commit in one transaction.
+10. Client submission state is separate from the RunInput `Pending` disposition. A definite transaction rejection creates neither Message nor RunInput; a lost response leaves the commit outcome unknown and cannot establish that neither committed.
 
 ### 19.3 Semantic disposition
 
@@ -1136,6 +1138,8 @@ Run completion
 
 Compress state, generation, Pending inputs, child Runs, and diff stats into header or expandable summary rather than occupying the main reading surface.
 
+The production Web Live Agent Timeline first projects existing durable facts: visible deltas, public status, RunInput, ProviderAttempt, and explicit terminal Run state. The timeline is the main reading surface; Activation diagnostics may collapse. Preserve source Thread navigation, narrow viewports, and keyboard accessibility. This slice does not change the Human Run Composer or fabricate Tool Call or file events without a producer.
+
 ## 36. Human direct Send-to-Run
 
 The Workbench composer is not private Provider input. It performs:
@@ -1144,7 +1148,7 @@ The Workbench composer is not private Provider input. It performs:
 send_to_run(
   run_id,
   message_body,
-  expected_run_revision?
+  expected_run_revision
 )
 
 → create a Human Message in the Run's home Thread
@@ -1160,6 +1164,10 @@ send_to_run(
 5. Terminal Runs reject Send-to-Run and offer Successor creation.
 6. Without real-time Steer, RunInput remains Pending while UI immediately shows it was added.
 7. Message and RunInput succeed or fail together.
+8. Web uses the existing `POST /api/v1/commands/send-to-run` with `idempotencyKey`, `runId`, `body`, and required `expectedRunRevision`. The Run determines the destination Thread and Agent; do not substitute ordinary Reply or direct Provider input.
+9. One submission identity fixes the Human Principal, Run, body, revision, and idempotency key. Preserve it across lost responses, network errors, unreadable responses, or uncertain server outcomes. Recover by retrying the identical request, never guessing with a new revision or key. Idempotent replay returns the original result even after the Run advances or becomes terminal.
+10. Current-credential failure requires reauthentication while preserving the draft and submission identity; recovery requires the original Human Principal. A delayed `401` from obsolete credentials must not clear a replacement session and may retry the original request with replacement credentials for the same Principal. Authentication/authorization rejection during recovery cannot prove that an earlier unknown submission did not commit.
+11. Definite stale-revision or terminal-Run transaction rejection creates neither half. Preserve the draft and refresh facts for Human judgment; never automatically change revision and resubmit. Terminal Runs disallow new submissions. If Successor creation is not implemented in the Client, explicitly mark it unavailable and direct the Human to request follow-up in the public Thread rather than offering a false action.
 
 ```text
 @Agent
@@ -1183,6 +1191,8 @@ Provider token/delta
 
 Create a durable Message only when the Agent calls `reply` or an adapter has an explicit final-public-response mapping.
 
+The current ACP adapter persists `agent_message_chunk` through the capability bridge's `AppendRunActivity` before it enters the timeline. Deltas, status, Provider turn end, HTTP reads, and SSE replay must not automatically publish a Message, dispose RunInput, or complete a Run.
+
 ### 37.2 RunActivityEvent
 
 This is a runtime record, not a new collaboration object:
@@ -1199,6 +1209,8 @@ retention class
 
 It may include user-visible assistant delta, tool start/completion/failure/cancellation, public RunInput delivery update, file-change summary, Artifact/external reference publication, status, provider reconnect, delivery retry, and terminal output reference.
 
+Activity identity and order use server-assigned `id` and monotonic per-Run `sequence`, not timestamps, HTTP response order, or SSE arrival order. SQLite activity insertion, sequence allocation, and public invalidation events commit atomically. The Run projection defaults to the latest 100 items, not complete history. `ListActivity` / the HTTP activity API has bounded pages with exclusive `afterSequence` for forward reads and exclusive `beforeSequence` for historical backfill. Backward pages still return ascending sequence order, with `nextCursor` pointing to the page's earliest sequence. With both bounds, read forward within the finite interval. Each explicit client history load reads at most 100 items.
+
 ### 37.3 Safety boundary
 
 1. Do not display or persist hidden chain-of-thought.
@@ -1211,6 +1223,10 @@ It may include user-visible assistant delta, tool start/completion/failure/cance
 8. Auto-follow only while the Human remains at the bottom; otherwise show a return-to-latest control.
 9. Tool Calls default collapsed while status stays visible; details open on demand.
 10. UI may show explicit public plans, status explanations, and Provider-marked user-visible reasoning summaries, but not hidden chain-of-thought.
+11. SSE invalidates projections; it is not activity content or state authority. Clients read durable facts through authenticated HTTP, deduplicate activity identity, order by sequence, and retain loaded history across replay, duplicate/out-of-order notifications, and reconnect. Fill gaps between the loaded tail and a new window in pages of at most 100 with a fixed upper bound, never chasing an indefinitely growing head.
+12. Background refresh must not unmount the timeline or steal focus. Appends preserve the reading position after the Human scrolls upward; prepending history preserves the visible item and its relative position. `Back to latest` explicitly resumes following. Switching Runs resets that view's history, errors, and follow state; late responses from an old Run/session cannot populate the new view. Narrow-viewport drawers cancel deferred focus operations on transitions or unmount and must not steal focus already chosen by the Human inside the drawer.
+13. History failures are visible and retryable, without clearing loaded items or presenting unknown history as complete. Authentication, cross-window session updates, authorization scope, and revision fencing apply to every backfill request.
+14. Composer paired refreshes and standalone Run refreshes use the same timeline-history merge rules, never replacing loaded history with the latest 100 items. Run refresh ownership includes bounded gap reads and remains independent of the Thread read. Preserve earlier-history backfill completed before the paired result is published. A gap-read failure follows the paired-read failure semantics in section 44.2 without changing acknowledged receipts, recovery identities, another Run's draft, reading anchors, or follow state.
 
 ## 38. Files
 
@@ -1553,6 +1569,8 @@ Run source
 
 Timeline items expose source type without becoming domain objects. Stable history and active streaming head may use separate transport and compose into one timeline.
 
+Each activity shows source type, original kind, per-Run sequence, timestamp, and available Activation/ProviderAttempt provenance. Known visible deltas and status use focused plain-text presentation. Unknown kinds show only a generic activity marker and provenance metadata: never execute HTML or infer/expand an unknown payload. RunInput and ProviderAttempt use current projection facts, timestamps, and their own identities without fabricated RunActivityEvent sequences. Keep semantic input disposition separate from Provider delivery. Run `Active` is not Provider running; Provider `Completed` is not Run completion. Run `Completed`, `Failed`, and `Cancelled` come from authoritative Run state and revision. If a cancelled Run still has a `Started`, `Acknowledged`, or `Unknown` ProviderAttempt, explicitly show that stop is unconfirmed.
+
 ### 44.2 Run Composer
 
 Each Agent Run Pane has a fixed composer showing the target:
@@ -1562,13 +1580,18 @@ Send to Sable · R184
 Also published in #torsor-core / current Thread
 ```
 
-It uses atomic `send_to_run`. Client may optimistically show the Human item and update:
+It uses atomic `send_to_run` from section 36 independently of Live Timeline implementation.
 
-```text
-Pending → Delivered → Accepted
-```
-
-Delivery state does not replace semantic disposition. On send failure, restore the draft and state that neither Message nor RunInput committed; never show a half-success.
+1. Show target Agent name and ID, full Run ID, observed revision, and the explicit public home Channel/Thread destination with a return action.
+2. Show `Submitting` and prevent duplicate submission. Do not insert optimistic Message or RunInput into committed projections. Success confirms both committed and refreshes Thread and RunInput facts; a read failure only means projections need refreshing, not that the acknowledged commit failed.
+3. A definite transaction rejection reports the reason and that neither committed. A structured `413/payload_too_large` with `requestId` received before command execution on the initial attempt, with no prior unknown outcome, is also a definite rejection: release the recovery request identity, retain an editable draft, and let the Human shorten or replace the body and send again with a new idempotency key. Revision conflict preserves the draft and requires refresh and another Human send; terminal rejection must not fall back to ordinary Reply.
+4. Lost responses and other uncertain outcomes show `Submission outcome unknown`, never `Not submitted`. Freeze the original request and offer `Retry same submission`. If the prior outcome is unknown, authentication/authorization failures or `413/payload_too_large` during retry preserve uncertainty and the original request identity until same-identity idempotent replay confirms the outcome. Rejecting a later request before command execution cannot establish that the earlier request did not commit.
+5. Retain per-Run drafts and recovery identities as local state of the current Client Window across panel closure, Run selection, background refresh, and reauthentication. Late results update only their own Run's submission, never clear another Run's draft or navigate back. This slice does not promise draft recovery after browser reload or process exit.
+6. Committed does not mean the Provider received, accepted, or incorporated the input. Do not show `Delivered` or `Accepted` without public delivery evidence; display RunInput disposition separately. Unknown real-time Steer capability must explicitly disclaim immediate delivery without disabling durable RunInput submission.
+7. Provide labels, perceivable pending/success/error states, visible focus, and keyboard submission/recovery. Enter inserts a newline; Ctrl/Cmd+Enter explicitly submits without interfering with IME. Async outcomes must not steal focus from another Run or control. On narrow viewports, destination, body, status, and actions must wrap/scroll and remain keyboard-accessible.
+8. Explicitly explain absent/mismatched Run projections, unavailable authentication, terminal state, and unimplemented Successor/real-time control capabilities. Never present clickable no-op actions.
+9. Thread and Run reads own their replacement, loading, and error state independently. A paired refresh must not discard a still-current half through a shared freshness predicate. A single or paired replacement takes over only its own projection; the remaining current half must complete or explicitly fail. Replacement failure propagates to waiters; old responses must not clear loading, errors, or facts for a newer selection, Session, or Project. Publish both halves together when both remain current and succeed; if both remain current but either read fails, retain the original projections, settle loading, and allow read retry.
+10. Failure of either projection read after an acknowledged commit must expose a perceivable `Committed; projections could not be refreshed` inside that Run's Composer, including narrow-screen modals, not only in inert content outside the modal. The existing Composer refresh action retries reads only, never the command. Retain the acknowledged request's idempotency identity and receipt separately from unconfirmed recovery identity; refresh failure must not turn a committed submission into unknown or a retryable command. Scope refresh state by Run and attempt and retain it across pane remounts; older refresh results must not overwrite newer refreshes or steal Human focus.
 
 ### 44.3 Tool Call expansion and failure
 
@@ -1581,6 +1604,8 @@ Shell npm test                 failed
 ```
 
 Expansion reveals arguments and cwd, truncated output, changed files or diff summary, error and retry/replace result, and ProviderAttempt or TerminalSession provenance. Running, failed, and cancelled remain distinguishable while collapsed. Expansion is Client view state.
+
+This Tool Call lifecycle is a requirement for a later producer capability, not permission to enable ACP native tools in this Live Timeline slice. The current adapter stays deny-by-default. Do not parse text deltas as tool execution or synthesize Tool Calls. Existing Provider running/failed/Unknown and Run failed/cancelled facts remain distinguishable without expansion, with details available on demand.
 
 ### 44.4 External capability and plugin boundary
 
