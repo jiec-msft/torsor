@@ -6,6 +6,9 @@
     "paths": {
       "@torsor/kernel": [
         "../../packages/kernel/src/index.ts"
+      ],
+      "@torsor/agent-runtime": [
+        "../../packages/agent-runtime/src/index.ts"
       ]
     },
     "types": [

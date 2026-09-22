@@ -996,6 +996,8 @@ Runtime 定期恢复：
 
 所有恢复操作继续使用幂等键。
 
+Runtime Host 调度恢复 pass 时，连续执行的 pass 数量必须有界，并在继续前让出事件循环并重新检查关闭请求。积压处理不得饿死 HTTP、timer、signal 或关闭处理。空闲轮询等待必须可被关闭请求中断；无论等待还是关闭先完成，都必须移除对应 listener 并取消不再需要的 timer。
+
 ## 22. Worktree 和 Writer Lease
 
 ### 22.1 所有权

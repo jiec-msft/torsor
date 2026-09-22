@@ -1,7 +1,7 @@
 {
   "name": "@torsor/server",
   "version": "0.1.0",
-  "description": "Local HTTP and SSE service for the Torsor durable kernel",
+  "description": "Local production host for the Torsor kernel and agent runtime",
   "license": "Apache-2.0",
   "private": true,
   "type": "module",
@@ -17,10 +17,11 @@
     "start": "node dist/main.js",
     "test": "npm run build && vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
-    "prebuild": "npm run build --workspace @torsor/kernel",
+    "prebuild": "npm run build --workspace @torsor/kernel && npm run build --workspace @torsor/agent-runtime",
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@torsor/agent-runtime": "0.1.0",
     "@torsor/kernel": "0.1.0"
   },
   "devDependencies": {

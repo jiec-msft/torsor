@@ -48,9 +48,7 @@ export interface LocalCredential {
   readonly principalContext: PrincipalContext;
 }
 
-export interface TorsorHttpServiceOptions {
-  readonly databasePath: string;
-  readonly bootstrap?: KernelBootstrap;
+interface TorsorHttpServiceBaseOptions {
   readonly credentials: readonly LocalCredential[];
   readonly host?: string;
   readonly port?: number;
@@ -59,9 +57,26 @@ export interface TorsorHttpServiceOptions {
   readonly eventPollIntervalMs?: number;
   readonly heartbeatIntervalMs?: number;
   readonly sessionDurationMs?: number;
+}
+
+interface OwnedKernelHttpServiceOptions {
+  readonly kernel?: never;
+  readonly databasePath: string;
+  readonly bootstrap?: KernelBootstrap;
   readonly clock?: () => Date;
   readonly idFactory?: (prefix: string) => string;
 }
+
+interface SharedKernelHttpServiceOptions {
+  readonly kernel: TorsorKernel;
+  readonly databasePath?: never;
+  readonly bootstrap?: never;
+  readonly clock?: never;
+  readonly idFactory?: never;
+}
+
+export type TorsorHttpServiceOptions = TorsorHttpServiceBaseOptions &
+  (OwnedKernelHttpServiceOptions | SharedKernelHttpServiceOptions);
 
 export interface TorsorHttpService {
   readonly origin: string | null;
@@ -92,6 +107,7 @@ class HttpError extends Error {
 
 class Service implements TorsorHttpService {
   readonly #kernel: TorsorKernel;
+  readonly #ownsKernel: boolean;
   readonly #server: Server;
   readonly #credentials = new Map<string, PrincipalContext>();
   readonly #sessions = new Map<
@@ -154,12 +170,18 @@ class Service implements TorsorHttpService {
       options.sessionDurationMs ?? defaultSessionDurationMs,
       "sessionDurationMs",
     );
-    this.#kernel = TorsorKernel.open({
-      databasePath: options.databasePath,
-      ...(options.bootstrap ? { bootstrap: options.bootstrap } : {}),
-      ...(options.clock ? { clock: options.clock } : {}),
-      ...(options.idFactory ? { idFactory: options.idFactory } : {}),
-    });
+    if (options.kernel) {
+      this.#kernel = options.kernel;
+      this.#ownsKernel = false;
+    } else {
+      this.#kernel = TorsorKernel.open({
+        databasePath: options.databasePath,
+        ...(options.bootstrap ? { bootstrap: options.bootstrap } : {}),
+        ...(options.clock ? { clock: options.clock } : {}),
+        ...(options.idFactory ? { idFactory: options.idFactory } : {}),
+      });
+      this.#ownsKernel = true;
+    }
     this.#server = createServer((request, response) => {
       void this.#handle(request, response);
     });
@@ -236,7 +258,9 @@ class Service implements TorsorHttpService {
       await closed;
     }
     this.#sessions.clear();
-    this.#kernel.close();
+    if (this.#ownsKernel) {
+      this.#kernel.close();
+    }
     this.#origin = null;
     this.#state = "closed";
   }
