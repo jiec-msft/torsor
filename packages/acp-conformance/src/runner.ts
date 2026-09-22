@@ -75,6 +75,7 @@ export async function runScenario(input: Scenario, options: RunOptions = {}): Pr
     await guard(owned.started, scenario.limits.startupMs);
     const updates: Json[] = [];
     let updated = deferred<void>();
+    // Wire validates permission lifecycle both before dispatch and before writing the response.
     connection = client()
       .onRequest("session/request_permission", () => ({ outcome: { outcome: "cancelled" } }))
       .onNotification("session/update", (value: unknown) => value, (context) => {

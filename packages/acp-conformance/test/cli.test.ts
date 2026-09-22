@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +22,43 @@ function invoke(args: string[], closeInput = false) {
 }
 
 describe("CLI and opt-in contract (spec sections 2 and 6)", () => {
+  it.each(["result.json", "transcript.jsonl"])("preserves existing %s without creating a partial pair and permits clean retry", async (extension) => {
+    const directory = await mkdtemp(join(tmpdir(), "acp-cli-pair-"));
+    const existing = `basic.${extension}`;
+    try {
+      await writeFile(join(directory, existing), "synthetic-existing-content\n");
+      for (let attempt = 0; attempt < 2; attempt++) {
+        expect((await invoke(["run", example, "--out", directory])).code).toBe(2);
+        expect(await readdir(directory)).toEqual([existing]);
+        expect(await readFile(join(directory, existing), "utf8")).toBe("synthetic-existing-content\n");
+      }
+      await unlink(join(directory, existing));
+      expect((await invoke(["run", example, "--out", directory])).code).toBe(0);
+      expect((await readdir(directory)).sort()).toEqual(["basic.result.json", "basic.transcript.jsonl"]);
+      const summary = await readFile(join(directory, "basic.result.json"), "utf8");
+      const transcript = await readFile(join(directory, "basic.transcript.jsonl"), "utf8");
+      expect(JSON.parse(summary)).toMatchObject({ status: "passed", schemaVersion: 1 });
+      expect(transcript.trim().split("\n").map((line) => JSON.parse(line))).not.toHaveLength(0);
+      expect((await invoke(["run", example, "--out", directory])).code).toBe(2);
+      expect(await readFile(join(directory, "basic.result.json"), "utf8")).toBe(summary);
+      expect(await readFile(join(directory, "basic.transcript.jsonl"), "utf8")).toBe(transcript);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it("allows only one concurrent writer to publish a complete artifact pair", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "acp-cli-concurrent-pair-"));
+    try {
+      const results = await Promise.all([
+        invoke(["run", example, "--out", directory]), invoke(["run", example, "--out", directory]),
+      ]);
+      expect(results.map((result) => result.code).sort()).toEqual([0, 2]);
+      expect((await readdir(directory)).sort()).toEqual(["basic.result.json", "basic.transcript.jsonl"]);
+      expect(JSON.parse(await readFile(join(directory, "basic.result.json"), "utf8")).status).toBe("passed");
+      const transcript = await readFile(join(directory, "basic.transcript.jsonl"), "utf8");
+      expect(JSON.parse(transcript.trim().split("\n").at(-1)!)).toMatchObject({ direction: "harness", kind: "closed" });
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
   it("fails standalone mock actions with a fixed diagnostic and nonzero exit", async () => {
     const directory = await mkdtemp(join(tmpdir(), "acp-cli-mock-failure-"));
     try {

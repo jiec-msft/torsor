@@ -35,6 +35,8 @@ const suite = await runSuite([scenario]);
 
 参数支持 `{ "$ref": "workspace" }` 和 `{ "$ref": "session#/sessionId" }`；第二种引用已消费的响应。没有字符串插值、环境展开或执行代码。
 
+`session/new` 返回的非空 ID 在本连接必须唯一。每个 Session 的初始 `tool_call` ID 也必须非空且唯一；先宣布 Tool，再发送引用它的 Update 或 Permission 请求。内容/工具 Update 和 Permission 需要活动 Prompt；合法 Permission 一律 `cancelled`，无效生命周期在应答前拒绝。新 Prompt 不允许复用该 Session 的初始 Tool ID。
+
 `mock.handlers` 的 `method` / `kind` 注册 SDK Handler；动作包括 `reply`、`notify`、反向 `request`、具名 `wait` / `release` Gate 和 `fault`。`mock.onStdinClose` 可确定性注入 EOF 之后的输出。`fault.kind` 包括 `malformed`、`oversized`、`stderr`、`stdout-close`、`stdin-close`、`exit`、`hang`、`wire`。`wire.message` 为显式 JSON 消息，`wire.newline: false` 用于半帧；`oversized` / `stderr` 使用 `bytes`。这些是测试故障，不是生产兼容行为。
 
 ```powershell
@@ -48,6 +50,8 @@ npm exec -- acp-conformance mock packages\acp-conformance\examples\basic.json
 ## 结果与预算
 
 `--out <directory>` 生成每场景的 `.result.json` 和 `.transcript.jsonl`，拒绝覆盖。返回状态为 `passed`、`failed` 或 `skipped`。CLI 退出码分别为全通过 `0`、失败 `1`、配置/用法/I/O 错误 `2`、真实 Provider 未启用 `3`；失败优先于跳过。
+
+每对文件先独占预留两个目标；任一目标冲突时不修改现有文件，并回滚本次预留，不留下新的半对 Artifact。移除冲突后可直接重试。回滚失败明确报 I/O 错误；不保证跨场景或崩溃时的原子提交。
 
 Diagnostic 包含稳定 `code`、从零开始的 `step`（启动阶段为 `-1`）和不包含原始值的说明。`expectFailure` 用于测试 Harness 的错误路径；匹配时保留 Diagnostic，清理失败永不视为成功。
 
@@ -64,7 +68,7 @@ npm exec -- acp-conformance run packages\acp-conformance\examples\basic.json --a
 npm exec -- acp-conformance run packages\acp-conformance\examples\basic.json --allow-real -- provider-executable --acp
 ```
 
-只授权必要环境名称；不要将凭据放入场景、参数、Artifact 或仓库。未设置的环境名称明确报错。默认隔离 HOME、配置、缓存和临时目录，不自动复用登录文件。具名 Copilot Profile 禁用工具和非必要集成，并将日志限制在临时 Workspace。所有权限请求自动 `cancelled`；其他客户端工具请求返回 Method Not Found。标准工具活动通知本身不等于协议违规。
+只授权必要环境名称；不要将凭据放入场景、参数、Artifact 或仓库。未设置的环境名称明确报错。默认隔离 HOME、配置、缓存和临时目录，不自动复用登录文件。具名 Copilot Profile 禁用工具和非必要集成，并将日志限制在临时 Workspace。生命周期有效的权限请求自动 `cancelled`，无效请求令场景失败；其他客户端工具请求返回 Method Not Found。合法工具活动通知本身不等于协议违规。
 
 API 使用 `runScenario(scenario, { allowReal: true, provider: { command, args, environment } })` 或 `provider: { profile: "copilot-cli-v1", environment }`。Command/Args 分离且不开 Shell；Windows `.cmd` / `.bat` 被拒绝。普通 CI 永不启用真实 Provider。`basic` 是 Mock/真实 Provider 共用的 Smoke 子集；取消和故障例子要求脚本化协调，不能假定任意真实模型会匹配。
 

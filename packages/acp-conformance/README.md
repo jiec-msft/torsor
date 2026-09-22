@@ -35,6 +35,8 @@ The single configuration schema lives in `src/schema.ts`. JSON/YAML parse into t
 
 Parameters support `{ "$ref": "workspace" }` and `{ "$ref": "session#/sessionId" }`; the latter references a consumed response. No string interpolation, environment expansion, or executable code.
 
+Nonempty IDs returned by `session/new` must be unique on the connection. Initial `tool_call` IDs must also be nonempty and unique within each session; announce a tool before updates or permission requests refer to it. Content/tool updates and permission requests require an active prompt. Valid permissions always receive `cancelled`; invalid lifecycles are rejected before acknowledgement. A new prompt cannot reuse that session's initial tool IDs.
+
 `mock.handlers` registers SDK handlers by `method` / `kind`; actions are `reply`, `notify`, reverse `request`, named `wait` / `release` gates, and `fault`. `mock.onStdinClose` deterministically injects post-EOF output. `fault.kind` includes `malformed`, `oversized`, `stderr`, `stdout-close`, `stdin-close`, `exit`, `hang`, and `wire`. `wire.message` is an explicit JSON message; `wire.newline: false` tests partial frames. `oversized` / `stderr` use `bytes`. These are test faults, not production compatibility behavior.
 
 ```powershell
@@ -48,6 +50,8 @@ This command exposes a standard ACP stdio peer that other clients can launch dir
 ## Results and budgets
 
 `--out <directory>` writes per-scenario `.result.json` and `.transcript.jsonl`, refusing overwrites. Results are `passed`, `failed`, or `skipped`. CLI codes are all-passed `0`, failure `1`, configuration/usage/I/O error `2`, and real-provider-disabled `3`; failure takes precedence over skips.
+
+Both destinations are exclusively reserved before either file is written. A collision preserves existing files and rolls back this attempt's reservations without leaving a new partial pair; remove the conflict and retry. Rollback failures explicitly report an I/O error. Cross-scenario and crash-atomic commits are not guaranteed.
 
 Diagnostics contain stable `code`, zero-based `step` (`-1` during startup), and descriptions without raw values. `expectFailure` exercises harness failure paths; a match retains its diagnostic, and cleanup failure never passes.
 
@@ -64,7 +68,7 @@ npm exec -- acp-conformance run packages\acp-conformance\examples\basic.json --a
 npm exec -- acp-conformance run packages\acp-conformance\examples\basic.json --allow-real -- provider-executable --acp
 ```
 
-Authorize only necessary environment names; never put credentials in scenarios, arguments, artifacts, or the repository. Unset environment names fail explicitly. Home, config, cache, and temporary directories are isolated by default; login files are not automatically reused. The named Copilot profile disables tools and unnecessary integrations and directs logs into the temporary workspace. Every permission request returns `cancelled`; other client-tool requests return Method Not Found. Standard tool-activity notifications alone are not protocol violations.
+Authorize only necessary environment names; never put credentials in scenarios, arguments, artifacts, or the repository. Unset environment names fail explicitly. Home, config, cache, and temporary directories are isolated by default; login files are not automatically reused. The named Copilot profile disables tools and unnecessary integrations and directs logs into the temporary workspace. Lifecycle-valid permission requests receive `cancelled`, while invalid requests fail the scenario; other client-tool requests return Method Not Found. Valid tool-activity notifications alone are not protocol violations.
 
 API callers use `runScenario(scenario, { allowReal: true, provider: { command, args, environment } })` or `provider: { profile: "copilot-cli-v1", environment }`. Command/args are separate and never invoke a shell; Windows `.cmd` / `.bat` are rejected. Ordinary CI never enables real providers. `basic` is the shared mock/real smoke subset; cancellation/fault examples require scripted coordination and cannot be assumed to match arbitrary real models.
 

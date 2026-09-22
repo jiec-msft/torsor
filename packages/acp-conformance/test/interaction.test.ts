@@ -13,6 +13,10 @@ const deny = {
   type: "request", method: "session/request_permission", params: permission,
   expect: [{ path: "/outcome/outcome", equals: "cancelled" }],
 };
+const announce = {
+  type: "notify", method: "session/update",
+  params: { sessionId: permission.sessionId, update: { sessionUpdate: "tool_call", ...permission.toolCall } },
+};
 
 describe("coordinated conversations (spec sections 3-4)", () => {
   it.each([false, true])("fails notification assertions independently of explicit exit: %s", async (explicitExit) => {
@@ -24,6 +28,7 @@ describe("coordinated conversations (spec sections 3-4)", () => {
     data.steps.at(-1).expect[0].equals = "cancelled";
     if (explicitExit) data.steps.push({ type: "close-stdin" }, { type: "exit", code: 0 });
     data.mock.handlers[2].actions = [
+      announce,
       data.mock.handlers[2].actions[0],
       { type: "wait", gate: "cancel" },
       deny,
@@ -54,7 +59,7 @@ describe("coordinated conversations (spec sections 3-4)", () => {
   it("reports request action assertion failures through the same sanitized channel", async () => {
     const data = structuredClone(basic);
     data.expectFailure = "rpc_error";
-    data.mock.handlers[2].actions.unshift({
+    data.mock.handlers[2].actions.unshift(announce, {
       ...deny, expect: [{ path: "/outcome/outcome", equals: "selected" }],
     });
     const result = await runScenario(loadScenario(JSON.stringify(data), { format: "json" }));
@@ -71,6 +76,7 @@ describe("coordinated conversations (spec sections 3-4)", () => {
     );
     data.steps.at(-1).expect[0].equals = "cancelled";
     data.mock.handlers[2].actions = [
+      announce,
       deny,
       data.mock.handlers[2].actions[0],
       { type: "wait", gate: "cancel" },

@@ -1,10 +1,41 @@
 #!/usr/bin/env node
-import { mkdir, open, writeFile } from "node:fs/promises";
+import { mkdir, open, unlink, type FileHandle } from "node:fs/promises";
 import { extname, join } from "node:path";
 
-import { ConfigurationError, loadScenario, runSuite, toJsonl, type RunOptions } from "./index.js";
+import { ConfigurationError, loadScenario, runSuite, toJsonl, type RunOptions, type RunResult } from "./index.js";
+import { record } from "./facts.js";
 
 const usage = "Usage: acp-conformance run <scenario...> [--out <directory>] [--allow-real] [--inherit-env NAME] [--profile copilot-cli-v1 | -- <command> <args...>]\n       acp-conformance mock <scenario>";
+
+class ArtifactError extends Error {}
+
+async function writeArtifacts(directory: string, result: RunResult): Promise<void> {
+  const { transcript: _transcript, ...summary } = result;
+  const files = [
+    { path: join(directory, `${result.id}.result.json`), content: JSON.stringify(summary, null, 2) + "\n" },
+    { path: join(directory, `${result.id}.transcript.jsonl`), content: toJsonl(result) },
+  ];
+  const reserved: { path: string; handle: FileHandle; content: string }[] = [];
+  let written = false;
+  try {
+    for (const file of files) reserved.push({ ...file, handle: await open(file.path, "wx") });
+    for (const file of reserved) await file.handle.writeFile(file.content);
+    written = true;
+  } catch (error) {
+    if (record(error) && error.code === "EEXIST") throw new ArtifactError("Artifact destination already exists; no files were overwritten.");
+    throw error;
+  } finally {
+    const closed = await Promise.allSettled(reserved.map((file) => file.handle.close()));
+    const closeFailed = closed.some((result) => result.status === "rejected");
+    if (!written || closeFailed) {
+      const removed = await Promise.allSettled(reserved.map((file) => unlink(file.path)));
+      if (removed.some((result) => result.status === "rejected")) {
+        throw new ArtifactError("Could not remove incomplete artifact files.");
+      }
+    }
+    if (closeFailed) throw new ArtifactError("Could not close artifact output files.");
+  }
+}
 
 async function readScenario(path: string) {
   const extension = extname(path).toLowerCase();
@@ -74,11 +105,7 @@ async function main(): Promise<number> {
   const results = await runSuite(scenarios, options);
   if (out) await mkdir(out, { recursive: true });
   for (const result of results) {
-    if (out) {
-      const { transcript: _transcript, ...summary } = result;
-      await writeFile(join(out, `${result.id}.result.json`), JSON.stringify(summary, null, 2) + "\n", { flag: "wx" });
-      await writeFile(join(out, `${result.id}.transcript.jsonl`), toJsonl(result), { flag: "wx" });
-    }
+    if (out) await writeArtifacts(out, result);
     console.log(`${result.status.toUpperCase()} ${result.id}`);
     for (const diagnostic of result.diagnostics) {
       console.log(`  step ${diagnostic.step}: ${diagnostic.code}: ${diagnostic.message}`);
@@ -90,6 +117,6 @@ async function main(): Promise<number> {
 
 try { process.exitCode = await main(); }
 catch (error) {
-  console.error(error instanceof ConfigurationError ? error.message : "Could not read scenario or write artifacts.");
+  console.error(error instanceof ConfigurationError || error instanceof ArtifactError ? error.message : "Could not read scenario or write artifacts.");
   process.exitCode = 2;
 }

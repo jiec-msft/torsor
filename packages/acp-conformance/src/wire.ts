@@ -12,13 +12,13 @@ const turnUpdates = new Set(["user_message_chunk", "agent_message_chunk", "agent
 
 export class Wire {
   readonly stream: Stream;
-  readonly #pending = new Map<string, { method: string; sessionId: unknown; cancelled: boolean }>();
+  readonly #pending = new Map<string, { method: string; sessionId: unknown; toolCallId: unknown; cancelled: boolean }>();
   #buffer = Buffer.alloc(0);
   #bytes = 0;
   #events = 0;
   #ended = false;
   #initialized = false;
-  readonly #sessions = new Set<string>();
+  readonly #sessions = new Map<string, Set<string>>();
 
   constructor(
     private readonly owned: OwnedProcess,
@@ -99,6 +99,9 @@ export class Wire {
       }
       const request = this.#pending.get(key);
       if (!request) fail("unexpected_response", "Response ID is unknown or already completed.");
+      if (direction === "client" && request.method === "session/request_permission") {
+        this.permission(request.sessionId, request.toolCallId);
+      }
       this.#pending.delete(key);
       if (request.cancelled && (!record(message.result) || message.result.stopReason !== "cancelled")) {
         fail("protocol_result", "A cancelled prompt must return stopReason cancelled.");
@@ -154,6 +157,16 @@ export class Wire {
           turnUpdates.has(params.update.sessionUpdate) && !this.activePrompt(params.sessionId)) {
           fail("protocol_state", "Content and tool updates require an outstanding prompt for their session.");
         }
+        if (record(params.update) && (params.update.sessionUpdate === "tool_call" || params.update.sessionUpdate === "tool_call_update")) {
+          this.tool(params.sessionId, params.update.toolCallId, params.update.sessionUpdate === "tool_call");
+        }
+      }
+      if (direction === "provider" && message.method === "session/request_permission") {
+        const params = message.params;
+        if (!hasId || !record(params) || !record(params.toolCall)) {
+          fail("protocol_state", "Permission must be a request identifying a session and tool.");
+        }
+        this.permission(params.sessionId, params.toolCall.toolCallId);
       }
       if (direction === "client" && message.method === "session/cancel" && record(message.params)) {
         for (const [pendingKey, request] of this.#pending) {
@@ -166,11 +179,32 @@ export class Wire {
         this.#pending.set(key, {
           method: message.method,
           sessionId: record(message.params) ? message.params.sessionId : undefined,
+          toolCallId: record(message.params) && record(message.params.toolCall) ? message.params.toolCall.toolCallId : undefined,
           cancelled: false,
         });
       }
     }
     this.transcript.protocol(direction, message);
+  }
+
+  private tool(sessionId: string, toolCallId: unknown, initial = false): void {
+    const tools = this.#sessions.get(sessionId);
+    if (!tools || typeof toolCallId !== "string" || !toolCallId) {
+      fail("protocol_state", "Tool identity requires a created session and nonempty tool ID.");
+    }
+    if (initial ? tools.has(toolCallId) : !tools.has(toolCallId)) {
+      fail("protocol_state", initial
+        ? "Initial tool ID was already used in this session."
+        : "Tool update or permission refers to a tool not announced in this session.");
+    }
+    if (initial) tools.add(toolCallId);
+  }
+
+  private permission(sessionId: unknown, toolCallId: unknown): void {
+    if (typeof sessionId !== "string" || !this.#sessions.has(sessionId) || !this.activePrompt(sessionId)) {
+      fail("protocol_state", "Permission requires a created session with an outstanding prompt.");
+    }
+    this.tool(sessionId, toolCallId);
   }
 
   private activePrompt(sessionId: string): boolean {
@@ -191,7 +225,10 @@ export class Wire {
       if (!record(result) || typeof result.sessionId !== "string" || !result.sessionId) {
         fail("protocol_result", "Session creation requires a nonempty sessionId.");
       }
-      this.#sessions.add(result.sessionId);
+      if (this.#sessions.has(result.sessionId)) {
+        fail("protocol_result", "Session creation returned an ID already used on this connection.");
+      }
+      this.#sessions.set(result.sessionId, new Set());
     }
     if (method === "session/prompt" && (!record(result) || typeof result.stopReason !== "string" || !stopReasons.has(result.stopReason))) {
       fail("protocol_result", "Prompt result requires a supported stopReason.");

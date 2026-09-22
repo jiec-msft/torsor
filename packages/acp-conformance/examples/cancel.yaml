@@ -42,6 +42,16 @@ mock:
           params:
             sessionId: synthetic-session
             update:
+              sessionUpdate: tool_call
+              toolCallId: synthetic-tool
+              title: Synthetic tool
+              kind: other
+              status: pending
+        - type: notify
+          method: session/update
+          params:
+            sessionId: synthetic-session
+            update:
               sessionUpdate: agent_message_chunk
               content: { type: text, text: "Synthetic cancellation barrier." }
         - { type: wait, gate: cancel }

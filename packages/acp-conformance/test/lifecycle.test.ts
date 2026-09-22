@@ -14,8 +14,8 @@ const turnUpdates = [
   ...["user_message_chunk", "agent_message_chunk", "agent_thought_chunk"].map((sessionUpdate) => ({
     sessionUpdate, content: { type: "text", text: "Synthetic turn content." },
   })),
-  { sessionUpdate: "tool_call", toolCallId: "synthetic-tool", title: "Synthetic tool", kind: "read", status: "pending" },
-  { sessionUpdate: "tool_call_update", toolCallId: "synthetic-tool", status: "completed" },
+  { sessionUpdate: "tool_call", toolCallId: "synthetic-update-tool", title: "Synthetic tool", kind: "read", status: "pending" },
+  { sessionUpdate: "tool_call_update", toolCallId: "synthetic-update-tool", status: "completed" },
 ];
 const sessionUpdates = [
   { sessionUpdate: "available_commands_update", availableCommands: [] },
@@ -31,6 +31,18 @@ const unsafeParams = [
 ];
 
 describe("session lifecycle fences (spec section 4)", () => {
+  it.each([false, true])("rejects duplicate session IDs with concurrent creation: %s", async (concurrent) => {
+    const data = structuredClone(basic);
+    const second = { ...data.steps[2], id: "second" };
+    data.steps = concurrent
+      ? [...data.steps.slice(0, 3), second, data.steps[3], { type: "response", id: "second" }]
+      : [...data.steps.slice(0, 4), second, { type: "response", id: "second" }];
+    const result = await runScenario(loadScenario(JSON.stringify(data), { format: "json" }));
+    expect(result.status).toBe("failed");
+    expect(result.diagnostics[0]?.code).toBe("protocol_result");
+    expect(toJsonl(result)).not.toContain("synthetic-session");
+  });
+
   it.each([...turnUpdates, ...sessionUpdates])("rejects $sessionUpdate for a never-created session", async (update) => {
     const data = structuredClone(basic);
     data.mock.handlers[2].actions.unshift({
@@ -66,7 +78,7 @@ describe("session lifecycle fences (spec section 4)", () => {
     }));
     const result = await runScenario(loadScenario(JSON.stringify(data), { format: "json" }));
     expect(result).toMatchObject({ status: "passed", diagnostics: [] });
-    expect(result.transcript.filter((event) => event.message.method === "session/update")).toHaveLength(11);
+    expect(result.transcript.filter((event) => event.message.method === "session/update")).toHaveLength(12);
   });
 
   it.each(["before-prompt", "after-error"])("requires an active turn %s", async (phase) => {
