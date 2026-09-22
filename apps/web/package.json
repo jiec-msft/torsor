@@ -5,11 +5,18 @@
   "license": "Apache-2.0",
   "private": true,
   "type": "module",
+  "exports": {
+    "./controller": {
+      "types": "./dist-controller/public-controller.d.ts",
+      "import": "./dist-controller/public-controller.js"
+    }
+  },
   "scripts": {
     "dev": "vite",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "build": "tsc --noEmit -p tsconfig.json && vite build"
+    "build:controller": "tsc -p tsconfig.controller.json",
+    "build": "npm run build:controller && tsc --noEmit -p tsconfig.json && vite build"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

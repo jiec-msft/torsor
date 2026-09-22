@@ -1,5 +1,5 @@
-import { ApiError } from "./api";
-import type { Run } from "./types";
+import { ApiError } from "./api.js";
+import type { Run } from "./types.js";
 
 export interface SendToRunRequest {
   readonly idempotencyKey: string;

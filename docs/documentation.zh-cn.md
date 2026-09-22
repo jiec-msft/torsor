@@ -33,6 +33,8 @@
 | `docs/documentation.md` | `docs/documentation.zh-cn.md` | 文档策略与审计 | 已配对；规范性 |
 | `docs/specs/acp-conformance.md` | `docs/specs/acp-conformance.zh-cn.md` | 独立 ACP Harness 规格与公开复用研究 | 已配对；规范性 |
 | `packages/acp-conformance/README.md` | `packages/acp-conformance/README.zh-cn.md` | 独立工具入门 | 已配对；面向所有者与外部 Provider 作者 |
+| `docs/specs/system-scenarios.md` | `docs/specs/system-scenarios.zh-cn.md` | 系统测试契约 | 已配对；规范性 |
+| `packages/system-scenarios/README.md` | `packages/system-scenarios/README.zh-cn.md` | 系统测试入门 | 已配对；面向所有者 |
 | `apps/server/README.md` | 不要求 | 组件实现参考 | 保持英文；路由与认证参考直接绑定英文 API 语法，不是产品规格或所有者入门入口 |
 | `apps/web/README.md` | 不要求 | 组件实现参考 | 保持英文；构建和 Client 状态参考直接绑定实现 |
 | `packages/agent-runtime/README.md` | 不要求 | Package 实现参考 | 保持英文；详细 Runtime Contract 随代码维护，不作为 Human 产品基线 |

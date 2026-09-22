@@ -1,4 +1,4 @@
-import type { ActivityEvent, RunProjection } from "./types";
+import type { ActivityEvent, RunProjection } from "./types.js";
 
 export type ActivityWindow = RunProjection["activity"];
 

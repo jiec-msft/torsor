@@ -13,6 +13,9 @@
 配套的公开交互原型位于 [`mvp-0.1/`](mvp-0.1/)，场景截图和验证索引见
 [`mvp-0.1/README.zh-cn.md`](mvp-0.1/README.zh-cn.md)（[English](mvp-0.1/README.md)）。
 
+确定性系统行为的测试契约和场景追踪见
+[System Scenarios](../specs/system-scenarios.zh-cn.md)（[English](../specs/system-scenarios.md)）。
+
 ## 1. 产品目标
 
 Torsor 使用 Human 熟悉的 Channel、Thread、Message 和 Mention 作为协作语言，但不模拟 Human 的串行、迟缓和注意力瓶颈。
