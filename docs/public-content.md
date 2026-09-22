@@ -1,5 +1,7 @@
 # Public Content Policy
 
+> English | [简体中文](public-content.zh-cn.md)
+
 Everything committed to this repository is public.
 
 ## Allowed sources

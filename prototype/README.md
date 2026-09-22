@@ -1,5 +1,7 @@
 # Torsor chat prototype
 
+> English | [简体中文](README.zh-cn.md)
+
 This is a local discovery prototype for exploring how one deploying human can
 coordinate multiple replaceable software agent sessions through durable work
 state.
@@ -18,7 +20,8 @@ review results, and reconcile uncertain external effects.
 This React application records an earlier executable exploration. The accepted
 MVP 0.1 core, desktop interaction model, and dependency-free design prototype
 are documented in the
-[MVP 0.1 design baseline (Simplified Chinese)](../docs/prototype/001-overview.zh-cn.md).
+[MVP 0.1 design baseline (English)](../docs/prototype/001-overview.md) and
+[Simplified Chinese primary](../docs/prototype/001-overview.zh-cn.md).
 
 The next implementation slice should use that baseline when replacing or
 reusing behavior from this exploration.
