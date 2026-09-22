@@ -230,6 +230,8 @@ export function getThreadProjectionAt(
       `SELECT run.id, run.project_id, run.home_channel_id,
               run.thread_root_id, run.owner_agent_id,
               run.agent_config_revision, history.state, history.revision,
+              run.causal_root_id, run.parent_attention_id,
+              run.parent_run_id, run.delegation_depth,
               history.activation_generation, run.created_at,
               history.updated_at, history.terminal_reason
          FROM runs AS run
@@ -272,6 +274,8 @@ export function getRunProjectionAt(
     `SELECT current.id, current.project_id, current.home_channel_id,
             current.thread_root_id, current.owner_agent_id,
             current.agent_config_revision, history.state, history.revision,
+            current.causal_root_id, current.parent_attention_id,
+            current.parent_run_id, current.delegation_depth,
             history.activation_generation, current.created_at,
             history.updated_at, history.terminal_reason
        FROM runs AS current

@@ -6,6 +6,7 @@ import {
   resolveAttentionWithRun,
 } from "./attentions.js";
 import { replyToThread, startThread } from "./collaboration.js";
+import { rejectCausalOverrides } from "./causal-limits.js";
 import {
   allRows,
   getRow,
@@ -156,6 +157,7 @@ export class TorsorKernel {
     ) {
       requireKind(this.#context, principal, "runtime");
     }
+    rejectCausalOverrides(command);
     const payloadHash = hashPayload(command);
     this.#context.database.exec("BEGIN IMMEDIATE");
     try {

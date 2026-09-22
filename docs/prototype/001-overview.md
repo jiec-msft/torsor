@@ -4,7 +4,7 @@
 
 > Status: working notes
 >
-> Updated: 2026-09-21
+> Updated: 2026-09-22
 >
 > Purpose: record the current design consensus, unresolved questions, and the entry point for the next derivation round.
 >
@@ -847,7 +847,7 @@ Retry automatically only when the adapter proves idempotency. Otherwise retain `
 
 ### 25.1 Causal chain
 
-Agent-created Attention and Run records include:
+The first durable causal-limit slice uses immutable Run provenance:
 
 ```text
 causal_root_id
@@ -856,22 +856,30 @@ parent_run_id
 delegation_depth
 ```
 
-A new Human request starts a new causal root.
+1. `causal_root_id` is the initiating Human Message ID, not a Thread ID or Provider Session. Each new Human Message from `StartThread`, `ReplyToThread`, or `SendToRun` starts a root; multiple Mentions in that Message share it.
+2. All current new Runs are created through `ResolveAttentionWithRun`. Kernel derives provenance from the authenticated Attention Activation, the Attention's exact Message revision, and that Message's server-authored provenance. `parent_attention_id` is the Attention being resolved.
+3. A Run directly triggered by a Human Message has `parent_run_id = null` and `delegation_depth = 0`. A new Run triggered by an Agent's `PublishRunReply` or `CompleteRun.finalReply` uses the Message's `caused_by_run_id` as parent, inherits its root, and increments depth by one. A terminal parent does not reset provenance or depth.
+4. Attention traces causality through its immutable Message revision and Message provenance rather than duplicating budget fields that could drift. Creation without trustworthy Human or Run provenance fails closed, never falling back to a new root.
+5. Continuing an existing Run from Attention, Human Send-to-Run, and Activation/Provider retries neither rewrite existing Run provenance nor allocate another Run slot. Later delegation from that Run uses its original root, not its newest input's root.
+6. Agent/Provider payload root, parent, depth, or limit fields are not authoritative; Kernel rejects explicit submission of these server-owned fields. This slice adds no direct Fork, Retry, Successor, or Replacement creation commands; future creation paths must reuse the same admission boundary.
 
 ### 25.2 Budget envelope
 
-1. Child Runs and Attention receive allocations from the caller's budget.
-2. An Agent cannot increase the total budget.
-3. Limit at least concurrent nonterminal Runs per Project/Agent, depth and fan-out per causal root, Provider cost, and Attention creation rate.
-
-Initial runtime defaults:
+This first slice enforces only two hard limits, with approved initial defaults:
 
 ```text
 delegation depth: 4
 max non-terminal Runs per causal root: 50
 ```
 
-Values are configuration, not hard-coded domain semantics.
+1. Maximum depth is inclusive at 4 (initial Runs are depth 0). At most 50 nonterminal Runs share one root, including initial Runs and counting across all Agents in that root.
+2. Values belong to server-owned `KernelOpenOptions.causalLimits`, not Agent configuration or command parameters. New databases persist defaults or explicit configuration; all connections and restarts read the same durable configuration. Reopening with explicitly different values fails clearly. There is no online limit-changing command yet.
+3. In one `BEGIN IMMEDIATE` transaction, Kernel derives provenance, checks depth, counts durable Run occupancy, creates Run/RunInput, resolves Attention, and writes events, Outbox, and idempotency results. At most one of multiple SQLite connections racing for the last slot succeeds.
+4. Both `Active` and `Waiting` occupy one slot. Activation count, Provider state, lease expiry, and process exit do not release capacity. A future `Paused` state also remains nonterminal.
+5. Only a successful `Completed`, `Failed`, or `Cancelled` commit releases that Run's slot. It neither recursively releases children nor proves Provider stop. Terminal events and capacity evidence commit atomically. Pending Attention from a terminal parent may still create a child, preserving root/depth and rechecking capacity.
+6. Capacity counts current nonterminal Runs, not lifetime Run count or prepaid balance. Successful command replay returns its original idempotency result without counting again; only a new logical Run occupies a new slot. Failed transactions roll back Run, input, decision, events, Outbox, and idempotency result together.
+7. Rejection returns `CausalLimitExceeded` with root, proposed depth, current occupancy, effective limits, and the exceeded dimension. Attention stays Open and the failed command does not consume handler authority. The Agent may explicitly Ignore, continue an existing Run, or retry after conditions change; no silent discard or apparent success.
+8. Project/Agent concurrency quotas, fan-out, Attention rate, Provider cost, budget allocation, and a full policy language are deferred. This slice does not claim to enforce them or add UI budgeting.
 
 ### 25.3 Default Agent policy
 
@@ -926,6 +934,8 @@ Sensitive Prompt content and hidden reasoning are not stored by default.
 - Run terminal latency.
 - Delegation depth.
 - Budget consumption.
+
+For this slice, the last two metrics mean immutable root, parent Attention/Run, and depth in Run projections; provenance, effective limits, and post-commit nonterminal occupancy in `RunCreated`; root and post-release occupancy in `RunCompleted`, `RunFailed`, and `RunCancelled`; and admission evidence in limit errors. Occupancy comes from durable Run state within the same transaction and is explainable through creation/terminal events, not an in-process counter. Rejected creation commits no new domain event. Restart preserves provenance, configuration, and events. Cost accounting and other budget metrics remain deferred.
 
 ### 28.3 Explainability
 
@@ -1018,7 +1028,7 @@ No current evidence requires:
 4. **Whether completion requires a public summary.** Recommended: no; support atomic summary linking.
 5. **Which integrations or deployments require Human Approval.** Recommended: Agent Prompt, capability authorization, and protected external systems decide; no generic Approval.
 6. **Hard deletion and retention periods.** Deployment- and privacy-specific.
-7. **Default budget, depth, and concurrency values.** Initial recommendation: depth 4 and 50 nonterminal Runs per causal root.
+7. **Default budget, depth, and concurrency values.** Approved for the first slice: maximum depth 4 (root Runs are 0), at most 50 nonterminal Runs per causal root; server-owned durable configuration and capacity semantics are in §25.1–25.2. Cost, fan-out, and other budget dimensions still need later design.
 8. **Physical Worktree retention for Waiting, Paused, Failed, and Cancelled.** Runtime configuration.
 9. **Whether Human direct Send-to-Run is required.** Proven by the Workbench story; MVP supports atomic public Message plus Human-assigned RunInput.
 10. **Whether unauthorized Mention fails the whole Message or only the Mention.** Recommended: fail the whole transaction.

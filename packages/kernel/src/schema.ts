@@ -1,7 +1,13 @@
-export const CURRENT_SCHEMA_VERSION = 13;
+export const CURRENT_SCHEMA_VERSION = 14;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS causal_limits (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  max_depth INTEGER NOT NULL CHECK (max_depth >= 0),
+  max_non_terminal_runs_per_root INTEGER NOT NULL CHECK (max_non_terminal_runs_per_root > 0)
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS principals (
   id TEXT PRIMARY KEY,
@@ -137,6 +143,10 @@ CREATE TABLE IF NOT EXISTS runs (
   thread_root_id TEXT NOT NULL,
   owner_agent_id TEXT NOT NULL REFERENCES agents(id),
   agent_config_revision INTEGER NOT NULL,
+  causal_root_id TEXT NOT NULL REFERENCES messages(id),
+  parent_attention_id TEXT NOT NULL REFERENCES attentions(id),
+  parent_run_id TEXT REFERENCES runs(id),
+  delegation_depth INTEGER NOT NULL CHECK (delegation_depth >= 0),
   state TEXT NOT NULL CHECK (state IN ('Active', 'Waiting', 'Completed', 'Failed', 'Cancelled')),
   revision INTEGER NOT NULL CHECK (revision > 0),
   activation_generation INTEGER NOT NULL DEFAULT 0 CHECK (activation_generation >= 0),
@@ -146,11 +156,28 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   terminal_reason TEXT,
+  CHECK (
+    (parent_run_id IS NULL AND delegation_depth = 0)
+    OR (parent_run_id IS NOT NULL AND parent_run_id != id AND delegation_depth > 0)
+  ),
   FOREIGN KEY (owner_agent_id, agent_config_revision)
     REFERENCES agent_config_revisions(agent_id, revision)
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS runs_thread_idx ON runs(thread_root_id, created_at);
+
+CREATE INDEX IF NOT EXISTS runs_causal_nonterminal_idx ON runs(causal_root_id)
+  WHERE state NOT IN ('Completed', 'Failed', 'Cancelled');
+
+CREATE TRIGGER IF NOT EXISTS runs_causal_provenance_immutable
+BEFORE UPDATE OF causal_root_id, parent_attention_id, parent_run_id, delegation_depth ON runs
+WHEN OLD.causal_root_id IS NOT NEW.causal_root_id
+  OR OLD.parent_attention_id IS NOT NEW.parent_attention_id
+  OR OLD.parent_run_id IS NOT NEW.parent_run_id
+  OR OLD.delegation_depth IS NOT NEW.delegation_depth
+BEGIN
+  SELECT RAISE(ABORT, 'Run causal provenance is immutable.');
+END;
 
 CREATE INDEX IF NOT EXISTS runs_project_page_idx
   ON runs(project_id, created_event_sequence, id)

@@ -3,7 +3,7 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 
 import { KernelError } from "./errors.js";
 import { CURRENT_SCHEMA_VERSION, schemaSql } from "./schema.js";
-import type { KernelBootstrap, KernelOpenOptions } from "./types.js";
+import type { CausalLimits, KernelBootstrap, KernelOpenOptions } from "./types.js";
 import { boundedDuration, integer, type Row } from "./values.js";
 
 export type KernelContext = Readonly<{
@@ -35,7 +35,7 @@ export function openKernelContext(options: KernelOpenOptions): KernelContext {
     context.database.exec(
       `PRAGMA foreign_keys = ON; PRAGMA busy_timeout = ${sqliteBusyTimeoutMs()};`,
     );
-    initializeSchema(context);
+    initializeSchema(context, options.causalLimits);
     context.database.exec(
       `CREATE TEMP TABLE IF NOT EXISTS projection_activation_changes (
          activation_id TEXT PRIMARY KEY
@@ -94,13 +94,14 @@ export function translateError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-function initializeSchema(context: KernelContext): void {
+function initializeSchema(context: KernelContext, causalLimits?: CausalLimits): void {
   initializeSchemaExec(context, "BEGIN IMMEDIATE");
   try {
     const versionRow = initializeSchemaGet(context, "PRAGMA user_version");
     const version = versionRow ? integer(versionRow.user_version) : 0;
     if (version === CURRENT_SCHEMA_VERSION) {
       context.database.exec(schemaSql);
+      initializeCausalLimits(context, causalLimits, false);
       context.database.exec("COMMIT");
       return;
     }
@@ -124,11 +125,50 @@ function initializeSchema(context: KernelContext): void {
       );
     }
     context.database.exec(schemaSql);
+    initializeCausalLimits(context, causalLimits, true);
     context.database.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
     context.database.exec("COMMIT");
   } catch (error) {
     context.database.exec("ROLLBACK");
     throw translateError(error);
+  }
+}
+
+function initializeCausalLimits(
+  context: KernelContext,
+  requested: CausalLimits | undefined,
+  newDatabase: boolean,
+): void {
+  const defaults: CausalLimits = { maxDepth: 4, maxNonTerminalRunsPerRoot: 50 };
+  const configured = requested ?? defaults;
+  if (
+    !Number.isSafeInteger(configured.maxDepth) || configured.maxDepth < 0 ||
+    !Number.isSafeInteger(configured.maxNonTerminalRunsPerRoot) ||
+    configured.maxNonTerminalRunsPerRoot < 1
+  ) {
+    throw new KernelError(
+      "InvalidCommand",
+      "Causal limits require a nonnegative safe integer maxDepth and a positive safe integer maxNonTerminalRunsPerRoot.",
+    );
+  }
+  if (newDatabase) {
+    run(context, `INSERT INTO causal_limits
+      (singleton, max_depth, max_non_terminal_runs_per_root) VALUES (1, ?, ?)`,
+    configured.maxDepth, configured.maxNonTerminalRunsPerRoot);
+    return;
+  }
+  const stored = getRow(context, "SELECT * FROM causal_limits WHERE singleton = 1");
+  if (!stored) {
+    throw new KernelError("Conflict", "The database is missing its durable causal limits.");
+  }
+  if (requested && (
+    integer(stored.max_depth) !== requested.maxDepth ||
+    integer(stored.max_non_terminal_runs_per_root) !== requested.maxNonTerminalRunsPerRoot
+  )) {
+    throw new KernelError(
+      "Conflict",
+      "Configured causal limits differ from the durable database configuration. Reopen with matching limits or omit the override.",
+    );
   }
 }
 

@@ -85,12 +85,18 @@ export interface KernelBootstrap {
   readonly agents?: readonly BootstrapAgent[];
 }
 
+export interface CausalLimits {
+  readonly maxDepth: number;
+  readonly maxNonTerminalRunsPerRoot: number;
+}
+
 export interface KernelOpenOptions {
   readonly databasePath: string;
   readonly bootstrap?: KernelBootstrap;
   readonly clock?: () => Date;
   readonly idFactory?: (prefix: string) => string;
   readonly activationDurationMs?: number;
+  readonly causalLimits?: CausalLimits;
 }
 
 interface IdempotentCommand {
@@ -570,6 +576,10 @@ export interface RunView {
   readonly threadRootId: string;
   readonly ownerAgentId: string;
   readonly agentConfigRevision: number;
+  readonly causalRootId: string;
+  readonly parentAttentionId: string;
+  readonly parentRunId: string | null;
+  readonly delegationDepth: number;
   readonly state: RunState;
   readonly revision: number;
   readonly activationGeneration: number;
