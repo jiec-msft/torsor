@@ -687,12 +687,16 @@ export class ControlledWorktreeProcess {
   }
 
   async #stopAfterAuthorityLoss(): Promise<void> {
+    const stopSettlement = this.stop("Worktree authority monitor failed.");
+    let loggingFailure: unknown;
     if (!this.#authorityLossLogged) {
       this.#authorityLossLogged = true;
       await this.#log({
         event: "writer_authority.loss",
         outcome: "lost",
         errorCode: "writer_authority_lost",
+      }).catch((error: unknown) => {
+        loggingFailure = error;
       });
     }
     const cancellation = this.#options.runCancellation;
@@ -732,7 +736,22 @@ export class ControlledWorktreeProcess {
         this.#authorityClassificationError = error;
       }
     }
-    await this.stop("Worktree authority monitor failed.");
+    let stopFailure: unknown;
+    await stopSettlement.catch((error: unknown) => {
+      stopFailure = error;
+    });
+    if (stopFailure !== undefined && loggingFailure !== undefined) {
+      throw new AggregateError(
+        [stopFailure, loggingFailure],
+        "Authority loss stop and operational logging both failed.",
+      );
+    }
+    if (stopFailure !== undefined) {
+      throw stopFailure;
+    }
+    if (loggingFailure !== undefined) {
+      throw loggingFailure;
+    }
   }
 
   async #persistStop(): Promise<WorktreeExecutionState> {

@@ -566,6 +566,7 @@ export class AgentRuntime {
         ),
       },
       this.#runtimeContext,
+      operationContext,
     );
     const thread = await this.#kernel.query(
       {

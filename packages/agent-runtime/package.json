@@ -16,7 +16,8 @@
     "dist"
   ],
   "scripts": {
-    "prepack": "npm run build",
+    "prepack": "npm run build && node scripts/bundle-operational-logging.mjs prepare",
+    "postpack": "node scripts/bundle-operational-logging.mjs cleanup",
     "test": "npm run build && vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "prebuild": "npm --prefix ../kernel run build && npm --prefix ../operational-logging run build",
@@ -27,6 +28,9 @@
     "@torsor/operational-logging": "0.1.0",
     "koffi": "3.2.0"
   },
+  "bundleDependencies": [
+    "@torsor/operational-logging"
+  ],
   "devDependencies": {
     "@types/node": "^24.10.0",
     "typescript": "^5.9.3",

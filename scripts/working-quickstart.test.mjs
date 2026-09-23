@@ -328,7 +328,7 @@ test("public package tarballs contain the repository Apache license", async () =
   }
 });
 
-test("clean tracked source packs installable Kernel, logging, and agent-runtime tarballs", async () => {
+test("clean tracked source packs installable Kernel and agent-runtime tarballs", async () => {
   assert.ok(process.env.npm_execpath, "npm_execpath is required");
   const temporary = await mkdtemp(join(tmpdir(), "torsor-clean-pack-"));
   const source = join(temporary, "source");
@@ -353,29 +353,35 @@ test("clean tracked source packs installable Kernel, logging, and agent-runtime 
       source,
       120_000,
     ))[0];
-    const loggingPack = JSON.parse(await runNpm(
-      ["pack", "--json", "--workspace", "@torsor/operational-logging"],
-      source,
-      120_000,
-    ))[0];
     const runtimePack = JSON.parse(await runNpm(
       ["pack", "--json", "--workspace", "@torsor/agent-runtime"],
       source,
       120_000,
     ))[0];
     assert.ok(kernelPack.files.some((file) => file.path === "dist/index.js"));
-    assert.ok(loggingPack.files.some((file) => file.path === "dist/index.js"));
     assert.ok(runtimePack.files.some((file) => file.path === "dist/index.js"));
     assert.ok(runtimePack.files.some(
       (file) => file.path === "dist/provider-process-windows-owner.js",
     ));
+    assert.ok(runtimePack.bundled?.includes("@torsor/operational-logging"));
+    assert.ok(runtimePack.files.some(
+      (file) =>
+        file.path ===
+        "node_modules/@torsor/operational-logging/dist/index.js",
+    ));
+    assert.ok(runtimePack.files.some(
+      (file) =>
+        file.path ===
+        "node_modules/@torsor/operational-logging/LICENSE",
+    ));
     assert.equal(runtimePack.files.some(
       (file) => file.path.startsWith("src/") ||
         file.path.startsWith("test/") ||
+        file.path.includes("/src/") ||
+        file.path.includes("/test/") ||
         file.path.endsWith(".node"),
     ), false);
     const kernelTarball = join(source, kernelPack.filename);
-    const loggingTarball = join(source, loggingPack.filename);
     const runtimeTarball = join(source, runtimePack.filename);
     await mkdir(consumer, { recursive: true });
     await runNpm(["init", "-y"], consumer, 30_000);
@@ -385,7 +391,6 @@ test("clean tracked source packs installable Kernel, logging, and agent-runtime 
         "--no-audit",
         "--no-fund",
         kernelTarball,
-        loggingTarball,
         runtimeTarball,
       ],
       consumer,

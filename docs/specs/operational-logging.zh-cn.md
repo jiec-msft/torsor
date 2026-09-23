@@ -17,6 +17,7 @@
 5. Sink write 串行执行。默认最多接受 64 个尚未完成的 write，配置范围为 1 到 1024；达到上限时，新事件在进入队列前以明确 backpressure 错误失败，不能丢弃旧事件或静默降级。
 6. Production file sink 默认把当前文件限制为 1 MiB，可通过 `TORSOR_OPERATIONAL_LOG_MAX_BYTES` 配置为 65536 到 16777216 bytes；轮转时只保留当前文件和一个 `.1` predecessor。创建、轮转、写入或 backpressure 失败必须使对应操作和 Host lifecycle 明确失败；不得继续运行成看似已记录的状态。
 7. Sink 失败使用固定通用错误；不得把原始 sink exception、嵌套 cause、路径或 sink payload 复制进另一个日志事件。失败不能永久毒化后续 write。
+8. 运维日志不是 safety gate。取消、Writer Authority loss、Lease expiry、shutdown 或未知停止的物理 stop/containment 必须先启动且不能等待可能失败的日志 write；日志失败仍须明确传播，但不得阻止或替代 OS stop、持久化 stop/quarantine evidence，也不得掩盖独立的 stop 失败。
 
 ## 2. 封闭事件 Schema
 
@@ -70,9 +71,9 @@ errorCode?
 
 ## 3. 关联传播
 
-1. HTTP 边界为每个请求创建 `requestId`。`http.request` 始终记录该 ID；当 command 已提交时，同一事件还记录 Kernel 返回的 `correlationId`。HTTP command response 也返回该 `correlationId`，使 Operator 能从 response header 的 `requestId` 进入 durable work 链。
+1. HTTP 边界为每个请求创建 `requestId`。`http.request` 始终记录该 ID；当 command 已提交时，同一事件还记录 Kernel 返回的 `correlationId`。成功 command response 只能在该必需事件已由 sink 接受后返回 2xx，并返回同一 `correlationId`，使 Operator 能从 response header 的 `requestId` 进入 durable work 链。若 commit 后日志失败，Host 必须明确失败，且客户端不得观察到 2xx；客户端可把 command outcome 视为 uncertain，并用原 idempotency key 恢复。
 2. `requestId` 不写入 Kernel、Outbox 或 recovery 状态。后续 Runtime、Provider process、Writer Authority、terminal Run 和 recovery 事件只传播服务端签发的 `correlationId`；这避免把短期 transport identity 扩大为持久状态。
-3. Runtime 从 Attention 或触发 RunInput 的创建事件取得原始 `correlationId`；由 Attention 同一命令创建、没有独立公开创建事件的初始 RunInput 继承 Run 创建事件的关联。Runtime 把该值作为 server-bound operation context 用于 Activation、ProviderAttempt、Agent capability、native execution 和 settlement。Prompt、Provider 输出和 HTTP body 不能提供或覆盖该值。
+3. Runtime 从 Attention 或触发 RunInput 的创建事件取得原始 `correlationId`；由 Attention 同一命令创建、没有独立公开创建事件的初始 RunInput 继承 Run 创建事件的关联。Runtime 把该值作为 server-bound operation context 用于 Attention/Run Activation、ProviderAttempt、Agent capability、native execution 和 settlement；对应 durable Kernel events 与运维事件必须保留同一已验证关联。Prompt、Provider 输出和 HTTP body 不能提供或覆盖该值。
 4. `correlationId` 跟随持久工作跨异步边界和 recovery；后台 recovery 不得伪造 `requestId`。没有可验证来源关联时，事件必须省略关联而不是猜测。
 5. 已知 Run、Activation、ProviderAttempt、Worktree 或 execution receipt 身份时，使用对应不透明 ID 字段；不得把多个身份拼进 message、路径或自由文本。
 6. 关联字段是诊断链接，不是授权、Writer fencing 或幂等证明。

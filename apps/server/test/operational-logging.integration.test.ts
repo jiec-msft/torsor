@@ -282,6 +282,96 @@ describe("privacy-safe production operational logging", () => {
     await expect(host.close()).rejects.toBeInstanceOf(OperationalLogSinkError);
   });
 
+  it("does not acknowledge a committed command before its required request log succeeds", async () => {
+    const directory = await temporaryDirectory();
+    const databasePath = join(directory, "kernel.sqlite");
+    const idempotencyKey = "logging-failed-command-ack";
+    let committedCorrelationId: string | undefined;
+    const logger = new OperationalLogger({
+      sink: {
+        write: (line) => {
+          const event = JSON.parse(line) as {
+            event: string;
+            outcome: string;
+            correlationId?: string;
+          };
+          if (
+            event.event === "http.request" &&
+            event.outcome === "succeeded" &&
+            event.correlationId !== undefined
+          ) {
+            committedCorrelationId = event.correlationId;
+            throw new Error("Synthetic private sink failure.");
+          }
+        },
+      },
+    });
+    const host = createLocalRuntimeHost({
+      databasePath,
+      bootstrap,
+      port: 0,
+      credentials: [{
+        token: "synthetic-human-token",
+        principalContext: { principalId: "human" },
+      }],
+      runtimePrincipalId: "runtime",
+      projectIds: ["project"],
+      adapter: new DeterministicFakeAdapter(),
+      operationalLogger: logger,
+      runtimePollIntervalMs: 1,
+    });
+    const origin = await host.start();
+    const command = {
+      method: "POST",
+      headers: { ...authorization(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        idempotencyKey,
+        projectId: "project",
+        channelId: "channel",
+        body: "Synthetic private command body.",
+        targetAgentIds: ["orbit"],
+      }),
+    } as const;
+    const response = await fetch(
+      `${origin}/api/v1/commands/start-thread`,
+      command,
+    ).catch(() => undefined);
+    expect(
+      response?.status === undefined ||
+      response.status < 200 ||
+      response.status >= 300,
+    ).toBe(true);
+    await expect(host.finished).rejects.toBeInstanceOf(OperationalLogSinkError);
+    await expect(host.close()).rejects.toBeInstanceOf(OperationalLogSinkError);
+
+    const recovered = createLocalRuntimeHost({
+      databasePath,
+      bootstrap,
+      port: 0,
+      credentials: [{
+        token: "synthetic-human-token",
+        principalContext: { principalId: "human" },
+      }],
+      runtimePrincipalId: "runtime",
+      projectIds: ["project"],
+      adapter: new DeterministicFakeAdapter(),
+      runtimePollIntervalMs: 1,
+    });
+    cleanup.push(() => recovered.close());
+    const recoveredOrigin = await recovered.start();
+    const replay = await fetch(
+      `${recoveredOrigin}/api/v1/commands/start-thread`,
+      command,
+    );
+    expect(replay.status).toBe(200);
+    const replayBody = await replay.json() as {
+      result: { entityId: string; correlationId: string };
+    };
+    expect(replayBody.result.entityId).toMatch(/^message_/);
+    expect(committedCorrelationId).toMatch(/^corr-/);
+    expect(replayBody.result.correlationId).toBe(committedCorrelationId);
+  });
+
   it("rotates one bounded predecessor and hides filesystem failure details", async () => {
     const directory = await temporaryDirectory();
     const path = join(directory, "operational.ndjson");

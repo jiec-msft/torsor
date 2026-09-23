@@ -13,6 +13,7 @@ import {
   type KernelBootstrap,
   type ArtifactStorage,
   type KernelCommand,
+  type CommandResult,
   type PrincipalContext,
   type PublicEventEnvelope,
 } from "@torsor/kernel";
@@ -298,6 +299,8 @@ class Service implements TorsorHttpService {
     const startedAt = performance.now();
     let correlationId: string | undefined;
     let requestFailed = false;
+    let requestLogged = false;
+    let requestLoggingError: unknown;
     response.setHeader("X-Request-Id", requestId);
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
@@ -326,12 +329,26 @@ class Service implements TorsorHttpService {
       const authenticated = this.#authenticate(request);
 
       if (request.method === "POST" && segments[2] === "commands") {
-        correlationId = await this.#handleCommand(
+        const commandResult = await this.#handleCommand(
           segments[3],
           request,
-          response,
           authenticated,
         );
+        correlationId = commandResult.correlationId;
+        try {
+          await this.#emitHttpRequest({
+            requestId,
+            correlationId,
+            startedAt,
+            status: 200,
+            failed: false,
+          });
+          requestLogged = true;
+        } catch (error) {
+          requestLoggingError = error;
+          throw error;
+        }
+        sendJson(response, 200, { result: commandResult.result });
         return;
       }
 
@@ -361,27 +378,46 @@ class Service implements TorsorHttpService {
       } else if (!response.writableEnded) {
         response.destroy();
       }
+      if (requestLoggingError !== undefined) {
+        throw error;
+      }
     } finally {
-      if (this.#operationalLogger) {
-        const status = response.statusCode;
-        await this.#operationalLogger.emit({
-          event: "http.request",
-          outcome: requestFailed || status >= 400 ? "failed" : "succeeded",
-          durationMs: Math.min(
-            86_400_000,
-            Math.max(0, Math.round(performance.now() - startedAt)),
-          ),
-          httpStatus: status,
-          requestId: createOpaqueId(requestId),
-          ...(correlationId === undefined
-            ? {}
-            : { correlationId: createOpaqueId(correlationId) }),
-          ...(requestFailed || status >= 400
-            ? { errorCode: "http_request_failed" }
-            : {}),
+      if (!requestLogged && requestLoggingError === undefined) {
+        await this.#emitHttpRequest({
+          requestId,
+          ...(correlationId === undefined ? {} : { correlationId }),
+          startedAt,
+          status: response.statusCode,
+          failed: requestFailed || response.statusCode >= 400,
         });
       }
     }
+  }
+
+  async #emitHttpRequest(input: {
+    readonly requestId: string;
+    readonly correlationId?: string;
+    readonly startedAt: number;
+    readonly status: number;
+    readonly failed: boolean;
+  }): Promise<void> {
+    if (!this.#operationalLogger) {
+      return;
+    }
+    await this.#operationalLogger.emit({
+      event: "http.request",
+      outcome: input.failed ? "failed" : "succeeded",
+      durationMs: Math.min(
+        86_400_000,
+        Math.max(0, Math.round(performance.now() - input.startedAt)),
+      ),
+      httpStatus: input.status,
+      requestId: createOpaqueId(input.requestId),
+      ...(input.correlationId === undefined
+        ? {}
+        : { correlationId: createOpaqueId(input.correlationId) }),
+      ...(input.failed ? { errorCode: "http_request_failed" } : {}),
+    });
   }
 
   async #handleSession(
@@ -524,9 +560,11 @@ class Service implements TorsorHttpService {
   async #handleCommand(
     commandSlug: string | undefined,
     request: IncomingMessage,
-    response: ServerResponse,
     authenticated: AuthenticatedRequest,
-  ): Promise<string> {
+  ): Promise<{
+    readonly correlationId: string;
+    readonly result: CommandResult;
+  }> {
     if (!commandSlug || !(commandSlug in commandTypes)) {
       throw new HttpError(
         404,
@@ -579,8 +617,10 @@ class Service implements TorsorHttpService {
       authenticated.context,
       { correlationId },
     );
-    sendJson(response, 200, { result });
-    return result.correlationId ?? correlationId;
+    return {
+      correlationId: result.correlationId ?? correlationId,
+      result,
+    };
   }
 
   async #handleQuery(

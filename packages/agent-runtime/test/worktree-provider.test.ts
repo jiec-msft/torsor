@@ -2,7 +2,10 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { TorsorKernel } from "@torsor/kernel";
-import { OperationalLogger } from "@torsor/operational-logging";
+import {
+  OperationalLogSinkError,
+  OperationalLogger,
+} from "@torsor/operational-logging";
 import { describe, expect, it, vi } from "vitest";
 import { bootstrap, createRun, runtimeContext } from "../../kernel/test/helpers.js";
 import type { ControlledChild } from "../src/controlled-process.js";
@@ -266,6 +269,91 @@ describe("native provider Worktree ownership", () => {
       expect(serialized).not.toContain(f.repo.directory);
     } finally {
       owned.confirm();
+      await f.executor.close();
+      f.kernel.close();
+      f.repo.dispose();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("physically stops and settles after authority loss even when authority logging fails", async () => {
+    const logger = new OperationalLogger({
+      sink: {
+        write: (line) => {
+          const event = JSON.parse(line) as { event: string };
+          if (event.event === "writer_authority.loss") {
+            throw new Error("Synthetic private sink failure.");
+          }
+        },
+      },
+    });
+    const f = await fixture(logger);
+    const closed = deferred<{ code: number; signal: null; error: null }>();
+    let stopRequests = 0;
+    const controlled: ControlledChild = {
+      pid: 12345,
+      result: Promise.resolve(""),
+      closed: closed.promise,
+      requestStop: () => {
+        stopRequests += 1;
+        closed.resolve({ code: 0, signal: null, error: null });
+      },
+      forceStop: () => false,
+    };
+    let leaseToken: string | undefined;
+    const execute = f.kernel.execute.bind(f.kernel);
+    vi.spyOn(f.kernel, "execute").mockImplementation(
+      async (command, context, operationContext) => {
+        const result = await execute(command, context, operationContext);
+        if (command.type === "AcquireWorktreeWriterLease") {
+          leaseToken = result.leaseToken;
+        }
+        return result;
+      },
+    );
+    try {
+      const handle = await f.executor.startProvider({
+        runId: f.run.runId,
+        activationId: f.run.activationId,
+        providerAttemptId: f.providerAttemptId,
+        correlationId: f.correlationId,
+        policy,
+        start: () => controlled,
+      });
+      const tree = (await f.kernel.query({
+        type: "ListPhysicalWorktrees",
+        runId: f.run.runId,
+      }, runtimeContext)).items[0]!;
+      const lease = await f.kernel.query({
+        type: "GetWorktreeWriterLease",
+        worktreeId: tree.worktreeId,
+      }, runtimeContext);
+      await f.kernel.execute({
+        type: "QuarantineWorktreeWriterLease",
+        idempotencyKey: "synthetic-logging-failed-authority-loss",
+        worktreeId: tree.worktreeId,
+        expectedGeneration: lease.generation,
+        expectedFencingToken: lease.fencingToken,
+        leaseToken: leaseToken!,
+        reason: "Synthetic independent authority loss.",
+      }, runtimeContext);
+
+      await vi.waitFor(() => expect(stopRequests).toBe(1), { timeout: 200 });
+      await expect(handle.authorityClassificationError())
+        .rejects.toBeInstanceOf(OperationalLogSinkError);
+      expect(await f.kernel.query({
+        type: "GetPhysicalWorktree",
+        worktreeId: tree.worktreeId,
+      }, runtimeContext)).toMatchObject({
+        state: "Ready",
+        latestExecution: { state: "StopConfirmed" },
+      });
+      expect(await f.kernel.query({
+        type: "GetWorktreeWriterLease",
+        worktreeId: tree.worktreeId,
+      }, runtimeContext)).toMatchObject({ status: "Quarantined" });
+    } finally {
+      closed.resolve({ code: 0, signal: null, error: null });
       await f.executor.close();
       f.kernel.close();
       f.repo.dispose();
