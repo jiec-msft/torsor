@@ -21,9 +21,33 @@ function payloadText(payload: JsonValue, field: string): string | null {
   return typeof value === "string" ? value : null;
 }
 
+const toolKindLabels = {
+  read: "Read",
+  edit: "Edit",
+  delete: "Delete",
+  move: "Move",
+  search: "Search",
+  execute: "Execute",
+  think: "Think",
+  fetch: "Fetch",
+  switch_mode: "Switch mode",
+  other: "Other",
+} as const;
+
+function toolBody(payload: JsonValue, status: string): string {
+  const kind = payloadText(payload, "kind");
+  const label = kind && Object.hasOwn(toolKindLabels, kind)
+    ? toolKindLabels[kind as keyof typeof toolKindLabels] : "Other";
+  const id = payloadText(payload, "toolCallId");
+  const publicId = id && /^tool-[1-9][0-9]{0,2}$/.test(id) && Number(id.slice(5)) <= 128
+    ? id : null;
+  return [label, ...(publicId ? [publicId] : []), status].join(" · ");
+}
+
 function activityItem(event: ActivityEvent): TimelineItem {
   let title = "Unknown activity";
   let body: string | null = null;
+  let tone: TimelineItem["tone"] = "neutral";
   if (event.kind === "agent_message_chunk") {
     title = "Agent output";
     body = payloadText(event.payload, "text");
@@ -33,9 +57,22 @@ function activityItem(event: ActivityEvent): TimelineItem {
   } else if (event.kind === "provider_attempt_failure_parked") {
     title = "Provider failure parked the Run";
     body = payloadText(event.payload, "reason");
+    tone = "failed";
   } else if (event.kind === "late_output") {
     title = "Late output";
     body = payloadText(event.payload, "text");
+  } else if (event.kind === "tool_started") {
+    title = "Tool started";
+    body = toolBody(event.payload, "In progress");
+    tone = "running";
+  } else if (event.kind === "tool_completed") {
+    title = "Tool completed";
+    body = toolBody(event.payload, "Completed");
+    tone = "completed";
+  } else if (event.kind === "tool_failed") {
+    title = "Tool failed";
+    body = toolBody(event.payload, "Failed");
+    tone = "failed";
   }
   return {
     id: `activity:${event.id}`,
@@ -44,7 +81,7 @@ function activityItem(event: ActivityEvent): TimelineItem {
     label: `Activity sequence ${event.sequence}`,
     timestamp: event.createdAt,
     kind: event.kind,
-    tone: event.kind === "provider_attempt_failure_parked" ? "failed" : "neutral",
+    tone,
     body,
     provenance: [
       event.id,

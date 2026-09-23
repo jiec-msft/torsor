@@ -1,6 +1,15 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 import type { JsonValue } from "@torsor/kernel";
+import {
+  resolveProviderPolicy, serializeProviderPolicy,
+  type ProviderPolicy, type ProviderPolicySelection,
+} from "./provider-policy.js";
+import { buildCopilotProviderEnvironment, isRestrictedCopilotEnvironmentOverride } from "./copilot-provider-environment.js";
+import { OwnedProviderProcess } from "./provider-process.js";
+import { CopilotToolActivity } from "./copilot-tool-activity.js";
+import { isNativeRunCancellationInterruption } from "./native-run-cancellation.js";
+import type { ControlledWorktreeProcess } from "./worktree-executor.js";
 
 import {
   normalizeProviderExecutionError,
@@ -32,6 +41,8 @@ export interface CopilotAcpLaunchConfiguration {
 }
 
 export interface CopilotAcpAdapterOptions {
+  readonly policy?: ProviderPolicySelection;
+  readonly userEnvironment?: Readonly<Record<string, string | undefined>>;
   readonly command?: string;
   readonly commandArgs?: readonly string[];
   readonly unsafeAllowCustomCommandArgs?: boolean;
@@ -41,20 +52,11 @@ export interface CopilotAcpAdapterOptions {
   readonly limits?: Partial<CopilotAcpLimits>;
 }
 
-interface RpcResponse {
-  readonly jsonrpc: "2.0";
-  readonly id: number;
-  readonly result?: unknown;
-  readonly error?: {
-    readonly code: number;
-    readonly message: string;
-    readonly data?: unknown;
-  };
-}
+type RpcId = string | number;
 
 interface RpcRequest {
   readonly jsonrpc: "2.0";
-  readonly id?: number;
+  readonly id?: RpcId;
   readonly method: string;
   readonly params?: unknown;
 }
@@ -123,9 +125,14 @@ const secureCopilotArgs = [
   "--deny-tool=url",
 ] as const;
 
+const trustedCopilotArgs = [
+  "--acp", "--stdio", "--no-auto-update", "--no-remote", "--no-remote-export", "--no-ask-user",
+] as const;
+
 export class CopilotAcpAdapter implements ProviderAdapter {
   readonly name = "github-copilot-cli-acp";
-  readonly version = "4";
+  readonly version = "5";
+  readonly policy: ProviderPolicy;
   readonly capabilities = {
     acceptsInputWhileRunning: false,
     supportsCancel: true,
@@ -136,10 +143,15 @@ export class CopilotAcpAdapter implements ProviderAdapter {
   } as const;
 
   readonly #launch: CopilotAcpLaunchConfiguration;
+  readonly #attentionLaunch: CopilotAcpLaunchConfiguration;
   readonly #shutdownGraceMs: number;
   readonly #limits: CopilotAcpLimits;
 
   constructor(options: CopilotAcpAdapterOptions = {}) {
+    this.policy = resolveProviderPolicy(options.policy);
+    if (this.policy.kind === "trusted-local" && options.cwd !== undefined) {
+      throw new Error("Trusted-local cwd is derived by Runtime.");
+    }
     if (options.commandArgs && !options.unsafeAllowCustomCommandArgs) {
       throw new Error(
         "Custom ACP command arguments require unsafeAllowCustomCommandArgs=true.",
@@ -149,9 +161,22 @@ export class CopilotAcpAdapter implements ProviderAdapter {
       command: options.command ?? "copilot",
       args: options.commandArgs
         ? [...options.commandArgs]
-        : [...secureCopilotArgs],
+        : [...(this.policy.kind === "restricted" ? secureCopilotArgs : trustedCopilotArgs),
+          ...(this.policy.permissionMode === "allow-all" ? ["--allow-all"] : [])],
       cwd: options.cwd ?? process.cwd(),
-      environment: buildSanitizedEnvironment(options.environment ?? {}),
+      environment: buildCopilotProviderEnvironment(
+        this.policy, options.userEnvironment ?? process.env, options.environment,
+      ),
+    };
+    this.#attentionLaunch = this.policy.kind === "restricted" ? this.#launch : {
+      ...this.#launch,
+      args: options.commandArgs ? [...options.commandArgs] : [...secureCopilotArgs],
+      environment: buildCopilotProviderEnvironment(
+        resolveProviderPolicy(), options.userEnvironment ?? process.env,
+        Object.fromEntries(Object.entries(options.environment ?? {}).filter(
+          ([name]) => isRestrictedCopilotEnvironmentOverride(name),
+        )),
+      ),
     };
     this.#shutdownGraceMs = options.shutdownGraceMs ?? 2_000;
     this.#limits = validateLimits({
@@ -161,6 +186,9 @@ export class CopilotAcpAdapter implements ProviderAdapter {
   }
 
   getLaunchConfiguration(): CopilotAcpLaunchConfiguration {
+    if (this.policy.kind === "trusted-local") {
+      throw new Error("Trusted-local launch requires Runtime Worktree authority.");
+    }
     return {
       command: this.#launch.command,
       args: [...this.#launch.args],
@@ -172,16 +200,30 @@ export class CopilotAcpAdapter implements ProviderAdapter {
   async execute(
     context: ProviderExecutionContext,
   ): Promise<ProviderExecutionResult> {
-    const processHandle = spawn(
-      this.#launch.command,
-      [...this.#launch.args],
-      {
-        cwd: this.#launch.cwd,
-        env: { ...this.#launch.environment },
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true,
-      },
-    );
+    context.signal.throwIfAborted();
+    const policy = context.cause.type === "attention" ? resolveProviderPolicy() : this.policy;
+    let launch = context.cause.type === "attention" ? this.#attentionLaunch : this.#launch;
+    let owned: OwnedProviderProcess | undefined;
+    let worktree: ControlledWorktreeProcess | undefined;
+    let processHandle: ChildProcessWithoutNullStreams;
+    if (policy.kind === "trusted-local") {
+      if (!context.nativeExecution ||
+          serializeProviderPolicy(context.nativeExecution.policy) !== serializeProviderPolicy(policy)) {
+        throw new ProviderExecutionError("provider_worktree_authority_lost", "Unknown");
+      }
+      worktree = await context.nativeExecution.start((cwd) => {
+        launch = { ...launch, cwd };
+        owned = new OwnedProviderProcess(launch);
+        return owned;
+      });
+      if (!owned) throw new ProviderExecutionError("provider_process_start_failed", "Failed");
+      processHandle = owned.processHandle;
+    } else {
+      processHandle = spawn(launch.command, [...launch.args], {
+        cwd: launch.cwd, env: { ...launch.environment },
+        stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
+      });
+    }
     const connection = new NdjsonRpcConnection(
       processHandle,
       this.#limits.maxFrameBytes,
@@ -193,6 +235,11 @@ export class CopilotAcpAdapter implements ProviderAdapter {
     let activityBytes = 0;
     let primaryError: unknown;
     let executionResult: ProviderExecutionResult | undefined;
+    const tools = new CopilotToolActivity();
+    const stopOwned = () => {
+      if (worktree) void worktree.stop("Provider stop requested.").catch(() => undefined);
+      else processHandle.kill();
+    };
     const outputChunks: string[] = [];
     let stderrBytes = 0;
     const persistence = new PersistenceQueue(
@@ -200,7 +247,7 @@ export class CopilotAcpAdapter implements ProviderAdapter {
       (error) => {
         acceptUpdates = false;
         connection.fail(error);
-        processHandle.kill();
+        stopOwned();
       },
     );
 
@@ -212,7 +259,7 @@ export class CopilotAcpAdapter implements ProviderAdapter {
         connection.fail(
           new ProviderExecutionError("provider_stderr_limit", "Failed"),
         );
-        processHandle.kill();
+        stopOwned();
         return;
       }
       stderrBytes += bytes;
@@ -220,6 +267,20 @@ export class CopilotAcpAdapter implements ProviderAdapter {
 
     connection.onRequest = async (request) => {
       if (request.method === "session/request_permission") {
+        if (policy.kind === "trusted-local" && policy.permissionMode === "allow-all" &&
+            !context.signal.aborted && acceptUpdates) {
+          const params = getRecord(request.params, "permission params");
+          if (!sessionId || params.sessionId !== sessionId || !Array.isArray(params.options) ||
+              params.options.length > 32) throw new ProviderProtocolError();
+          worktree!.assertPublication();
+          const options = params.options.map((option) => getRecord(option, "permission option"));
+          const selected = options.find((option) => option.kind === "allow_always")
+            ?? options.find((option) => option.kind === "allow_once");
+          if (selected) return { outcome: {
+            outcome: "selected",
+            optionId: requireBoundedString(selected.optionId, "permission option", 256),
+          } };
+        }
         return { outcome: { outcome: "cancelled" } };
       }
       throw new ProviderProtocolError(
@@ -238,13 +299,30 @@ export class CopilotAcpAdapter implements ProviderAdapter {
         updateType === "tool_call" ||
         updateType === "tool_call_update"
       ) {
-        throw new ProviderProtocolError(
-          "Copilot emitted tool activity despite the deny-by-default tool policy.",
-          "provider_policy_violation",
-        );
+        if (policy.kind === "restricted") {
+          throw new ProviderProtocolError(
+            "Copilot emitted tool activity despite the deny-by-default tool policy.",
+            "provider_policy_violation",
+          );
+        }
+        if (!sessionId || params.sessionId !== sessionId) {
+          throw new ProviderProtocolError("Tool update belongs to another ACP session.");
+        }
+        if (updateType === "tool_call") outputChunks.length = 0;
+        for (const activity of tools.accept(update)) {
+          activityBytes = addWithinLimit(
+            activityBytes, Buffer.byteLength(JSON.stringify(activity.payload)),
+            this.#limits.maxActivityBytes, "persisted ACP activity",
+          );
+          persistence.enqueue(() => context.capabilities.appendActivity(activity.kind, activity.payload));
+        }
+        return;
       }
       if (updateType !== "agent_message_chunk") {
         return;
+      }
+      if (policy.kind === "trusted-local" && (!sessionId || params.sessionId !== sessionId)) {
+        throw new ProviderProtocolError("Message update belongs to another ACP session.");
       }
       const content = getRecord(update.content, "agent message content");
       if (content.type !== "text" || typeof content.text !== "string") {
@@ -258,6 +336,7 @@ export class CopilotAcpAdapter implements ProviderAdapter {
         "ACP output stream",
       );
       outputChunks.push(content.text);
+      if (policy.kind === "trusted-local") return;
       if (context.cause.type !== "run") {
         return;
       }
@@ -300,11 +379,19 @@ export class CopilotAcpAdapter implements ProviderAdapter {
         }
       }
       connection.fail(reason);
-      processHandle.kill();
+      stopOwned();
     };
     context.signal.addEventListener("abort", abort, { once: true });
 
     try {
+      if (owned) {
+        await owned.started;
+        void owned.providerExit.then(
+          () => connection.processExited(worktree?.providerExitInterruption()),
+          () => connection.fail(new ProviderExecutionError("provider_io_error", "Unknown")),
+        );
+      }
+      context.signal.throwIfAborted();
       const initialize = getRecord(
         await connection.request("initialize", {
           protocolVersion: 1,
@@ -324,7 +411,7 @@ export class CopilotAcpAdapter implements ProviderAdapter {
       }
       const session = getRecord(
         await connection.request("session/new", {
-          cwd: this.#launch.cwd,
+          cwd: launch.cwd,
           mcpServers: [],
         }),
         "session/new result",
@@ -334,6 +421,10 @@ export class CopilotAcpAdapter implements ProviderAdapter {
         "sessionId",
         this.#limits.maxFieldLength,
       );
+      if (policy.kind === "trusted-local") {
+        const selection = selectCodingMode(session);
+        if (selection) await connection.request(selection.method, { sessionId, ...selection.params });
+      }
       const promptResult = getRecord(
         await connection.request("session/prompt", {
           sessionId,
@@ -342,14 +433,12 @@ export class CopilotAcpAdapter implements ProviderAdapter {
         "session/prompt result",
       );
       connection.allowProcessExit();
-      await stopProcess(
-        processHandle,
-        this.#shutdownGraceMs,
-        () => connection.endInput(),
-      );
+      if (worktree) await worktree.finish();
+      else await stopProcess(processHandle, this.#shutdownGraceMs, () => connection.endInput());
       acceptUpdates = false;
       await persistence.drain();
       connection.seal();
+      if (policy.kind === "trusted-local") tools.assertComplete();
       const stopReason = requireBoundedString(
         promptResult.stopReason,
         "stopReason",
@@ -374,6 +463,8 @@ export class CopilotAcpAdapter implements ProviderAdapter {
       primaryError = error;
     } finally {
       acceptUpdates = false;
+      const stopping = worktree && primaryError !== undefined
+        ? worktree.stop("Provider execution failed.") : undefined;
       try {
         await persistence.drain();
       } catch (error) {
@@ -381,11 +472,8 @@ export class CopilotAcpAdapter implements ProviderAdapter {
       }
       context.signal.removeEventListener("abort", abort);
       try {
-        await stopProcess(
-          processHandle,
-          this.#shutdownGraceMs,
-          () => connection.endInput(),
-        );
+        if (worktree) await stopping;
+        else await stopProcess(processHandle, this.#shutdownGraceMs, () => connection.endInput());
       } catch (error) {
         primaryError ??= error;
       }
@@ -406,6 +494,40 @@ export class CopilotAcpAdapter implements ProviderAdapter {
     }
     return executionResult;
   }
+}
+
+function selectCodingMode(session: Record<string, unknown>): {
+  method: string; params: Record<string, string>;
+} | undefined {
+  // ACP config options supersede legacy modes. Only select an advertised coding
+  // mode, never infer approval from labels or turn Autopilot on for Allow All.
+  if (session.configOptions !== undefined) {
+    if (!Array.isArray(session.configOptions) || session.configOptions.length > 64) throw new ProviderProtocolError();
+    for (const value of session.configOptions) {
+      const config = getRecord(value, "session config");
+      if (config.id !== "mode" || config.type !== "select") continue;
+      if (!Array.isArray(config.options) || config.options.length > 64) throw new ProviderProtocolError();
+      const options = config.options.flatMap((option) => {
+        const record = getRecord(option, "config option");
+        if (record.options === undefined) return [record];
+        if (!Array.isArray(record.options) || record.options.length > 64) throw new ProviderProtocolError();
+        return record.options.map((item) => getRecord(item, "config value"));
+      });
+      const coding = options.find((option) => option.value === "agent")
+        ?? options.find((option) => option.value === "interactive");
+      if (coding && coding.value !== config.currentValue) return {
+        method: "session/set_config_option", params: { configId: "mode", value: String(coding.value) },
+      };
+    }
+    return undefined;
+  }
+  if (session.modes === undefined) return undefined;
+  const modes = getRecord(session.modes, "session modes");
+  if (!Array.isArray(modes.availableModes) || modes.availableModes.length > 64) throw new ProviderProtocolError();
+  const available = modes.availableModes.map((mode) => getRecord(mode, "session mode"));
+  const coding = available.find((mode) => mode.id === "agent") ?? available.find((mode) => mode.id === "interactive");
+  return coding && coding.id !== modes.currentModeId
+    ? { method: "session/set_mode", params: { modeId: String(coding.id) } } : undefined;
 }
 
 class PersistenceQueue {
@@ -480,8 +602,9 @@ class NdjsonRpcConnection {
   #inputEnd: Promise<void> | null = null;
   #buffer = Buffer.alloc(0);
   #stdoutBytes = 0;
+  readonly #incoming = new Set<RpcId>();
   readonly #pending = new Map<
-    number,
+    RpcId,
     {
       readonly resolve: (value: unknown) => void;
       readonly reject: (error: Error) => void;
@@ -571,6 +694,12 @@ class NdjsonRpcConnection {
   allowProcessExit(): void {
     this.#allowProcessExit = true;
     this.#shuttingDown = true;
+  }
+
+  processExited(error?: Error): void {
+    if (!this.#allowProcessExit && !this.#closed && !this.#sealed && !this.#failed) {
+      this.fail(error ?? new ProviderExecutionError("provider_process_exited", "Unknown"));
+    }
   }
 
   endInput(): Promise<void> {
@@ -678,47 +807,70 @@ class NdjsonRpcConnection {
       throw new ProviderProtocolError("ACP process emitted invalid NDJSON.");
     }
     const record = getRecord(message, "ACP message");
-    if (typeof record.id === "number" && ("result" in record || "error" in record)) {
-      const response = record as unknown as RpcResponse;
-      const pending = this.#pending.get(response.id);
-      if (!pending) {
-        return;
+    if (record.jsonrpc !== "2.0") throw new ProviderProtocolError("Invalid ACP JSON-RPC version.");
+    const id = Object.hasOwn(record, "id") ? requireRpcId(record.id) : undefined;
+    const hasResult = Object.hasOwn(record, "result");
+    const hasError = Object.hasOwn(record, "error");
+    if (!Object.hasOwn(record, "method")) {
+      if (id === undefined || hasResult === hasError) {
+        throw new ProviderProtocolError("ACP response must have an ID and exactly one result or error.");
       }
-      this.#pending.delete(response.id);
-      if (response.error) {
+      const pending = this.#pending.get(id);
+      if (!pending) {
+        throw new ProviderProtocolError("ACP response ID is unknown or already completed.");
+      }
+      if (hasError) {
+        const error = getRecord(record.error, "ACP error");
+        if (!Number.isSafeInteger(error.code) || typeof error.message !== "string") {
+          throw new ProviderProtocolError("Invalid ACP error response.");
+        }
+      }
+      this.#pending.delete(id);
+      if (hasError) {
         pending.reject(
           new ProviderProtocolError("ACP request returned an error."),
         );
       } else {
-        pending.resolve(response.result);
+        pending.resolve(record.result);
       }
       return;
     }
-    const request = record as unknown as RpcRequest;
-    if (typeof request.method !== "string") {
-      throw new ProviderProtocolError("ACP request is missing method.");
+    if (typeof record.method !== "string" || hasResult || hasError) {
+      throw new ProviderProtocolError("Invalid ACP request or notification envelope.");
     }
-    if (typeof request.id !== "number") {
+    const request: RpcRequest = {
+      jsonrpc: "2.0", method: record.method,
+      ...(id !== undefined ? { id } : {}),
+      ...(Object.hasOwn(record, "params") ? { params: record.params } : {}),
+    };
+    if (request.method === "session/request_permission" && id === undefined ||
+        request.method === "session/update" && id !== undefined) {
+      throw new ProviderProtocolError("ACP session message has the wrong request/notification kind.");
+    }
+    if (id === undefined) {
       this.onNotification(request);
       return;
     }
+    if (this.#incoming.has(id)) throw new ProviderProtocolError("ACP request ID is already active.");
+    this.#incoming.add(id);
     void this.onRequest(request)
       .then(
         (result) => {
           if (this.#canRespond()) {
-            this.#send({ jsonrpc: "2.0", id: request.id, result });
+            this.#send({ jsonrpc: "2.0", id, result });
           }
         },
         (error: unknown) => {
           if (this.#canRespond()) {
             this.#send({
               jsonrpc: "2.0",
-              id: request.id,
+              id,
               error: { code: -32601, message: errorMessage(error) },
             });
           }
         },
       )
+      .finally(() => this.#incoming.delete(id))
       .catch((error: unknown) => {
         if (!this.#shuttingDown && !this.#closed && !this.#failed) {
           this.fail(
@@ -764,6 +916,11 @@ class NdjsonRpcConnection {
   }
 }
 
+function requireRpcId(value: unknown): RpcId {
+  if (typeof value === "string" || typeof value === "number" && Number.isSafeInteger(value)) return value;
+  throw new ProviderProtocolError("ACP request ID must be a string or safe integer.");
+}
+
 function buildPrompt(context: ProviderExecutionContext): string {
   const state =
     context.cause.type === "attention"
@@ -802,7 +959,11 @@ function buildPrompt(context: ProviderExecutionContext): string {
     "You are executing one bounded Torsor Activation.",
     "The JSON below is rebuilt from durable Kernel state and is authoritative.",
     "Provider sessions and model memory are never authoritative recovery state.",
-    "Return only one JSON object with an actions array and no Markdown.",
+    ...(context.nativeExecution ? [
+      "Use your native tools to perform the requested work in the assigned working directory before returning final actions.",
+      "Do not copy private tool output, credentials, environment, command paths, or session IDs into public actions.",
+      "After the tools finish, return only one JSON object with an actions array and no Markdown or progress commentary.",
+    ] : ["Return only one JSON object with an actions array and no Markdown."]),
     required,
     allowed,
     "Provenance, Agent identity, Run identity, revisions, Activation identity, and ProviderAttempt identity are server-bound.",
@@ -1238,61 +1399,18 @@ function validateLimits(limits: CopilotAcpLimits): CopilotAcpLimits {
   return limits;
 }
 
-function buildSanitizedEnvironment(
-  explicit: Readonly<Record<string, string>>,
-): Readonly<Record<string, string>> {
-  const allowedHostNames = new Set(
-    [
-      "PATH",
-      "PATHEXT",
-      "SYSTEMROOT",
-      "WINDIR",
-      "COMSPEC",
-      "TEMP",
-      "TMP",
-      "HOME",
-      "USERPROFILE",
-      "APPDATA",
-      "LOCALAPPDATA",
-      "LANG",
-      "LC_ALL",
-      "TERM",
-    ].map((name) => name.toUpperCase()),
-  );
-  const environment: Record<string, string> = {};
-  for (const [name, value] of Object.entries(process.env)) {
-    if (
-      value !== undefined &&
-      allowedHostNames.has(name.toUpperCase())
-    ) {
-      environment[name] = value;
-    }
-  }
-  for (const [name, value] of Object.entries(explicit)) {
-    const upper = name.toUpperCase();
-    if (
-      upper === "COPILOT_ALLOW_ALL" ||
-      upper === "COPILOT_ASSISTED_APPROVAL" ||
-      upper === "GH_TOKEN" ||
-      upper === "GITHUB_TOKEN" ||
-      upper === "COPILOT_GITHUB_TOKEN" ||
-      (!upper.startsWith("COPILOT_PROVIDER_") &&
-        upper !== "COPILOT_PROVIDERS_CONFIG" &&
-        upper !== "COPILOT_HOME")
-    ) {
-      throw new Error(
-        `Copilot ACP environment variable ${name} is not in the explicit provider allowlist.`,
-      );
-    }
-    environment[name] = value;
-  }
-  return environment;
-}
-
 function normalizeExecutionError(
   error: unknown,
   signal: AbortSignal,
 ): Error {
+  if (isNativeRunCancellationInterruption(error)) {
+    return error;
+  }
+  if (
+    isNativeRunCancellationInterruption(signal.reason)
+  ) {
+    return normalizeProviderExecutionError(error, "Unknown");
+  }
   if (signal.aborted) {
     return abortReason(signal);
   }
@@ -1302,6 +1420,9 @@ function normalizeExecutionError(
 function abortReason(signal: AbortSignal): Error {
   if (signal.reason === undefined) {
     return new ProviderExecutionError("provider_cancelled", "Unknown");
+  }
+  if (isNativeRunCancellationInterruption(signal.reason)) {
+    return signal.reason;
   }
   return normalizeProviderExecutionError(signal.reason, "Unknown");
 }

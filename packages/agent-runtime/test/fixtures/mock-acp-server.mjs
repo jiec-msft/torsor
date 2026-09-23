@@ -2,6 +2,7 @@ import { createInterface } from "node:readline";
 import { closeSync } from "node:fs";
 
 const mode = process.argv[2] ?? "valid";
+const permissionId = mode === "permission-string" ? "synthetic-permission" : 900;
 const parameter = Number(process.argv[3] ?? "0");
 const lines = createInterface({ input: process.stdin });
 let promptId;
@@ -37,7 +38,7 @@ lines.on("line", (line) => {
     handlePrompt();
     return;
   }
-  if (message.id === 900 && mode === "permission") {
+  if (message.id === permissionId && (mode === "permission" || mode === "permission-string")) {
     if (
       message.result?.outcome?.outcome !== "cancelled"
     ) {
@@ -60,9 +61,10 @@ function handlePrompt() {
       ]);
       return;
     case "permission":
+    case "permission-string":
       send({
         jsonrpc: "2.0",
-        id: 900,
+        id: permissionId,
         method: "session/request_permission",
         params: {
           sessionId: "diagnostic-session",

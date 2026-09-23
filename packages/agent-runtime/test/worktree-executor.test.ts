@@ -271,7 +271,7 @@ describe("controlled Worktree executor (§22, §24, §38)", () => {
       expect((await kernel.query({ type: "GetPhysicalWorktree", worktreeId: "first" }, runtimeContext)).latestExecution?.events)
         .toMatchObject([
           { state: "Starting" }, { state: "Running" }, { state: "StopRequested" },
-          { state: "ForceTerminated", evidence: expect.stringContaining("Original child close") },
+          { state: "ForceTerminated", evidence: "Original process tree stop confirmed; normal exit: false." },
         ]);
     } finally { await executor.close(); await run.close(); kernel.close(); repo.dispose(); }
   });
