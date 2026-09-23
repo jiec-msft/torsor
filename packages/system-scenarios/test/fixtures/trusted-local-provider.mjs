@@ -1,10 +1,13 @@
 import { execFileSync, spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 
 const mode = process.argv[2] ?? "success";
 const privateValue = "synthetic-private-provider-data";
 const sessionId = "synthetic-private-session";
+const fixturePath = fileURLToPath(import.meta.url);
 const lines = createInterface({ input: process.stdin });
 let promptId;
 let descendant;
@@ -23,14 +26,23 @@ const text = (value) => update({
 });
 
 function beginRun() {
+  const worktreePath = process.cwd();
+  const resultPath = join(worktreePath, "native-result.txt");
   update({
     sessionUpdate: "tool_call",
-    toolCallId: `execute-${privateValue}`,
+    toolCallId: process.execPath,
     status: "in_progress",
     kind: "execute",
-    title: privateValue,
-    rawInput: { command: privateValue },
-    content: [{ text: privateValue }],
+    title: fixturePath,
+    rawInput: {
+      command: process.execPath,
+      cwd: worktreePath,
+      fixturePath,
+      args: ["--test", "synthetic.test.cjs"],
+      resultPath,
+      privateValue,
+    },
+    content: [{ text: resultPath }],
   });
   if (mode !== "success") {
     descendant = spawn(process.execPath, [
@@ -53,9 +65,15 @@ function beginRun() {
   });
   update({
     sessionUpdate: "tool_call_update",
-    toolCallId: `execute-${privateValue}`,
+    toolCallId: process.execPath,
     status: "completed",
-    rawOutput: { text: privateValue },
+    rawOutput: {
+      command: process.execPath,
+      cwd: worktreePath,
+      fixturePath,
+      resultPath,
+      text: privateValue,
+    },
   });
   text(JSON.stringify({
     actions: [
