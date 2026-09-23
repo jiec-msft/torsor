@@ -14,6 +14,9 @@
 
 The accompanying public interaction prototype is in [`mvp-0.1/`](mvp-0.1/). Its scenario screenshots and verification index are in [`mvp-0.1/README.md`](mvp-0.1/README.md).
 
+See [System Scenarios](../specs/system-scenarios.md)
+([简体中文](../specs/system-scenarios.zh-cn.md)) for deterministic system-test contracts and traceability.
+
 ## 1. Product goal
 
 Torsor uses the Human-familiar language of Channel, Thread, Message, and Mention without reproducing Human serial execution, latency, or attention bottlenecks.

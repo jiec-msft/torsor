@@ -1,5 +1,5 @@
-import { emptyRunCommand, isTerminalRun, needsRunRefresh, RunCommandModel, type RunCommandEntry, type RunCommandRequest } from "./run-composer-model";
-import type { Run, RunInput } from "./types";
+import { emptyRunCommand, isTerminalRun, needsRunRefresh, RunCommandModel, type RunCommandEntry, type RunCommandRequest } from "./run-composer-model.js";
+import type { Run, RunInput } from "./types.js";
 
 export type RunControlRequest = RunCommandRequest & (
   | { readonly kind: "cancel"; readonly reason: "Cancelled by Human from Run controls." }

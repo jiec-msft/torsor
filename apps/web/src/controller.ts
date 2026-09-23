@@ -1,4 +1,4 @@
-import { ApiError, readApiResponse } from "./api";
+import { ApiError, readApiResponse } from "./api.js";
 import {
   activityPath,
   historyWindow,
@@ -7,9 +7,9 @@ import {
   readActivityGap,
   validateActivityPage,
   type ActivityPage,
-} from "./timeline-history";
-import { RunComposerModel } from "./run-composer-model";
-import { RunControlsModel } from "./run-controls-model";
+} from "./timeline-history.js";
+import { RunComposerModel } from "./run-composer-model.js";
+import { RunControlsModel } from "./run-controls-model.js";
 import type {
   AgentStatus,
   Attention,
@@ -18,10 +18,16 @@ import type {
   PublicEvent,
   RunProjection,
   ThreadProjection,
-} from "./types";
+} from "./types.js";
 
 type Fetch = typeof fetch;
-type EventSourceFactory = (url: string) => EventSource;
+export interface WebEventSource {
+  onopen: ((event: Event) => void) | null;
+  onerror: ((event: Event) => void) | null;
+  addEventListener(type: string, listener: EventListener): void;
+  close(): void;
+}
+type EventSourceFactory = (url: string) => WebEventSource;
 type BroadcastChannelFactory = (name: string) => BroadcastChannel;
 type HumanCommand = "start-thread" | "reply-to-thread" | "send-to-run" | "cancel-run" | "withdraw-run-input";
 
@@ -186,7 +192,7 @@ export class WebController {
   #channelId: string | null = null;
   #threadId: string | null = null;
   #runId: string | null = null;
-  #events: EventSource | null = null;
+  #events: WebEventSource | null = null;
   #probeTimer: ReturnType<typeof setTimeout> | null = null;
   #livenessTimer: ReturnType<typeof setTimeout> | null = null;
   #seenEventIds: string[] = [];
