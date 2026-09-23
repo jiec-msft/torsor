@@ -753,11 +753,20 @@ async function terminateManagedProcess(process) {
 
 async function terminateWebWrapper(webProcess) {
   await terminateManagedProcess(webProcess.process);
-  const releasedPort = createTcpServer();
-  try {
-    await listen(releasedPort, webProcess.port, webProcess.host);
-  } finally {
-    await closeServer(releasedPort);
+  const deadline = Date.now() + 2_000;
+  while (true) {
+    const releasedPort = createTcpServer();
+    try {
+      await listen(releasedPort, webProcess.port, webProcess.host);
+      return;
+    } catch (error) {
+      if (error?.code !== "EADDRINUSE" || Date.now() >= deadline) {
+        throw error;
+      }
+    } finally {
+      await closeServer(releasedPort);
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
   }
 }
 
