@@ -3,7 +3,7 @@ import { chmod, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { AgentRuntime, DeterministicFakeAdapter } from "@torsor/agent-runtime";
+import { AgentRuntime, DeterministicFakeAdapter, LocalWorktreeExecutor } from "@torsor/agent-runtime";
 import type { AgentRuntimeHooks } from "@torsor/agent-runtime";
 import {
   LocalArtifactStorage,
@@ -27,6 +27,8 @@ import {
   createTorsorHttpService,
   type LocalRuntimeHost,
 } from "../src/index.js";
+import { syntheticRepository } from "../../../packages/agent-runtime/test/fixtures/worktree-fixture.js";
+import { nodeProbeDriver, type ControlledChild } from "../../../packages/agent-runtime/src/controlled-process.js";
 
 const bootstrap: KernelBootstrap = {
   principals: [
@@ -63,6 +65,185 @@ afterEach(async () => {
 });
 
 describe("Local runtime host", () => {
+  it("does not open HTTP or dispatch after shutdown is requested during physical recovery", async () => {
+    const directory = await temporaryDirectory();
+    const recovery = deferred<void>();
+    let executorClosed = false;
+    const adapter = new DeterministicFakeAdapter();
+    const host = createLocalRuntimeHost({
+      databasePath: join(directory, "kernel.sqlite"), bootstrap,
+      credentials: [{ token: "human-token", principalContext: { principalId: "principal-human" } }],
+      runtimePrincipalId: "principal-runtime", projectIds: ["project-sample"], adapter,
+      worktreeExecutorFactory: () => ({
+        recover: () => recovery.promise,
+        probe: async () => { throw new Error("No probe should be admitted."); },
+        stopActivation: async () => {},
+        close: async () => { executorClosed = true; },
+      }),
+    });
+    const starting = host.start();
+    const rejected = expect(starting).rejects.toThrow(/closed during recovery/);
+    const closing = host.close();
+    recovery.resolve();
+    await closing;
+    await rejected;
+    await host.finished;
+    expect(host.origin).toBeNull();
+    expect(adapter.invocationCount).toBe(0);
+    expect(executorClosed).toBe(true);
+  });
+
+  it("persists quarantine before closing Kernel when physical stop cannot be confirmed", async () => {
+    const repository = syntheticRepository();
+    repository.addWorktree("probe");
+    let executor!: LocalWorktreeExecutor;
+    let actual: ControlledChild | undefined;
+    const childStarted = deferred<void>();
+    const releaseProvider = deferred<void>();
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        const runId = await context.capabilities.createRunFromAttention();
+        await executor.register({
+          worktreeId: "uncertain-host", directoryName: "probe", runId, baseRevision: repository.baseRevision,
+        });
+      } else {
+        const child = await executor.start({ worktreeId: "uncertain-host", activationId: context.activationId });
+        await child.result;
+        childStarted.resolve();
+        await releaseProvider.promise;
+        await context.capabilities.wait("Physical stop requires independent confirmation.");
+      }
+    });
+    const host = createLocalRuntimeHost({
+      databasePath: repository.databasePath, bootstrap,
+      port: 0,
+      credentials: [{ token: "human-token", principalContext: { principalId: "principal-human" } }],
+      runtimePrincipalId: "principal-runtime", projectIds: ["project-sample"], adapter,
+      runtimePollIntervalMs: 10,
+      worktreeExecutorFactory: (kernel) => {
+        executor = new LocalWorktreeExecutor({
+          kernel, runtimePrincipalId: "principal-runtime", ...repository, stopGraceMs: 20, forceGraceMs: 20,
+          driver: { start: (input) => {
+            actual = nodeProbeDriver.start(input);
+            return { ...actual, requestStop: () => {}, forceStop: () => false };
+          } },
+        });
+        return executor;
+      },
+    });
+    try {
+      const origin = await host.start();
+      const response = await fetch(`${origin}/api/v1/commands/start-thread`, {
+        method: "POST", headers: { ...authorization(), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          idempotencyKey: "uncertain-host", projectId: "project-sample", channelId: "channel-general",
+          body: "Exercise controlled shutdown uncertainty.", targetAgentIds: ["agent-orbit"],
+        }),
+      });
+      expect(response.status).toBe(200);
+      await childStarted.promise;
+      const closing = host.close();
+      releaseProvider.resolve();
+      await expect(closing).rejects.toMatchObject({ outcome: "Unknown" });
+      process.kill(actual!.pid!, 0);
+      const reopened = TorsorKernel.open({ databasePath: repository.databasePath });
+      try {
+        expect(await reopened.query({
+          type: "GetPhysicalWorktree", worktreeId: "uncertain-host",
+        }, { principalId: "principal-runtime" })).toMatchObject({
+          state: "Quarantined", latestExecution: { state: "Uncertain" },
+        });
+      } finally { reopened.close(); }
+    } finally {
+      releaseProvider.resolve();
+      try {
+        await expect(host.close()).rejects.toMatchObject({ outcome: "Unknown" });
+      } finally {
+        actual?.forceStop();
+        if (actual) await actual.closed;
+        repository.dispose();
+      }
+    }
+  });
+
+  it("runs the physical tracer through authorized report finalization, HTTP, Runtime and confirmed shutdown", async () => {
+    const repository = syntheticRepository();
+    repository.addWorktree("probe");
+    const artifactStorage = await LocalArtifactStorage.open(join(repository.directory, "artifacts"));
+    let executor!: LocalWorktreeExecutor;
+    let lateProbe: (() => Promise<unknown>) | undefined;
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        expect(context.worktree).toBeUndefined();
+        const runId = await context.capabilities.createRunFromAttention();
+        await executor.register({
+          worktreeId: "host-probe", directoryName: "probe", runId, baseRevision: repository.baseRevision,
+        });
+      } else {
+        if (!context.worktree) throw new Error("Expected the explicitly enabled controlled executor.");
+        lateProbe = () => context.worktree!.probe("host-probe");
+        const result = await context.worktree.probe("host-probe");
+        expect(result.stop).toBe("StopConfirmed");
+        await context.capabilities.appendActivity("worktree_probe", result.digest);
+        await context.capabilities.publishReport({
+          idempotencyKey: "controlled-report", text: `Controlled probe SHA-256: ${result.digest}\n`,
+        });
+        await context.capabilities.complete({ incorporatedThroughInputSequence: 1 });
+      }
+    });
+    const host = createLocalRuntimeHost({
+      databasePath: repository.databasePath, bootstrap, artifactStorage,
+      port: 0,
+      credentials: [{ token: "human-token", principalContext: { principalId: "principal-human" } }],
+      runtimePrincipalId: "principal-runtime", projectIds: ["project-sample"], adapter,
+      runtimePollIntervalMs: 10,
+      worktreeExecutorFactory: (kernel) => {
+        executor = new LocalWorktreeExecutor({ kernel, runtimePrincipalId: "principal-runtime", ...repository });
+        return executor;
+      },
+    });
+    try {
+      const origin = await host.start();
+      const response = await fetch(`${origin}/api/v1/commands/start-thread`, {
+        method: "POST",
+        headers: { ...authorization(), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          idempotencyKey: "physical-host-tracer", projectId: "project-sample", channelId: "channel-general",
+          body: "Run the synthetic controlled Worktree probe.", targetAgentIds: ["agent-orbit"],
+        }),
+      });
+      expect(response.status).toBe(200);
+      const { result } = await response.json() as { result: { entityId: string } };
+      const thread = await waitForCompletedThread(origin, result.entityId);
+      expect(thread.runs).toMatchObject([{ state: "Completed" }]);
+      expect(thread.artifacts).toHaveLength(1);
+      expect(thread.artifacts[0]).toMatchObject({
+        producerRunId: thread.runs[0]!.id, producerThreadRootId: result.entityId,
+        mediaType: "text/plain; charset=utf-8",
+      });
+      expect(thread.runs[0]).toMatchObject({ causalRootId: result.entityId, delegationDepth: 0 });
+      const report = await fetch(`${origin}/api/v1/artifacts/${thread.artifacts[0]!.id}/content`, {
+        headers: authorization(),
+      });
+      expect(report.status).toBe(200);
+      expect(await report.text()).toMatch(/^Controlled probe SHA-256: [a-f0-9]{64}\n$/);
+      expect(JSON.stringify(thread)).not.toContain(repository.directory);
+      await host.close();
+      await expect(lateProbe!()).rejects.toThrow(/scope is closed/);
+      const reopened = TorsorKernel.open({ databasePath: repository.databasePath });
+      try {
+        expect(await reopened.query({
+          type: "GetPhysicalWorktree", worktreeId: "host-probe",
+        }, { principalId: "principal-runtime" })).toMatchObject({
+          state: "Ready", latestExecution: { state: "StopConfirmed" },
+        });
+        await expect(reopened.query({
+          type: "GetPhysicalWorktree", worktreeId: "host-probe",
+        }, { principalId: "principal-human" })).rejects.toMatchObject({ code: "Forbidden" });
+      } finally { reopened.close(); }
+    } finally { await host.close(); repository.dispose(); }
+  });
+
   it("finalizes Runtime reports, downloads authorized real bytes and restores SQLite/HTTP after restart", async () => {
     const directory = await temporaryDirectory();
     const databasePath = join(directory, "reports.sqlite");

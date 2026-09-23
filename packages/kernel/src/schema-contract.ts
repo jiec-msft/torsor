@@ -29,6 +29,10 @@ export function validateSchemaContract(database: DatabaseSync): void {
   if (!database.prepare("SELECT singleton FROM kernel_runtime_state WHERE singleton = 1").get()) {
     throw new KernelError("Conflict", "The database is missing its durable runtime configuration.");
   }
+  const identity = database.prepare("SELECT identity FROM worktree_storage_identity WHERE singleton = 1").get()?.identity;
+  if (typeof identity !== "string" || !/^[a-f0-9]{64}$/.test(identity)) {
+    throw new KernelError("Conflict", "The database is missing its durable Worktree storage identity.");
+  }
 }
 
 function fingerprint(database: DatabaseSync): string {

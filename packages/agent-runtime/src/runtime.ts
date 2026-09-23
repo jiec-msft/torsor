@@ -14,6 +14,7 @@ import {
 } from "@torsor/kernel";
 
 import { KernelActivationCapabilityBridge } from "./capability-bridge.js";
+import type { WorktreeExecutor } from "./worktree-executor.js";
 import {
   ProviderExecutionError,
   ProviderProtocolError,
@@ -78,6 +79,7 @@ export interface AgentRuntimeOptions {
   readonly leaseSafetyMs?: number;
   readonly clock?: () => Date;
   readonly hooks?: AgentRuntimeHooks;
+  readonly worktreeExecutor?: WorktreeExecutor;
 }
 
 export interface RuntimePassResult {
@@ -123,6 +125,7 @@ export class AgentRuntime {
   readonly #leaseSafetyMs: number;
   readonly #clock: () => Date;
   readonly #hooks: AgentRuntimeHooks;
+  readonly #worktreeExecutor: WorktreeExecutor | undefined;
   readonly #agents = new Map<string, BootstrapAgent>();
   readonly #attentionProjectDiscoveryContinuations = new Map<
     string,
@@ -148,6 +151,7 @@ export class AgentRuntime {
     this.#leaseSafetyMs = options.leaseSafetyMs ?? 1_000;
     this.#clock = options.clock ?? (() => new Date());
     this.#hooks = options.hooks ?? {};
+    this.#worktreeExecutor = options.worktreeExecutor;
     requireIntegerAtLeast(
       this.#attentionLeaseMs,
       1,
@@ -822,7 +826,8 @@ export class AgentRuntime {
       pendingInputIds.has(inputId),
     );
     if (deliveryInputIds.length === 0) {
-      await this.#kernel.execute(
+      await this.#finishRecoveredActivation(
+        currentProjection.run.id,
         {
           type: "FinishActivation",
           idempotencyKey: `${activationView.id}:no-pending-input`,
@@ -830,7 +835,6 @@ export class AgentRuntime {
           outcome: "Completed",
           detail: "The outbox wake-up had no Pending RunInput to deliver.",
         },
-        this.#runtimeContext,
       );
       return true;
     }
@@ -990,6 +994,7 @@ export class AgentRuntime {
       return false;
     }
     const controller = new AbortController();
+    let worktreeScopeOpen = true;
     const stopMonitor = this.#monitorExecution(
       input.cause,
       input.activationId,
@@ -1007,6 +1012,18 @@ export class AgentRuntime {
           cause: input.cause,
           capabilities: bridge,
           signal: controller.signal,
+          ...(input.cause.type === "run" && this.#worktreeExecutor ? {
+            worktree: {
+              probe: (worktreeId: string) => {
+                if (!worktreeScopeOpen || controller.signal.aborted) {
+                  return Promise.reject(new Error("Worktree execution scope is closed."));
+                }
+                return this.#worktreeExecutor!.probe({
+                  worktreeId, activationId: input.activationId, signal: controller.signal,
+                });
+              },
+            },
+          } : {}),
         }),
         controller.signal,
       );
@@ -1047,7 +1064,9 @@ export class AgentRuntime {
       const providerError =
         error instanceof ProviderExecutionError
           ? error
-          : new ProviderExecutionError(errorMessage(error), "Failed");
+          : error instanceof KernelError && error.code === "WriterAuthorityLost"
+            ? new ProviderExecutionError("Controlled Worktree publication authority was lost.", "Unknown")
+            : new ProviderExecutionError(errorMessage(error), "Failed");
       if (input.cause.type === "run" && bridge.terminalAction === null) {
         const latest = await this.#kernel.query(
           { type: "GetRunProjection", runId: input.cause.run.run.id },
@@ -1072,6 +1091,7 @@ export class AgentRuntime {
                 waitError instanceof KernelError &&
                 (waitError.code === "StaleRevision" ||
                   waitError.code === "Conflict" ||
+                  waitError.code === "WriterAuthorityLost" ||
                   waitError.code === "TerminalRun")
               )
             ) {
@@ -1109,7 +1129,9 @@ export class AgentRuntime {
       }
       throw providerError;
     } finally {
+      worktreeScopeOpen = false;
       stopMonitor();
+      await this.#worktreeExecutor?.stopActivation(input.activationId);
     }
   }
 
@@ -1419,7 +1441,8 @@ export class AgentRuntime {
         );
         detail = "Recovered an uncertain ProviderAttempt.";
       }
-      await this.#kernel.execute(
+      await this.#finishRecoveredActivation(
+        projection.run.id,
         {
           type: "FinishActivation",
           idempotencyKey: `${activation.id}:reconciled-${outcome.toLowerCase()}`,
@@ -1427,8 +1450,39 @@ export class AgentRuntime {
           outcome,
           detail,
         },
-        this.#runtimeContext,
       );
+    }
+  }
+
+  async #finishRecoveredActivation(runId: string, command: {
+    readonly type: "FinishActivation";
+    readonly idempotencyKey: string;
+    readonly activationId: string;
+    readonly outcome: "Completed" | "Failed" | "Expired";
+    readonly detail: string;
+  }): Promise<void> {
+    try {
+      await this.#kernel.execute(command, this.#runtimeContext);
+    } catch (error) {
+      if (!(error instanceof KernelError && error.code === "WriterAuthorityLost") ||
+          command.outcome !== "Completed") throw error;
+      // A committed result survives its Writer; recovery must not republish success.
+      try {
+        await this.#kernel.execute({
+          type: "FinishActivation",
+          idempotencyKey: `${command.activationId}:reconciled-authority-lost`,
+          activationId: command.activationId,
+          outcome: "Expired",
+          detail: "Recovered orphaned Activation after Worktree authority was lost; committed results were preserved.",
+        }, this.#runtimeContext);
+      } catch (settlementError) {
+        if (!(settlementError instanceof KernelError && settlementError.code === "Conflict" &&
+            settlementError.message === "The Activation is already finished.")) throw settlementError;
+        const current = await this.#kernel.query({ type: "GetRunProjection", runId }, this.#runtimeContext);
+        const activation = current.activations.find((candidate) => candidate.id === command.activationId);
+        if (!activation || activation.finishedAt === null) throw settlementError;
+        // Another Host won settlement. Preserve its outcome; only delivery acknowledgement remains.
+      }
     }
   }
 
