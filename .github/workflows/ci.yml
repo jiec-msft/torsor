@@ -23,13 +23,13 @@ jobs:
           - slice: kernel-runtime
             command: npm run test:kernel && npm run test:operational-logging && npm run test:agent-runtime && npm run typecheck --workspace @torsor/kernel && npm run typecheck --workspace @torsor/operational-logging && npm run typecheck --workspace @torsor/agent-runtime
           - slice: acp-smoke
-            command: npm run test:acp-conformance && npm run typecheck --workspace @torsor/acp-conformance && npm run test:trusted-local-smoke
+            command: npm run test:acp-conformance && npm run typecheck --workspace @torsor/acp-conformance && npm run build --workspace @torsor/agent-runtime && npm run test:trusted-local-smoke
           - slice: server-web
             command: npm run test:server && npm run test:web && npm run typecheck --workspace @torsor/server && npm run typecheck --workspace @torsor/web
           - slice: quickstart
             command: npm run test:quickstart
           - slice: system-scenarios
-            command: npm run test:system-scenarios && npm run typecheck --workspace @torsor/system-scenarios
+            command: npm run build --workspace @torsor/server && npm run test:system-scenarios && npm run typecheck --workspace @torsor/system-scenarios
     steps:
       - uses: actions/checkout@v4
         with:
