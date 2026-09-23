@@ -81,7 +81,7 @@ PID fixture；不得以 mock owner、fake Kernel 或预制成功结果替代生�
 | SS-3.5 | depth 4 可准入、5 拒绝；root 同时非终态上限 50，Waiting 占位，只有终态提交释放；释放后重试不重复准入且保持来源 | 25.1–25.2 |
 | SS-3.6 | 可信报告 digest、固化、重开和重试；相同字节在不同 Run 保留独立 descriptor；父子或兄弟不可互读，不存在与越界读取不可区分 | 21.3–21.5、23 |
 | SS-3.7 | 崩溃/重开保留已提交事实，不保留未提交工作；新 Runtime 只从持久输入继续，不需要长寿命 Agent 内存 | 20–21 |
-| SS-3.8 | schema 18 的公开 lease execution：旧 generation、fenced/expired 活进程不能发布变更、descriptor、成功活动或完成；新 generation 胜出，晚到输出拒绝/隔离，重启与 reconciliation 确定 | 21.5、22、24、38 |
+| SS-3.8 | schema 19 保留的公开 lease execution：旧 generation、fenced/expired 活进程不能发布变更、descriptor、成功活动或完成；新 generation 胜出，晚到输出拒绝/隔离，重启与 reconciliation 确定；schema 18 及更早布局在写入前拒绝 | 21.5、22、24、38 |
 | SS-3.10 | 生产路径 trusted-local 生命周期：正常完成、Human cancel 后停止结果未知并隔离/恢复、独立 fencing 后取消且不误确认 delivery | 20.2、22、24、27、31.1、45 |
 
 **SS-3.8.1** 使用公开 `LocalWorktreeExecutor`，由 Human/Runtime 创建 Run，

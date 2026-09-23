@@ -17,7 +17,16 @@ import {
   resolveAttentionWithExistingRun,
   resolveAttentionWithRun,
 } from "./attentions.js";
-import { replyToThread, startThread } from "./collaboration.js";
+import {
+  deleteMessage,
+  editMessage,
+  replyToThread,
+  startThread,
+} from "./collaboration.js";
+import {
+  adoptRunConfig,
+  updateAgentConfig,
+} from "./configuration.js";
 import { rejectCausalOverrides } from "./causal-limits.js";
 import {
   allRows,
@@ -1017,6 +1026,38 @@ export class TorsorKernel {
         );
       case "ReplyToThread":
         return replyToThread(
+          this.#context,
+          command,
+          principal,
+          context,
+          correlationId,
+        );
+      case "EditMessage":
+        return editMessage(
+          this.#context,
+          command,
+          principal,
+          context,
+          correlationId,
+        );
+      case "DeleteMessage":
+        return deleteMessage(
+          this.#context,
+          command,
+          principal,
+          context,
+          correlationId,
+        );
+      case "UpdateAgentConfig":
+        return updateAgentConfig(
+          this.#context,
+          command,
+          principal,
+          context,
+          correlationId,
+        );
+      case "AdoptRunConfig":
+        return adoptRunConfig(
           this.#context,
           command,
           principal,

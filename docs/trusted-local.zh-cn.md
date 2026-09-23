@@ -53,7 +53,7 @@ Provider，先加入 `KILL_ON_JOB_CLOSE` Job Object，再恢复原线程。
 从干净 checkout 执行 `npm pack --workspace @torsor/kernel` 或
 `npm pack --workspace @torsor/agent-runtime` 会先构建必要的 `dist`；安装两个 tarball 后
 可直接 import Agent Runtime root，且 Windows owner 随 Runtime Package 一起提供。
-丢失原 handle 后重启不会清除隔离。当前使用 schema 18；schema 17 被拒绝。
+丢失原 handle 后重启不会清除隔离。当前使用 schema 19；schema 18 及更早布局被拒绝。
 停止旧进程，显式使用新的可丢弃数据库和新的 managed root；不迁移、不自动删除。
 
 Timeline 只保留归一化 Tool started/completed/failed 与来源，不保留原始 Tool IDs、

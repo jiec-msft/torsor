@@ -9,6 +9,9 @@ import {
   type ProviderAdapter,
 } from "@torsor/agent-runtime";
 import {
+  TorsorKernel,
+} from "@torsor/kernel";
+import {
   OperationalLogSinkError,
   OperationalLogger,
 } from "@torsor/operational-logging";
@@ -286,10 +289,25 @@ describe("privacy-safe production operational logging", () => {
     const directory = await temporaryDirectory();
     const databasePath = join(directory, "kernel.sqlite");
     const idempotencyKey = "logging-failed-command-ack";
+    const privateBody = "private-edited-message-canary";
+    const seed = TorsorKernel.open({ databasePath, bootstrap });
+    const seededMessage = await seed.execute(
+      {
+        type: "StartThread",
+        idempotencyKey: "logging-edit-seed",
+        projectId: "project",
+        channelId: "channel",
+        body: "Synthetic seed message.",
+      },
+      { principalId: "human" },
+    );
+    seed.close();
     let committedCorrelationId: string | undefined;
+    const attemptedLines: string[] = [];
     const logger = new OperationalLogger({
       sink: {
         write: (line) => {
+          attemptedLines.push(line);
           const event = JSON.parse(line) as {
             event: string;
             outcome: string;
@@ -326,14 +344,14 @@ describe("privacy-safe production operational logging", () => {
       headers: { ...authorization(), "Content-Type": "application/json" },
       body: JSON.stringify({
         idempotencyKey,
-        projectId: "project",
-        channelId: "channel",
-        body: "Synthetic private command body.",
-        targetAgentIds: ["orbit"],
+        messageId: seededMessage.entityId,
+        expectedMessageRevision: 1,
+        body: privateBody,
+        targetAgentIds: [],
       }),
     } as const;
     const response = await fetch(
-      `${origin}/api/v1/commands/start-thread`,
+      `${origin}/api/v1/commands/edit-message`,
       command,
     ).catch(() => undefined);
     expect(
@@ -360,16 +378,27 @@ describe("privacy-safe production operational logging", () => {
     cleanup.push(() => recovered.close());
     const recoveredOrigin = await recovered.start();
     const replay = await fetch(
-      `${recoveredOrigin}/api/v1/commands/start-thread`,
+      `${recoveredOrigin}/api/v1/commands/edit-message`,
       command,
     );
     expect(replay.status).toBe(200);
     const replayBody = await replay.json() as {
       result: { entityId: string; correlationId: string };
     };
-    expect(replayBody.result.entityId).toMatch(/^message_/);
+    expect(replayBody.result.entityId).toBe(seededMessage.entityId);
     expect(committedCorrelationId).toMatch(/^corr-/);
     expect(replayBody.result.correlationId).toBe(committedCorrelationId);
+    expect(attemptedLines.join("")).not.toContain(privateBody);
+    expect(attemptedLines.join("")).not.toContain(idempotencyKey);
+    const threadResponse = await fetch(
+      `${recoveredOrigin}/api/v1/threads/${seededMessage.entityId}`,
+      { headers: authorization() },
+    );
+    expect(threadResponse.status).toBe(200);
+    const threadBody = await threadResponse.json() as {
+      thread: { messages: readonly { revisions: readonly unknown[] }[] };
+    };
+    expect(threadBody.thread.messages[0]!.revisions).toHaveLength(2);
   });
 
   it("rotates one bounded predecessor and hides filesystem failure details", async () => {

@@ -2,11 +2,11 @@
 
 > English | [简体中文](operational-logging.zh-cn.md)
 
-> Status: MVP 0.1 schema 18 production integration
+> Status: MVP 0.1 schema 19 production integration
 >
 > Scope: local structured operational records for the trusted-local Host, HTTP, Runtime, Provider process, Writer Authority, and recovery.
 
-This specification refines the diagnostic and audit boundaries in sections 20, 22, and 28 of [`docs/prototype/001-overview.md`](../prototype/001-overview.md) and operates with the schema 18 execution receipt, stop, and quarantine contract in the [trusted-local Provider policy](trusted-local-provider-policy.md).
+This specification refines the diagnostic and audit boundaries in sections 20, 22, and 28 of [`docs/prototype/001-overview.md`](../prototype/001-overview.md) and operates with the schema 19 contract in the [trusted-local Provider policy](trusted-local-provider-policy.md). Schema 19 retains schema 18's execution receipt, stop, and quarantine facts and adds the pinned Agent config revision to Run history. Schema 18 and older layouts remain explicitly rejected before writes.
 
 ## 1. Output and ownership
 

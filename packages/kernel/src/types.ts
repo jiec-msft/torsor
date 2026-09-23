@@ -128,6 +128,33 @@ export interface ReplyToThreadCommand extends IdempotentCommand, MessageContent 
   readonly expectedThreadCursor?: number;
 }
 
+export interface EditMessageCommand extends IdempotentCommand, MessageContent {
+  readonly type: "EditMessage";
+  readonly messageId: string;
+  readonly expectedMessageRevision: number;
+}
+
+export interface DeleteMessageCommand extends IdempotentCommand {
+  readonly type: "DeleteMessage";
+  readonly messageId: string;
+  readonly expectedMessageRevision: number;
+}
+
+export interface UpdateAgentConfigCommand extends IdempotentCommand {
+  readonly type: "UpdateAgentConfig";
+  readonly agentId: string;
+  readonly expectedAgentConfigRevision: number;
+  readonly config: JsonValue;
+}
+
+export interface AdoptRunConfigCommand extends IdempotentCommand {
+  readonly type: "AdoptRunConfig";
+  readonly runId: string;
+  readonly expectedRunRevision: number;
+  readonly expectedAgentConfigRevision: number;
+  readonly targetAgentConfigRevision: number;
+}
+
 export interface SendToRunCommand extends IdempotentCommand, MessageContent {
   readonly type: "SendToRun";
   readonly runId: string;
@@ -459,6 +486,10 @@ export interface ResolveWorktreeWriterLeaseQuarantineCommand
 export type KernelCommand =
   | StartThreadCommand
   | ReplyToThreadCommand
+  | EditMessageCommand
+  | DeleteMessageCommand
+  | UpdateAgentConfigCommand
+  | AdoptRunConfigCommand
   | SendToRunCommand
   | CancelRunCommand
   | WithdrawRunInputCommand
@@ -644,6 +675,8 @@ export interface MessageRevisionView {
   readonly id: string;
   readonly revision: number;
   readonly body: string;
+  readonly tombstone: boolean;
+  readonly targetAgentIds: readonly string[];
   readonly createdAt: string;
 }
 

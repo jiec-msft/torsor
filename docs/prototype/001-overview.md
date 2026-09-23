@@ -418,20 +418,77 @@ Request fields with the same names are not authoritative.
 
 ### 15.4 Agent configuration versions
 
-1. A Run pins `agent_config_revision` at creation.
-2. Every Activation records the actual configuration revision.
-3. Configuration updates do not silently change existing Runs.
-4. Existing Runs adopt a new revision only through explicit `adopt_config_revision`.
+1. Agent configuration revisions are immutable append-only records; an Agent's
+   `current_config_revision` only points at the latest record. Only a Human may
+   create the next revision through explicit idempotent `update_agent_config`,
+   which includes the observed `expected_agent_config_revision`. The new
+   revision is exactly current plus one. Only one concurrent update succeeds,
+   and a stale request writes no partial record.
+2. `update_agent_config` accepts only non-secret configuration that may be
+   visible to Project collaborators and the execution surface. Provider
+   credentials, tokens, private environment values, and private Host material
+   do not belong in Agent config. Public events, receipts, errors, and Client
+   recovery metadata contain only Agent ID, revisions, and request identity,
+   never the complete config body. Durable event actor and time record update
+   provenance.
+3. A Run pins `agent_config_revision` at creation, and every Activation records
+   the actual configuration revision. Updating Agent config does not silently
+   change an existing Run, started Activation, ProviderAttempt, Lease, or
+   running process.
+4. A Human explicitly and idempotently adopts a revision for an existing
+   nonterminal Run through `adopt_config_revision`, including
+   `expected_run_revision`, `expected_agent_config_revision`, and
+   `target_agent_config_revision`. The expected Agent revision must still be
+   the owner Agent's current revision. The target must exist for that Agent, be
+   strictly newer than the Run's pinned revision, and not exceed the expected
+   Agent revision. Terminal Runs, stale Runs, concurrent Agent updates,
+   unknown/other-Agent revisions, and equal or older targets fail atomically.
+5. Successful adoption only changes the Run's pinned config revision and
+   increments its Run revision. It does not revoke, restart, or rewrite an
+   existing Activation. Later authorized Activations record and use the adopted
+   revision. Idempotent replay returns the original receipt even after later
+   Run or Agent changes.
+6. Persist every Run history version together with its
+   `agent_config_revision`. Snapshot-bounded Run and Thread list projections
+   read state, Run revision, and pinned config revision from the same historical
+   version; they never combine historical Run facts with the current config
+   revision into a state that never existed.
 
 ## 16. Message and Thread
 
 ### 16.1 Message revision
 
-1. Message revisions are append-only.
-2. Edit commands include expected Message revision.
-3. UI shows the latest revision by default and exposes history.
-4. MVP deletion adds a tombstone; it does not erase referenced history.
-5. Existing Attention, RunInput, and ProviderAttempt facts are not secretly withdrawn by edits or deletion.
+1. Message revisions are append-only. Each revision fixes its body, tombstone
+   flag, Mention set, creation time, and stable ID. Later revisions never
+   rewrite the Message's original author, Agent/Run/Attention provenance,
+   Thread position, or creation time.
+2. Only the original `author_principal_id` may mutate a Message. MVP Human Web
+   exposes edit and delete only for Messages authored by the current Human. A
+   Human cannot rewrite an Agent's or another Human's expression. This slice
+   adds no Agent self-edit entry point; a future one still requires the same
+   original Agent Principal and a currently valid capability, never a Human
+   override.
+3. Explicit idempotent `edit_message` includes
+   `expected_message_revision`, the complete new body, and the complete new
+   Mention target set. In one transaction it appends a revision, updates the
+   latest projection, creates at most one Attention for every valid Mention in
+   that revision, and advances the Thread cursor once. Only one concurrent edit
+   at an expected revision succeeds; failure creates no revision, Mention,
+   Attention, or Thread event.
+4. Explicit idempotent `delete_message` includes
+   `expected_message_revision`. It only appends a revision with an empty body,
+   empty Mention set, and tombstone flag, updates the latest projection, and
+   advances the Thread cursor once. It never physically deletes a Message or
+   revision. A tombstone is terminal in MVP: there is no restore or later edit.
+   Same-request replay returns the original receipt; a new duplicate delete or
+   stale request fails explicitly.
+5. UI shows the latest revision by default. A tombstone is an explicit deleted
+   placeholder, not blank success, and full history exposes each revision's
+   Mentions and tombstone state. Historical Attention, RunInput,
+   ProviderAttempt, public event, and specific `message_revision_id`
+   references remain resolvable and never redirect to the latest revision.
+6. Existing Attention, RunInput, and ProviderAttempt facts are not secretly
+   withdrawn by edits or deletion.
 
 ### 16.2 Thread structure
 
@@ -503,7 +560,9 @@ Resolution records outcome, actor, Activation, time, created/updated Run, create
 
 ### 17.5 Message edits
 
-1. A new revision with a new Mention creates new Attention.
+1. Every Mention in a non-tombstone revision creates one new Attention by
+   `(message_revision_id, target_agent_id, trigger_kind)`. Mentioning the same
+   Agent in an older revision does not suppress the new revision's Attention.
 2. Removing a Mention or tombstoning does not revoke existing Attention.
 3. Activation receives both the triggering and current latest revision.
 4. A Human explicitly cancels or stops already-triggered work.
@@ -791,9 +850,9 @@ A report finalization request is identified by `(principal_id, run_id, idempoten
 
 This slice uses caller-driven retry, not background replay of Provider output. A crash during staging leaves only an invisible temporary file; content publication before database commit leaves only an invisible content-addressed blob; a lost response after commit is recoverable from durable idempotency results and Run/Thread projections. Retry verifies and reuses the blob and rechecks current authorization, Activation, and Run revision in the transaction. Revocation or a terminal Run blocks new descriptors; currently authorized Humans/Runtime may still query committed descriptors. No automatic orphan/staging deletion is included: cleanup is offline maintenance, avoiding races with concurrent finalization.
 
-The integrated durable-causal-limit, trusted-Artifact, physical-Worktree, and provider-diagnostic-boundary database uses schema **18**. It retains section 25's Run root/parent/depth, immutable constraints, admission index and durable configuration alongside section 23's trusted report descriptors and section 22's physical identities, executions and irreversible Writer publication fence, adding native execution ProviderAttempt/policy receipt bindings. Schema 17 is rejected because it lacks those native receipts; no migration is supported. Schema 16 is rejected and recreated because it may contain raw provider diagnostics publicly persisted before this boundary; the former causal-only, Artifact-only and Worktree-only schema 14 layouts and integrated schema 15 are also incompatible. Equal version numbers must not authorize different layouts. Opening any older or unversioned nonempty development database must fail explicitly before applying DDL/bootstrap, without migration, version rewriting, or data deletion. Operators stop old processes and explicitly use a fresh disposable database and fresh managed root. Schema 18 reopen still validates durable causal configuration and Worktree storage identity.
+The integrated durable-causal-limit, trusted-Artifact, physical-Worktree, and provider-diagnostic-boundary database uses schema **19**. It retains section 25's Run root/parent/depth, immutable constraints, admission index and durable configuration alongside section 23's trusted report descriptors, section 22's physical identities, executions and irreversible Writer publication fence, and schema 18's native execution ProviderAttempt/policy receipt bindings, while adding the pinned Agent config revision to every Run history version. Schema 18 is rejected because it cannot reconstruct pre-adoption Run/Thread snapshots correctly; schema 17 also lacks native receipts. No migration is supported. Schema 16 is rejected and recreated because it may contain raw provider diagnostics publicly persisted before this boundary; the former causal-only, Artifact-only and Worktree-only schema 14 layouts and integrated schema 15 are also incompatible. Equal version numbers must not authorize different layouts. Opening any older or unversioned nonempty development database must fail explicitly before applying DDL/bootstrap, without migration, version rewriting, or data deletion. Operators stop old processes and explicitly use a fresh disposable database and fresh managed root. Schema 19 reopen still validates durable causal configuration and Worktree storage identity.
 
-`user_version = 18` is not layout proof. Before any DDL, bootstrap or configuration write, existing databases undergo read-only comparison against a complete schema fingerprint generated from trusted DDL in an isolated memory database: object sets, columns/types/nullability/defaults/PKs/FKs, indexes/uniqueness/partial predicates, triggers, CHECK and STRICT constraints. Compare SQLite-parsed metadata and SQL tokens that preserve literal/operator semantics; ignore only whitespace, comments and unquoted keyword/identifier case, never whitespace inside strings. Reject missing, extra-incompatible, partial, corrupt, predecessor-shaped or future layouts without changing file bytes or logical state; never repair with `CREATE IF NOT EXISTS`. SQLite-owned statistics objects are outside the application layout. Only version 0 with no persistent objects may execute DDL, initial configuration and bootstrap in one transaction, with complete rollback on failure. Valid schema 18 reopen does not reapply bootstrap or modify durable causal configuration or storage identity.
+`user_version = 19` is not layout proof. Before any DDL, bootstrap or configuration write, existing databases undergo read-only comparison against a complete schema fingerprint generated from trusted DDL in an isolated memory database: object sets, columns/types/nullability/defaults/PKs/FKs, indexes/uniqueness/partial predicates, triggers, CHECK and STRICT constraints. Compare SQLite-parsed metadata and SQL tokens that preserve literal/operator semantics; ignore only whitespace, comments and unquoted keyword/identifier case, never whitespace inside strings. Reject missing, extra-incompatible, partial, corrupt, predecessor-shaped or future layouts without changing file bytes or logical state; never repair with `CREATE IF NOT EXISTS`. SQLite-owned statistics objects are outside the application layout. Only version 0 with no persistent objects may execute DDL, initial configuration and bootstrap in one transaction, with complete rollback on failure. Valid schema 19 reopen does not reapply bootstrap or modify durable causal configuration or storage identity.
 
 The Runtime Host must bound consecutive recovery passes, yield to the event loop before continuing, and recheck shutdown. Backlog processing must not starve HTTP, timers, signals, or shutdown handling. Idle polling waits must be interruptible by shutdown and must remove their listener and cancel any no-longer-needed timer regardless of which side completes first.
 
@@ -1275,7 +1334,7 @@ that deliberately daemonize and escape the owned process tree, or exactly-once
 external MCP/API effects. These non-goals do not weaken section 14 identity,
 provenance, and terminal boundaries; section 22 Lease, fencing, stop, and
 quarantine contracts; section 27 privacy and minimum-context rules; or existing
-authorization, current schema 18, and explicit-failure contracts.
+authorization, current schema 19, and explicit-failure contracts.
 
 For the remaining MVP work, a release-blocking finding must have a reproducible
 supported path, credible user or data-integrity impact, and a minimal acceptance
@@ -1921,6 +1980,80 @@ It uses atomic `send_to_run` from section 36 independently of Live Timeline impl
 6. Success or confirmed same-identity recovery refreshes the Run, home Thread, and existing Timeline history without fabricated events or optimistic dispositions. Read failure after acknowledged commit displays `Committed; projections could not be refreshed` inside Run controls, retains the receipt, and provides read-only refresh, never command resubmission. Late reads from old Runs / Sessions cannot replace the current selection or steal focus.
 7. Always distinguish logical `Cancelled`, asynchronous stop requests, physical `StopConfirmed`, and Worktree quarantine. Success confirms logical cancellation only; ProviderAttempt settlement, cancel acknowledgement, terminal Run state, or lease revocation is not physical-stop evidence. The current public Run projection exposes no physical execution / quarantine facts: explicitly state that confirmation is unavailable here, without claiming safe Worktree release or actual quarantine. Preserve existing Provider stop-unconfirmed notices. This slice adds no physical controls, quarantine release, or Trusted Local execution.
 8. Use named native buttons supporting Tab, Enter, Space, visible focus, disabled / busy states, and perceivable status / error regions; withdrawal labels include input sequence and ID. Recovery and read-only refresh remain accessible inside narrow-screen modals without asynchronous focus theft. Deterministic controller and rendered tests cover success, eligibility, repeated activation, lost response, revision / conflict, permission / CSRF / session expiry, reload / reopen, and logical cancellation with unconfirmed physical stop or quarantined Worktrees.
+
+### 44.2.2 Human Message revision controls
+
+1. Conversation exposes `Edit message` and explicitly confirmed
+   `Delete message` only for a non-tombstoned Message originally authored by
+   the current Human. Other Human and Agent Messages are read-only. Hiding the
+   Client action does not replace server-side author checks.
+2. Edit initializes from the observed latest revision and submits the complete
+   body, Mention set, and `expectedMessageRevision` to `edit-message`. Delete
+   submits the observed revision to `delete-message`. Confirmation states that
+   the Message becomes a tombstone while history, Attention, and RunInput
+   references remain and are not cancelled.
+3. Freeze Message ID, expected revision, body/Mentions when applicable, and
+   idempotency key before sending. Disable repeated activation while pending.
+   Lost or unverifiable responses show `Outcome unknown` and only retry the
+   same request. Definite stale/permission/conflict results preserve the edit
+   draft or delete intent; after refresh the Human reviews and creates a new
+   request rather than automatic revision replacement. If an earlier outcome
+   is unknown, a retry receiving 401 or invalid CSRF retains the frozen request
+   and unknown state across the SessionGate. After the same Principal
+   reauthenticates, the control restores the original body/revision/key and
+   permits only same-identity replay. A definite 4xx without prior uncertainty
+   remains a definite rejection rather than becoming unknown.
+4. Success or same-identity replay confirmation refreshes the Thread without
+   optimistic revision, tombstone, Mention, or Attention facts. A failed read
+   after acknowledged commit shows `Committed; projections could not be
+   refreshed` and retries reads only. Late old-Thread or old-Session results
+   cannot replace current selection or focus.
+5. Message bodies are not Client recovery logs. The current Window may retain a
+   frozen request in memory across authentication recovery, but bodies,
+   credentials, and CSRF never enter public events, command receipts, or
+   persistent recovery metadata. Authentication/authorization failure after an
+   unknown outcome preserves uncertainty until same-Principal idempotent replay
+   confirms it.
+6. The body shows the latest revision by default; tombstones use a perceivable
+   placeholder. `Revision history` expands revisions in order with number,
+   time, body or tombstone, and Mentions, without treating history as the
+   current editable draft. Controls remain keyboard, focus, confirmation, and
+   narrow-viewport accessible.
+
+### 44.2.3 Human Agent config and Run adoption controls
+
+1. Agents view shows the current Agent config revision and non-secret JSON
+   configuration, with `Update config` for an authenticated Human. It submits
+   the complete config and observed `expectedAgentConfigRevision` to
+   `update-agent-config`. Success creates the next immutable revision without
+   modifying existing Runs.
+2. Run detail shows the Run's pinned revision and owner Agent's current
+   revision. `Adopt current config` exists only for a nonterminal Run with a
+   higher current revision, submitting observed `expectedRunRevision`,
+   `expectedAgentConfigRevision`, and that current target revision to
+   `adopt-run-config`. Running Activations explicitly remain on their recorded
+   revision; success affects later Activations only.
+3. Both operations freeze target, expected/target revisions, request body for
+   update only, and idempotency key. They reuse `Outcome unknown`, `Retry same
+   action`, same-Principal authentication recovery, explicit refresh/review
+   after conflict, and read-only refresh after acknowledged commit. Never
+   auto-adopt a newly observed revision or silently rewrite a stale target.
+   If an unknown update/adoption retry receives 401 or invalid CSRF, the
+   SessionGate and reauthenticated control continue to show the unknown
+   outcome and restore the byte-identical request/key from current-window
+   Controller memory. A definite 4xx without prior uncertainty still releases
+   that request identity.
+4. Config bodies never enter public events, command receipts, error text, or
+   persistent Client recovery metadata. The current Window may retain an
+   unknown update request in memory for same-identity replay. After browser
+   reload, if the complete original request is unavailable, report that it
+   cannot be recovered instead of guessing a new key. Adoption recovery
+   metadata contains only public IDs, revisions, and key.
+5. Successful update refreshes Agents/bootstrap projection. Successful
+   adoption refreshes the Run, Run list, and source Thread. Read failure does
+   not revoke the receipt or resend the command. Native buttons, JSON input
+   labels, error regions, busy/disabled states, keyboard behavior, and narrow
+   viewports remain accessible.
 
 ### 44.3 Tool Call expansion and failure
 

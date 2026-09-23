@@ -117,7 +117,8 @@ delivery 不误确认。PID fixture 仅用于独立证明本场景拥有的 Prov
 阈值、不关闭 SQLite 持久性来伪造速度。重复命令输出实际值而非紧 wall-clock 断言。
 外层进程使用真实单调时钟，hosted runner 可能更慢；CI 日志保留每轮实际值。
 
-SS-3.8 与 SS-3.10 对齐 schema 18：前者保留固定 deterministic tracer，后者覆盖
+SS-3.8 与 SS-3.10 对齐 schema 19（保留 schema 18 execution receipt，且拒绝
+schema 18 及更早布局）：前者保留固定 deterministic tracer，后者覆盖
 受支持 trusted-local 生产路径的合成 ACP edit/test 与实际 owned process tree。
 本包不是 hostile-code sandbox，不验证真实模型质量或外部副作用 exactly-once，
 也不替代最终 exact-head 独立审查。

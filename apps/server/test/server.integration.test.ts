@@ -12,6 +12,7 @@ import {
   type PrincipalContext,
   type PublicEventEnvelope,
 } from "@torsor/kernel";
+import { OperationalLogger } from "@torsor/operational-logging";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -167,6 +168,220 @@ describe("Torsor HTTP and SSE service", () => {
         code: "stale_revision",
         details: { expectedRevision: 1, actualRevision: 2 },
       },
+    });
+  });
+
+  it("serves durable Message and Agent config revision operations", async () => {
+    const directory = await temporaryDirectory();
+    const databasePath = join(directory, "torsor.sqlite");
+    const seeded = await seedRun(databasePath, "collaboration-http");
+    const operationalLines: string[] = [];
+    const first = await startHarness({
+      databasePath,
+      operationalLogger: new OperationalLogger({
+        sink: {
+          write: (line) => {
+            operationalLines.push(line);
+          },
+        },
+      }),
+    });
+
+    const foreignEdit = await command(
+      first.origin,
+      "edit-message",
+      {
+        idempotencyKey: "foreign-message-edit",
+        messageId: seeded.threadId,
+        expectedMessageRevision: 1,
+        body: "private-foreign-edit-canary",
+      },
+      "riley-token",
+    );
+    expect(foreignEdit.status).toBe(403);
+    expect(await foreignEdit.json()).toMatchObject({
+      error: { code: "forbidden" },
+    });
+
+    const editRequest = {
+      idempotencyKey: "http-message-edit",
+      messageId: seeded.threadId,
+      expectedMessageRevision: 1,
+      body: "private-message-edit-canary",
+      targetAgentIds: ["agent-orbit"],
+    };
+    const edited = await command(first.origin, "edit-message", editRequest);
+    expect(edited.status).toBe(200);
+    const editedBody = await edited.json() as {
+      result: { correlationId: string };
+    };
+    expectSuccessfulCommandLog(
+      operationalLines,
+      edited.headers.get("x-request-id"),
+      editedBody.result.correlationId,
+    );
+    const editReplay = await command(
+      first.origin,
+      "edit-message",
+      editRequest,
+    );
+    expect(await editReplay.json()).toEqual(editedBody);
+    const staleEdit = await command(first.origin, "edit-message", {
+      ...editRequest,
+      idempotencyKey: "http-message-edit-stale",
+      body: "This stale revision must fail.",
+    });
+    expect(staleEdit.status).toBe(409);
+    expect(await staleEdit.json()).toMatchObject({
+      error: {
+        code: "stale_revision",
+        details: { expectedRevision: 1, actualRevision: 2 },
+      },
+    });
+
+    const deleted = await command(first.origin, "delete-message", {
+      idempotencyKey: "http-message-delete",
+      messageId: seeded.threadId,
+      expectedMessageRevision: 2,
+    });
+    expect(deleted.status).toBe(200);
+    const deleteBody = await deleted.json() as {
+      result: { correlationId: string };
+    };
+    expectSuccessfulCommandLog(
+      operationalLines,
+      deleted.headers.get("x-request-id"),
+      deleteBody.result.correlationId,
+    );
+
+    const configRequest = {
+      idempotencyKey: "http-config-update",
+      agentId: "agent-orbit",
+      expectedAgentConfigRevision: 3,
+      config: {
+        model: "private-config-model-canary",
+        mode: "private-config-mode-canary",
+      },
+    };
+    const config = await command(
+      first.origin,
+      "update-agent-config",
+      configRequest,
+    );
+    expect(config.status).toBe(200);
+    const configBody = await config.json() as {
+      result: { correlationId: string; entityId: string; revision: number };
+    };
+    expect(configBody).toMatchObject({
+      result: { entityId: "agent-orbit", revision: 4 },
+    });
+    expectSuccessfulCommandLog(
+      operationalLines,
+      config.headers.get("x-request-id"),
+      configBody.result.correlationId,
+    );
+
+    const adopted = await command(first.origin, "adopt-run-config", {
+      idempotencyKey: "http-config-adoption",
+      runId: seeded.runId,
+      expectedRunRevision: 1,
+      expectedAgentConfigRevision: 4,
+      targetAgentConfigRevision: 4,
+    });
+    expect(adopted.status).toBe(200);
+    const adoptedBody = await adopted.json() as {
+      result: { correlationId: string };
+    };
+    expectSuccessfulCommandLog(
+      operationalLines,
+      adopted.headers.get("x-request-id"),
+      adoptedBody.result.correlationId,
+    );
+    const staleAdoption = await command(first.origin, "adopt-run-config", {
+      idempotencyKey: "http-config-adoption-stale",
+      runId: seeded.runId,
+      expectedRunRevision: 1,
+      expectedAgentConfigRevision: 4,
+      targetAgentConfigRevision: 4,
+    });
+    expect(staleAdoption.status).toBe(409);
+    expect(await staleAdoption.json()).toMatchObject({
+      error: {
+        code: "stale_revision",
+        details: { expectedRevision: 1, actualRevision: 2 },
+      },
+    });
+
+    await first.service.close();
+    const second = await startHarness({ databasePath });
+    const deleteReplay = await command(
+      second.origin,
+      "delete-message",
+      {
+        idempotencyKey: "http-message-delete",
+        messageId: seeded.threadId,
+        expectedMessageRevision: 2,
+      },
+    );
+    expect(await deleteReplay.json()).toEqual(deleteBody);
+    const configReplay = await command(
+      second.origin,
+      "update-agent-config",
+      configRequest,
+    );
+    expect(await configReplay.json()).toMatchObject({
+      result: { entityId: "agent-orbit", revision: 4 },
+    });
+    const serializedOperationalLog = operationalLines.join("");
+    for (const privateCanary of [
+      "private-foreign-edit-canary",
+      "private-message-edit-canary",
+      "private-config-model-canary",
+      "private-config-mode-canary",
+      "http-message-edit",
+      "http-message-delete",
+      "http-config-update",
+      "http-config-adoption",
+    ]) {
+      expect(serializedOperationalLog).not.toContain(privateCanary);
+    }
+    const thread = await jsonRequest<{
+      thread: {
+        cursor: number;
+        messages: ReadonlyArray<{
+          latestRevision: number;
+          targetAgentIds: readonly string[];
+          revisions: ReadonlyArray<{
+            body: string;
+            tombstone: boolean;
+            targetAgentIds: readonly string[];
+          }>;
+        }>;
+      };
+    }>(`${second.origin}/api/v1/threads/${seeded.threadId}`);
+    expect(thread.thread.messages[0]).toMatchObject({
+      latestRevision: 3,
+      targetAgentIds: [],
+      revisions: [
+        {
+          body: "Orbit, create a durable Run.",
+          tombstone: false,
+          targetAgentIds: ["agent-orbit"],
+        },
+        {
+          body: "private-message-edit-canary",
+          tombstone: false,
+          targetAgentIds: ["agent-orbit"],
+        },
+        { body: "", tombstone: true, targetAgentIds: [] },
+      ],
+    });
+    const run = await jsonRequest<{
+      run: { run: { revision: number; agentConfigRevision: number } };
+    }>(`${second.origin}/api/v1/runs/${seeded.runId}`);
+    expect(run.run.run).toMatchObject({
+      revision: 2,
+      agentConfigRevision: 4,
     });
   });
 
@@ -1094,7 +1309,7 @@ describe("Torsor HTTP and SSE service", () => {
     await reader.cancel().catch(() => undefined);
   });
 
-  it.each([14, 15, 16, 17, 99])("rejects incompatible development schema %i on service startup", async (version) => {
+  it.each([14, 15, 16, 17, 18, 99])("rejects incompatible development schema %i on service startup", async (version) => {
     const directory = await temporaryDirectory();
     const databasePath = join(directory, "torsor.sqlite");
     const database = new DatabaseSync(databasePath);
@@ -1108,16 +1323,16 @@ describe("Torsor HTTP and SSE service", () => {
         credentials,
         port: 0,
       }),
-    ).toThrow(`Incompatible development database schema version ${version}; expected 18.`);
+    ).toThrow(`Incompatible development database schema version ${version}; expected 19.`);
   });
 
-  it.each(["partial", "missing-index", "missing-trigger"])("refuses %s schema 18 unchanged before HTTP startup", async (layout) => {
+  it.each(["partial", "missing-index", "missing-trigger"])("refuses %s schema 19 unchanged before HTTP startup", async (layout) => {
     const directory = await temporaryDirectory();
     const databasePath = join(directory, "state.sqlite");
     if (layout !== "partial") TorsorKernel.open({ databasePath, bootstrap }).close();
     const database = new DatabaseSync(databasePath);
     database.exec(layout === "partial"
-      ? "CREATE TABLE causal_limits (singleton INTEGER PRIMARY KEY); PRAGMA user_version = 18;"
+      ? "CREATE TABLE causal_limits (singleton INTEGER PRIMARY KEY); PRAGMA user_version = 19;"
       : layout === "missing-index" ? "DROP INDEX runs_causal_nonterminal_idx;"
       : "DROP TRIGGER runs_causal_provenance_immutable;");
     database.close();
@@ -1126,7 +1341,7 @@ describe("Torsor HTTP and SSE service", () => {
       let service: TorsorHttpService | undefined;
       try {
         expect(() => { service = createTorsorHttpService({ databasePath, bootstrap, credentials, port: 0 }); })
-          .toThrow("Incompatible development database schema 18 contract.");
+          .toThrow("Incompatible development database schema 19 contract.");
       } finally {
         await service?.close();
       }
@@ -1245,6 +1460,7 @@ async function startHarness(
     readonly heartbeatIntervalMs?: number;
     readonly sessionDurationMs?: number;
     readonly clock?: () => Date;
+    readonly operationalLogger?: OperationalLogger;
   } = {},
 ): Promise<Harness> {
   const databasePath =
@@ -1267,10 +1483,30 @@ async function startHarness(
       ? { sessionDurationMs: options.sessionDurationMs }
       : {}),
     ...(options.clock ? { clock: options.clock } : {}),
+    ...(options.operationalLogger
+      ? { operationalLogger: options.operationalLogger }
+      : {}),
   });
   const origin = await service.listen();
   cleanup.push(() => service.close());
   return { service, origin };
+}
+
+function expectSuccessfulCommandLog(
+  lines: readonly string[],
+  requestId: string | null,
+  correlationId: string,
+): void {
+  expect(requestId).toMatch(/^[\da-f-]{36}$/);
+  expect(lines.map((line) => JSON.parse(line))).toContainEqual(
+    expect.objectContaining({
+      event: "http.request",
+      outcome: "succeeded",
+      httpStatus: 200,
+      requestId,
+      correlationId,
+    }),
+  );
 }
 
 async function temporaryDirectory(): Promise<string> {
@@ -1283,7 +1519,7 @@ async function seedRun(
   databasePath: string,
   prefix = "seed",
   clock?: () => Date,
-): Promise<{ readonly runId: string }> {
+): Promise<{ readonly runId: string; readonly threadId: string }> {
   const kernel = TorsorKernel.open({
     databasePath,
     bootstrap,
@@ -1343,7 +1579,7 @@ async function seedRun(
       },
     );
     expect(thread.entityId).toBeTruthy();
-    return { runId: run.entityId };
+    return { runId: run.entityId, threadId: thread.entityId };
   } finally {
     kernel.close();
   }

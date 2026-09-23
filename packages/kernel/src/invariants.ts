@@ -836,6 +836,14 @@ export function requireAgent(kernel: db.KernelContext, id: string): Row {
   return row;
 }
 
+export function requireMessage(kernel: db.KernelContext, id: string): Row {
+  const row = db.getRow(kernel, "SELECT * FROM messages WHERE id = ?", id);
+  if (!row) {
+    throw new KernelError("NotFound", `Message ${id} does not exist.`);
+  }
+  return row;
+}
+
 export function requireProject(kernel: db.KernelContext, id: string): Row {
   const row = db.getRow(kernel, "SELECT * FROM projects WHERE id = ?", id);
   if (!row) {

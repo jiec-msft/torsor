@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -13,6 +13,7 @@ import {
   runProjection,
   thread,
 } from "./test/fixtures";
+import { ApiError } from "./api";
 import styles from "./styles.css?raw";
 import timelineStyles from "./timeline.css?raw";
 
@@ -47,6 +48,11 @@ function stubController(state: WebState = readyState()) {
     runComposer: new RunComposerModel(),
     runControls: new RunControlsModel({ getItem: () => null, setItem: () => {} }),
     principalId: "principal-human",
+    hasUnknownCollaborationOutcome: false,
+    pendingMessageEdit: vi.fn(() => null),
+    pendingMessageDelete: vi.fn(() => null),
+    pendingAgentConfigUpdate: vi.fn(() => null),
+    pendingRunConfigAdoption: vi.fn(() => null),
     getSnapshot: () => state,
     subscribe: () => () => undefined,
     resume: vi.fn(async () => undefined),
@@ -68,6 +74,10 @@ function stubController(state: WebState = readyState()) {
         _input: Parameters<WebController["replyToThread"]>[0],
       ): Promise<void> => Promise.resolve(),
     ),
+    editMessage: vi.fn(async () => ({ committed: true as const, refreshed: true })),
+    deleteMessage: vi.fn(async () => ({ committed: true as const, refreshed: true })),
+    updateAgentConfig: vi.fn(async () => ({ committed: true as const, refreshed: true })),
+    adoptRunConfig: vi.fn(async () => ({ committed: true as const, refreshed: true })),
     dispose: vi.fn(),
   };
   return controller as unknown as WebController & typeof controller;
@@ -80,6 +90,11 @@ function mutableController(initialState: WebState) {
     runComposer: new RunComposerModel(),
     runControls: new RunControlsModel({ getItem: () => null, setItem: () => {} }),
     principalId: "principal-human",
+    hasUnknownCollaborationOutcome: false,
+    pendingMessageEdit: vi.fn(() => null),
+    pendingMessageDelete: vi.fn(() => null),
+    pendingAgentConfigUpdate: vi.fn(() => null),
+    pendingRunConfigAdoption: vi.fn(() => null),
     getSnapshot: () => state,
     subscribe: (listener: () => void) => {
       listeners.add(listener);
@@ -104,6 +119,10 @@ function mutableController(initialState: WebState) {
         _input: Parameters<WebController["replyToThread"]>[0],
       ): Promise<void> => Promise.resolve(),
     ),
+    editMessage: vi.fn(async () => ({ committed: true as const, refreshed: true })),
+    deleteMessage: vi.fn(async () => ({ committed: true as const, refreshed: true })),
+    updateAgentConfig: vi.fn(async () => ({ committed: true as const, refreshed: true })),
+    adoptRunConfig: vi.fn(async () => ({ committed: true as const, refreshed: true })),
     dispose: vi.fn(),
     update(next: WebState) {
       state = next;
@@ -127,6 +146,163 @@ beforeEach(() => {
 });
 
 describe("TorsorApp", () => {
+  it("exposes author-only Message revision controls and tombstone confirmation", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(
+      {},
+      "",
+      "/?project=project-sample&channel=channel-general&thread=thread-1",
+    );
+    const controller = stubController();
+    render(<TorsorApp controller={controller} />);
+
+    expect(screen.getAllByRole("button", { name: "Edit message" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Delete message" })).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "Edit message" }));
+    const editor = screen.getByLabelText("Revised message");
+    await user.clear(editor);
+    await user.type(editor, "A Human-authored revised message.");
+    await user.click(screen.getByRole("button", { name: "Save revision" }));
+    expect(controller.editMessage).toHaveBeenCalledWith({
+      messageId: "thread-1",
+      threadRootId: "thread-1",
+      expectedMessageRevision: 1,
+      body: "A Human-authored revised message.",
+      targetAgentIds: ["agent-orbit"],
+    });
+
+    await user.click(screen.getByRole("button", { name: "Delete message" }));
+    expect(
+      screen.getByText(/Revision history, Attention, and RunInput references remain/),
+    ).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Confirm tombstone" }));
+    expect(controller.deleteMessage).toHaveBeenCalledWith({
+      messageId: "thread-1",
+      threadRootId: "thread-1",
+      expectedMessageRevision: 1,
+    });
+    expect(screen.getAllByText(/Revision history/).length).toBeGreaterThan(0);
+  });
+
+  it("keeps an initial definite Message conflict out of unknown recovery", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(
+      {},
+      "",
+      "/?project=project-sample&channel=channel-general&thread=thread-1",
+    );
+    const controller = stubController();
+    vi.mocked(controller.editMessage).mockRejectedValue(
+      new ApiError(
+        409,
+        "stale_revision",
+        "The Message revision changed.",
+      ),
+    );
+    render(<TorsorApp controller={controller} />);
+
+    await user.click(screen.getByRole("button", { name: "Edit message" }));
+    await user.click(screen.getByRole("button", { name: "Save revision" }));
+
+    expect(
+      await screen.findByRole("alert"),
+    ).toHaveTextContent("The Message revision changed.");
+    expect(
+      screen.queryByText("Outcome unknown. Retry same edit."),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Retry same edit" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders tombstones without Human mutation controls", () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/?project=project-sample&channel=channel-general&thread=thread-1",
+    );
+    const tombstoned = {
+      ...thread,
+      messages: thread.messages.map((message, index) =>
+        index === 0
+          ? {
+              ...message,
+              latestRevision: 2,
+              targetAgentIds: [],
+              revisions: [
+                ...message.revisions,
+                {
+                  id: "revision-tombstone",
+                  revision: 2,
+                  body: "",
+                  tombstone: true,
+                  targetAgentIds: [],
+                  createdAt: "2026-09-22T04:05:00.000Z",
+                },
+              ],
+            }
+          : message,
+      ),
+    };
+    render(
+      <TorsorApp
+        controller={stubController(
+          readyState({ thread: tombstoned, threads: [tombstoned] }),
+        )}
+      />,
+    );
+    expect(
+      screen.getByText("Message deleted; immutable history retained."),
+    ).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Edit message" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delete message" })).not.toBeInTheDocument();
+  });
+
+  it("exposes Agent config update and nonterminal Run adoption controls", async () => {
+    const user = userEvent.setup();
+    const newerAgent = { ...agent, configRevision: 4 };
+    const state = readyState({ agents: [newerAgent] });
+    const controller = stubController(state);
+    window.history.replaceState(
+      {},
+      "",
+      "/?project=project-sample&view=agents&channel=channel-general&thread=thread-1",
+    );
+    const rendered = render(<TorsorApp controller={controller} />);
+    await user.click(screen.getByRole("button", { name: "Update config" }));
+    const config = screen.getByLabelText("Non-secret Agent config JSON");
+    fireEvent.change(config, { target: { value: '{"model":"synthetic-v2"}' } });
+    await user.click(
+      screen.getByRole("button", { name: "Create config revision" }),
+    );
+    expect(controller.updateAgentConfig).toHaveBeenCalledWith({
+      agentId: "agent-orbit",
+      expectedAgentConfigRevision: 4,
+      config: { model: "synthetic-v2" },
+    });
+
+    rendered.unmount();
+    window.history.replaceState(
+      {},
+      "",
+      "/?project=project-sample&channel=channel-general&thread=thread-1&run=run-1&panel=run&panels=detail",
+    );
+    render(<TorsorApp controller={controller} />);
+    expect(
+      screen.getByText("Existing Activations remain pinned to their recorded configuration."),
+    ).toBeVisible();
+    await user.click(
+      screen.getByRole("button", { name: "Adopt current config" }),
+    );
+    expect(controller.adoptRunConfig).toHaveBeenCalledWith({
+      runId: "run-1",
+      threadRootId: "thread-1",
+      expectedRunRevision: 2,
+      expectedAgentConfigRevision: 4,
+      targetAgentConfigRevision: 4,
+    });
+  });
+
   it("keeps the selected timeline mounted and focused during live refresh", () => {
     window.history.replaceState(
       {}, "", "/?project=project-sample&channel=channel-general&thread=thread-1&run=run-1&panel=run&panels=detail",

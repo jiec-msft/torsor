@@ -6,9 +6,10 @@
 
 This specification implements the intent of [#24](https://github.com/jiec-msft/torsor/issues/24):
 the MVP 0.1 trusted-local execution slice. Phase 2 connects the Phase 1 policy
-intent and environment preparation to merged lease-backed execution. Schema 18
-preserves schema 17 public diagnostics and adds Provider receipts. Policy itself
-still grants no Writer Authority.
+intent and environment preparation to merged lease-backed execution. Schema 19
+retains schema 18 Provider receipts and adds the pinned Agent config revision to
+Run history; schema 18 and older layouts are rejected. Policy itself still
+grants no Writer Authority.
 
 The [design baseline](../prototype/001-overview.md), sections 5, 22, 34, 43, and
 44.4, permits Agents to use granted CLI, API, MCP, and provider-native tools
@@ -220,13 +221,16 @@ by this cancellation stop remains valid containment. A `provider_cancelled`,
 `provider_process_exited`, or `provider_worktree_authority_lost` diagnostic code,
 or a Run that only later becomes `Cancelled`, is not sufficient to suppress an error.
 
-Schema 18 extends schema 17's diagnostic privacy contract with explicit native
+Schema 19 retains schema 18's extension of schema 17's diagnostic privacy
+contract with explicit native
 execution ProviderAttempt/policy binding. `StartWorktreeExecution.provider`
 accepts only `providerAttemptId`, `policy: "trusted-local"`, and
 `permissionMode: "provider-default" | "allow-all"`. The ProviderAttempt must belong
 to the same Activation and remain executing. Persist this binding as a receipt
 fact, never arbitrary configuration. Omission still means the fixed probe.
-Schema 17 is rejected. Stop old processes and explicitly use a fresh disposable
+Schema 19 also records the pinned config revision in every Run history version
+so snapshots cannot mix in current configuration. Schema 18 and older layouts
+are rejected. Stop old processes and explicitly use a fresh disposable
 database and fresh managed root; no migration, automatic data deletion, or
 restoration of diagnostic-session identifiers.
 

@@ -18,6 +18,7 @@ import { WebController } from "./controller";
 const bootstrap: KernelBootstrap = {
   principals: [
     { id: "principal-human", kind: "human", displayName: "Avery Stone" },
+    { id: "principal-riley", kind: "human", displayName: "Riley Park" },
     { id: "principal-runtime", kind: "runtime", displayName: "Local Runtime" },
     { id: "principal-orbit", kind: "agent", displayName: "Orbit" },
   ],
@@ -45,6 +46,10 @@ const credentials: readonly LocalCredential[] = [
   {
     token: "human-token",
     principalContext: { principalId: "principal-human" },
+  },
+  {
+    token: "riley-token",
+    principalContext: { principalId: "principal-riley" },
   },
 ];
 
@@ -209,6 +214,117 @@ describe("WebController production HTTP path", () => {
     });
     expect(controller.getSnapshot().thread!.messages).toHaveLength(before.messages.length + 1);
     expect(controller.getSnapshot().run!.inputs).toHaveLength(committed.run!.inputs.length);
+  });
+
+  it("executes Message revision and Agent config adoption controls with same-request recovery", async () => {
+    const { server, browser, controller, run } = await prepareRunComposer();
+    const root = controller.getSnapshot().thread!.messages[0]!;
+    const edit = {
+      messageId: root.id,
+      threadRootId: root.threadRootId,
+      expectedMessageRevision: root.latestRevision,
+      body: "Revised through the production Web controller.",
+      targetAgentIds: ["agent-orbit"],
+    } as const;
+
+    browser.loseNextCommandResponse();
+    await expect(controller.editMessage(edit)).rejects.toThrow(
+      "The committed response was lost.",
+    );
+    await controller.loadThread(root.threadRootId);
+    expect(controller.getSnapshot().thread!.messages[0]).toMatchObject({
+      latestRevision: 2,
+      targetAgentIds: ["agent-orbit"],
+    });
+    expect(await controller.editMessage(edit)).toEqual({
+      committed: true,
+      refreshed: true,
+    });
+    expect(browser.commandRequests[1]).toEqual(browser.commandRequests[0]);
+
+    const rileyBrowser = new BrowserTransport();
+    const riley = createWindowController(server.origin, rileyBrowser);
+    await riley.controller.exchangeSession("riley-token", "project-sample");
+    await riley.controller.loadThread(root.threadRootId);
+    await expect(
+      riley.controller.editMessage({
+        ...edit,
+        expectedMessageRevision: 2,
+        body: "Riley cannot rewrite Avery's speech.",
+      }),
+    ).rejects.toMatchObject({ status: 403, code: "forbidden" });
+
+    const configUpdate = {
+      agentId: "agent-orbit",
+      expectedAgentConfigRevision: 1,
+      config: { model: "deterministic-fake-v2" },
+    } as const;
+    browser.loseNextCommandResponse();
+    await expect(controller.updateAgentConfig(configUpdate)).rejects.toThrow(
+      "The committed response was lost.",
+    );
+    expect(await controller.updateAgentConfig(configUpdate)).toEqual({
+      committed: true,
+      refreshed: true,
+    });
+    expect(browser.commandRequests[3]).toEqual(browser.commandRequests[2]);
+    expect(
+      controller.getSnapshot().agents.find(
+        (agent) => agent.id === "agent-orbit",
+      ),
+    ).toMatchObject({
+      configRevision: 2,
+      config: { model: "deterministic-fake-v2" },
+    });
+
+    expect(
+      await controller.adoptRunConfig({
+        runId: run.id,
+        threadRootId: run.threadRootId,
+        expectedRunRevision: run.revision,
+        expectedAgentConfigRevision: 2,
+        targetAgentConfigRevision: 2,
+      }),
+    ).toEqual({ committed: true, refreshed: true });
+    expect(controller.getSnapshot().run!.run).toMatchObject({
+      revision: 2,
+      agentConfigRevision: 2,
+    });
+    expect(
+      controller.getSnapshot().run!.activations.every(
+        (activation) => activation.configRevision === 1,
+      ),
+    ).toBe(true);
+
+    await expect(
+      controller.adoptRunConfig({
+        runId: run.id,
+        threadRootId: run.threadRootId,
+        expectedRunRevision: run.revision,
+        expectedAgentConfigRevision: 2,
+        targetAgentConfigRevision: 2,
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "stale_revision",
+    });
+
+    expect(
+      await controller.deleteMessage({
+        messageId: root.id,
+        threadRootId: root.threadRootId,
+        expectedMessageRevision: 2,
+      }),
+    ).toEqual({ committed: true, refreshed: true });
+    expect(controller.getSnapshot().thread!.messages[0]).toMatchObject({
+      latestRevision: 3,
+      targetAgentIds: [],
+      revisions: [
+        { tombstone: false },
+        { tombstone: false },
+        { body: "", tombstone: true, targetAgentIds: [] },
+      ],
+    });
   });
 
   it("rejects stale revisions and terminal Runs without publishing either half", async () => {

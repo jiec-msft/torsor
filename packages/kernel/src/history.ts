@@ -363,6 +363,8 @@ function recordRunVersion(
     previous &&
     text(previous.state) === text(current.state) &&
     integer(previous.revision) === integer(current.revision) &&
+    integer(previous.agent_config_revision) ===
+      integer(current.agent_config_revision) &&
     integer(previous.activation_generation) ===
       integer(current.activation_generation) &&
     text(previous.updated_at) === text(current.updated_at) &&
@@ -374,13 +376,14 @@ function recordRunVersion(
   db.run(
     kernel,
     `INSERT INTO run_history
-      (run_id, event_sequence, state, revision, activation_generation,
-       updated_at, terminal_reason)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      (run_id, event_sequence, state, revision, agent_config_revision,
+       activation_generation, updated_at, terminal_reason)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     runId,
     eventSequence,
     text(current.state),
     integer(current.revision),
+    integer(current.agent_config_revision),
     integer(current.activation_generation),
     text(current.updated_at),
     optionalText(current.terminal_reason),

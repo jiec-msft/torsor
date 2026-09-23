@@ -2,11 +2,11 @@
 
 > 简体中文（主要版本） | [English](operational-logging.md)
 
-> 状态：MVP 0.1 schema 18 production integration
+> 状态：MVP 0.1 schema 19 production integration
 >
 > 适用范围：trusted-local Host、HTTP、Runtime、Provider process、Writer Authority 与 recovery 的本地结构化运维记录。
 
-本规格细化 [`docs/prototype/001-overview.zh-cn.md`](../prototype/001-overview.zh-cn.md) 第 20、22、28 节的诊断与审计边界，并与 [trusted-local Provider policy](trusted-local-provider-policy.zh-cn.md) 的 schema 18 execution receipt、停止和 quarantine 契约共同生效。
+本规格细化 [`docs/prototype/001-overview.zh-cn.md`](../prototype/001-overview.zh-cn.md) 第 20、22、28 节的诊断与审计边界，并与 [trusted-local Provider policy](trusted-local-provider-policy.zh-cn.md) 的 schema 19 契约共同生效；schema 19 保留 schema 18 的 execution receipt、停止和 quarantine 事实，并为 Run 历史补充固定的 Agent config revision。schema 18 及更早布局保持写入前明确拒绝。
 
 ## 1. 输出与所有权
 

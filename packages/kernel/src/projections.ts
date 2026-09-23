@@ -99,13 +99,18 @@ export function getThreadProjection(
   const thread = invariants.requireThread(kernel, threadRootId);
   const messageRows = db.allRows(kernel, "SELECT * FROM messages WHERE thread_root_id = ? ORDER BY thread_sequence", threadRootId);
   const messages = messageRows.map((message) => {
-    const revisions = db.allRows(kernel, "SELECT * FROM message_revisions WHERE message_id = ? ORDER BY revision", text(message.id)).map(mapMessageRevision);
-    const mentions = db.allRows(kernel, `SELECT m.target_agent_id
-           FROM mentions m
-           JOIN message_revisions r ON r.id = m.message_revision_id
-          WHERE r.message_id = ?
-          ORDER BY m.target_agent_id`, text(message.id)).map((row) => text(row.target_agent_id));
-    return mapMessage(message, revisions, mentions);
+    const revisions = db.allRows(
+      kernel,
+      "SELECT * FROM message_revisions WHERE message_id = ? ORDER BY revision",
+      text(message.id),
+    ).map((revision) => mapMessageRevision(
+      revision,
+      revisionMentionTargets(kernel, text(revision.id)),
+    ));
+    const latest = revisions.find(
+      (revision) => revision.revision === integer(message.latest_revision),
+    );
+    return mapMessage(message, revisions, latest?.targetAgentIds ?? []);
   });
   return {
     projectId: text(thread.project_id),
@@ -180,20 +185,18 @@ export function getThreadProjectionAt(
         ORDER BY revision`,
       text(message.id),
       snapshotEventSequence,
-    ).map(mapMessageRevision);
-    const mentions = db.allRows(
-      kernel,
-      `SELECT mention.target_agent_id
-         FROM mentions AS mention
-         JOIN message_revisions AS revision
-           ON revision.id = mention.message_revision_id
-        WHERE revision.message_id = ?
-          AND mention.created_event_sequence <= ?
-        ORDER BY mention.target_agent_id`,
-      text(message.id),
-      snapshotEventSequence,
-    ).map((row) => text(row.target_agent_id));
-    return mapMessage(message, revisions, mentions);
+    ).map((revision) => mapMessageRevision(
+      revision,
+      revisionMentionTargets(
+        kernel,
+        text(revision.id),
+        snapshotEventSequence,
+      ),
+    ));
+    const latest = revisions.find(
+      (revision) => revision.revision === integer(message.latest_revision),
+    );
+    return mapMessage(message, revisions, latest?.targetAgentIds ?? []);
   });
   return {
     projectId: text(thread.project_id),
@@ -231,7 +234,7 @@ export function getThreadProjectionAt(
       kernel,
       `SELECT run.id, run.project_id, run.home_channel_id,
               run.thread_root_id, run.owner_agent_id,
-              run.agent_config_revision, history.state, history.revision,
+              history.agent_config_revision, history.state, history.revision,
               run.causal_root_id, run.parent_attention_id,
               run.parent_run_id, run.delegation_depth,
               history.activation_generation, run.created_at,
@@ -258,6 +261,29 @@ export function getThreadProjectionAt(
   };
 }
 
+function revisionMentionTargets(
+  kernel: db.KernelContext,
+  messageRevisionId: string,
+  snapshotEventSequence?: number,
+): readonly string[] {
+  const snapshotClause =
+    snapshotEventSequence === undefined
+      ? ""
+      : " AND created_event_sequence <= ?";
+  const parameters =
+    snapshotEventSequence === undefined
+      ? [messageRevisionId]
+      : [messageRevisionId, snapshotEventSequence];
+  return db.allRows(
+    kernel,
+    `SELECT target_agent_id
+       FROM mentions
+      WHERE message_revision_id = ?${snapshotClause}
+      ORDER BY target_agent_id`,
+    ...parameters,
+  ).map((row) => text(row.target_agent_id));
+}
+
 export function getRunProjectionAt(
   kernel: db.KernelContext,
   runId: string,
@@ -267,7 +293,7 @@ export function getRunProjectionAt(
     kernel,
     `SELECT current.id, current.project_id, current.home_channel_id,
             current.thread_root_id, current.owner_agent_id,
-            current.agent_config_revision, history.state, history.revision,
+            history.agent_config_revision, history.state, history.revision,
             current.causal_root_id, current.parent_attention_id,
             current.parent_run_id, current.delegation_depth,
             history.activation_generation, current.created_at,

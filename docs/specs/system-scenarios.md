@@ -94,7 +94,7 @@ numbers trace implementation and tests; domain semantics come from the paired
 | SS-3.5 | Depth 4 admitted, 5 rejected; root nonterminal cap 50 includes Waiting and releases only on terminal commit. Retry after release admits once with unchanged provenance | 25.1–25.2 |
 | SS-3.6 | Trusted report digest, finalization, reopen and retry; equal bytes in different Runs retain independent descriptors; parent/child or sibling isolation, indistinguishable absent/out-of-scope reads | 21.3–21.5, 23 |
 | SS-3.7 | Crash/reopen preserves committed facts, not uncommitted work; a fresh Runtime continues from durable inputs without long-lived Agent memory | 20–21 |
-| SS-3.8 | Public schema-18 lease execution: old-generation/fenced/expired live processes cannot publish mutations, descriptors, success activity or completion; new generation wins, late output is rejected/quarantined, restart/reconciliation is deterministic | 21.5, 22, 24, 38 |
+| SS-3.8 | Public lease execution retained by schema 19: old-generation/fenced/expired live processes cannot publish mutations, descriptors, success activity or completion; new generation wins, late output is rejected/quarantined, restart/reconciliation is deterministic; schema 18 and older layouts are rejected before writes | 21.5, 22, 24, 38 |
 | SS-3.10 | Production-path trusted-local lifecycle: normal completion, Human cancellation with unknown stop/quarantine/recovery, and independent fencing followed by cancellation without false delivery acknowledgement | 20.2, 22, 24, 27, 31.1, 45 |
 
 **SS-3.8.1** Use public `LocalWorktreeExecutor`, with Human/Runtime Run creation,

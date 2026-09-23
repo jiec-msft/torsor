@@ -6,7 +6,8 @@
 
 本规范对应 [#24](https://github.com/jiec-msft/torsor/issues/24)，定义 MVP 0.1
 的 trusted-local 执行。Phase 1 的策略意图和环境准备由 Phase 2 连接到已合并的
-Lease 执行；schema 18 保留 schema 17 公开诊断边界并添加 Provider receipt。
+Lease 执行；schema 19 保留 schema 18 的 Provider receipt，并为 Run 历史补充固定
+Agent config revision；schema 18 及更早布局均明确拒绝。
 策略本身仍不授予 Writer Authority。
 
 本规范遵循[设计基线](../prototype/001-overview.zh-cn.md)第 5、22、34、43 和
@@ -175,12 +176,13 @@ generation/fencing，且 Writer Lease 未被独立 quarantine 或推进 fence；
 `provider_process_exited` 或
 `provider_worktree_authority_lost` 诊断码以及后来变成 `Cancelled` 的 Run 都不足以吞掉错误。
 
-Schema 18 在 schema 17 的诊断隐私契约上增加 native execution 的显式
+Schema 19 保留 schema 18 在 schema 17 诊断隐私契约上增加的 native execution 显式
 ProviderAttempt/策略绑定：`StartWorktreeExecution.provider` 只接受
 `providerAttemptId`、`policy: "trusted-local"` 和
 `permissionMode: "provider-default" | "allow-all"`。ProviderAttempt 必须属于同一
 Activation 且仍在执行；绑定作为 receipt 的持久事实，不含任意配置。
-未提供该字段继续表示固定 probe。schema 17 被拒绝；停止旧进程后显式使用
+未提供该字段继续表示固定 probe。schema 19 另为每个 Run 历史版本记录固定 config
+revision，避免 snapshot 混入当前配置。schema 18 及更早布局被拒绝；停止旧进程后显式使用
 新的可丢弃数据库和新的 managed root，不迁移、不自动删除；不得恢复 diagnostic session 标识。
 
 Tool 观察只保存 `tool_started`、`tool_completed`、`tool_failed` 活动，payload

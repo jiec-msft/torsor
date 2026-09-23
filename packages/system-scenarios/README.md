@@ -132,7 +132,8 @@ measurements rather than tight wall-clock assertions.
 The outer process measures real monotonic time.
 Hosted runners may be slower; CI logs retain each actual measurement.
 
-SS-3.8 and SS-3.10 align with schema 18: the former retains the fixed
+SS-3.8 and SS-3.10 align with schema 19, which retains schema 18 execution
+receipts while rejecting schema 18 and older layouts: the former retains the fixed
 deterministic tracer, while the latter covers synthetic ACP edit/test and an
 actual owned process tree through the supported trusted-local production path.
 This package is not a hostile-code sandbox, does not validate real-model quality

@@ -32,6 +32,7 @@ import {
   useSyncExternalStore,
 } from "react";
 
+import { ApiError } from "./api";
 import type { WebController, WebState } from "./controller";
 import { LiveTimeline } from "./LiveTimeline";
 import { RunComposer } from "./RunComposer";
@@ -44,8 +45,11 @@ import {
 } from "./routing";
 import {
   latestMessageBody,
+  latestMessageRevision,
   type Activation,
   type AgentStatus,
+  type JsonValue,
+  type Message,
   type Run,
   type RunProjection,
   type ThreadProjection,
@@ -304,6 +308,7 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
       <SessionGate
         state={state}
         projectId={route.projectId}
+        hasUnknownOutcome={controller.hasUnknownCollaborationOutcome}
         onExchange={async (token, projectId) => {
           const next = { ...route, projectId };
           updateRoute(setRoute, next, "replace");
@@ -449,6 +454,7 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
         ) : null}
         {route.view === "threads" ? (
           <Conversation
+            controller={controller}
             state={state}
             route={route}
             composerValue={
@@ -470,7 +476,11 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
         ) : route.view === "activity" ? (
           <ActivityCenter state={state} onSelectRun={selectRun} onSelectThread={selectThread} />
         ) : (
-          <AgentOverview state={state} onSelectRun={selectRun} />
+          <AgentOverview
+            controller={controller}
+            state={state}
+            onSelectRun={selectRun}
+          />
         )}
       </main>
       <DetailPanel
@@ -507,10 +517,12 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
 function SessionGate({
   state,
   projectId,
+  hasUnknownOutcome,
   onExchange,
 }: {
   readonly state: WebState;
   readonly projectId: string;
+  readonly hasUnknownOutcome: boolean;
   readonly onExchange: (token: string, projectId: string) => Promise<void>;
 }) {
   const tokenRef = useRef<HTMLInputElement>(null);
@@ -549,6 +561,9 @@ function SessionGate({
             Run drafts and submission identities are retained in this window.
             A lost response may have committed; reconnect to recover it.
             Run control recovery is retained across reconnect and reload in this window.
+            {hasUnknownOutcome
+              ? " Outcome unknown. Reconnect to retry the same collaboration request."
+              : null}
           </div>
         ) : null}
         {state.authError ? (
@@ -875,6 +890,7 @@ function WorkbenchHeader({
 }
 
 function Conversation({
+  controller,
   state,
   route,
   composerValue,
@@ -882,6 +898,7 @@ function Conversation({
   onSelectRun,
   onReply,
 }: {
+  readonly controller: WebController;
   readonly state: WebState;
   readonly route: WindowRoute;
   readonly composerValue: ComposerValue;
@@ -926,7 +943,11 @@ function Conversation({
       <div className="conversation-scroll">
         <article className="root-message">
           <MessageHeader message={root} agents={state.agents} root />
-          <p>{latestMessageBody(root)}</p>
+          <MessageRevisionControls
+            controller={controller}
+            state={state}
+            message={root}
+          />
           <div className="fact-row">
             <Fact>{selectedThread.cursor} thread cursor</Fact>
             <Fact>{selectedThread.attentions.length} attentions</Fact>
@@ -942,7 +963,11 @@ function Conversation({
               <li key={message.id}>
                 <article className="reply-message">
                   <MessageHeader message={message} agents={state.agents} />
-                  <p>{latestMessageBody(message)}</p>
+                  <MessageRevisionControls
+                    controller={controller}
+                    state={state}
+                    message={message}
+                  />
                   {causedRun ? (
                     <RunLink
                       run={causedRun}
@@ -999,6 +1024,264 @@ function Conversation({
           onSend={onReply}
         />
       </div>
+    </div>
+  );
+}
+
+function MessageRevisionControls({
+  controller,
+  state,
+  message,
+}: {
+  readonly controller: WebController;
+  readonly state: WebState;
+  readonly message: Message;
+}) {
+  const latest = latestMessageRevision(message);
+  const recoveredEdit = controller.pendingMessageEdit(message.id);
+  const recoveredDelete = controller.pendingMessageDelete(message.id);
+  const [editing, setEditing] = useState(recoveredEdit !== null);
+  const [confirmingDelete, setConfirmingDelete] = useState(
+    recoveredDelete !== null,
+  );
+  const [draft, setDraft] = useState(
+    recoveredEdit?.body ?? latest?.body ?? "",
+  );
+  const [targets, setTargets] = useState<readonly string[]>(
+    recoveredEdit?.targetAgentIds ?? latest?.targetAgentIds ?? [],
+  );
+  const [pending, setPending] = useState(false);
+  const [status, setStatus] = useState<string | null>(
+    recoveredEdit
+      ? "Outcome unknown. Retry same edit."
+      : recoveredDelete
+        ? "Outcome unknown. Retry same delete."
+        : null,
+  );
+  const [error, setError] = useState<string | null>(null);
+  const [frozenEdit, setFrozenEdit] = useState<{
+    readonly messageId: string;
+    readonly threadRootId: string;
+    readonly expectedMessageRevision: number;
+    readonly body: string;
+    readonly targetAgentIds: readonly string[];
+  } | null>(recoveredEdit);
+  const [frozenDelete, setFrozenDelete] = useState<{
+    readonly messageId: string;
+    readonly threadRootId: string;
+    readonly expectedMessageRevision: number;
+  } | null>(recoveredDelete);
+  const canMutate =
+    state.session === "ready" &&
+    controller.principalId === message.authorPrincipalId &&
+    latest !== undefined &&
+    !latest.tombstone;
+
+  const submitEdit = async () => {
+    const request =
+      frozenEdit ?? {
+        messageId: message.id,
+        threadRootId: message.threadRootId,
+        expectedMessageRevision: message.latestRevision,
+        body: draft,
+        targetAgentIds: targets,
+      };
+    if (!request.body.trim()) {
+      setError("Message body must not be empty.");
+      return;
+    }
+    setFrozenEdit(request);
+    setPending(true);
+    setError(null);
+    setStatus(null);
+    try {
+      const outcome = await controller.editMessage(request);
+      setStatus(
+        outcome.refreshed
+          ? "Message revision committed."
+          : "Committed; projections could not be refreshed.",
+      );
+      setFrozenEdit(null);
+      setEditing(false);
+    } catch (caught) {
+      const retained = controller.pendingMessageEdit(message.id);
+      if (isUncertainUiError(caught) || retained) {
+        setFrozenEdit(retained ?? request);
+        setStatus("Outcome unknown. Retry same edit.");
+      } else {
+        setError(
+          caught instanceof Error ? caught.message : "Message edit failed.",
+        );
+        setFrozenEdit(null);
+      }
+    } finally {
+      setPending(false);
+    }
+  };
+
+  const submitDelete = async () => {
+    const request =
+      frozenDelete ?? {
+        messageId: message.id,
+        threadRootId: message.threadRootId,
+        expectedMessageRevision: message.latestRevision,
+      };
+    setFrozenDelete(request);
+    setPending(true);
+    setError(null);
+    setStatus(null);
+    try {
+      const outcome = await controller.deleteMessage(request);
+      setStatus(
+        outcome.refreshed
+          ? "Message tombstone committed."
+          : "Committed; projections could not be refreshed.",
+      );
+      setFrozenDelete(null);
+      setConfirmingDelete(false);
+    } catch (caught) {
+      const retained = controller.pendingMessageDelete(message.id);
+      if (isUncertainUiError(caught) || retained) {
+        setFrozenDelete(retained ?? request);
+        setStatus("Outcome unknown. Retry same delete.");
+      } else {
+        setError(
+          caught instanceof Error ? caught.message : "Message deletion failed.",
+        );
+        setFrozenDelete(null);
+      }
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <div className="message-revisions">
+      {latest?.tombstone ? (
+        <p>
+          <em>Message deleted; immutable history retained.</em>
+        </p>
+      ) : (
+        <p>{latest?.body ?? latestMessageBody(message)}</p>
+      )}
+      {canMutate ? (
+        <div className="fact-row">
+          <button
+            type="button"
+            disabled={pending || frozenDelete !== null}
+            onClick={() => {
+              setDraft(latest.body);
+              setTargets(latest.targetAgentIds);
+              setEditing(true);
+              setConfirmingDelete(false);
+              setError(null);
+            }}
+          >
+            Edit message
+          </button>
+          <button
+            type="button"
+            disabled={pending || frozenEdit !== null}
+            onClick={() => {
+              setConfirmingDelete(true);
+              setEditing(false);
+              setError(null);
+            }}
+          >
+            Delete message
+          </button>
+        </div>
+      ) : null}
+      {editing ? (
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submitEdit();
+          }}
+        >
+          <label>
+            Revised message
+            <textarea
+              value={draft}
+              disabled={pending || frozenEdit !== null}
+              onChange={(event) => setDraft(event.currentTarget.value)}
+            />
+          </label>
+          <fieldset disabled={pending || frozenEdit !== null}>
+            <legend>Notify Agents in this revision</legend>
+            {state.agents.map((agent) => (
+              <label key={agent.id}>
+                <input
+                  type="checkbox"
+                  checked={targets.includes(agent.id)}
+                  onChange={(event) =>
+                    setTargets(
+                      event.currentTarget.checked
+                        ? [...targets, agent.id].sort()
+                        : targets.filter((target) => target !== agent.id),
+                    )
+                  }
+                />
+                {agent.name}
+              </label>
+            ))}
+          </fieldset>
+          <button type="submit" disabled={pending}>
+            {frozenEdit ? "Retry same edit" : "Save revision"}
+          </button>
+          <button
+            type="button"
+            disabled={pending || frozenEdit !== null}
+            onClick={() => setEditing(false)}
+          >
+            Cancel edit
+          </button>
+        </form>
+      ) : null}
+      {confirmingDelete ? (
+        <div role="group" aria-label="Confirm Message deletion">
+          <p>
+            This creates a tombstone. Revision history, Attention, and RunInput
+            references remain.
+          </p>
+          <button type="button" disabled={pending} onClick={() => void submitDelete()}>
+            {frozenDelete ? "Retry same delete" : "Confirm tombstone"}
+          </button>
+          <button
+            type="button"
+            disabled={pending || frozenDelete !== null}
+            onClick={() => setConfirmingDelete(false)}
+          >
+            Cancel deletion
+          </button>
+        </div>
+      ) : null}
+      {status ? <p role="status">{status}</p> : null}
+      {error ? <p role="alert">{error}</p> : null}
+      <details>
+        <summary>Revision history ({message.revisions.length})</summary>
+        <ol>
+          {message.revisions.map((revision) => (
+            <li key={revision.id}>
+              <strong>Revision {revision.revision}</strong>{" "}
+              <time dateTime={revision.createdAt}>{revision.createdAt}</time>
+              <p>
+                {revision.tombstone
+                  ? "Tombstone"
+                  : revision.body}
+              </p>
+              <small>
+                Mentions:{" "}
+                {revision.targetAgentIds.length
+                  ? revision.targetAgentIds
+                      .map((target) => agentName(state.agents, target))
+                      .join(", ")
+                  : "none"}
+              </small>
+            </li>
+          ))}
+        </ol>
+      </details>
     </div>
   );
 }
@@ -1094,9 +1377,11 @@ function ActivityCenter({
 }
 
 function AgentOverview({
+  controller,
   state,
   onSelectRun,
 }: {
+  readonly controller: WebController;
   readonly state: WebState;
   readonly onSelectRun: (runId: string, threadId: string, channelId: string) => void;
 }) {
@@ -1145,12 +1430,18 @@ function AgentOverview({
                 />
               </div>
               <div className="agent-metrics">
+                <Fact>config revision {agent.configRevision}</Fact>
                 <Fact>{agent.nonterminalRunCount ?? 0} nonterminal runs</Fact>
                 <Fact>{agent.liveRunActivationCount ?? 0} run activations</Fact>
                 <Fact>
                   {agent.liveAttentionActivationCount ?? 0} attention activations
                 </Fact>
               </div>
+              <AgentConfigControl
+                controller={controller}
+                state={state}
+                agent={agent}
+              />
               <div className="agent-run-list">
                 {runs.length ? (
                   runs.slice(0, 8).map(({ run }) => (
@@ -1227,7 +1518,17 @@ function DetailPanel({
       {route.detailPanel === "run" && route.runId ? (
         <>
           <RunDetail state={state} onLoadEarlier={onLoadEarlier} onRefresh={onRefreshRun}
-            controls={<RunControls key={route.runId} controller={controller} state={state} runId={route.runId} />} />
+            controls={
+              <>
+                <RunControls key={route.runId} controller={controller} state={state} runId={route.runId} />
+                <RunConfigAdoption
+                  key={`${route.runId}-config`}
+                  controller={controller}
+                  state={state}
+                  runId={route.runId}
+                />
+              </>
+            } />
           <RunComposer
             key={route.runId}
             controller={controller}
@@ -1245,6 +1546,226 @@ function DetailPanel({
       )}
     </aside>
   );
+}
+
+function AgentConfigControl({
+  controller,
+  state,
+  agent,
+}: {
+  readonly controller: WebController;
+  readonly state: WebState;
+  readonly agent: AgentStatus;
+}) {
+  const recovered = controller.pendingAgentConfigUpdate(agent.id);
+  const [editing, setEditing] = useState(recovered !== null);
+  const [draft, setDraft] = useState(() =>
+    JSON.stringify(recovered?.config ?? agent.config, null, 2),
+  );
+  const [frozen, setFrozen] = useState<{
+    readonly agentId: string;
+    readonly expectedAgentConfigRevision: number;
+    readonly config: JsonValue;
+  } | null>(recovered);
+  const [pending, setPending] = useState(false);
+  const [status, setStatus] = useState<string | null>(
+    recovered ? "Outcome unknown. Retry same config update." : null,
+  );
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async () => {
+    let request = frozen;
+    if (!request) {
+      try {
+        request = {
+          agentId: agent.id,
+          expectedAgentConfigRevision: agent.configRevision,
+          config: JSON.parse(draft) as JsonValue,
+        };
+      } catch {
+        setError("Agent config must be valid JSON.");
+        return;
+      }
+    }
+    setFrozen(request);
+    setPending(true);
+    setError(null);
+    setStatus(null);
+    try {
+      const outcome = await controller.updateAgentConfig(request);
+      setStatus(
+        outcome.refreshed
+          ? "Agent config revision committed."
+          : "Committed; projections could not be refreshed.",
+      );
+      setFrozen(null);
+      setEditing(false);
+    } catch (caught) {
+      const retained = controller.pendingAgentConfigUpdate(agent.id);
+      if (isUncertainUiError(caught) || retained) {
+        setFrozen(retained ?? request);
+        setStatus("Outcome unknown. Retry same config update.");
+      } else {
+        setError(
+          caught instanceof Error ? caught.message : "Config update failed.",
+        );
+        setFrozen(null);
+      }
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <div className="agent-config-control">
+      <pre>{JSON.stringify(agent.config, null, 2)}</pre>
+      {state.session === "ready" ? (
+        <button
+          type="button"
+          disabled={pending}
+          onClick={() => {
+            setDraft(JSON.stringify(agent.config, null, 2));
+            setEditing(true);
+            setError(null);
+          }}
+        >
+          Update config
+        </button>
+      ) : null}
+      {editing ? (
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submit();
+          }}
+        >
+          <label>
+            Non-secret Agent config JSON
+            <textarea
+              value={draft}
+              disabled={pending || frozen !== null}
+              onChange={(event) => setDraft(event.currentTarget.value)}
+            />
+          </label>
+          <button type="submit" disabled={pending}>
+            {frozen ? "Retry same config update" : "Create config revision"}
+          </button>
+          <button
+            type="button"
+            disabled={pending || frozen !== null}
+            onClick={() => setEditing(false)}
+          >
+            Cancel config update
+          </button>
+        </form>
+      ) : null}
+      {status ? <p role="status">{status}</p> : null}
+      {error ? <p role="alert">{error}</p> : null}
+    </div>
+  );
+}
+
+function RunConfigAdoption({
+  controller,
+  state,
+  runId,
+}: {
+  readonly controller: WebController;
+  readonly state: WebState;
+  readonly runId: string;
+}) {
+  const run = state.run?.run.id === runId ? state.run.run : null;
+  const agent = state.agents.find(
+    (candidate) => candidate.id === run?.ownerAgentId,
+  );
+  const recovered = controller.pendingRunConfigAdoption(runId);
+  const [frozen, setFrozen] = useState<{
+    readonly runId: string;
+    readonly threadRootId: string;
+    readonly expectedRunRevision: number;
+    readonly expectedAgentConfigRevision: number;
+    readonly targetAgentConfigRevision: number;
+  } | null>(recovered);
+  const [pending, setPending] = useState(false);
+  const [status, setStatus] = useState<string | null>(
+    recovered ? "Outcome unknown. Retry same config adoption." : null,
+  );
+  const [error, setError] = useState<string | null>(null);
+  if (!run || !agent) {
+    return null;
+  }
+  const nonterminal =
+    run.state === "Active" || run.state === "Waiting";
+  const eligible =
+    state.session === "ready" &&
+    nonterminal &&
+    agent.configRevision > run.agentConfigRevision;
+
+  const submit = async () => {
+    const request =
+      frozen ?? {
+        runId: run.id,
+        threadRootId: run.threadRootId,
+        expectedRunRevision: run.revision,
+        expectedAgentConfigRevision: agent.configRevision,
+        targetAgentConfigRevision: agent.configRevision,
+      };
+    setFrozen(request);
+    setPending(true);
+    setError(null);
+    setStatus(null);
+    try {
+      const outcome = await controller.adoptRunConfig(request);
+      setStatus(
+        outcome.refreshed
+          ? "Run config adoption committed; existing Activations are unchanged."
+          : "Committed; projections could not be refreshed.",
+      );
+      setFrozen(null);
+    } catch (caught) {
+      const retained = controller.pendingRunConfigAdoption(run.id);
+      if (isUncertainUiError(caught) || retained) {
+        setFrozen(retained ?? request);
+        setStatus("Outcome unknown. Retry same config adoption.");
+      } else {
+        setError(
+          caught instanceof Error ? caught.message : "Config adoption failed.",
+        );
+        setFrozen(null);
+      }
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <section aria-label="Run Agent configuration">
+      <div className="fact-row">
+        <Fact>Run config {run.agentConfigRevision}</Fact>
+        <Fact>Agent current config {agent.configRevision}</Fact>
+      </div>
+      <p>
+        Existing Activations remain pinned to their recorded configuration.
+      </p>
+      {eligible || frozen ? (
+        <button type="button" disabled={pending} onClick={() => void submit()}>
+          {frozen ? "Retry same adoption" : "Adopt current config"}
+        </button>
+      ) : (
+        <p className="compact-empty">
+          {!nonterminal
+            ? "Terminal Runs cannot adopt configuration."
+            : "No newer Agent config revision is available."}
+        </p>
+      )}
+      {status ? <p role="status">{status}</p> : null}
+      {error ? <p role="alert">{error}</p> : null}
+    </section>
+  );
+}
+
+function isUncertainUiError(error: unknown): boolean {
+  return !(error instanceof ApiError) || error.status >= 500;
 }
 
 function StatusDetail({

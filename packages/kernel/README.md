@@ -1,6 +1,6 @@
 # `@torsor/kernel`
 
-## Physical execution records (schema 18)
+## Physical execution records (schema 19)
 
 `RegisterPhysicalWorktree`, `StartWorktreeExecution`, `RecordWorktreeExecution`,
 `RevokeWorktreeExecutionAuthority`, and `RecoverWorktreeExecution` are trusted Runtime-only commands.
@@ -173,6 +173,21 @@ Every command has a principal-scoped idempotency key. Runtime activity must
 carry durable Activation or ProviderAttempt provenance. Provider session IDs
 are diagnostic only; provider delivery never changes RunInput disposition or
 other semantic state.
+
+`EditMessage` and `DeleteMessage` require the original Human author and the
+expected latest Message revision. Editing appends an immutable revision with a
+complete replacement body and Mention set; deleting appends a terminal
+tombstone revision. Revision history, original provenance, prior Attention and
+RunInput references, and revision-specific Mentions remain queryable.
+
+`UpdateAgentConfig` creates the next immutable JSON configuration revision for
+an Agent after checking the expected current revision. `AdoptRunConfig`
+explicitly pins a nonterminal Run to a valid newer revision after checking both
+the Run revision and current Agent configuration revision. Existing
+Activations keep their recorded revision; only later Activations use the
+adopted revision. Configuration content is not included in public event
+payloads. Schema 19 records the pinned Agent config revision in every Run
+history version so snapshot projections remain internally consistent.
 
 An Attention wakes its target Agent but does not choose a Run. A claimed
 Attention Activation can use `IgnoreAttention`, attach the triggering Message
@@ -351,8 +366,10 @@ clock-derived expiry, and
 release, expiry, quarantine, and reconciliation ledger. These primitives do
 not perform filesystem mutation, process execution, or shell execution.
 
-The current direct schema version is 18. It adds closed native ProviderAttempt,
-policy, and permission-mode execution bindings; schema 17 lacks these receipts.
+The current direct schema version is 19. It retains schema 18's closed native
+ProviderAttempt, policy, and permission-mode execution bindings and adds the
+pinned Agent config revision to Run history. Schema 18 cannot reconstruct
+pre-adoption snapshots correctly; schema 17 also lacks native receipts.
 It combines the physical records and
 irreversible Writer publication fences above with trusted Artifact byte
 length and source Thread provenance (replacing caller-provided storage

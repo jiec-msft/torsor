@@ -7,6 +7,7 @@ import type {
   PrincipalContext
 } from "./types.js";
 import {
+  integer,
   requireNonEmpty,
   text,
   unique,
@@ -59,6 +60,122 @@ export function replyToThread(kernel: db.KernelContext, command: Extract<KernelC
     revision: 1,
     threadCursor: created.threadCursor,
     relatedIds: { messageRevisionId: created.messageRevisionId },
+  };
+}
+
+export function editMessage(kernel: db.KernelContext, command: Extract<KernelCommand, {
+  type: "EditMessage";
+}>, principal: Row, context: PrincipalContext, correlationId: string): CommandResult {
+  invariants.requireKind(kernel, principal, "human");
+  requireValidRevision(command.expectedMessageRevision, "expected Message revision");
+  const message = invariants.requireMessage(kernel, command.messageId);
+  requireOriginalAuthor(message, principal);
+  const latest = latestMessageRevision(kernel, message);
+  invariants.checkRevision(
+    kernel,
+    integer(message.latest_revision),
+    command.expectedMessageRevision,
+    "Message",
+  );
+  if (integer(latest.tombstone) === 1) {
+    throw new KernelError("Conflict", "A tombstoned Message cannot be edited.");
+  }
+  requireNonEmpty(command.body, "body");
+  const targetAgentIds = validateTargetAgentIds(command.targetAgentIds);
+  const revision = integer(message.latest_revision) + 1;
+  const revisionId = appendMessageRevision(kernel, {
+    message,
+    revision,
+    body: command.body.trim(),
+    tombstone: false,
+    targetAgentIds,
+    actor: principal,
+    activationId: null,
+    correlationId,
+  });
+  const cursor = invariants.emitThreadEvent(kernel, {
+    type: "MessageEdited",
+    projectId: text(message.project_id),
+    channelId: text(message.channel_id),
+    threadRootId: text(message.thread_root_id),
+    entityType: "Message",
+    entityId: command.messageId,
+    actorPrincipalId: text(principal.id),
+    activationId: null,
+    causationId: revisionId,
+    correlationId,
+    payload: {
+      messageRevisionId: revisionId,
+      revision,
+      targetAgentIds: [...targetAgentIds],
+    },
+  });
+  invariants.enqueueOutbox(kernel, "message.revised", "Message", command.messageId, {
+    messageRevisionId: revisionId,
+    threadRootId: text(message.thread_root_id),
+    tombstone: false,
+  });
+  return {
+    commandType: command.type,
+    entityId: command.messageId,
+    revision,
+    threadCursor: cursor,
+    relatedIds: { messageRevisionId: revisionId },
+  };
+}
+
+export function deleteMessage(kernel: db.KernelContext, command: Extract<KernelCommand, {
+  type: "DeleteMessage";
+}>, principal: Row, context: PrincipalContext, correlationId: string): CommandResult {
+  invariants.requireKind(kernel, principal, "human");
+  requireValidRevision(command.expectedMessageRevision, "expected Message revision");
+  const message = invariants.requireMessage(kernel, command.messageId);
+  requireOriginalAuthor(message, principal);
+  const latest = latestMessageRevision(kernel, message);
+  invariants.checkRevision(
+    kernel,
+    integer(message.latest_revision),
+    command.expectedMessageRevision,
+    "Message",
+  );
+  if (integer(latest.tombstone) === 1) {
+    throw new KernelError("Conflict", "The Message is already tombstoned.");
+  }
+  const revision = integer(message.latest_revision) + 1;
+  const revisionId = appendMessageRevision(kernel, {
+    message,
+    revision,
+    body: "",
+    tombstone: true,
+    targetAgentIds: [],
+    actor: principal,
+    activationId: null,
+    correlationId,
+  });
+  const cursor = invariants.emitThreadEvent(kernel, {
+    type: "MessageDeleted",
+    projectId: text(message.project_id),
+    channelId: text(message.channel_id),
+    threadRootId: text(message.thread_root_id),
+    entityType: "Message",
+    entityId: command.messageId,
+    actorPrincipalId: text(principal.id),
+    activationId: null,
+    causationId: revisionId,
+    correlationId,
+    payload: { messageRevisionId: revisionId, revision, tombstone: true },
+  });
+  invariants.enqueueOutbox(kernel, "message.revised", "Message", command.messageId, {
+    messageRevisionId: revisionId,
+    threadRootId: text(message.thread_root_id),
+    tombstone: true,
+  });
+  return {
+    commandType: command.type,
+    entityId: command.messageId,
+    revision,
+    threadCursor: cursor,
+    relatedIds: { messageRevisionId: revisionId },
   };
 }
 
@@ -158,4 +275,144 @@ export function createMessage(kernel: db.KernelContext, input: {
   });
   invariants.enqueueOutbox(kernel, "message.published", "Message", messageId, { messageRevisionId: revisionId, threadRootId });
   return { messageId, messageRevisionId: revisionId, threadCursor };
+}
+
+function appendMessageRevision(kernel: db.KernelContext, input: {
+  message: Row;
+  revision: number;
+  body: string;
+  tombstone: boolean;
+  targetAgentIds: readonly string[];
+  actor: Row;
+  activationId: string | null;
+  correlationId: string;
+}): string {
+  const revisionId = kernel.idFactory("message_revision");
+  const now = db.now(kernel);
+  db.run(
+    kernel,
+    `INSERT INTO message_revisions
+      (id, message_id, revision, body, tombstone, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    revisionId,
+    text(input.message.id),
+    input.revision,
+    input.body,
+    input.tombstone ? 1 : 0,
+    now,
+  );
+  db.run(
+    kernel,
+    "UPDATE messages SET latest_revision = ? WHERE id = ?",
+    input.revision,
+    text(input.message.id),
+  );
+  for (const targetAgentId of input.targetAgentIds) {
+    const agent = invariants.requireAgent(kernel, targetAgentId);
+    if (text(agent.project_id) !== text(input.message.project_id)) {
+      throw new KernelError(
+        "Forbidden",
+        "Mentioned Agents must belong to the Message Project.",
+      );
+    }
+    db.run(
+      kernel,
+      `INSERT INTO mentions
+        (id, message_revision_id, target_agent_id, created_at)
+       VALUES (?, ?, ?, ?)`,
+      kernel.idFactory("mention"),
+      revisionId,
+      targetAgentId,
+      now,
+    );
+    const attentionId = kernel.idFactory("attention");
+    db.run(
+      kernel,
+      `INSERT INTO attentions
+        (id, project_id, channel_id, thread_root_id, message_revision_id,
+         target_agent_id, trigger_kind, status, revision, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'Mention', 'Open', 1, ?)`,
+      attentionId,
+      text(input.message.project_id),
+      text(input.message.channel_id),
+      text(input.message.thread_root_id),
+      revisionId,
+      targetAgentId,
+      now,
+    );
+    const createdEventSequence = invariants.emitEvent(kernel, {
+      type: "AttentionOpened",
+      projectId: text(input.message.project_id),
+      channelId: text(input.message.channel_id),
+      threadRootId: text(input.message.thread_root_id),
+      threadCursor: null,
+      entityType: "Attention",
+      entityId: attentionId,
+      actorPrincipalId: text(input.actor.id),
+      activationId: input.activationId,
+      causationId: revisionId,
+      correlationId: input.correlationId,
+      payload: { targetAgentId, triggerKind: "Mention" },
+    });
+    db.run(
+      kernel,
+      "UPDATE attentions SET created_event_sequence = ? WHERE id = ?",
+      createdEventSequence,
+      attentionId,
+    );
+    invariants.recordAttentionHistory(
+      kernel,
+      attentionId,
+      createdEventSequence,
+    );
+  }
+  return revisionId;
+}
+
+function latestMessageRevision(kernel: db.KernelContext, message: Row): Row {
+  const row = db.getRow(
+    kernel,
+    `SELECT *
+       FROM message_revisions
+      WHERE message_id = ? AND revision = ?`,
+    text(message.id),
+    integer(message.latest_revision),
+  );
+  if (!row) {
+    throw new Error(`Message ${text(message.id)} latest revision is missing.`);
+  }
+  return row;
+}
+
+function requireOriginalAuthor(message: Row, principal: Row): void {
+  if (text(message.author_principal_id) !== text(principal.id)) {
+    throw new KernelError(
+      "Forbidden",
+      "Only the original Message author can edit or delete it.",
+    );
+  }
+}
+
+function requireValidRevision(revision: number, field: string): void {
+  if (!Number.isInteger(revision) || revision < 1) {
+    throw new KernelError("InvalidCommand", `${field} is invalid.`);
+  }
+}
+
+function validateTargetAgentIds(
+  targetAgentIds: readonly string[] | undefined,
+): string[] {
+  if (
+    targetAgentIds !== undefined &&
+    (
+      !Array.isArray(targetAgentIds) ||
+      !targetAgentIds.every(
+        (targetAgentId) =>
+          typeof targetAgentId === "string" && targetAgentId.length > 0,
+      )
+    )
+  ) {
+    throw new KernelError("InvalidCommand", "Mention targets are invalid.");
+  }
+  return unique(targetAgentIds ?? []).sort();
 }
