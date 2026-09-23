@@ -9,6 +9,7 @@ import {
   type ActivityPage,
 } from "./timeline-history";
 import { RunComposerModel } from "./run-composer-model";
+import { RunControlsModel } from "./run-controls-model";
 import type {
   AgentStatus,
   Attention,
@@ -22,6 +23,7 @@ import type {
 type Fetch = typeof fetch;
 type EventSourceFactory = (url: string) => EventSource;
 type BroadcastChannelFactory = (name: string) => BroadcastChannel;
+type HumanCommand = "start-thread" | "reply-to-thread" | "send-to-run" | "cancel-run" | "withdraw-run-input";
 
 export type SessionState =
   | "signed-out"
@@ -145,6 +147,7 @@ type ProjectionRead =
 
 export class WebController {
   readonly runComposer = new RunComposerModel();
+  readonly runControls: RunControlsModel;
   readonly #apiBase: string;
   readonly #fetch: Fetch;
   readonly #eventSourceFactory: EventSourceFactory;
@@ -214,6 +217,7 @@ export class WebController {
       options.eventSourceFactory ??
       ((url) => new EventSource(url, { withCredentials: true }));
     this.#storage = options.sessionStorage ?? sessionStorage;
+    this.runControls = new RunControlsModel(this.#storage);
     this.#reconnectProbeDelayMs = options.reconnectProbeDelayMs ?? 1_500;
     this.#agentLivenessRefreshMs = options.agentLivenessRefreshMs ?? 30_000;
     if (
@@ -258,6 +262,10 @@ export class WebController {
   }
 
   getSnapshot = (): WebState => this.#state;
+
+  get principalId(): string | null {
+    return this.#principalId;
+  }
 
   subscribe = (listener: () => void): (() => void) => {
     this.#listeners.add(listener);
@@ -803,6 +811,50 @@ export class WebController {
     }
   }
 
+  cancelRun(runId: string): Promise<boolean> {
+    return this.#runControl(runId);
+  }
+
+  withdrawRunInput(runId: string, runInputId: string): Promise<boolean> {
+    return this.#runControl(runId, runInputId);
+  }
+
+  async #runControl(runId: string, inputId?: string): Promise<boolean> {
+    const projection = this.#state.run;
+    if (!projection || projection.run.id !== runId || this.#runId !== runId ||
+      !this.#principalId || this.#state.session !== "ready") {
+      throw new Error("Load the selected Run in an authenticated Human session before using controls.");
+    }
+    const submitted = await this.runControls.submit(
+      projection.run, this.#principalId, inputId,
+      projection.inputs.find((input) => input.id === inputId),
+      !this.#state.loadingRun,
+      (request) => {
+        if (request.kind === "cancel") {
+          const { kind: _kind, ...body } = request;
+          return this.#command("cancel-run", body);
+        }
+        const { kind: _kind, runId: _runId, ...body } = request;
+        return this.#command("withdraw-run-input", body);
+      },
+    );
+    if (submitted && this.#runId === runId && this.#state.session === "ready") {
+      await this.refreshRunControls(runId);
+    }
+    return submitted;
+  }
+
+  async refreshRunControls(runId: string): Promise<boolean> {
+    if (this.#runId !== runId || this.#state.session !== "ready") return false;
+    const finish = Object.entries(this.runControls.getSnapshot())
+      .filter(([key]) => JSON.parse(key)[0] === runId)
+      .map(([key]) => this.runControls.beginRefresh(key));
+    const loaded = this.#state.run?.run.id === runId || await this.loadRun(runId);
+    const succeeded = loaded && await this.refreshRunComposer(runId);
+    for (const settle of finish) settle(succeeded);
+    return succeeded;
+  }
+
   async refreshRunComposer(runId: string): Promise<boolean> {
     const selected = this.#state.run?.run;
     if (!selected || selected.id !== runId || this.#runId !== runId) return false;
@@ -1043,7 +1095,7 @@ export class WebController {
   }
 
   async #command(
-    slug: "start-thread" | "reply-to-thread" | "send-to-run",
+    slug: HumanCommand,
     body: Readonly<Record<string, unknown>>,
   ): Promise<unknown> {
     if (!this.#csrfToken) {
@@ -1071,7 +1123,7 @@ export class WebController {
       );
     } catch (error) {
       if (
-        slug === "send-to-run" &&
+        (slug === "send-to-run" || slug === "cancel-run" || slug === "withdraw-run-input") &&
         error instanceof ApiError && error.status === 401 &&
         this.#csrfRevision !== csrfRevision && this.#csrfToken &&
         this.#principalId === principalId
@@ -1129,7 +1181,7 @@ export class WebController {
   }
 
   async #sendCommand(
-    slug: "start-thread" | "reply-to-thread" | "send-to-run",
+    slug: HumanCommand,
     body: Readonly<Record<string, unknown>>,
     csrfToken: string,
     sessionGeneration: number,

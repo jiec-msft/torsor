@@ -129,6 +129,10 @@ the full scenario set and explicit real-provider opt-in rules.
 - [Contributing](CONTRIBUTING.md) ([简体中文](CONTRIBUTING.zh-cn.md))
 - [Security policy](SECURITY.md) ([简体中文](SECURITY.zh-cn.md))
 
+## Human Run controls
+
+In production Web Run detail, `Cancel Run` cancels an eligible logical work line; `Withdraw Input` withdraws only Pending input you assigned, without deleting its public Message. Cancellation does not confirm physical Provider stop or safe Worktree release; this view cannot confirm physical stop or quarantine. For an unknown response, use `Retry same action`, not a replacement request. Refresh and review revision / conflict rejections; reauthentication or reload in the same window retains the original recovery identity. After acknowledged commit with failed reads, use read-only refresh inside the controls. See the [Human controls specification](docs/prototype/001-overview.md#4421-human-cancel-and-withdraw-controls).
+
 ## License
 
 Torsor is licensed under the Apache License 2.0.
