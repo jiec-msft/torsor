@@ -1020,6 +1020,7 @@ function kernelStatus(code: KernelError["code"]): number {
       return 400;
     case "Conflict":
     case "DomainBusy":
+    case "WriterAuthorityLost":
     case "CausalLimitExceeded":
     case "StaleRevision":
     case "ConditionalCheckFailed":

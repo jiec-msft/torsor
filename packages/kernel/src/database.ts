@@ -13,6 +13,7 @@ export type KernelContext = Readonly<{
   clock: () => Date;
   idFactory: (prefix: string) => string;
   activationDurationMs: number;
+  localWorktreeRevocations: Set<string>;
 }>;
 
 const schemaInitializationHookSymbol = Symbol.for(
@@ -24,6 +25,7 @@ const sqliteBusyTimeoutOverrideSymbol = Symbol.for(
 
 export function openKernelContext(options: KernelOpenOptions): KernelContext {
   const configuration = {
+    localWorktreeRevocations: new Set<string>(),
     clock: options.clock ?? (() => new Date()),
     idFactory:
       options.idFactory ?? ((prefix) => `${prefix}_${randomUUID()}`),
