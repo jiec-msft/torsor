@@ -116,6 +116,7 @@ describe("Local runtime host", () => {
     });
     const host = createLocalRuntimeHost({
       databasePath: repository.databasePath, bootstrap,
+      port: 0,
       credentials: [{ token: "human-token", principalContext: { principalId: "principal-human" } }],
       runtimePrincipalId: "principal-runtime", projectIds: ["project-sample"], adapter,
       runtimePollIntervalMs: 10,
@@ -192,6 +193,7 @@ describe("Local runtime host", () => {
     });
     const host = createLocalRuntimeHost({
       databasePath: repository.databasePath, bootstrap, artifactStorage,
+      port: 0,
       credentials: [{ token: "human-token", principalContext: { principalId: "principal-human" } }],
       runtimePrincipalId: "principal-runtime", projectIds: ["project-sample"], adapter,
       runtimePollIntervalMs: 10,
