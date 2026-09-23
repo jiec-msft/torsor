@@ -363,8 +363,8 @@ export function getRunProjectionAt(
               attempt.capability_snapshot_json,
               attempt.run_input_ids_json,
               attempt.request_idempotency_key,
-              attempt.diagnostic_session_id, history.status,
-              history.detail, attempt.started_at, history.finished_at
+              history.status, history.detail,
+              attempt.started_at, history.finished_at
          FROM provider_attempts AS attempt
          JOIN provider_attempt_history AS history
            ON history.provider_attempt_id = attempt.id

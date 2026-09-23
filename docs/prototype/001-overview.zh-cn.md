@@ -902,6 +902,27 @@ Unknown
 - 开始和结束时间
 - 结果或 Unknown 原因
 
+Provider 失败诊断的持久化和公开边界采用白名单投影。Run、Activation、
+ProviderAttempt、Timeline、HTTP 和 Web 只能包含稳定错误码、结果状态，以及
+由 Runtime 明确定义且有长度上限的通用摘要。Provider stderr、原始进程错误、
+启动命令和环境、机器路径、Credential、Prompt、模型输出、任意 Provider
+错误文本及嵌套 cause 消息不得进入这些字段。Runtime 必须在持久化前按错误类型
+映射到固定诊断；不能以正则替换 Secret 作为主要边界，也不能静默吞掉失败。
+若没有具备明确所有权和显式 opt-in 的私有诊断通道，原始诊断只可在有界内存中
+短暂存在并在执行结束后丢弃。
+
+当前稳定错误码为：`provider_process_start_failed`、
+`provider_process_exited`、`provider_protocol_error`、
+`provider_policy_violation`、`provider_output_limit`、
+`provider_stderr_limit`、`provider_io_error`、`provider_timeout`、
+`provider_cancelled`、`provider_cleanup_failed`、
+`provider_runtime_monitor_failed`、`provider_not_started`、
+`provider_worktree_execution_failed`、`provider_worktree_authority_lost`、
+`provider_recovered_worktree_authority_lost`、
+`provider_recovered_failed`、`provider_recovered_unknown` 和
+`provider_execution_failed`。公开详情采用 `<code>: <generic summary>`
+格式，总长度不超过 160 个字符。
+
 ### 20.3 Provider 能力
 
 Adapter 暴露带版本的 capability profile，例如：
@@ -1016,15 +1037,16 @@ Artifact 和原始 provenance，不重复发布事件。新 Activation 只有在
 阻止新 descriptor；已提交 descriptor 仍由当前获授权的 Human/Runtime 查询。
 首片不自动删除 orphan 或 staging 文件，避免与并发固化竞争；清理留给停机维护。
 
-持久因果限制、可信 Artifact 与物理 Worktree 的整合数据库使用 schema **16**，同时保留第 25 节的
+持久因果限制、可信 Artifact、物理 Worktree 与 Provider 诊断边界的整合数据库使用 schema **17**，同时保留第 25 节的
 Run root/parent/depth、不可变约束、准入索引及持久配置，以及第 23 节的可信报告
 descriptor，并加入第 22 节的物理身份、执行记录及不可逆的 Writer publication fence。
-此前 causal-only、Artifact-only、Worktree-only schema 14 以及整合 schema 15
-均不兼容；不得因版本数字相同而接受另一套布局。打开任何旧版或未版本化的非空
+schema 16 可能包含诊断边界修复前公开持久化的 Provider 原始诊断，因此必须拒绝并重建；
+更早的 causal-only、Artifact-only、Worktree-only schema 14 及整合 schema 15
+同样不兼容。不得因版本数字相同而接受另一套布局。打开任何旧版或未版本化的非空
 开发数据库必须在应用 DDL/Bootstrap 前明确拒绝，不迁移、不改写版本、不删除数据。
-停止旧进程后由操作者显式重建可丢弃数据库和新的 managed root。schema 16 重开仍校验持久 causal 配置及 Worktree storage identity。
+停止旧进程后由操作者显式重建可丢弃数据库和新的 managed root。schema 17 重开仍校验持久 causal 配置及 Worktree storage identity。
 
-`user_version = 16` 不是布局证明。已有数据库必须在任何 DDL、Bootstrap 或配置写入
+`user_version = 17` 不是布局证明。已有数据库必须在任何 DDL、Bootstrap 或配置写入
 之前，以只读方式对照由可信 DDL 在隔离内存库生成的完整 schema 指纹：对象集合、
 列/type/not-null/default/PK/FK、索引/唯一性/partial predicate、trigger、CHECK
 和 STRICT 等约束。比较 SQLite 解析后的 metadata 与保留 literal/operator 语义的
@@ -1032,7 +1054,7 @@ SQL token；只忽略空白、注释和未引用 keyword/identifier 大小写，
 缺失、额外不兼容、部分、损坏、前驱形状或未来布局必须拒绝，保持原文件字节及逻辑
 状态不变，不用 `CREATE IF NOT EXISTS` 修补。SQLite 自有统计对象不属于应用布局。
 只有没有持久对象的 version 0 数据库可在同一事务内执行 DDL、初始配置及 Bootstrap；
-失败完整回滚。有效 schema 16 重开不重新应用 Bootstrap，也不修改持久 causal 配置或 storage identity。
+失败完整回滚。有效 schema 17 重开不重新应用 Bootstrap，也不修改持久 causal 配置或 storage identity。
 
 Runtime Host 调度恢复 pass 时，连续执行的 pass 数量必须有界，并在继续前让出事件循环并重新检查关闭请求。积压处理不得饿死 HTTP、timer、signal 或关闭处理。空闲轮询等待必须可被关闭请求中断；无论等待还是关闭先完成，都必须移除对应 listener 并取消不再需要的 timer。
 
@@ -1445,6 +1467,10 @@ result
 ```
 
 敏感 Prompt 和隐藏思维不默认写入审计日志。
+
+Provider 或进程诊断同样不默认进入公开审计或持久投影。公开诊断只保留稳定
+错误码、结果状态和白名单通用摘要；本地开发日志不得隐式打印 Credential 或
+完整环境。
 
 ### 28.2 基础指标
 

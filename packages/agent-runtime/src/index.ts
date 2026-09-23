@@ -31,6 +31,7 @@ export {
   type ProviderAdapter,
   type ProviderCapabilityProfile,
   type ProviderCause,
+  type ProviderDiagnosticCode,
   type ProviderExecutionContext,
   type ProviderExecutionResult,
 } from "./types.js";

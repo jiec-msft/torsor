@@ -501,7 +501,7 @@ describe("SQLite persistence", () => {
       const metadata = new DatabaseSync(databasePath, { readOnly: true });
       try {
         expect(metadata.prepare("PRAGMA user_version").get()).toMatchObject({
-          user_version: 16,
+          user_version: 17,
         });
       } finally {
         metadata.close();
@@ -1533,7 +1533,7 @@ describe("SQLite persistence", () => {
       expect(() =>
         TorsorKernel.open({ databasePath: priorLeaseSchemaPath, bootstrap }),
       ).toThrow(
-        /Incompatible development database schema version 13; expected 16.*Stop old Torsor processes.*recreate the disposable local database/,
+        /Incompatible development database schema version 13; expected 17.*Stop old Torsor processes.*recreate the disposable local database/,
       );
       const preservedLeaseSchema = new DatabaseSync(priorLeaseSchemaPath, { readOnly: true });
       try {

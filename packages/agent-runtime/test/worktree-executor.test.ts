@@ -42,7 +42,10 @@ describe("controlled Worktree executor (§22, §24, §38)", () => {
         });
         await expect(executor.probe({ worktreeId: "first", activationId: run.activationId }))
           .rejects.toMatchObject({
-            outcome: "Unknown", message: "Controlled Worktree execution did not complete with current authority.",
+            diagnosticCode: "provider_worktree_execution_failed",
+            outcome: "Unknown",
+            message:
+              "provider_worktree_execution_failed: Controlled Worktree execution did not complete.",
           });
         const physical = await kernel.query({ type: "GetPhysicalWorktree", worktreeId: "first" }, runtimeContext);
         expect(physical.latestExecution?.authorityRevokedAt).not.toBeNull();

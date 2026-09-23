@@ -33,7 +33,7 @@ export class DeterministicFakeAdapter implements ProviderAdapter {
     context.signal.throwIfAborted();
     await this.handler(context);
     context.signal.throwIfAborted();
-    return { detail: "Deterministic fake execution completed." };
+    return {};
   }
 }
 
