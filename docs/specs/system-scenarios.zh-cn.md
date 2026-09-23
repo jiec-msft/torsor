@@ -46,6 +46,13 @@ SSE 重连从明确 cursor 回放，允许在传输端暂停、重复、倒序�
 `sync()` 先捕获至调用时的持久高水位，再一次性释放该有限 SSE 前缀；
 网络分包不得决定投影刷新次数。支持断线期间捕获前缀后倒序/重复释放。
 禁止任意 sleep、真实模型、互联网、浏览器和真实凭据。
+runner 同时控制 `performance.now()` 与应用 timer；磁盘或 CPU 延迟不能消耗
+逻辑场景的执行预算。Kernel 日期时钟仍单独显式推进。fresh-process 基准使用
+测试进程外的真实单调时钟，不把虚拟时间作为速度证据。
+
+**SS-2.4** 无新增事实、首次连接或重开后 cursor 已在高水位时，`sync()` 仍必须
+完成真实认证 SSE handshake 并通知 Web `onopen`，等待其重连读取与 invalidation
+重试完成。不得伪造事件、重发命令或停留在 `connecting`/`reconnecting`。
 
 ## 3. 首批目录与派生方法
 
@@ -63,7 +70,34 @@ SSE 重连从明确 cursor 回放，允许在传输端暂停、重复、倒序�
 | SS-3.5 | depth 4 可准入、5 拒绝；root 同时非终态上限 50，Waiting 占位，只有终态提交释放；释放后重试不重复准入且保持来源 | 25.1–25.2 |
 | SS-3.6 | 可信报告 digest、固化、重开和重试；相同字节在不同 Run 保留独立 descriptor；父子或兄弟不可互读，不存在与越界读取不可区分 | 21.3–21.5、23 |
 | SS-3.7 | 崩溃/重开保留已提交事实，不保留未提交工作；新 Runtime 只从持久输入继续，不需要长寿命 Agent 内存 | 20–21 |
-| SS-3.8 | lease execution 集成进入 main 后：旧 generation、fenced/expired 活进程不能发布变更、descriptor、成功活动或完成；新 generation 胜出，晚到输出拒绝/隔离，重启与 reconciliation 确定 | 21.5、22、24、38 |
+| SS-3.8 | schema 16 的公开 lease execution：旧 generation、fenced/expired 活进程不能发布变更、descriptor、成功活动或完成；新 generation 胜出，晚到输出拒绝/隔离，重启与 reconciliation 确定 | 21.5、22、24、38 |
+
+**SS-3.8.1** 使用公开 `LocalWorktreeExecutor`，由 Human/Runtime 创建 Run，
+在合成 detached Git worktree 执行固定 `write-probe-v1` child。只有固定 digest、
+原 handle 正常停止及有效 Writer authority 同时成立，才发布可信报告、活动、Reply
+和 completion；HTTP/SSE/Web 显示同一已提交结果。新 lease generation/fencing
+拒绝旧 token；正常停止保留 publication window，settlement 后才释放。
+
+**SS-3.8.2** 通过公开 executor options 的 trusted process driver，仅编排固定
+probe 的 result、stop request、force request 与原 handle close。逻辑时钟推进到
+精确 expiry，runner 显式推进 monitor/grace timer，不用 sleep。旧进程仍 live 时，
+拒绝活动（含幂等重放）、Reply、Artifact 固化及成功结束；expiry、stop request
+或 force request 本身不证明停止。没有 close 则 `Uncertain`/quarantine，拒绝
+同目录 acquisition；晚到原 handle close 可收敛物理状态，但不能复活旧 Writer。
+
+**SS-3.8.3** 在同一 SQLite 上打开独立 Kernel/Runtime/HTTP/Web composition，
+以受控交错代表 executor 重启与并发恢复；不 mock Kernel、不复用 Agent 内存。
+新 executor 必须隔离旧 incarnation 未停止的 intent。新的合法 Run Activation
+可在从已知合成 base 提供的独立目录完成，旧输出不得污染新结果；旧 receipt 的
+晚到停止不得修改新执行。重开和重复恢复保留已提交事实，不重复 Provider 成功。
+此场景不声称覆盖真实掉电或跨重启 OS containment。
+
+**SS-3.8.4** `runSystemScenario` 的可选 Worktree 模式只提供固定合成 Git
+provisioning、公开 executor 与窄 process controls；Git 使用隔离配置、空 hooks、
+固定身份/日期、明确 argument vector 及有界 watchdog。每个 scenario 独占目录，
+同库 composition 共享目录所有者并按依赖顺序关闭。显式预期的 Runtime 失败必须
+由断言逐个确认；不得忽略其他脚本异常。清理必须释放 held result/close，停止 executor、
+取消 monitor/grace/retry timer，再关闭 SQLite；失败路径也遵守该顺序。
 
 **SS-3.9** 普通场景只查询公开投影；仅专门的 schema/crash 边界可检查
 数据库字节/布局或在事务内制造进程退出。普通 Provider 脚本不 mock Kernel。
@@ -97,5 +131,7 @@ loopback credential 每次在内存生成，禁止读取真实登录配置、环
 引用，不发布临时绝对路径、token、进程环境或非公开材料。
 
 **SS-5.2** 延后真实模型/browser 测试、完整 ACP 协议覆盖、fuzzing、
-完整 Cartesian catalog、多主机、通用虚拟时间框架、power-loss 保证和
+完整 Cartesian catalog、分布式多主机、通用虚拟时间框架、power-loss 保证和
 跨进程草稿恢复。本包不是 OS sandbox，不声称验证 LLM 理解或通用 exactly-once。
+可信本地真实 Agent 工作负载、通用进程树隔离及 shell/write 集成仍待后续切片；
+本目录只覆盖已集成的固定 `write-probe-v1`，不能替代该集成的最终独立审查。

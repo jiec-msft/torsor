@@ -13,6 +13,11 @@ import { createTorsorHttpService, type TorsorHttpService } from "@torsor/server"
 import { WebController } from "@torsor/web/controller";
 import { deferred, HttpEventSource, HttpTransport } from "./transport.js";
 import { trackHandles } from "./resources.js";
+import { ScenarioWorktrees } from "./worktrees.js";
+
+export interface SystemScenarioOptions {
+  readonly worktrees?: "fixed" | "scripted";
+}
 
 const projectId = "project-scenario";
 const channelId = "channel-scenario";
@@ -62,12 +67,14 @@ class SystemScenario {
   readonly kernel: TorsorKernel;
   readonly web: WebController;
   readonly http: HttpTransport;
+  readonly worktrees: ScenarioWorktrees | undefined;
   readonly #service: TorsorHttpService;
   readonly #runtime: AgentRuntime;
   readonly #sources: HttpEventSource[] = [];
   readonly #gates: ScenarioGate[] = [];
   readonly #failures: unknown[] = [];
   readonly #work = new Set<Promise<unknown>>();
+  readonly #peers: SystemScenario[] = [];
   #stopped = false;
   #successor: SystemScenario | null = null;
   #handler: DeterministicFakeHandler = async () => {
@@ -80,12 +87,17 @@ class SystemScenario {
     service: TorsorHttpService,
     origin: string,
     readonly clock: ScenarioClock,
+    worktrees: ScenarioWorktrees | undefined,
+    private readonly options: SystemScenarioOptions,
+    private readonly ownsDirectory: boolean,
   ) {
     this.kernel = kernel;
     this.#service = service;
+    this.worktrees = worktrees;
     this.#runtime = new AgentRuntime({
       kernel, runtimePrincipalId: this.runtimePrincipal.principalId,
       projectIds: [projectId], clock: clock.now,
+      ...(worktrees ? { worktreeExecutor: worktrees.executor } : {}),
       adapter: new DeterministicFakeAdapter(async (context) => {
         try { await this.#handler(context); }
         catch (error) { this.#failures.push(error); throw error; }
@@ -112,36 +124,43 @@ class SystemScenario {
     });
   }
 
-  static async open(): Promise<SystemScenario> {
+  static async open(options: SystemScenarioOptions): Promise<SystemScenario> {
     const directory = await mkdtemp(join(tmpdir(), "torsor-scenario-"));
-    return SystemScenario.#openDirectory(directory, new ScenarioClock());
+    return SystemScenario.#openDirectory(directory, new ScenarioClock(), options);
   }
 
-  static async #openDirectory(directory: string, clock: ScenarioClock): Promise<SystemScenario> {
+  static async #openDirectory(
+    directory: string, clock: ScenarioClock, options: SystemScenarioOptions, ownsDirectory = true,
+  ): Promise<SystemScenario> {
     const token = randomUUID();
     let kernel: TorsorKernel | undefined;
     let service: TorsorHttpService | undefined;
     let system: SystemScenario | undefined;
+    let worktrees: ScenarioWorktrees | undefined;
     try {
       const artifactStorage = await LocalArtifactStorage.open(join(directory, "artifacts"));
       kernel = TorsorKernel.open({
         databasePath: join(directory, "state.sqlite"), bootstrap, clock: clock.now, artifactStorage,
       });
+      if (options.worktrees) {
+        worktrees = new ScenarioWorktrees(directory, kernel, "runtime-scenario", options.worktrees);
+        await worktrees.executor.recover();
+      }
       service = createTorsorHttpService({
         kernel, port: 0,
         credentials: [{ token, principalContext: { principalId: "human-scenario" } }],
       });
       const origin = await service.listen();
-      system = new SystemScenario(directory, kernel, service, origin, clock);
+      system = new SystemScenario(directory, kernel, service, origin, clock, worktrees, options, ownsDirectory);
       await system.web.exchangeSession(token, projectId);
       if (system.web.getSnapshot().session !== "ready") throw new Error("Scenario session did not open.");
       return system;
     } catch (error) {
       if (system) await system.close();
       else {
-        try { await service?.close(); } finally {
+        try { await worktrees?.close(); await service?.close(); } finally {
           kernel?.close();
-          await rm(directory, { recursive: true, force: true });
+          if (ownsDirectory) await rm(directory, { recursive: true, force: true });
         }
       }
       throw error;
@@ -200,6 +219,20 @@ class SystemScenario {
     return work;
   }
 
+  async expectRuntimeFailure(
+    work: Promise<void>, assertion: (error: unknown) => void | Promise<void>,
+  ): Promise<void> {
+    const error = await work.then(
+      () => { throw new Error("Expected Runtime work to fail."); },
+      (failure: unknown) => failure,
+    );
+    await assertion(error);
+    if (!this.#failures.includes(error)) throw new Error("Expected failure did not belong to tracked Runtime work.");
+    for (let index = this.#failures.length - 1; index >= 0; index -= 1) {
+      if (this.#failures[index] === error) this.#failures.splice(index, 1);
+    }
+  }
+
   async cancel(runId: string): Promise<void> {
     const { run } = await this.kernel.query({ type: "GetRunProjection", runId }, this.human);
     await this.kernel.execute({
@@ -254,11 +287,18 @@ class SystemScenario {
     if (this.#failures.length) throw new AggregateError(this.#failures.splice(0), "Scenario Provider failed.");
   }
 
+  async fork(): Promise<SystemScenario> {
+    if (this.#stopped) throw new Error("Cannot fork a stopped scenario.");
+    const peer = await SystemScenario.#openDirectory(this.directory, this.clock, this.options, false);
+    this.#peers.push(peer);
+    return peer;
+  }
+
   async reopen(): Promise<SystemScenario> {
     if (this.#successor) throw new Error("This scenario instance was already replaced.");
     if (this.#work.size) throw new Error("Settle Runtime work before reopening.");
     await this.#stop();
-    this.#successor = await SystemScenario.#openDirectory(this.directory, this.clock);
+    this.#successor = await SystemScenario.#openDirectory(this.directory, this.clock, this.options, false);
     return this.#successor;
   }
 
@@ -267,6 +307,7 @@ class SystemScenario {
     this.#stopped = true;
     const errors: unknown[] = [];
     for (const gate of this.#gates) gate.release();
+    try { await this.worktrees?.close(); } catch (error) { errors.push(error); }
     const work = await Promise.allSettled(this.#work);
     for (const result of work) if (result.status === "rejected") errors.push(result.reason);
     this.web.dispose();
@@ -287,23 +328,30 @@ class SystemScenario {
   }
 
   async close(): Promise<void> {
-    try {
-      await this.#stop();
-      await this.#successor?.close();
-    } finally {
-      await rm(this.directory, { recursive: true, force: true });
+    const errors: unknown[] = [];
+    for (const cleanup of [
+      ...[...this.#peers].reverse().map((peer) => () => peer.close()),
+      () => this.#successor?.close(),
+      () => this.#stop(),
+      async () => {
+        if (this.ownsDirectory) await rm(this.directory, { recursive: true, force: true });
+      },
+    ]) {
+      try { await cleanup(); } catch (error) { errors.push(error); }
     }
+    if (errors.length) throw new AggregateError(errors, "Scenario ownership cleanup failed.");
   }
 }
 
 export async function runSystemScenario(
   scenario: (system: SystemScenario) => Promise<void>,
+  options: SystemScenarioOptions = {},
 ): Promise<void> {
   const assertHandlesClosed = trackHandles();
   const errors: unknown[] = [];
   let system: SystemScenario | undefined;
   try {
-    system = await SystemScenario.open();
+    system = await SystemScenario.open(options);
     await scenario(system);
   } catch (error) { errors.push(error); }
   try { await system?.close(); } catch (error) { errors.push(error); }

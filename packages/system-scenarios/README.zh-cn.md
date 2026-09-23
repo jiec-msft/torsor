@@ -43,7 +43,8 @@ await runSystemScenario(async (system) => {
 });
 ```
 
-在本包的 Vitest 配置下运行测试；`test/setup.ts` 冻结并检查应用 timer。
+在本包的 Vitest 配置下运行测试；`test/setup.ts` 冻结并检查应用 timer，
+同时控制 `performance.now()`，避免磁盘延迟消耗虚拟执行预算。
 `gate().entered/wait()/release()` 控制 Provider 次序，`clock.advance(ms)`
 只推进 Kernel/Runtime 逻辑时钟。`sync()` 捕获至调用时的持久 SSE 高水位再批量
 投递；`advanceUntil(predicate)` 在公开持久条件成立时停止 Runtime pass，
@@ -53,8 +54,30 @@ await runSystemScenario(async (system) => {
 `http.loseNextResponse(path)` 在服务器处理后丢弃响应；
 `http.failNextRead(path)` 注入明确读取失败。未消费故障控制使清理失败。
 `reopen()` 返回全新实例；必须显式重新配置 Provider，原实例统一拥有后续清理。
-唯一 child 边界 `crashDuringReport()` 在真实报告字节落盘后、descriptor 提交前
-退出；不提供任意 command/path API。
+`crashDuringReport()` 在真实报告字节落盘后、descriptor 提交前退出；
+另一个真实 child 边界是下面的固定 Worktree probe，不提供任意 command/path API。
+
+## Lease-backed Worktree 场景
+
+给 `runSystemScenario` 传入第二个参数 `{ worktrees: "fixed" }` 或
+`{ worktrees: "scripted" }`，启用真实公开 `LocalWorktreeExecutor`。
+`system.worktrees.register(runId)` 创建隔离配置下的合成 detached Git fixture，
+返回 opaque ID；Provider 只调用 `context.worktree.probe(id)`，不获取路径或命令。
+`fixed` 使用生产固定 Node child；`scripted` 仅替换公开 options 中的 trusted
+process driver，不替换 Runtime、Kernel、SQLite 或网络投影。
+
+`system.worktrees.processes.holdNext()` 返回下次 child 的 readiness Promise，
+其 `emitResult()`、`confirmStop()` 和 stop/force 计数分别控制/观察结果与物理证据。
+未 held 的脚本正常返回固定 digest 并确认停止。脚本 lease 为 1000 ms，
+stop/force grace 各 10 ms；测试显式推进 Vitest timer 和独立 Kernel 时钟。
+这些是确定性调度值，不是 wall-clock 性能断言。
+`system.worktrees.executor` 保留生产公开 lifecycle 接口。
+
+`fork()` 在同一数据库打开全新的 Kernel/Runtime/HTTP/Web composition，先恢复
+executor 再开放 HTTP；原实例可仍持有旧 process handle。每个 composition
+必须重新设置 Provider。`reopen()` 则先关闭旧实例；两者均由最初目录所有者清理，
+不能删除仍共享的目录。`expectRuntimeFailure(work, assertion)` 只消费断言确认的
+同一个已跟踪错误，其他 Provider assertion 仍使场景失败。
 
 ## 首批场景
 
@@ -66,9 +89,20 @@ await runSystemScenario(async (system) => {
 | SS-3.5 | depth 4/5；真实默认 cap 50，Waiting 占位、终态释放后重试 |
 | SS-3.6 | SHA-256、独立 descriptor、兄弟 Run scope、固化/重开/下载 |
 | SS-3.7 | 真正进程退出、未提交报告不可见、持久 checkpoint 与新 Runtime 续跑 |
+| SS-3.8.1 | 固定 child 正常停止、generation/fencing、可信报告及 SSE completion |
+| SS-3.8.2 | 精确 expiry、所有旧 Writer publication 拒绝、未知停止隔离、晚到 close reconciliation |
+| SS-3.8.3 | 独立 composition 并发接管、独立目录、新 Run generation、晚到旧输出拒绝、重复恢复 |
+| SS-2.4 | 无新事件时仍完成真实 SSE handshake；初始连接、重连与重开不重发命令 |
+| SS-2.2/SS-3.8.4 | 显式 Runtime 失败断言不掩盖独立 Provider assertion |
 | SS-4.2 | 清理成功路径及未知活跃 handle 的失败路径 |
 
 本地目标为运行阶段少于 10 秒；普通 in-process 场景目标少于 300 ms。
-真实 50-Run cap 和大分页目录有大量持久事务，是较慢的边界例外；不减小产品默认
+真实 50-Run cap、大分页和 Git/Worktree 边界有大量持久事务，是较慢的例外；不减小产品默认
 阈值、不关闭 SQLite 持久性来伪造速度。重复命令输出实际值而非紧 wall-clock 断言。
-lease execution 场景 `SS-3.8` 仅在相应公开 main 接口集成后添加。
+Windows/Node 24 的一次三轮 fresh-process 测量为每轮 **13/13**，
+**9.151–9.548 秒**（不含构建）；Worktree 场景约 **0.56–1.18 秒**。
+外层进程使用真实单调时钟，hosted runner 可能更慢；CI 日志保留每轮实际值。
+
+SS-3.8 已集成 schema 16 的固定 `write-probe-v1`。可信本地真实 Agent 工作负载、
+通用 shell/write 和跨重启进程树隔离仍未集成；不以 fake/fixed process 场景替代
+这些能力的生产验收或最终 exact-head 独立审查。

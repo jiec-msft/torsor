@@ -134,7 +134,7 @@ export class HttpEventSource extends EventTarget implements WebEventSource {
   }
 
   async sync(target: string | null, delivery?: "reverse-duplicate"): Promise<void> {
-    if (target === this.#cursor) return;
+    const emptyPrefix = target === this.#cursor;
     this.close();
     await this.finished();
     const url = new URL(this.url);
@@ -151,6 +151,11 @@ export class HttpEventSource extends EventTarget implements WebEventSource {
       if (response.statusCode !== 200) {
         reached.reject(new Error(`SSE status ${response.statusCode}.`));
         response.resume();
+        return;
+      }
+      if (emptyPrefix) {
+        reachedTarget = true;
+        reached.resolve();
         return;
       }
       response.setEncoding("utf8");

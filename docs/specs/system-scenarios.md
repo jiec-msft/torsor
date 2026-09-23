@@ -54,6 +54,15 @@ are forbidden.
 that finite SSE prefix as one batch; network chunking must not determine
 projection refresh counts. Captured disconnected prefixes may be released in
 reverse/duplicate order.
+The runner also controls `performance.now()` alongside application timers:
+disk/CPU delays cannot consume a logical scenario's execution budget. Advance
+the Kernel date clock separately. Fresh-process benchmarks use the real monotonic
+clock outside the test process, never virtual time as speed evidence.
+
+**SS-2.4** With no new facts, on initial connection or after reopening at the
+high-water cursor, `sync()` still completes a real authenticated SSE handshake,
+notifies Web `onopen`, and awaits reconnect reads and invalidation retries.
+Never fabricate events, resend commands, or leave Web `connecting`/`reconnecting`.
 
 ## 3. Initial catalog and derivation
 
@@ -72,7 +81,42 @@ numbers trace implementation and tests; domain semantics come from the paired
 | SS-3.5 | Depth 4 admitted, 5 rejected; root nonterminal cap 50 includes Waiting and releases only on terminal commit. Retry after release admits once with unchanged provenance | 25.1–25.2 |
 | SS-3.6 | Trusted report digest, finalization, reopen and retry; equal bytes in different Runs retain independent descriptors; parent/child or sibling isolation, indistinguishable absent/out-of-scope reads | 21.3–21.5, 23 |
 | SS-3.7 | Crash/reopen preserves committed facts, not uncommitted work; a fresh Runtime continues from durable inputs without long-lived Agent memory | 20–21 |
-| SS-3.8 | After lease execution lands on main: old-generation/fenced/expired live processes cannot publish mutations, descriptors, success activity or completion; new generation wins, late output is rejected/quarantined, restart/reconciliation is deterministic | 21.5, 22, 24, 38 |
+| SS-3.8 | Public schema-16 lease execution: old-generation/fenced/expired live processes cannot publish mutations, descriptors, success activity or completion; new generation wins, late output is rejected/quarantined, restart/reconciliation is deterministic | 21.5, 22, 24, 38 |
+
+**SS-3.8.1** Use public `LocalWorktreeExecutor`, with Human/Runtime Run creation,
+to execute the fixed `write-probe-v1` child in a synthetic detached Git worktree.
+Publish a trusted report, activity, Reply and completion only after the fixed
+digest, original-handle normal stop and current Writer authority all hold.
+HTTP/SSE/Web show the same committed result. New lease generation/fencing rejects
+old tokens; normal stop retains the publication window until settlement releases it.
+
+**SS-3.8.2** Use the public executor options' trusted process driver to schedule
+only fixed-probe result, stop request, force request and original-handle close.
+Advance the logical clock to exact expiry and explicitly advance runner-controlled
+monitor/grace timers, without sleeps. While the old process remains live, deny
+activity (including idempotent replay), Reply, Artifact finalization and success
+settlement. Expiry, stop request and force request do not prove stop. Missing close
+means `Uncertain`/quarantine and denied same-directory acquisition. Late original-
+handle close may reconcile physical state but never revive the old Writer.
+
+**SS-3.8.3** Open an independent Kernel/Runtime/HTTP/Web composition on the same
+SQLite database, with controlled interleaving representing executor restart and
+concurrent recovery; do not mock Kernel or reuse Agent memory. The new executor
+quarantines the old incarnation's unstopped intent. A new authorized Run Activation
+may complete in a separate directory provisioned from the known synthetic base.
+Old output cannot contaminate the new result; late old-receipt stop cannot modify
+the new execution. Reopen and repeated recovery retain committed facts without
+duplicate Provider success. This does not claim real power-loss or cross-restart
+OS containment coverage.
+
+**SS-3.8.4** The optional Worktree mode of `runSystemScenario` supplies only fixed
+synthetic Git provisioning, the public executor and narrow process controls.
+Git uses isolated configuration, empty hooks, fixed identity/date, explicit argument
+vectors and bounded watchdogs. Each scenario owns its directories; same-database
+compositions share directory ownership and close in dependency order. Explicitly
+expected Runtime failures require individual assertions and must not hide other
+script errors. Cleanup releases held result/close controls, stops executors and
+cancels monitor/grace/retry timers before closing SQLite, including failure paths.
 
 **SS-3.9** Ordinary assertions use public projections. Only dedicated
 schema/crash boundaries may inspect database bytes/layout or terminate inside a
@@ -113,6 +157,9 @@ contains only test names/counts/times and public commit/CI references, not
 temporary absolute paths, tokens, process environments or non-public material.
 
 **SS-5.2** Defer real-model/browser tests, complete ACP coverage, fuzzing, the full
-Cartesian catalog, multi-host operation, a general virtual-time framework,
+Cartesian catalog, distributed multi-host operation, a general virtual-time framework,
 power-loss guarantees and cross-process draft recovery. This is not an OS
 sandbox and does not prove LLM understanding or generic exactly-once delivery.
+Trusted-local real Agent workloads, general process-tree containment and shell/write
+integration remain deferred. This catalog covers only integrated `write-probe-v1`,
+not the eventual independent final review of that broader integration.

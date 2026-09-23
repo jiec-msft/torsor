@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, vi } from "vitest";
 
 beforeEach(() => {
   vi.useFakeTimers({
-    toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "performance"],
   });
 });
 
