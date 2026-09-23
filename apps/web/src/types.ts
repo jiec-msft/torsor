@@ -137,7 +137,6 @@ export interface ProviderAttempt {
   readonly capabilitySnapshot: JsonValue;
   readonly runInputIds: readonly string[];
   readonly requestIdempotencyKey: string;
-  readonly diagnosticSessionId: string | null;
   readonly status:
     | "Started"
     | "Acknowledged"

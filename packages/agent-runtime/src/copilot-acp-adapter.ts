@@ -3,6 +3,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { JsonValue } from "@torsor/kernel";
 
 import {
+  normalizeProviderExecutionError,
   ProviderExecutionError,
   ProviderProtocolError,
   type ProviderAdapter,
@@ -12,7 +13,9 @@ import {
 
 export interface CopilotAcpLimits {
   readonly maxFrameBytes: number;
+  readonly maxStdoutBytes: number;
   readonly maxStreamBytes: number;
+  readonly maxStderrBytes: number;
   readonly maxActivityBytes: number;
   readonly maxPendingPersistenceOperations: number;
   readonly maxJsonDepth: number;
@@ -92,7 +95,9 @@ type CopilotAction =
 
 const defaultLimits: CopilotAcpLimits = {
   maxFrameBytes: 256 * 1024,
+  maxStdoutBytes: 1024 * 1024,
   maxStreamBytes: 512 * 1024,
+  maxStderrBytes: 16 * 1024,
   maxActivityBytes: 256 * 1024,
   maxPendingPersistenceOperations: 16,
   maxJsonDepth: 16,
@@ -120,7 +125,7 @@ const secureCopilotArgs = [
 
 export class CopilotAcpAdapter implements ProviderAdapter {
   readonly name = "github-copilot-cli-acp";
-  readonly version = "3";
+  readonly version = "4";
   readonly capabilities = {
     acceptsInputWhileRunning: false,
     supportsCancel: true,
@@ -180,6 +185,7 @@ export class CopilotAcpAdapter implements ProviderAdapter {
     const connection = new NdjsonRpcConnection(
       processHandle,
       this.#limits.maxFrameBytes,
+      this.#limits.maxStdoutBytes,
     );
     let sessionId: string | null = null;
     let acceptUpdates = true;
@@ -188,7 +194,6 @@ export class CopilotAcpAdapter implements ProviderAdapter {
     let primaryError: unknown;
     let executionResult: ProviderExecutionResult | undefined;
     const outputChunks: string[] = [];
-    const stderrChunks: string[] = [];
     let stderrBytes = 0;
     const persistence = new PersistenceQueue(
       this.#limits.maxPendingPersistenceOperations,
@@ -202,15 +207,15 @@ export class CopilotAcpAdapter implements ProviderAdapter {
     processHandle.stderr.setEncoding("utf8");
     processHandle.stderr.on("data", (chunk: string) => {
       const bytes = Buffer.byteLength(chunk);
-      if (stderrBytes >= 16_384) {
+      if (bytes > this.#limits.maxStderrBytes - stderrBytes) {
+        stderrBytes = this.#limits.maxStderrBytes;
+        connection.fail(
+          new ProviderExecutionError("provider_stderr_limit", "Failed"),
+        );
+        processHandle.kill();
         return;
       }
-      stderrChunks.push(
-        bytes + stderrBytes <= 16_384
-          ? chunk
-          : Buffer.from(chunk).subarray(0, 16_384 - stderrBytes).toString(),
-      );
-      stderrBytes = Math.min(16_384, stderrBytes + bytes);
+      stderrBytes += bytes;
     });
 
     connection.onRequest = async (request) => {
@@ -235,6 +240,7 @@ export class CopilotAcpAdapter implements ProviderAdapter {
       ) {
         throw new ProviderProtocolError(
           "Copilot emitted tool activity despite the deny-by-default tool policy.",
+          "provider_policy_violation",
         );
       }
       if (updateType !== "agent_message_chunk") {
@@ -351,7 +357,9 @@ export class CopilotAcpAdapter implements ProviderAdapter {
       );
       if (stopReason !== "end_turn") {
         throw new ProviderExecutionError(
-          `Copilot ACP stopped with ${stopReason}.`,
+          stopReason === "cancelled"
+            ? "provider_cancelled"
+            : "provider_execution_failed",
           stopReason === "cancelled" ? "Unknown" : "Failed",
         );
       }
@@ -361,10 +369,7 @@ export class CopilotAcpAdapter implements ProviderAdapter {
         throw new ProviderProtocolError("Report Artifact storage is not configured.");
       }
       await applyActions(actions, context);
-      executionResult = {
-        detail: `Copilot ACP completed session ${sessionId}.`,
-        diagnosticSessionId: sessionId,
-      };
+      executionResult = {};
     } catch (error) {
       primaryError = error;
     } finally {
@@ -391,12 +396,11 @@ export class CopilotAcpAdapter implements ProviderAdapter {
       throw normalizeExecutionError(
         primaryError,
         context.signal,
-        stderrChunks.join("").trim(),
       );
     }
     if (!executionResult) {
       throw new ProviderExecutionError(
-        "Copilot ACP ended without a result.",
+        "provider_execution_failed",
         "Unknown",
       );
     }
@@ -475,6 +479,7 @@ class NdjsonRpcConnection {
   #failed: Error | null = null;
   #inputEnd: Promise<void> | null = null;
   #buffer = Buffer.alloc(0);
+  #stdoutBytes = 0;
   readonly #pending = new Map<
     number,
     {
@@ -486,6 +491,7 @@ class NdjsonRpcConnection {
   constructor(
     private readonly processHandle: ChildProcessWithoutNullStreams,
     private readonly maxFrameBytes: number,
+    private readonly maxStdoutBytes: number,
   ) {
     processHandle.stdout.on("data", (chunk: Buffer) => {
       try {
@@ -498,13 +504,15 @@ class NdjsonRpcConnection {
         );
       }
     });
-    processHandle.once("error", (error) => {
-      this.fail(error);
+    processHandle.once("error", () => {
+      this.fail(
+        new ProviderExecutionError("provider_process_start_failed", "Failed"),
+      );
     });
     processHandle.stdin.on("error", (error) => {
       this.fail(stdinFailure(error));
     });
-    processHandle.once("exit", (code, signal) => {
+    processHandle.once("exit", () => {
       if (
         !this.#allowProcessExit &&
         !this.#closed &&
@@ -512,9 +520,7 @@ class NdjsonRpcConnection {
         !this.#failed
       ) {
         this.fail(
-          new Error(
-            `ACP process exited before completion (code=${String(code)}, signal=${String(signal)}).`,
-          ),
+          new ProviderExecutionError("provider_process_exited", "Unknown"),
         );
       }
     });
@@ -631,6 +637,12 @@ class NdjsonRpcConnection {
     if (this.#closed || this.#failed) {
       return;
     }
+    this.#stdoutBytes = addWithinLimit(
+      this.#stdoutBytes,
+      chunk.length,
+      this.maxStdoutBytes,
+      "ACP stdout",
+    );
     this.#buffer = Buffer.concat([this.#buffer, chunk]);
     for (;;) {
       const newline = this.#buffer.indexOf(0x0a);
@@ -638,6 +650,7 @@ class NdjsonRpcConnection {
         if (this.#buffer.length > this.maxFrameBytes) {
           throw new ProviderProtocolError(
             `ACP frame exceeded ${this.maxFrameBytes} bytes.`,
+            "provider_output_limit",
           );
         }
         return;
@@ -650,6 +663,7 @@ class NdjsonRpcConnection {
       if (frame.length > this.maxFrameBytes) {
         throw new ProviderProtocolError(
           `ACP frame exceeded ${this.maxFrameBytes} bytes.`,
+          "provider_output_limit",
         );
       }
       this.#receiveFrame(frame.toString("utf8"));
@@ -673,9 +687,7 @@ class NdjsonRpcConnection {
       this.#pending.delete(response.id);
       if (response.error) {
         pending.reject(
-          new Error(
-            `ACP request failed (${response.error.code}): ${response.error.message}`,
-          ),
+          new ProviderProtocolError("ACP request returned an error."),
         );
       } else {
         pending.resolve(response.result);
@@ -1209,7 +1221,10 @@ function addWithinLimit(
   name: string,
 ): number {
   if (addition > limit - current) {
-    throw new ProviderProtocolError(`${name} exceeded ${limit} bytes.`);
+    throw new ProviderProtocolError(
+      `${name} exceeded ${limit} bytes.`,
+      "provider_output_limit",
+    );
   }
   return current + addition;
 }
@@ -1277,27 +1292,18 @@ function buildSanitizedEnvironment(
 function normalizeExecutionError(
   error: unknown,
   signal: AbortSignal,
-  stderr: string,
 ): Error {
   if (signal.aborted) {
     return abortReason(signal);
   }
-  if (error instanceof ProviderExecutionError) {
-    return error;
-  }
-  const message = errorMessage(error);
-  return new ProviderExecutionError(
-    stderr
-      ? `Copilot ACP failed: ${message}; stderr: ${stderr}`
-      : `Copilot ACP failed: ${message}`,
-    "Unknown",
-  );
+  return normalizeProviderExecutionError(error, "Unknown");
 }
 
 function abortReason(signal: AbortSignal): Error {
-  return signal.reason instanceof Error
-    ? signal.reason
-    : new ProviderExecutionError("Copilot ACP execution was aborted.", "Unknown");
+  if (signal.reason === undefined) {
+    return new ProviderExecutionError("provider_cancelled", "Unknown");
+  }
+  return normalizeProviderExecutionError(signal.reason, "Unknown");
 }
 
 async function stopProcess(
@@ -1329,15 +1335,17 @@ async function stopProcess(
     }
   }
   if (!isProcessClosed(processHandle)) {
-    throw new ProviderProtocolError(
-      "Copilot ACP process did not terminate after forced shutdown.",
+    throw new ProviderExecutionError(
+      "provider_cleanup_failed",
+      "Unknown",
     );
   }
 }
 
 function stdinFailure(error: Error): ProviderExecutionError {
+  void error;
   return new ProviderExecutionError(
-    `Copilot ACP stdin failed: ${error.message}`,
+    "provider_io_error",
     "Unknown",
   );
 }

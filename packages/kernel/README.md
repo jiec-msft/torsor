@@ -1,6 +1,6 @@
 # `@torsor/kernel`
 
-## Physical execution records (schema 16)
+## Physical execution records (schema 17)
 
 `RegisterPhysicalWorktree`, `StartWorktreeExecution`, `RecordWorktreeExecution`,
 `RevokeWorktreeExecutionAuthority`, and `RecoverWorktreeExecution` are trusted Runtime-only commands.
@@ -351,14 +351,15 @@ clock-derived expiry, and
 release, expiry, quarantine, and reconciliation ledger. These primitives do
 not perform filesystem mutation, process execution, or shell execution.
 
-The current direct schema version is 16. It combines the physical records and
+The current direct schema version is 17. It combines the physical records and
 irreversible Writer publication fences above with trusted Artifact byte
 length and source Thread provenance (replacing caller-provided storage
 locations) with durable server-owned causal limits, immutable Run root/parent/depth,
 and the root-scoped nonterminal admission index. Defaults remain inclusive depth
-4 and at most 50 nonterminal Runs per root. Earlier schema 14 layouts
-(causal-only, Artifact-only and Worktree-only) and schema 15 are rejected before
-DDL/bootstrap. There is no version-only compatibility shortcut or migration.
+4 and at most 50 nonterminal Runs per root. Schema 16 is rejected because it
+can contain pre-redaction public Provider diagnostics. Earlier schema 14 layouts
+(causal-only, Artifact-only and Worktree-only) and schema 15 are also rejected
+before DDL/bootstrap. There is no version-only compatibility shortcut or migration.
 Artifacts trace causality through their producer Run; equal content in parent
 and child Runs shares a blob, not descriptor identity, authorization or a Run slot.
 Version 13 adds durable Worktree

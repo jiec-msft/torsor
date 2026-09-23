@@ -92,10 +92,7 @@ export interface ProviderExecutionContext {
   };
 }
 
-export interface ProviderExecutionResult {
-  readonly detail?: string;
-  readonly diagnosticSessionId?: string;
-}
+export type ProviderExecutionResult = Readonly<Record<never, never>>;
 
 export interface ProviderAdapter {
   readonly name: string;
@@ -106,22 +103,116 @@ export interface ProviderAdapter {
   ): Promise<ProviderExecutionResult>;
 }
 
+const providerDiagnosticSummaries = {
+  provider_cancelled: "Provider execution was cancelled.",
+  provider_cleanup_failed: "Provider process cleanup did not complete.",
+  provider_execution_failed: "Provider execution failed.",
+  provider_io_error: "Provider process I/O failed.",
+  provider_not_started:
+    "Provider execution did not start because authority expired.",
+  provider_output_limit: "Provider output exceeded a configured safety limit.",
+  provider_policy_violation: "Provider violated the configured capability policy.",
+  provider_process_exited: "Provider process exited before completion.",
+  provider_process_start_failed: "Provider process could not be started.",
+  provider_protocol_error: "Provider protocol validation failed.",
+  provider_recovered_failed: "Runtime recovered a failed provider attempt.",
+  provider_recovered_unknown:
+    "Runtime recovered an unfinished provider attempt.",
+  provider_runtime_monitor_failed:
+    "Runtime could not confirm provider execution authority.",
+  provider_stderr_limit:
+    "Provider diagnostic output exceeded a configured safety limit.",
+  provider_timeout: "Provider execution exceeded its allowed time.",
+  provider_worktree_execution_failed:
+    "Controlled Worktree execution did not complete.",
+  provider_worktree_authority_lost:
+    "Controlled Worktree publication authority was lost.",
+  provider_recovered_worktree_authority_lost:
+    "Runtime recovered an Activation after Worktree authority was lost.",
+} as const;
+
+export type ProviderDiagnosticCode = keyof typeof providerDiagnosticSummaries;
+
 export class ProviderExecutionError extends Error {
+  readonly diagnosticCode: ProviderDiagnosticCode;
+  readonly outcome: Extract<ProviderAttemptStatus, "Failed" | "Unknown">;
+
   constructor(
-    message: string,
-    public readonly outcome: Extract<
+    diagnosticCode: ProviderDiagnosticCode,
+    outcome: Extract<
       ProviderAttemptStatus,
       "Failed" | "Unknown"
     >,
   ) {
-    super(message);
+    const safeCode = isProviderDiagnosticCode(diagnosticCode)
+      ? diagnosticCode
+      : "provider_execution_failed";
+    const safeOutcome = outcome === "Unknown" ? "Unknown" : "Failed";
+    super(providerPublicDiagnostic(safeCode));
+    this.diagnosticCode = safeCode;
+    this.outcome = safeOutcome;
     this.name = "ProviderExecutionError";
   }
 }
 
 export class ProviderProtocolError extends ProviderExecutionError {
-  constructor(message: string) {
-    super(message, "Failed");
+  constructor(
+    _privateDetail?: string,
+    diagnosticCode: Extract<
+      ProviderDiagnosticCode,
+      | "provider_output_limit"
+      | "provider_policy_violation"
+      | "provider_protocol_error"
+    > = "provider_protocol_error",
+  ) {
+    super(diagnosticCode, "Failed");
     this.name = "ProviderProtocolError";
   }
+}
+
+export function normalizeProviderExecutionError(
+  error: unknown,
+  fallbackOutcome: Extract<
+    ProviderAttemptStatus,
+    "Failed" | "Unknown"
+  > = "Failed",
+): ProviderExecutionError {
+  let current = error;
+  const visited = new Set<unknown>();
+  for (let depth = 0; depth < 8 && !visited.has(current); depth += 1) {
+    if (current instanceof ProviderExecutionError) {
+      return new ProviderExecutionError(
+        current.diagnosticCode,
+        current.outcome,
+      );
+    }
+    visited.add(current);
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return new ProviderExecutionError(
+    "provider_execution_failed",
+    fallbackOutcome,
+  );
+}
+
+export function providerPublicDiagnostic(
+  code: ProviderDiagnosticCode,
+): string {
+  const safeCode = isProviderDiagnosticCode(code)
+    ? code
+    : "provider_execution_failed";
+  const detail = `${safeCode}: ${providerDiagnosticSummaries[safeCode]}`;
+  if (detail.length > 160) {
+    throw new Error(`Provider diagnostic ${safeCode} exceeds 160 characters.`);
+  }
+  return detail;
+}
+
+function isProviderDiagnosticCode(
+  value: unknown,
+): value is ProviderDiagnosticCode {
+  return (
+    typeof value === "string" &&
+    Object.prototype.hasOwnProperty.call(providerDiagnosticSummaries, value)
+  );
 }

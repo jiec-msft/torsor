@@ -180,7 +180,6 @@ export function mapProviderAttempt(row: Row): ProviderAttemptView {
     capabilitySnapshot: parseJson(row.capability_snapshot_json),
     runInputIds: parseStringArray(row.run_input_ids_json),
     requestIdempotencyKey: text(row.request_idempotency_key),
-    diagnosticSessionId: optionalText(row.diagnostic_session_id),
     status: text(row.status) as ProviderAttemptView["status"],
     detail: optionalText(row.detail),
     startedAt: text(row.started_at),
