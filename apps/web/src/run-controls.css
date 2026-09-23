@@ -1,0 +1,20 @@
+.run-controls {
+  padding: 12px;
+  border-top: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+
+.run-controls p {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.run-control-action {
+  margin-block: 12px;
+}
+
+.run-controls button {
+  min-height: 36px;
+  max-width: 100%;
+  white-space: normal;
+}
