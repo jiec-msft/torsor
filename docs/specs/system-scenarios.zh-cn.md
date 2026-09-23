@@ -9,6 +9,10 @@
 ```text
 Scenario -> Scripted Provider -> Agent Runtime -> Kernel/SQLite
          -> HTTP/SSE -> WebController -> Assertions
+
+Scenario -> Local Runtime Host -> trusted-local ACP Adapter
+         -> LocalWorktreeExecutor -> native process-tree owner
+         -> Kernel/SQLite -> HTTP/SSE -> WebController -> Assertions
 ```
 
 使用真实 Runtime、临时文件 SQLite、生产 HTTP/SSE 与无浏览器 WebController。
@@ -17,7 +21,8 @@ Scenario -> Scripted Provider -> Agent Runtime -> Kernel/SQLite
 不扩展其严格协议 DSL 为系统测试 DSL。
 
 **SS-1.2** 复用 `TorsorKernel.open`、`AgentRuntime`、
-`createTorsorHttpService` 的公开 shared-Kernel embedding API。
+`createTorsorHttpService`、`createLocalRuntimeHost`、`CopilotAcpAdapter` 与
+`LocalWorktreeExecutor` 的公开 API。
 Web 包公开 `@torsor/web/controller`，仅导出 headless controller、其选项、
 状态与事件源端口，不导出 React/App 私有实现。默认浏览器行为不变。
 测试不得深层导入其他包的 source/test 内部文件。
@@ -54,6 +59,12 @@ runner 同时控制 `performance.now()` 与应用 timer；磁盘或 CPU 延迟�
 完成真实认证 SSE handshake 并通知 Web `onopen`，等待其重连读取与 invalidation
 重试完成。不得伪造事件、重发命令或停留在 `connecting`/`reconnecting`。
 
+**SS-2.5** `runTrustedLocalScenario` 使用真实 Host/Runtime/Adapter/Worktree
+composition 和平台原生进程树 owner。Provider 是本包拥有的固定合成 ACP child，
+只使用一次性 Git fixture，不读取用户环境、登录配置、真实凭据或网络。
+场景可观察公开持久投影、公开 HTTP/SSE/Web 状态及该合成 child 自行写入的
+PID fixture；不得以 mock owner、fake Kernel 或预制成功结果替代生产路径。
+
 ## 3. 首批目录与派生方法
 
 **SS-3.1** 每个规则按正常路径、边界、重试/回放、打断/并发四个维度推导；
@@ -70,7 +81,8 @@ runner 同时控制 `performance.now()` 与应用 timer；磁盘或 CPU 延迟�
 | SS-3.5 | depth 4 可准入、5 拒绝；root 同时非终态上限 50，Waiting 占位，只有终态提交释放；释放后重试不重复准入且保持来源 | 25.1–25.2 |
 | SS-3.6 | 可信报告 digest、固化、重开和重试；相同字节在不同 Run 保留独立 descriptor；父子或兄弟不可互读，不存在与越界读取不可区分 | 21.3–21.5、23 |
 | SS-3.7 | 崩溃/重开保留已提交事实，不保留未提交工作；新 Runtime 只从持久输入继续，不需要长寿命 Agent 内存 | 20–21 |
-| SS-3.8 | schema 17 的公开 lease execution：旧 generation、fenced/expired 活进程不能发布变更、descriptor、成功活动或完成；新 generation 胜出，晚到输出拒绝/隔离，重启与 reconciliation 确定 | 21.5、22、24、38 |
+| SS-3.8 | schema 18 的公开 lease execution：旧 generation、fenced/expired 活进程不能发布变更、descriptor、成功活动或完成；新 generation 胜出，晚到输出拒绝/隔离，重启与 reconciliation 确定 | 21.5、22、24、38 |
+| SS-3.10 | 生产路径 trusted-local 生命周期：正常完成、Human cancel 后停止结果未知并隔离/恢复、独立 fencing 后取消且不误确认 delivery | 20.2、22、24、27、31.1、45 |
 
 **SS-3.8.1** 使用公开 `LocalWorktreeExecutor`，由 Human/Runtime 创建 Run，
 在合成 detached Git worktree 执行固定 `write-probe-v1` child。只有固定 digest、
@@ -103,14 +115,43 @@ provisioning、公开 executor 与窄 process controls；Git 使用隔离配置�
 
 **SS-3.9** 普通场景只查询公开投影；仅专门的 schema/crash 边界可检查
 数据库字节/布局或在事务内制造进程退出。普通 Provider 脚本不 mock Kernel。
-物理执行仅允许已批准的固定受控 tracer；不开放通用 ACP shell/write、
-Human Terminal、任意 host command、插件市场或宽泛文件系统接口。
+物理执行仅允许已批准的固定受控 tracer 与 SS-3.10 的合成 trusted-local ACP
+fixture；不开放 Human Terminal、任意外部 host command、插件市场或宽泛文件系统接口。
+
+**SS-3.10.1** 正常 trusted-local 场景必须经 `createLocalRuntimeHost`、
+真实 Runtime、`CopilotAcpAdapter`、`LocalWorktreeExecutor` 和平台原生 owner，
+在分配 Worktree 中实际写入文件并执行固定 Node test。最终证据必须同时包含
+`StopConfirmed`、绑定正确 ProviderAttempt/policy/permission mode 的 execution receipt、
+Completed Run/ProviderAttempt、公开 allowlisted Tool activity、HTTP/SSE/Web 一致投影，
+以及对应 delivery 已确认；原始 tool id、命令、路径、payload、session id 和私密
+Provider 文本不得进入公开证据。
+
+**SS-3.10.2** stubborn 合成 Provider 必须创建真实 descendant。Human cancel 使用
+极短 stop/force grace 形成没有原 handle close 证据的 `Uncertain`，Run 为 Cancelled，
+ProviderAttempt 为 Unknown，Worktree 保持 quarantine。场景独立确认
+Provider 与 descendant PID 均消失；确认前同目录 acquisition 必须以 `DomainBusy`
+拒绝。新建 executor 在同一 SQLite/root 上执行 `recover()` 后仍不得清除
+`Uncertain`、quarantine 或 replacement denial。
+
+**SS-3.10.3** 独立 Runtime 必须以执行时捕获的精确 live Writer authority 执行
+fence，随后 Human cancel。真实 owner 停止完整进程树；Host 必须传播稳定
+`provider_worktree_authority_lost`/`Unknown`，不得降格为成功或普通取消。
+重开后 Run 为 Cancelled、ProviderAttempt 为 Unknown、物理停止有确认，
+触发该执行的 delivery 仍未确认。只有独立 PID 消失证据成立后，场景才可按
+公开 quarantine token/revision/fencing 契约显式解除隔离。
+
+**SS-3.10.4** trusted-local 清理必须先关闭恢复 executor/Kernel，再关闭在线
+Controller/SSE/HTTP/Host，并独立等待已记录进程树消失。只有持久 stop receipt
+为 `StopConfirmed`/`ForceTerminated`，或场景已独立确认其全部 owned PID 消失，
+才可删除一次性目录。失败发生在物理停止确认前时，清理必须失败并保留明确目录，
+不得删除可能仍由 Writer 使用的 Worktree。
 
 ## 4. 速度、清理与证据
 
-**SS-4.1** 当前 main 场景包本地目标少于 10 秒；单个 in-process 场景通常
+**SS-4.1** 当前 main 的完整 16 场景包本地目标少于 20 秒；单个 in-process 场景通常
 少于 300 ms。这是测量目标，不是脆弱的逐测试 wall-clock 断言。
 重用同一测试进程但每场景隔离持久目录；只允许极少的 crash/物理边界启动 child。
+真实 trusted-local Host/ACP/Git/process-tree 场景是较慢的边界例外。
 提供 fresh Node process 重复命令，报告每轮总时间和测试计数；CI 可见。
 
 **SS-4.2** 即使断言失败也关闭 Controller、SSE、HTTP、Runtime 工作、
@@ -118,6 +159,7 @@ Provider gate、SQLite 与场景创建的临时目录。清理失败不能通过
 未消费的脚本错误、unhandled rejection、遗留 timer/handle/child 或生成状态
 均使测试失败。只清理本场景拥有的明确路径和进程，不扫描/终止其他进程。
 不采用强制成功退出掩盖泄漏；超时是失败 watchdog，不是调度机制。
+物理 Writer 停止未确认时必须保留其目录并报告清理失败。
 速度目标不作为 hosted runner 的失败 deadline：单测试 watchdog 为 60 秒，
 清理 hook 为 30 秒，fresh-process 外层 watchdog 为 120 秒。慢磁盘仍报告
 真实耗时和目标是否达到，不放宽任何领域断言或 SQLite durability。
@@ -132,8 +174,10 @@ loopback credential 每次在内存生成，禁止读取真实登录配置、环
 用户工作目录或外部服务。公开证据只记录测试名、计数、时间、公开 commit/CI
 引用，不发布临时绝对路径、token、进程环境或非公开材料。
 
-**SS-5.2** 延后真实模型/browser 测试、完整 ACP 协议覆盖、fuzzing、
+**SS-5.2** 延后真实外部模型/browser 测试、完整 ACP 协议覆盖、fuzzing、
 完整 Cartesian catalog、分布式多主机、通用虚拟时间框架、power-loss 保证和
 跨进程草稿恢复。本包不是 OS sandbox，不声称验证 LLM 理解或通用 exactly-once。
-可信本地真实 Agent 工作负载、通用进程树隔离及 shell/write 集成仍待后续切片；
-本目录只覆盖已集成的固定 `write-probe-v1`，不能替代该集成的最终独立审查。
+SS-3.10 已覆盖受支持 trusted-local 路径上的合成 ACP write/test 与实际 owned
+进程树生命周期，但不声称防御恶意本机 owner、主动逃离 owned tree 的 daemon、
+任意第三方 Provider 行为或外部 MCP/API exactly-once；这些边界遵循 Core §31.1，
+且不能替代最终 exact-head 独立审查。

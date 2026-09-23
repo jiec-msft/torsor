@@ -64,7 +64,7 @@ for (let round = 1; round <= rounds; round += 1) {
   const elapsedMs = Math.round(performance.now() - started);
   measurements.push(elapsedMs);
   console.log(JSON.stringify({
-    round, tests: result.numTotalTests, elapsedMs, targetMet: elapsedMs < 10_000,
+    round, tests: result.numTotalTests, elapsedMs, targetMet: elapsedMs < 20_000,
     scenarios: result.testResults.flatMap((file) => file.assertionResults.map((test) => ({
       name: test.fullName, elapsedMs: Math.round(test.duration ?? 0),
     }))),

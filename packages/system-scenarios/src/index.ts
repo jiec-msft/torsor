@@ -367,3 +367,9 @@ export async function runSystemScenario(
 }
 
 export type { SystemScenario, ScenarioClock, ScenarioGate };
+export {
+  runTrustedLocalScenario,
+  type TrustedLocalScenario,
+  type TrustedLocalProviderMode,
+  type TrustedLocalScenarioOptions,
+} from "./trusted-local.js";

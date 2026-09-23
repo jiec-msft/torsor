@@ -88,7 +88,23 @@ cleans both forms without removing still-shared directories.
 `expectRuntimeFailure(work, assertion)` consumes only the same tracked error
 confirmed by the assertion; other Provider assertions still fail the scenario.
 
-## Initial catalog
+## Production-path trusted-local scenarios
+
+`runTrustedLocalScenario` composes the real `createLocalRuntimeHost`, Runtime,
+`CopilotAcpAdapter`, `LocalWorktreeExecutor`, SQLite, HTTP/SSE, WebController,
+and Windows Job Object/Linux process-group owner. Its fixed synthetic ACP
+Provider only writes `native-result.txt` and runs a fixed Node test in a
+disposable Git Worktree, or creates an actual descendant for cancel/fence
+coverage. It reads no real Copilot credentials, user environment, or network.
+
+The three SS-3.10 scenarios cover normal completion, quarantine/recovery after
+an `Uncertain` stop, and `provider_worktree_authority_lost` plus no false
+delivery acknowledgement after independent fencing and Human cancellation.
+The PID fixture independently proves that only the owned Provider/descendant
+disappeared. If stop is unconfirmed, cleanup preserves the explicit temporary
+directory and fails rather than deleting a possibly active Worktree.
+
+## 16-scenario catalog
 
 | Specification | Scenario |
 |---|---|
@@ -101,21 +117,24 @@ confirmed by the assertion; other Provider assertions still fail the scenario.
 | SS-3.8.1 | Fixed-child normal stop, generation/fencing, trusted report and SSE completion |
 | SS-3.8.2 | Exact expiry, denial of all stale Writer publication, unknown-stop quarantine, late-close reconciliation |
 | SS-3.8.3 | Concurrent independent composition, isolated directory, new Run generation, rejected late output, repeated recovery |
+| SS-3.10.1 | Real Host/ACP/native-owner edit/test, receipt, Tool activity, and SSE/Web completion |
+| SS-3.10.2 | Human cancellation, real stubborn process tree, `Uncertain`/quarantine, fresh-executor recovery |
+| SS-3.10.3 | Exact live-authority fence, Human cancellation, authority loss, no false delivery acknowledgement |
 | SS-2.4 | Real SSE handshake without new events; initial connection, reconnect and reopen never resend commands |
 | SS-2.2/SS-3.8.4 | Explicit Runtime failure assertions cannot hide a distinct Provider assertion |
 | SS-4.2 | Successful cleanup and failure on an unknown live handle |
 
-Target the run phase below 10 seconds locally and ordinary in-process scenarios
+Target the complete 16-scenario run phase below 20 seconds locally and ordinary in-process scenarios
 below 300 ms. The real 50-Run cap, large pagination and Git/Worktree boundaries perform many
 durable transactions and are slower boundary exceptions; do not lower product
 defaults or disable SQLite durability to manufacture speed. Repeats report
 measurements rather than tight wall-clock assertions.
-A representative Windows/Node 24 three-round fresh-process run passed **13/13**
-each round in **9.151–9.548 seconds**, excluding builds; Worktree scenarios took
-about **0.56–1.18 seconds**. The outer process measures real monotonic time.
+The outer process measures real monotonic time.
 Hosted runners may be slower; CI logs retain each actual measurement.
 
-SS-3.8 now integrates schema-17 fixed `write-probe-v1`. Trusted-local real Agent
-workloads, general shell/write and cross-restart process-tree isolation remain
-unintegrated. Fake/fixed-process scenarios do not replace their production
-acceptance or the eventual independent exact-head review.
+SS-3.8 and SS-3.10 align with schema 18: the former retains the fixed
+deterministic tracer, while the latter covers synthetic ACP edit/test and an
+actual owned process tree through the supported trusted-local production path.
+This package is not a hostile-code sandbox, does not validate real-model quality
+or exactly-once external effects, and does not replace final exact-head
+independent review.

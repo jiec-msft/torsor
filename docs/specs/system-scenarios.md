@@ -9,6 +9,10 @@
 ```text
 Scenario -> Scripted Provider -> Agent Runtime -> Kernel/SQLite
          -> HTTP/SSE -> WebController -> Assertions
+
+Scenario -> Local Runtime Host -> trusted-local ACP Adapter
+         -> LocalWorktreeExecutor -> native process-tree owner
+         -> Kernel/SQLite -> HTTP/SSE -> WebController -> Assertions
 ```
 
 Use the real Runtime, temporary file-backed SQLite, production HTTP/SSE and
@@ -17,8 +21,9 @@ package, never a production dependency. `@torsor/acp-conformance` independently
 tests ACP v1; neither harness depends on the other, and its strict protocol DSL
 must not become a system-test DSL.
 
-**SS-1.2** Reuse public `TorsorKernel.open`, `AgentRuntime` and
-`createTorsorHttpService` shared-Kernel embedding APIs. The web package exposes
+**SS-1.2** Reuse public `TorsorKernel.open`, `AgentRuntime`,
+`createTorsorHttpService`, `createLocalRuntimeHost`, `CopilotAcpAdapter` and
+`LocalWorktreeExecutor` APIs. The web package exposes
 `@torsor/web/controller`: only the headless controller, options, state and event
 source port, not React/App internals. Default browser behavior is unchanged.
 Tests must not deep-import another package's source/test internals.
@@ -64,6 +69,14 @@ high-water cursor, `sync()` still completes a real authenticated SSE handshake,
 notifies Web `onopen`, and awaits reconnect reads and invalidation retries.
 Never fabricate events, resend commands, or leave Web `connecting`/`reconnecting`.
 
+**SS-2.5** `runTrustedLocalScenario` uses the real Host/Runtime/Adapter/Worktree
+composition and platform-native process-tree owner. Its Provider is a fixed
+synthetic ACP child owned by this package and uses only a disposable Git fixture;
+it never reads user environment, login configuration, real credentials or the
+network. Scenarios may observe public durable projections, public HTTP/SSE/Web
+state, and the PID fixture written by that synthetic child. A mock owner, fake
+Kernel or precomputed success result must not replace the production path.
+
 ## 3. Initial catalog and derivation
 
 **SS-3.1** Derive each rule along normal path, boundary, retry/replay and
@@ -81,7 +94,8 @@ numbers trace implementation and tests; domain semantics come from the paired
 | SS-3.5 | Depth 4 admitted, 5 rejected; root nonterminal cap 50 includes Waiting and releases only on terminal commit. Retry after release admits once with unchanged provenance | 25.1–25.2 |
 | SS-3.6 | Trusted report digest, finalization, reopen and retry; equal bytes in different Runs retain independent descriptors; parent/child or sibling isolation, indistinguishable absent/out-of-scope reads | 21.3–21.5, 23 |
 | SS-3.7 | Crash/reopen preserves committed facts, not uncommitted work; a fresh Runtime continues from durable inputs without long-lived Agent memory | 20–21 |
-| SS-3.8 | Public schema-17 lease execution: old-generation/fenced/expired live processes cannot publish mutations, descriptors, success activity or completion; new generation wins, late output is rejected/quarantined, restart/reconciliation is deterministic | 21.5, 22, 24, 38 |
+| SS-3.8 | Public schema-18 lease execution: old-generation/fenced/expired live processes cannot publish mutations, descriptors, success activity or completion; new generation wins, late output is rejected/quarantined, restart/reconciliation is deterministic | 21.5, 22, 24, 38 |
+| SS-3.10 | Production-path trusted-local lifecycle: normal completion, Human cancellation with unknown stop/quarantine/recovery, and independent fencing followed by cancellation without false delivery acknowledgement | 20.2, 22, 24, 27, 31.1, 45 |
 
 **SS-3.8.1** Use public `LocalWorktreeExecutor`, with Human/Runtime Run creation,
 to execute the fixed `write-probe-v1` child in a synthetic detached Git worktree.
@@ -124,15 +138,54 @@ cancels monitor/grace/retry timers before closing SQLite, including failure path
 **SS-3.9** Ordinary assertions use public projections. Only dedicated
 schema/crash boundaries may inspect database bytes/layout or terminate inside a
 transaction. Ordinary Provider scripts do not mock Kernel. Physical execution
-permits only the approved fixed controlled tracer: no general ACP shell/write,
-Human Terminal, arbitrary host commands, marketplace or broad filesystem APIs.
+permits only the approved fixed controlled tracer and the SS-3.10 synthetic
+trusted-local ACP fixture: no Human Terminal, arbitrary external host commands,
+marketplace or broad filesystem APIs.
+
+**SS-3.10.1** The normal trusted-local scenario must pass through
+`createLocalRuntimeHost`, the real Runtime, `CopilotAcpAdapter`,
+`LocalWorktreeExecutor`, and the platform-native owner, actually writing a file
+and running a fixed Node test in the assigned Worktree. Final evidence must
+include `StopConfirmed`, an execution receipt bound to the correct
+ProviderAttempt/policy/permission mode, Completed Run and ProviderAttempt,
+public allowlisted Tool activity, consistent HTTP/SSE/Web projections, and
+acknowledged delivery. Raw tool ids, commands, paths, payloads, session ids and
+private Provider text must not enter public evidence.
+
+**SS-3.10.2** A stubborn synthetic Provider must create a real descendant.
+Human cancellation uses very short stop/force grace to produce `Uncertain`
+without original-handle close evidence. The Run is Cancelled, ProviderAttempt
+Unknown, and the Worktree remains quarantined. The scenario
+independently confirms both Provider and descendant PIDs disappear. Before that
+confirmation, same-directory acquisition must fail with `DomainBusy`. A fresh
+executor running `recover()` against the same SQLite/root must not clear
+`Uncertain`, quarantine, or replacement denial.
+
+**SS-3.10.3** An independent Runtime must fence using the exact live Writer
+authority captured for the execution, followed by Human cancellation. The real
+owner stops the complete process tree; the Host must propagate stable
+`provider_worktree_authority_lost`/`Unknown`, never success or ordinary
+cancellation. After reopen, the Run is Cancelled, ProviderAttempt Unknown,
+physical stop is confirmed, and delivery that triggered the execution remains
+unacknowledged. The scenario may explicitly resolve quarantine through the
+public token/revision/fencing contract only after independent PID-disappearance
+evidence.
+
+**SS-3.10.4** Trusted-local cleanup closes any recovery executor/Kernel first,
+then online Controller/SSE/HTTP/Host, and independently waits for recorded
+process-tree PIDs to disappear. It may delete the disposable directory only
+when the durable stop receipt is `StopConfirmed`/`ForceTerminated`, or the
+scenario independently confirmed every owned PID disappeared. A failure before
+physical stop confirmation must fail cleanup and preserve the explicit
+directory, never delete a Worktree that a Writer may still use.
 
 ## 4. Speed, cleanup and evidence
 
-**SS-4.1** Target the current-main package below 10 seconds locally and individual
+**SS-4.1** Target the complete current-main 16-scenario package below 20 seconds locally and individual
 in-process scenarios normally below 300 ms. These are measured goals, not brittle
 per-test wall-clock assertions. Reuse a test process with isolated persistent
 directories; only a tiny crash/physical boundary subset may spawn children.
+Real trusted-local Host/ACP/Git/process-tree scenarios are slower boundary exceptions.
 Provide a fresh-Node-process repeat command reporting per-round elapsed time
 and test counts, visible in CI.
 
@@ -142,6 +195,7 @@ Unconsumed script errors, unhandled rejections, leftover timers/handles/children
 or generated state fail. Clean only explicitly owned paths/processes, never
 scan/terminate unrelated processes. Do not force successful exit to hide leaks;
 timeouts are failure watchdogs, not scheduling.
+Preserve the directory and fail cleanup whenever physical Writer stop is unconfirmed.
 Performance goals are not hosted-runner failure deadlines: use a 60-second
 per-test watchdog, 30 seconds for cleanup hooks, and a 120-second outer
 fresh-process watchdog. Slow disks still report actual timings and whether
@@ -159,10 +213,13 @@ environment secrets, user workspaces or external services. Public evidence
 contains only test names/counts/times and public commit/CI references, not
 temporary absolute paths, tokens, process environments or non-public material.
 
-**SS-5.2** Defer real-model/browser tests, complete ACP coverage, fuzzing, the full
+**SS-5.2** Defer real external-model/browser tests, complete ACP coverage, fuzzing, the full
 Cartesian catalog, distributed multi-host operation, a general virtual-time framework,
 power-loss guarantees and cross-process draft recovery. This is not an OS
 sandbox and does not prove LLM understanding or generic exactly-once delivery.
-Trusted-local real Agent workloads, general process-tree containment and shell/write
-integration remain deferred. This catalog covers only integrated `write-probe-v1`,
-not the eventual independent final review of that broader integration.
+SS-3.10 covers synthetic ACP write/test and an actual owned process-tree
+lifecycle on the supported trusted-local path. It does not claim defense against
+a malicious local owner, daemons deliberately escaping the owned tree, arbitrary
+third-party Provider behavior, or exactly-once external MCP/API effects. Those
+boundaries follow Core section 31.1 and do not replace final exact-head
+independent review.

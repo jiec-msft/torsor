@@ -79,7 +79,20 @@ executor 再开放 HTTP；原实例可仍持有旧 process handle。每个 compo
 不能删除仍共享的目录。`expectRuntimeFailure(work, assertion)` 只消费断言确认的
 同一个已跟踪错误，其他 Provider assertion 仍使场景失败。
 
-## 首批场景
+## 生产路径 trusted-local 场景
+
+`runTrustedLocalScenario` 组合真实 `createLocalRuntimeHost`、Runtime、
+`CopilotAcpAdapter`、`LocalWorktreeExecutor`、SQLite、HTTP/SSE、WebController
+和 Windows Job Object/Linux process-group owner。固定合成 ACP Provider 只在一次性
+Git Worktree 中写入 `native-result.txt`、执行固定 Node test，或创建用于
+cancel/fence 的实际 descendant；不读取真实 Copilot 凭据、用户环境或网络。
+
+三个 SS-3.10 场景分别验证正常完成、`Uncertain` 停止后的 quarantine/recovery，
+以及独立 fencing 后 Human cancel 的 `provider_worktree_authority_lost` 和
+delivery 不误确认。PID fixture 仅用于独立证明本场景拥有的 Provider/descendant
+已消失。停止未确认时清理保留明确临时目录并失败，不会删除可能仍在写入的 Worktree。
+
+## 16 个场景
 
 | 规格 | 场景 |
 |---|---|
@@ -92,17 +105,19 @@ executor 再开放 HTTP；原实例可仍持有旧 process handle。每个 compo
 | SS-3.8.1 | 固定 child 正常停止、generation/fencing、可信报告及 SSE completion |
 | SS-3.8.2 | 精确 expiry、所有旧 Writer publication 拒绝、未知停止隔离、晚到 close reconciliation |
 | SS-3.8.3 | 独立 composition 并发接管、独立目录、新 Run generation、晚到旧输出拒绝、重复恢复 |
+| SS-3.10.1 | 真实 Host/ACP/native owner 正常 edit/test、receipt、Tool activity、SSE/Web completion |
+| SS-3.10.2 | Human cancel、真实 stubborn process tree、`Uncertain`/quarantine、fresh-executor recovery |
+| SS-3.10.3 | 精确 live-authority fence、Human cancel、authority-lost、无 false delivery acknowledgement |
 | SS-2.4 | 无新事件时仍完成真实 SSE handshake；初始连接、重连与重开不重发命令 |
 | SS-2.2/SS-3.8.4 | 显式 Runtime 失败断言不掩盖独立 Provider assertion |
 | SS-4.2 | 清理成功路径及未知活跃 handle 的失败路径 |
 
-本地目标为运行阶段少于 10 秒；普通 in-process 场景目标少于 300 ms。
+完整 16 场景本地目标为运行阶段少于 20 秒；普通 in-process 场景目标少于 300 ms。
 真实 50-Run cap、大分页和 Git/Worktree 边界有大量持久事务，是较慢的例外；不减小产品默认
 阈值、不关闭 SQLite 持久性来伪造速度。重复命令输出实际值而非紧 wall-clock 断言。
-Windows/Node 24 的一次三轮 fresh-process 测量为每轮 **13/13**，
-**9.151–9.548 秒**（不含构建）；Worktree 场景约 **0.56–1.18 秒**。
 外层进程使用真实单调时钟，hosted runner 可能更慢；CI 日志保留每轮实际值。
 
-SS-3.8 已集成 schema 17 的固定 `write-probe-v1`。可信本地真实 Agent 工作负载、
-通用 shell/write 和跨重启进程树隔离仍未集成；不以 fake/fixed process 场景替代
-这些能力的生产验收或最终 exact-head 独立审查。
+SS-3.8 与 SS-3.10 对齐 schema 18：前者保留固定 deterministic tracer，后者覆盖
+受支持 trusted-local 生产路径的合成 ACP edit/test 与实际 owned process tree。
+本包不是 hostile-code sandbox，不验证真实模型质量或外部副作用 exactly-once，
+也不替代最终 exact-head 独立审查。
