@@ -115,8 +115,8 @@ describe("trusted-local Runtime integration", () => {
     const f = await setup("hang");
     const toolStarted = deferred<string>();
     const execute = f.kernel.execute.bind(f.kernel);
-    vi.spyOn(f.kernel, "execute").mockImplementation(async (command, context) => {
-      const result = await execute(command, context);
+    vi.spyOn(f.kernel, "execute").mockImplementation(async (command, context, operationContext) => {
+      const result = await execute(command, context, operationContext);
       if (command.type === "AppendRunActivity" && command.kind === "tool_started") {
         toolStarted.resolve(command.runId);
       }
@@ -174,8 +174,8 @@ describe("trusted-local Runtime integration", () => {
       },
     }));
     const execute = f.kernel.execute.bind(f.kernel);
-    vi.spyOn(f.kernel, "execute").mockImplementation(async (command, context) => {
-      const result = await execute(command, context);
+    vi.spyOn(f.kernel, "execute").mockImplementation(async (command, context, operationContext) => {
+      const result = await execute(command, context, operationContext);
       if (command.type === "AppendRunActivity" && command.kind === "tool_started") toolStarted.resolve();
       return result;
     });

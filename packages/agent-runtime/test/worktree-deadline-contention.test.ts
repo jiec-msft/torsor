@@ -23,8 +23,8 @@ describe("nonblocking physical supervision with production SQLite timeout (MVP 2
       const forces = [vi.fn(), vi.fn()];
       const deadlines: number[] = [];
       const execute = kernel.execute.bind(kernel);
-      vi.spyOn(kernel, "execute").mockImplementation(async (command, context) => {
-        const result = await execute(command, context);
+      vi.spyOn(kernel, "execute").mockImplementation(async (command, context, operationContext) => {
+        const result = await execute(command, context, operationContext);
         if (command.type === "AcquireWorktreeWriterLease") deadlines.push(Date.parse(result.leaseExpiresAt!));
         return result;
       });

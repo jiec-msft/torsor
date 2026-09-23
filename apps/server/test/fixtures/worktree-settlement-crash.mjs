@@ -11,8 +11,8 @@ const executor = new LocalWorktreeExecutor({ kernel, runtimePrincipalId: "runtim
 let sourceActivation;
 let admission;
 const execute = kernel.execute.bind(kernel);
-kernel.execute = async (command, context) => {
-  const result = await execute(command, context);
+kernel.execute = async (command, context, operationContext) => {
+  const result = await execute(command, context, operationContext);
   if (command.type === "StartProviderAttempt" && command.outboxEventId) {
     admission = { outboxEventId: command.outboxEventId, outboxLeaseToken: command.outboxLeaseToken };
   }

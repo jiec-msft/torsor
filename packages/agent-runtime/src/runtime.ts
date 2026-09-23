@@ -1,11 +1,20 @@
 import { randomUUID } from "node:crypto";
 
 import {
+  createOpaqueId,
+  type OperationalErrorCode,
+  type OperationalEventInput,
+  type OperationalLogger,
+  type OperationalOutcome,
+} from "@torsor/operational-logging";
+import {
   KernelError,
   type ActivationAttemptView,
   type AttentionView,
   type BootstrapAgent,
   type JsonValue,
+  type KernelOperationContext,
+  type OperationalCorrelationEntityType,
   type OutboxEventView,
   type ProviderAttemptStatus,
   type RecoverableAttentionExecutionView,
@@ -87,6 +96,7 @@ export interface AgentRuntimeOptions {
   readonly clock?: () => Date;
   readonly hooks?: AgentRuntimeHooks;
   readonly worktreeExecutor?: WorktreeExecutor;
+  readonly operationalLogger?: OperationalLogger;
 }
 
 export interface RuntimePassResult {
@@ -137,6 +147,7 @@ export class AgentRuntime {
   readonly #clock: () => Date;
   readonly #hooks: AgentRuntimeHooks;
   readonly #worktreeExecutor: WorktreeExecutor | undefined;
+  readonly #operationalLogger: OperationalLogger | undefined;
   readonly #agents = new Map<string, BootstrapAgent>();
   readonly #attentionProjectDiscoveryContinuations = new Map<
     string,
@@ -165,6 +176,7 @@ export class AgentRuntime {
     this.#clock = options.clock ?? (() => new Date());
     this.#hooks = options.hooks ?? {};
     this.#worktreeExecutor = options.worktreeExecutor;
+    this.#operationalLogger = options.operationalLogger;
     requireIntegerAtLeast(
       this.#attentionLeaseMs,
       1,
@@ -484,6 +496,8 @@ export class AgentRuntime {
     attention: AttentionView,
     agent: BootstrapAgent,
   ): Promise<AttentionDispatchResult> {
+    const correlationId = await this.#operationalCorrelation("Attention", attention.id);
+    const operationContext = this.#operationContext(correlationId);
     if (await this.#hasEarlierOpenAttention(attention)) {
       return "blocked";
     }
@@ -499,6 +513,7 @@ export class AgentRuntime {
           leaseDurationMs: this.#attentionLeaseMs,
         },
         this.#runtimeContext,
+        operationContext,
       );
     } catch (error) {
       if (error instanceof KernelError && error.code === "DomainBusy") {
@@ -597,6 +612,7 @@ export class AgentRuntime {
       authorityLeaseExpiresAt: leaseExpiresAt,
       runInputIds: [],
       requestIdempotencyKey: `attention:${attention.id}:${handlerLeaseToken}`,
+      correlationId,
     });
     return providerStarted ? "dispatched" : "blocked";
   }
@@ -698,6 +714,8 @@ export class AgentRuntime {
       event.payload,
       "runInputId",
     );
+    const correlationId = await this.#operationalCorrelation("RunInput", triggeringInputId);
+    const operationContext = this.#operationContext(correlationId);
     if (
       !projection.inputs.some(
         (input) =>
@@ -744,6 +762,7 @@ export class AgentRuntime {
             currentProjection,
             event,
             priorAttempt.status,
+            operationContext,
           );
         }
         await this.#reconcileRunProjection(currentProjection);
@@ -763,6 +782,7 @@ export class AgentRuntime {
             currentProjection,
             event,
             "Unknown",
+            operationContext,
           );
           await this.#reconcileRunProjection(currentProjection);
         } else {
@@ -802,6 +822,7 @@ export class AgentRuntime {
           ),
         },
         this.#runtimeContext,
+        operationContext,
       );
       currentProjection = await this.#kernel.query(
         { type: "GetRunProjection", runId: currentProjection.run.id },
@@ -857,6 +878,7 @@ export class AgentRuntime {
           outcome: "Completed",
           detail: "The outbox wake-up had no Pending RunInput to deliver.",
         },
+        operationContext,
       );
       return true;
     }
@@ -869,6 +891,7 @@ export class AgentRuntime {
       authorityLeaseExpiresAt,
       runInputIds: deliveryInputIds,
       requestIdempotencyKey,
+      correlationId,
     });
   }
 
@@ -883,7 +906,10 @@ export class AgentRuntime {
     readonly authorityLeaseExpiresAt: string;
     readonly runInputIds: readonly string[];
     readonly requestIdempotencyKey: string;
+    readonly correlationId: string;
   }): Promise<boolean> {
+    const executionStartedAt = performance.now();
+    const operationContext = this.#operationContext(input.correlationId);
     const policy = input.cause.type === "attention"
       ? resolveProviderPolicy()
       : parseProviderPolicy(this.#adapter.policy ?? resolveProviderPolicy());
@@ -896,7 +922,7 @@ export class AgentRuntime {
       nativeHandle.assertPublication();
     };
     if (this.#stopped || this.#providerExecutionBudget(input.authorityLeaseExpiresAt) <= 0) {
-      await this.#finishActivationBeforeProvider(input.activationId);
+      await this.#finishActivationBeforeProvider(input.activationId, operationContext);
       return false;
     }
     const admissionCommand = {
@@ -918,7 +944,24 @@ export class AgentRuntime {
     const attempt = await this.#kernel.execute(
       admissionCommand,
       this.#runtimeContext,
+      operationContext,
     );
+    await this.#logOperational({
+      event: "runtime.activation",
+      outcome: "started",
+      correlationId: input.correlationId,
+      ...(input.cause.type === "run" ? { runId: input.cause.run.run.id } : {}),
+      activationId: input.activationId,
+      providerAttemptId: attempt.entityId,
+    });
+    await this.#logOperational({
+      event: "runtime.provider_attempt",
+      outcome: "started",
+      correlationId: input.correlationId,
+      ...(input.cause.type === "run" ? { runId: input.cause.run.run.id } : {}),
+      activationId: input.activationId,
+      providerAttemptId: attempt.entityId,
+    });
     await this.#hooks.afterProviderAttemptStarted?.({
       activationId: input.activationId,
       providerAttemptId: attempt.entityId,
@@ -968,6 +1011,7 @@ export class AgentRuntime {
           latest,
           input.outboxEvent,
           existingStatus,
+          operationContext,
         );
         await this.#reconcileRunProjection(latest);
       } else {
@@ -982,6 +1026,7 @@ export class AgentRuntime {
             agent: input.agent,
             activationId: input.activationId,
             providerAttemptId: attempt.entityId,
+            correlationId: input.correlationId,
             causeType: "attention",
             attention: input.cause.attention,
             attentionRevision: input.attentionRevision!,
@@ -993,6 +1038,7 @@ export class AgentRuntime {
             agent: input.agent,
             activationId: input.activationId,
             providerAttemptId: attempt.entityId,
+            correlationId: input.correlationId,
             causeType: "run",
             projection: input.cause.run,
             assertPublication,
@@ -1000,6 +1046,7 @@ export class AgentRuntime {
     const admission = await this.#kernel.execute(
       admissionCommand,
       this.#runtimeContext,
+      operationContext,
     );
     if (admission.entityId !== attempt.entityId) {
       throw new Error(
@@ -1023,8 +1070,18 @@ export class AgentRuntime {
         idempotencyKey: `${attempt.entityId}:lease-budget-exhausted`,
         status: "Failed",
         detail: PROVIDER_NOT_STARTED_DETAIL,
+      }, operationContext);
+      await this.#logOperational({
+        event: "runtime.provider_attempt",
+        outcome: "failed",
+        correlationId: input.correlationId,
+        ...(input.cause.type === "run" ? { runId: input.cause.run.run.id } : {}),
+        activationId: input.activationId,
+        providerAttemptId: attempt.entityId,
+        errorCode: "provider_not_started",
+        durationMs: performance.now() - executionStartedAt,
       });
-      await this.#finishActivationBeforeProvider(input.activationId);
+      await this.#finishActivationBeforeProvider(input.activationId, operationContext);
       return false;
     }
     const controller = new AbortController();
@@ -1068,7 +1125,8 @@ export class AgentRuntime {
                 nativeStartRequested = true;
                 nativeLaunch = this.#worktreeExecutor.startProvider({
                   runId: input.cause.run.run.id, activationId: input.activationId,
-                  providerAttemptId: attempt.entityId, policy, start,
+                  providerAttemptId: attempt.entityId, correlationId: input.correlationId,
+                  policy, start,
                   ...(nativeRunCancellation
                     ? { cancellationInterruption: nativeRunCancellation }
                     : {}),
@@ -1108,6 +1166,15 @@ export class AgentRuntime {
         providerAttemptId: attempt.entityId,
         idempotencyKey: `${attempt.entityId}:completed`,
         status: "Completed",
+      }, operationContext);
+      await this.#logOperational({
+        event: "runtime.provider_attempt",
+        outcome: "succeeded",
+        correlationId: input.correlationId,
+        ...(input.cause.type === "run" ? { runId: input.cause.run.run.id } : {}),
+        activationId: input.activationId,
+        providerAttemptId: attempt.entityId,
+        durationMs: performance.now() - executionStartedAt,
       });
       if (input.cause.type === "run") {
         await this.#kernel.execute(
@@ -1118,7 +1185,29 @@ export class AgentRuntime {
             outcome: "Completed",
           },
           this.#runtimeContext,
+          operationContext,
         );
+        await this.#logOperational({
+          event: "runtime.activation",
+          outcome: "succeeded",
+          correlationId: input.correlationId,
+          runId: input.cause.run.run.id,
+          activationId: input.activationId,
+          providerAttemptId: attempt.entityId,
+          durationMs: performance.now() - executionStartedAt,
+        });
+        if (bridge.terminalAction === "complete" || bridge.terminalAction === "fail") {
+          await this.#logOperational({
+            event: "runtime.run_terminal",
+            outcome: bridge.terminalAction === "complete" ? "succeeded" : "failed",
+            correlationId: input.correlationId,
+            runId: input.cause.run.run.id,
+            activationId: input.activationId,
+            providerAttemptId: attempt.entityId,
+            ...(bridge.terminalAction === "fail" ? { errorCode: "run_failed" } : {}),
+            durationMs: performance.now() - executionStartedAt,
+          });
+        }
       }
       return true;
     } catch (error) {
@@ -1231,15 +1320,25 @@ export class AgentRuntime {
           idempotencyKey: `${attempt.entityId}:unknown`,
           status: "Unknown",
           detail: providerError.message,
-        });
+        }, operationContext);
       } else {
         await this.#settleProviderAttempt({
           providerAttemptId: attempt.entityId,
           idempotencyKey: `${attempt.entityId}:failed`,
           status: "Failed",
           detail: providerError.message,
-        });
+        }, operationContext);
       }
+      await this.#logOperational({
+        event: "runtime.provider_attempt",
+        outcome: providerError.outcome === "Unknown" ? "unknown" : "failed",
+        correlationId: input.correlationId,
+        ...(input.cause.type === "run" ? { runId: input.cause.run.run.id } : {}),
+        activationId: input.activationId,
+        providerAttemptId: attempt.entityId,
+        errorCode: providerError.diagnosticCode,
+        durationMs: performance.now() - executionStartedAt,
+      });
       if (input.cause.type === "run" || !bridge.attentionDecision) {
         await this.#kernel.execute(
           {
@@ -1250,11 +1349,34 @@ export class AgentRuntime {
             detail: providerError.message,
           },
           this.#runtimeContext,
+          operationContext,
         );
       }
       // A committed Human cancellation is handled work, not a successful
       // Provider attempt and not a reason to tear down the observation Host.
-      if (cancelledNativeRun) return true;
+      if (cancelledNativeRun) {
+        await this.#logOperational({
+          event: "runtime.run_terminal",
+          outcome: "cancelled",
+          correlationId: input.correlationId,
+          ...(input.cause.type === "run" ? { runId: input.cause.run.run.id } : {}),
+          activationId: input.activationId,
+          providerAttemptId: attempt.entityId,
+          errorCode: "run_cancelled",
+          durationMs: performance.now() - executionStartedAt,
+        });
+        return true;
+      }
+      await this.#logOperational({
+        event: "runtime.activation",
+        outcome: providerError.outcome === "Unknown" ? "unknown" : "failed",
+        correlationId: input.correlationId,
+        ...(input.cause.type === "run" ? { runId: input.cause.run.run.id } : {}),
+        activationId: input.activationId,
+        providerAttemptId: attempt.entityId,
+        errorCode: providerError.diagnosticCode,
+        durationMs: performance.now() - executionStartedAt,
+      });
       throw providerError;
     } finally {
       worktreeScopeOpen = false;
@@ -1401,6 +1523,7 @@ export class AgentRuntime {
 
   async #finishActivationBeforeProvider(
     activationId: string,
+    operationContext: KernelOperationContext,
   ): Promise<void> {
     await this.#kernel.execute(
       {
@@ -1411,6 +1534,7 @@ export class AgentRuntime {
         detail: PROVIDER_NOT_STARTED_DETAIL,
       },
       this.#runtimeContext,
+      operationContext,
     );
   }
 
@@ -1432,7 +1556,7 @@ export class AgentRuntime {
     readonly idempotencyKey: string;
     readonly status: "Completed" | "Failed" | "Unknown";
     readonly detail?: string;
-  }): Promise<ProviderAttemptStatus> {
+  }, operationContext?: KernelOperationContext): Promise<ProviderAttemptStatus> {
     try {
       if (input.status === "Failed") {
         await this.#kernel.execute(
@@ -1443,6 +1567,7 @@ export class AgentRuntime {
             error: input.detail ?? "Provider execution failed.",
           },
           this.#runtimeContext,
+          operationContext,
         );
       } else {
         await this.#kernel.execute(
@@ -1454,6 +1579,7 @@ export class AgentRuntime {
             ...(input.detail === undefined ? {} : { detail: input.detail }),
           },
           this.#runtimeContext,
+          operationContext,
         );
       }
       return input.status;
@@ -1481,6 +1607,16 @@ export class AgentRuntime {
     if (!attempt || isTerminalProviderStatus(attempt.status)) {
       return;
     }
+    const correlationId = await this.#operationalCorrelation("ProviderAttempt", attempt.id);
+    const operationContext = this.#operationContext(correlationId);
+    await this.#logOperational({
+      event: "recovery.pass",
+      outcome: "started",
+      correlationId,
+      runId: projection.run.id,
+      activationId,
+      providerAttemptId: attempt.id,
+    });
     await this.#kernel.execute(
       {
         type: "FinishProviderAttempt",
@@ -1490,6 +1626,7 @@ export class AgentRuntime {
         detail: PROVIDER_RECOVERED_UNKNOWN_DETAIL,
       },
       this.#runtimeContext,
+      operationContext,
     );
     const activation = requireActivation(projection, activationId);
     if (activation.finishedAt === null) {
@@ -1502,14 +1639,24 @@ export class AgentRuntime {
           detail: PROVIDER_RECOVERED_UNKNOWN_DETAIL,
         },
         this.#runtimeContext,
+        operationContext,
       );
     }
+    await this.#logOperational({
+      event: "recovery.pass",
+      outcome: "succeeded",
+      correlationId,
+      runId: projection.run.id,
+      activationId,
+      providerAttemptId: attempt.id,
+    });
   }
 
   async #parkRunAfterDeliveryFailure(
     projection: RunProjection,
     event: OutboxEventView,
     status: "Failed" | "Unknown",
+    operationContext: KernelOperationContext,
   ): Promise<void> {
     const attempt = projection.providerAttempts
       .filter(
@@ -1543,15 +1690,25 @@ export class AgentRuntime {
             : "Provider delivery failed and requires explicit resumption.",
       },
       this.#runtimeContext,
+      operationContext,
     );
     await this.#hooks.afterFailureParking?.(hookInput);
   }
 
   async #reconcileRunProjection(projection: RunProjection): Promise<void> {
+    const correlationId = await this.#operationalCorrelation("Run", projection.run.id);
+    const operationContext = this.#operationContext(correlationId);
     for (const activation of projection.activations) {
       if (activation.finishedAt !== null) {
         continue;
       }
+      await this.#logOperational({
+        event: "recovery.pass",
+        outcome: "started",
+        correlationId,
+        runId: projection.run.id,
+        activationId: activation.id,
+      });
       const attempt = projection.providerAttempts.find(
         (candidate) => candidate.activationId === activation.id,
       );
@@ -1576,6 +1733,7 @@ export class AgentRuntime {
             detail: PROVIDER_RECOVERED_UNKNOWN_DETAIL,
           },
           this.#runtimeContext,
+          operationContext,
         );
         detail = PROVIDER_RECOVERED_UNKNOWN_DETAIL;
       }
@@ -1588,7 +1746,16 @@ export class AgentRuntime {
           outcome,
           detail,
         },
+        operationContext,
       );
+      await this.#logOperational({
+        event: "recovery.pass",
+        outcome: "succeeded",
+        correlationId,
+        runId: projection.run.id,
+        activationId: activation.id,
+        ...(attempt ? { providerAttemptId: attempt.id } : {}),
+      });
     }
   }
 
@@ -1598,9 +1765,9 @@ export class AgentRuntime {
     readonly activationId: string;
     readonly outcome: "Completed" | "Failed" | "Expired";
     readonly detail: string;
-  }): Promise<void> {
+  }, operationContext?: KernelOperationContext): Promise<void> {
     try {
-      await this.#kernel.execute(command, this.#runtimeContext);
+      await this.#kernel.execute(command, this.#runtimeContext, operationContext);
     } catch (error) {
       if (!(error instanceof KernelError && error.code === "WriterAuthorityLost") ||
           command.outcome !== "Completed") throw error;
@@ -1614,7 +1781,7 @@ export class AgentRuntime {
           detail: providerPublicDiagnostic(
             "provider_recovered_worktree_authority_lost",
           ),
-        }, this.#runtimeContext);
+        }, this.#runtimeContext, operationContext);
       } catch (settlementError) {
         if (!(settlementError instanceof KernelError && settlementError.code === "Conflict" &&
             settlementError.message === "The Activation is already finished.")) throw settlementError;
@@ -1694,6 +1861,17 @@ export class AgentRuntime {
     execution: RecoverableAttentionExecutionView,
     recoveryRevision: number,
   ): Promise<number> {
+    const correlationId = await this.#operationalCorrelation(
+      "Attention",
+      execution.attention.id,
+    );
+    const operationContext = this.#operationContext(correlationId);
+    await this.#logOperational({
+      event: "recovery.pass",
+      outcome: "started",
+      correlationId,
+      activationId: execution.activation.id,
+    });
     let recoveries = 0;
     let outcome: "Completed" | "Failed" | "Expired" = "Expired";
     let detail = PROVIDER_RECOVERED_UNKNOWN_DETAIL;
@@ -1741,6 +1919,7 @@ export class AgentRuntime {
             detail,
           },
           this.#runtimeContext,
+          operationContext,
         );
       } catch (error) {
         if (!(error instanceof KernelError && error.code === "Conflict")) {
@@ -1759,13 +1938,65 @@ export class AgentRuntime {
         idempotencyKey: `${attempt.id}:attention-reconciled-unknown`,
         status: "Unknown",
         detail: PROVIDER_RECOVERED_UNKNOWN_DETAIL,
-      });
+      }, operationContext);
       recoveries += 1;
       if (attempt.id === latestAttempt?.id) {
         latestStatus = settledStatus;
       }
     }
+    await this.#logOperational({
+      event: "recovery.pass",
+      outcome: "succeeded",
+      correlationId,
+      activationId: execution.activation.id,
+      ...(latestAttempt ? { providerAttemptId: latestAttempt.id } : {}),
+    });
     return recoveries;
+  }
+
+  async #operationalCorrelation(
+    entityType: OperationalCorrelationEntityType,
+    entityId: string,
+  ): Promise<string> {
+    return (await this.#kernel.query(
+      { type: "GetOperationalCorrelation", entityType, entityId },
+      this.#runtimeContext,
+    )).correlationId;
+  }
+
+  #operationContext(correlationId: string): KernelOperationContext {
+    return { correlationId };
+  }
+
+  async #logOperational(input: {
+    readonly event: OperationalEventInput["event"];
+    readonly outcome: OperationalOutcome;
+    readonly correlationId?: string;
+    readonly runId?: string;
+    readonly activationId?: string;
+    readonly providerAttemptId?: string;
+    readonly errorCode?: OperationalErrorCode;
+    readonly durationMs?: number;
+  }): Promise<void> {
+    if (!this.#operationalLogger) return;
+    await this.#operationalLogger.emit({
+      event: input.event,
+      outcome: input.outcome,
+      ...(input.durationMs === undefined
+        ? {}
+        : { durationMs: boundedOperationalDuration(input.durationMs) }),
+      ...(input.correlationId === undefined
+        ? {}
+        : { correlationId: createOpaqueId(input.correlationId) }),
+      ...(input.runId === undefined ? {} : { runId: createOpaqueId(input.runId) }),
+      ...(input.activationId === undefined
+        ? {}
+        : { activationId: createOpaqueId(input.activationId) }),
+      ...(input.providerAttemptId === undefined
+        ? {}
+        : { providerAttemptId: createOpaqueId(input.providerAttemptId) }),
+      ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
+    });
   }
 }
 
@@ -2129,6 +2360,10 @@ function normalizeWorktreeProviderError(error: unknown): ProviderExecutionError 
   return error instanceof KernelError && error.code === "WriterAuthorityLost"
     ? new ProviderExecutionError("provider_worktree_authority_lost", "Unknown")
     : normalizeProviderExecutionError(error);
+}
+
+function boundedOperationalDuration(value: number): number {
+  return Math.min(86_400_000, Math.max(0, Math.round(value)));
 }
 
 function isNativeRunCancellation(

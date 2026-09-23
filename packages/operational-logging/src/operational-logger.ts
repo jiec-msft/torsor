@@ -4,10 +4,12 @@ const eventComponents = {
   "http.request": "http",
   "runtime.activation": "runtime",
   "runtime.provider_attempt": "runtime",
+  "runtime.run_terminal": "runtime",
   "provider_process.spawn": "provider_process",
   "provider_process.stop": "provider_process",
   "writer_authority.acquire": "writer_authority",
   "writer_authority.loss": "writer_authority",
+  "writer_authority.quarantine": "writer_authority",
   "recovery.pass": "recovery",
 } as const;
 
@@ -16,7 +18,10 @@ const operationalErrorCodes = new Set([
   "host_stop_failed",
   "http_request_failed",
   "runtime_activation_failed",
+  "run_failed",
+  "run_cancelled",
   "writer_authority_lost",
+  "writer_authority_quarantined",
   "recovery_failed",
   "provider_cancelled",
   "provider_cleanup_failed",
@@ -49,7 +54,7 @@ const allowedInputKeys = new Set([
   "activationId",
   "providerAttemptId",
   "worktreeId",
-  "writerLeaseId",
+  "executionId",
   "errorCode",
 ]);
 
@@ -62,7 +67,7 @@ const allowedContextualInputKeys = new Set([
   "activationId",
   "providerAttemptId",
   "worktreeId",
-  "writerLeaseId",
+  "executionId",
   "errorCode",
 ]);
 
@@ -100,7 +105,10 @@ export type OperationalErrorCode =
   | "host_stop_failed"
   | "http_request_failed"
   | "runtime_activation_failed"
+  | "run_failed"
+  | "run_cancelled"
   | "writer_authority_lost"
+  | "writer_authority_quarantined"
   | "recovery_failed"
   | "provider_cancelled"
   | "provider_cleanup_failed"
@@ -132,7 +140,7 @@ export interface OperationalEventInput {
   readonly activationId?: OpaqueId;
   readonly providerAttemptId?: OpaqueId;
   readonly worktreeId?: OpaqueId;
-  readonly writerLeaseId?: OpaqueId;
+  readonly executionId?: OpaqueId;
   readonly errorCode?: OperationalErrorCode;
 }
 
@@ -299,7 +307,7 @@ export class OperationalLogger {
     validateOptionalOpaqueId(input.activationId);
     validateOptionalOpaqueId(input.providerAttemptId);
     validateOptionalOpaqueId(input.worktreeId);
-    validateOptionalOpaqueId(input.writerLeaseId);
+    validateOptionalOpaqueId(input.executionId);
     validateErrorCode(input.outcome, input.errorCode);
 
     const event = {
@@ -325,9 +333,9 @@ export class OperationalLogger {
       ...(input.worktreeId === undefined
         ? {}
         : { worktreeId: input.worktreeId }),
-      ...(input.writerLeaseId === undefined
+      ...(input.executionId === undefined
         ? {}
-        : { writerLeaseId: input.writerLeaseId }),
+        : { executionId: input.executionId }),
       ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
     };
     const line = `${JSON.stringify(event)}\n`;

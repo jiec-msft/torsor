@@ -43,7 +43,7 @@ describe("privacy-safe operational NDJSON", () => {
       outcome: "lost",
       correlationId: createOpaqueId("correlation-02"),
       worktreeId: createOpaqueId("worktree-02"),
-      writerLeaseId: createOpaqueId("lease-02"),
+      executionId: createOpaqueId("execution-02"),
       errorCode: "writer_authority_lost",
     });
 
@@ -56,9 +56,49 @@ describe("privacy-safe operational NDJSON", () => {
       outcome: "lost",
       correlationId: "correlation-02",
       worktreeId: "worktree-02",
-      writerLeaseId: "lease-02",
+      executionId: "execution-02",
       errorCode: "writer_authority_lost",
     });
+  });
+
+  it("keeps terminal Run and quarantine events in the closed registry", async () => {
+    const lines: string[] = [];
+    const logger = loggerFor(lines);
+
+    await logger.emit({
+      event: "runtime.run_terminal",
+      outcome: "failed",
+      correlationId: createOpaqueId("correlation-terminal"),
+      runId: createOpaqueId("run-terminal"),
+      errorCode: "run_failed",
+    });
+    await logger.emit({
+      event: "writer_authority.quarantine",
+      outcome: "succeeded",
+      correlationId: createOpaqueId("correlation-terminal"),
+      worktreeId: createOpaqueId("worktree-terminal"),
+      executionId: createOpaqueId("execution-terminal"),
+    });
+
+    expect(lines.map((line) => {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      return {
+        component: event.component,
+        event: event.event,
+        outcome: event.outcome,
+      };
+    })).toEqual([
+      {
+        component: "runtime",
+        event: "runtime.run_terminal",
+        outcome: "failed",
+      },
+      {
+        component: "writer_authority",
+        event: "writer_authority.quarantine",
+        outcome: "succeeded",
+      },
+    ]);
   });
 
   it("binds request and correlation IDs across observable downstream events", async () => {

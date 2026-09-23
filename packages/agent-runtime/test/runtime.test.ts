@@ -2305,8 +2305,13 @@ describe("AgentRuntime", () => {
         humanContext,
       );
       expect(run.inputs).toHaveLength(2);
+      const continuedAttention = projection.attentions.find(
+        (attention) =>
+          attention.resolutionOutcome === "ExistingRunContinued" &&
+          attention.resolvedRunId === selectedRunId,
+      );
       expect(run.inputs[1]?.sourceAttentionId).toBe(
-        projection.attentions[1]?.id,
+        continuedAttention?.id,
       );
     } finally {
       kernel.close();
@@ -2407,6 +2412,7 @@ describe("AgentRuntime", () => {
         agent: bootstrapView.agents[0]!,
         activationId: firstActivation.entityId,
         providerAttemptId: "provider-attempt-stale",
+        correlationId: "corr-stale-attention",
         causeType: "attention",
         attention,
         attentionRevision: firstClaim.revision!,
@@ -2511,6 +2517,7 @@ describe("AgentRuntime", () => {
         agent: bootstrapView.agents[0]!,
         activationId: activation.entityId,
         providerAttemptId: attempt.entityId,
+        correlationId: attempt.correlationId!,
         causeType: "attention",
         attention,
         attentionRevision: claim.revision!,

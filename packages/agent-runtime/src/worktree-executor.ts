@@ -4,8 +4,13 @@ import { basename, dirname, join } from "node:path";
 
 import {
   KernelError, type PhysicalWorktreeView, type TorsorKernel,
-  type WorktreeExecutionState, type WorktreeMutationAuthority,
+  type KernelOperationContext, type WorktreeExecutionState, type WorktreeMutationAuthority,
 } from "@torsor/kernel";
+import {
+  createOpaqueId,
+  type OperationalEventInput,
+  type OperationalLogger,
+} from "@torsor/operational-logging";
 
 import { nodeProbeDriver, type ChildCloseEvidence, type ControlledChild, type ControlledProcessDriver } from "./controlled-process.js";
 import { canonicalDirectory, inspectWorktree, readPlainFile, type WorktreeRegistration } from "./worktree-paths.js";
@@ -27,6 +32,7 @@ export interface WorktreeProviderInput {
   readonly runId: string;
   readonly activationId: string;
   readonly providerAttemptId: string;
+  readonly correlationId: string;
   readonly policy: ProviderPolicy;
   readonly cancellationInterruption?: NativeRunCancellationInterruption;
   readonly signal?: AbortSignal;
@@ -51,6 +57,7 @@ export interface LocalWorktreeExecutorOptions {
   readonly stopGraceMs?: number;
   readonly forceGraceMs?: number;
   readonly driver?: ControlledProcessDriver;
+  readonly operationalLogger?: OperationalLogger;
 }
 
 const probeContent = "Torsor controlled Worktree probe v1.\n";
@@ -68,6 +75,7 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
   readonly #stopMs: number;
   readonly #forceMs: number;
   readonly #baseRevision: string | undefined;
+  readonly #operationalLogger: OperationalLogger | undefined;
   readonly #handles = new Map<string, ControlledWorktreeProcess>();
   readonly #starts = new Map<Promise<ControlledWorktreeProcess>, string>();
   #recovery: Promise<void> | undefined;
@@ -83,6 +91,7 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
       throw new Error("Native Worktree provisioning requires a full immutable base commit.");
     }
     this.#baseRevision = options.baseRevision;
+    this.#operationalLogger = options.operationalLogger;
     this.#leaseMs = positive(options.leaseDurationMs ?? 30_000);
     this.#stopMs = positive(options.stopGraceMs ?? 1_000);
     this.#forceMs = positive(options.forceGraceMs ?? 1_000);
@@ -117,10 +126,52 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
         const execution = tree.latestExecution;
         if (execution && execution.executorId !== this.#executorId &&
             (execution.authorityRevokedAt === null || !stoppedStates.has(execution.state))) {
+          const correlationId = (await this.#kernel.query({
+            type: "GetOperationalCorrelation",
+            entityType: execution.provider ? "ProviderAttempt" : "Run",
+            entityId: execution.provider?.providerAttemptId ?? tree.runId,
+          }, this.#context)).correlationId;
+          const operationContext = { correlationId };
+          await emitOperational(this.#operationalLogger, {
+            event: "recovery.pass",
+            outcome: "started",
+            correlationId: createOpaqueId(correlationId),
+            runId: createOpaqueId(tree.runId),
+            activationId: createOpaqueId(execution.activationId),
+            ...(execution.provider
+              ? { providerAttemptId: createOpaqueId(execution.provider.providerAttemptId) }
+              : {}),
+            worktreeId: createOpaqueId(tree.worktreeId),
+            executionId: createOpaqueId(execution.id),
+          });
           await this.#kernel.execute({
             type: "RecoverWorktreeExecution", idempotencyKey: `${this.#executorId}:recover:${execution.id}`,
             executionId: execution.id, reason: "Executor restarted without the original child handle; PID is not authority.",
-          }, this.#context);
+          }, this.#context, operationContext);
+          await emitOperational(this.#operationalLogger, {
+            event: "writer_authority.quarantine",
+            outcome: "succeeded",
+            correlationId: createOpaqueId(correlationId),
+            runId: createOpaqueId(tree.runId),
+            activationId: createOpaqueId(execution.activationId),
+            ...(execution.provider
+              ? { providerAttemptId: createOpaqueId(execution.provider.providerAttemptId) }
+              : {}),
+            worktreeId: createOpaqueId(tree.worktreeId),
+            executionId: createOpaqueId(execution.id),
+          });
+          await emitOperational(this.#operationalLogger, {
+            event: "recovery.pass",
+            outcome: "succeeded",
+            correlationId: createOpaqueId(correlationId),
+            runId: createOpaqueId(tree.runId),
+            activationId: createOpaqueId(execution.activationId),
+            ...(execution.provider
+              ? { providerAttemptId: createOpaqueId(execution.provider.providerAttemptId) }
+              : {}),
+            worktreeId: createOpaqueId(tree.worktreeId),
+            executionId: createOpaqueId(execution.id),
+          });
         }
       }
       if (!page.hasMore) break;
@@ -216,10 +267,13 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
     const tree = await this.#kernel.query({ type: "GetPhysicalWorktree", worktreeId: input.worktreeId }, this.#context);
     this.#checkTree(tree, provider !== undefined);
     const requestId = randomUUID();
+    const operationContext: KernelOperationContext | undefined = provider
+      ? { correlationId: provider.correlationId }
+      : undefined;
     const lease = await this.#kernel.execute({
       type: "AcquireWorktreeWriterLease", idempotencyKey: `${requestId}:acquire`,
       worktreeId: input.worktreeId, leaseDurationMs: this.#leaseMs,
-    }, this.#context);
+    }, this.#context, operationContext);
     const leaseDeadlineAt = performance.now() +
       Date.parse(lease.leaseExpiresAt!) - Date.parse(lease.authorityObservedAt!);
     const leaseAuthority = {
@@ -237,11 +291,11 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
           policy: "trusted-local" as const,
           permissionMode: provider.policy.permissionMode,
         } } : {}),
-      }, this.#context);
+      }, this.#context, operationContext);
     } catch (error) {
       await this.#kernel.execute({
         type: "ReleaseWorktreeWriterLease", idempotencyKey: `${requestId}:unused`, ...leaseAuthority,
-      }, this.#context);
+      }, this.#context, operationContext);
       throw error;
     }
     const authority: WorktreeMutationAuthority = {
@@ -258,11 +312,34 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
       kernel: this.#kernel, principalId: this.#context.principalId, authority,
       activationId: input.activationId, stopMs: this.#stopMs, forceMs: this.#forceMs,
       leaseDeadlineAt,
+      ...(provider
+        ? {
+            correlationId: provider.correlationId,
+            runId: provider.runId,
+            providerAttemptId: provider.providerAttemptId,
+            worktreeId: input.worktreeId,
+          }
+        : {}),
+      ...(this.#operationalLogger
+        ? { operationalLogger: this.#operationalLogger }
+        : {}),
       ...(provider?.cancellationInterruption
         ? { runCancellation: provider.cancellationInterruption }
         : {}),
       ...(input.signal ? { signal: input.signal } : {}),
     });
+    if (provider) {
+      await emitOperational(this.#operationalLogger, {
+        event: "writer_authority.acquire",
+        outcome: "succeeded",
+        correlationId: createOpaqueId(provider.correlationId),
+        runId: createOpaqueId(provider.runId),
+        activationId: createOpaqueId(input.activationId),
+        providerAttemptId: createOpaqueId(provider.providerAttemptId),
+        worktreeId: createOpaqueId(input.worktreeId),
+        executionId: createOpaqueId(started.entityId),
+      });
+    }
     this.#handles.set(started.entityId, handle);
     try {
       if (!provider) {
@@ -285,6 +362,18 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
           : this.#driver.start({ cwd: tree.directoryPath, content: probeContent }));
       });
       await handle.running();
+      if (provider) {
+        await emitOperational(this.#operationalLogger, {
+          event: "provider_process.spawn",
+          outcome: "succeeded",
+          correlationId: createOpaqueId(provider.correlationId),
+          runId: createOpaqueId(provider.runId),
+          activationId: createOpaqueId(input.activationId),
+          providerAttemptId: createOpaqueId(provider.providerAttemptId),
+          worktreeId: createOpaqueId(input.worktreeId),
+          executionId: createOpaqueId(started.entityId),
+        });
+      }
       return handle;
     } catch (error) {
       await handle.stop("Controlled start failed.");
@@ -362,6 +451,11 @@ interface ProcessOptions {
   readonly stopMs: number;
   readonly forceMs: number;
   readonly leaseDeadlineAt: number;
+  readonly operationalLogger?: OperationalLogger;
+  readonly correlationId?: string;
+  readonly runId?: string;
+  readonly providerAttemptId?: string;
+  readonly worktreeId?: string;
   readonly runCancellation?: NativeRunCancellationInterruption;
   readonly signal?: AbortSignal;
 }
@@ -391,6 +485,9 @@ export class ControlledWorktreeProcess {
   #removeAbort: (() => void) | undefined;
   #authorityStop: Promise<void> | undefined;
   #authorityClassificationError: unknown;
+  #authorityLossLogged = false;
+  #stopLogged = false;
+  #quarantineLogged = false;
   readonly #finished: Promise<WorktreeExecutionState>;
   #resolveFinished!: (state: WorktreeExecutionState) => void;
   #rejectFinished!: (error: unknown) => void;
@@ -590,6 +687,14 @@ export class ControlledWorktreeProcess {
   }
 
   async #stopAfterAuthorityLoss(): Promise<void> {
+    if (!this.#authorityLossLogged) {
+      this.#authorityLossLogged = true;
+      await this.#log({
+        event: "writer_authority.loss",
+        outcome: "lost",
+        errorCode: "writer_authority_lost",
+      });
+    }
     const cancellation = this.#options.runCancellation;
     if (cancellation && !this.#providerExitObserved) {
       try {
@@ -660,6 +765,23 @@ export class ControlledWorktreeProcess {
       this.#durablySettled = true;
       this.#resolveFinished(this.#state);
     }
+    if (!this.#stopLogged) {
+      this.#stopLogged = true;
+      await this.#log({
+        event: "provider_process.stop",
+        outcome: this.#state === "Uncertain" ? "unknown" : "succeeded",
+        ...(this.#state === "Uncertain"
+          ? { errorCode: "provider_cleanup_failed" }
+          : {}),
+      });
+    }
+    if (this.#state === "Uncertain" && !this.#quarantineLogged) {
+      this.#quarantineLogged = true;
+      await this.#log({
+        event: "writer_authority.quarantine",
+        outcome: "succeeded",
+      });
+    }
     // Cancellation may have arrived while a normal drain awaited persistence.
     await this.#persistRevocation();
     if (this.#revocationReason && stoppedStates.has(this.#state)) await this.#release();
@@ -672,7 +794,7 @@ export class ControlledWorktreeProcess {
       type: "RevokeWorktreeExecutionAuthority",
       idempotencyKey: `${this.#options.authority.executionId}:revoke`,
       ...this.#options.authority, reason: this.#revocationReason,
-    }, this.#options);
+    }, this.#options, this.#operationContext());
     this.#durablyRevoked = true;
   }
 
@@ -683,7 +805,7 @@ export class ControlledWorktreeProcess {
       type: "RecordWorktreeExecution", idempotencyKey: `${this.#options.authority.executionId}:${state}`,
       ...this.#options.authority, state, evidence, preservePublicationAuthority,
       ...(this.#child?.pid ? { pid: this.#child.pid } : {}),
-    }, this.#options);
+    }, this.#options, this.#operationContext());
     this.#state = state;
   }
 
@@ -696,7 +818,7 @@ export class ControlledWorktreeProcess {
       await this.#options.kernel.execute({
         type: "ReleaseWorktreeWriterLease", idempotencyKey: `${this.#options.authority.executionId}:release`,
         ...this.#options.authority,
-      }, this.#options);
+      }, this.#options, this.#operationContext());
     } catch (error) {
       if (!(error instanceof KernelError && error.code === "Conflict")) throw error;
       const current = await this.#options.kernel.query({
@@ -713,6 +835,35 @@ export class ControlledWorktreeProcess {
       leaseGeneration: this.#options.authority.generation,
       fencingToken: this.#options.authority.fencingToken,
     };
+  }
+
+  #operationContext(): KernelOperationContext | undefined {
+    return this.#options.correlationId
+      ? { correlationId: this.#options.correlationId }
+      : undefined;
+  }
+
+  async #log(
+    input: Pick<OperationalEventInput, "event" | "outcome" | "errorCode">,
+  ): Promise<void> {
+    if (
+      !this.#options.operationalLogger ||
+      !this.#options.correlationId ||
+      !this.#options.runId ||
+      !this.#options.providerAttemptId ||
+      !this.#options.worktreeId
+    ) {
+      return;
+    }
+    await emitOperational(this.#options.operationalLogger, {
+      ...input,
+      correlationId: createOpaqueId(this.#options.correlationId),
+      runId: createOpaqueId(this.#options.runId),
+      activationId: createOpaqueId(this.activationId),
+      providerAttemptId: createOpaqueId(this.#options.providerAttemptId),
+      worktreeId: createOpaqueId(this.#options.worktreeId),
+      executionId: createOpaqueId(this.#options.authority.executionId),
+    });
   }
 }
 
@@ -735,4 +886,11 @@ async function within<T>(promise: Promise<T>, milliseconds: number): Promise<T |
       timer = setTimeout(() => resolve(undefined), milliseconds);
     })]);
   } finally { clearTimeout(timer); }
+}
+
+async function emitOperational(
+  logger: OperationalLogger | undefined,
+  event: OperationalEventInput,
+): Promise<void> {
+  if (logger) await logger.emit(event);
 }
