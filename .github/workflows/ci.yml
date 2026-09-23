@@ -19,7 +19,7 @@ jobs:
       matrix:
         include:
           - slice: docs-build
-            command: npm run check:docs && npm run test:docs && npm run build && npm exec --prefix prototype -- tsc --noEmit -p prototype/tsconfig.app.json && npm run test:prototype
+            command: npm run check:docs && npm run test:docs && npm run test:ci-config && npm run build && npm exec --prefix prototype -- tsc --noEmit -p prototype/tsconfig.app.json && npm run test:prototype
           - slice: kernel-runtime
             command: npm run test:kernel && npm run test:operational-logging && npm run test:agent-runtime && npm run typecheck --workspace @torsor/kernel && npm run typecheck --workspace @torsor/operational-logging && npm run typecheck --workspace @torsor/agent-runtime
           - slice: acp-smoke
