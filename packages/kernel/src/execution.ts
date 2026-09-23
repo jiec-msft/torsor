@@ -295,8 +295,8 @@ export function startProviderAttempt(kernel: db.KernelContext, command: Extract<
   db.run(kernel, `INSERT INTO provider_attempts
         (id, activation_id, run_id, adapter, adapter_version,
          capability_snapshot_json, run_input_ids_json, request_idempotency_key,
-         diagnostic_session_id, status, started_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Started', ?)`, providerAttemptId, command.activationId, runId, command.adapter, command.adapterVersion, JSON.stringify(command.capabilitySnapshot), JSON.stringify(runInputIds), command.requestIdempotencyKey, command.diagnosticSessionId ?? null, db.now(kernel));
+         status, started_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Started', ?)`, providerAttemptId, command.activationId, runId, command.adapter, command.adapterVersion, JSON.stringify(command.capabilitySnapshot), JSON.stringify(runInputIds), command.requestIdempotencyKey, db.now(kernel));
   const scope = invariants.activationScope(kernel, activation);
   invariants.emitEvent(kernel, {
     type: "ProviderAttemptStarted",

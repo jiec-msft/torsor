@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { KernelError, TorsorKernel } from "../src/index.js";
+import {
+  KernelError,
+  TorsorKernel,
+  type StartProviderAttemptCommand,
+} from "../src/index.js";
 import {
   bootstrap,
   claimRunOutboxAuthority,
@@ -247,24 +251,26 @@ describe("TorsorKernel transactions and invariants", () => {
     }
   });
 
-  it("keeps Provider delivery separate from RunInput disposition", async () => {
+  it("keeps legacy Provider diagnostic session IDs out of durable projections", async () => {
     const kernel = openMemoryKernel();
+    const privateMarker = "SYNTHETIC_PRIVATE_DIAGNOSTIC_SESSION";
     try {
       const setup = await createRun(kernel);
+      const command: StartProviderAttemptCommand & Record<string, unknown> = {
+        type: "StartProviderAttempt",
+        idempotencyKey: "provider-start",
+        activationId: setup.activationId,
+        outboxEventId: setup.outboxEventId,
+        outboxLeaseToken: setup.outboxLeaseToken,
+        adapter: "deterministic-fake",
+        adapterVersion: "1",
+        capabilitySnapshot: { acceptsInputWhileRunning: false },
+        runInputIds: [setup.runInputId],
+        requestIdempotencyKey: "provider-request-1",
+        diagnosticSessionId: privateMarker,
+      };
       const provider = await kernel.execute(
-        {
-          type: "StartProviderAttempt",
-          idempotencyKey: "provider-start",
-          activationId: setup.activationId,
-          outboxEventId: setup.outboxEventId,
-          outboxLeaseToken: setup.outboxLeaseToken,
-          adapter: "deterministic-fake",
-          adapterVersion: "1",
-          capabilitySnapshot: { acceptsInputWhileRunning: false },
-          runInputIds: [setup.runInputId],
-          requestIdempotencyKey: "provider-request-1",
-          diagnosticSessionId: "diagnostic-only",
-        },
+        command,
         runtimeContext,
       );
       await kernel.execute(
@@ -281,10 +287,11 @@ describe("TorsorKernel transactions and invariants", () => {
         humanContext,
       );
 
-      expect(projection.providerAttempts[0]).toMatchObject({
-        status: "Completed",
-        diagnosticSessionId: "diagnostic-only",
-      });
+      expect(projection.providerAttempts[0]).toMatchObject({ status: "Completed" });
+      expect(JSON.stringify(projection)).not.toContain(privateMarker);
+      expect(projection.providerAttempts[0]).not.toHaveProperty(
+        "diagnosticSessionId",
+      );
       expect(projection.inputs[0]?.disposition).toBe("Pending");
       expect(projection.run.state).toBe("Active");
     } finally {

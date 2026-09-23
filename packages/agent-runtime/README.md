@@ -1,5 +1,68 @@
 # `@torsor/agent-runtime`
 
+## Controlled physical Worktree tracer
+
+The optional `LocalWorktreeExecutor` implements only `write-probe-v1`, governed by
+MVP §§22.1–22.4, 24.2–24.3, 38.1–38.4, and 43.1. It registers a trusted,
+pre-provisioned detached Git worktree under a private managed root, exclusively
+creates `torsor-probe.txt`, and runs a fixed Node child to digest the content.
+It does not provision Git worktrees, execute repository code, run arbitrary
+commands, or grant ACP native shell/write tools.
+
+`register` binds immutable physical/repository/Run facts; `start` and `probe`
+require a live Run Activation. Every mediated mutation is checked under the
+Kernel write lock after a durable execution intent. `stopActivation`, `recover`,
+and `close` bound the lifecycle. Runtime gives explicitly enabled trusted
+adapters only `context.worktree.probe(worktreeId)`, never a path or executable.
+Attention contexts have no such capability.
+
+Clean `probe` requires the fixed digest, normal child close and a current Writer
+fence; it retains the lease until Activation publication/settlement ends. Kernel
+guards activity, report finalization, terminal effects and cached mutation results.
+Cancellation, uncertainty, expiry or restart irreversibly revokes publication,
+even if a late child close makes the directory physically reusable. Reports go
+through the existing authorized `publishReport` capability, never raw descriptors.
+The fixed stdout protocol is bounded to 65 bytes, stderr to 1024 discarded bytes;
+the child inherits no credentials or injection settings. Provider-facing failures
+are fixed `Unknown` diagnostics, not local paths or raw process output.
+
+Logical lease expiry is not process exit. An unsettled execution blocks lease
+release and reacquisition. Unconfirmed stop quarantines the directory; only
+original-handle close evidence permits local reconciliation. A restart that
+loses that handle leaves quarantine in place even when the old PID disappears.
+There is no manual text-based physical quarantine override.
+
+Stopping an owned child does not wait for SQLite persistence. Local receipt-bound
+authority is revoked immediately; physical stop/force and retained close evidence
+are independent of durable revocation/disposition/release. Persistence failures
+surface to callers and retain a retry timer; repeated stop/close retries writes
+without resending successful signals. Host keeps Kernel open on cleanup failure
+until a later close succeeds. Recovery of already committed Provider completion
+uses an `Expired` Activation settlement if Writer authority is lost, preserves
+the committed result, and acknowledges the recovered outbox without rerunning work.
+If another Host wins that settlement, only the specific already-finished conflict
+plus a fresh authoritative terminal Activation permits acknowledging delivery;
+unrelated conflicts and unfinished Activations remain errors.
+
+The monitor uses Kernel's rollback-only authority observation, not a write lock.
+Before the first physical effect, the Kernel instance opts into no-wait synchronous
+database scopes for the rest of its lifetime, restoring the configured production
+busy timeout after each call. This covers commands, publications and cleanup
+retries as well as monitoring, so SQLite contention cannot starve another handle's
+deadline, queued cancellation or shutdown. Every actual mutation still rechecks
+authority transactionally; observational snapshots grant no effect permission.
+
+The managed root is bound to one database storage identity by `.torsor-owner`.
+Use a fresh root after recreating the database. Do not concurrently run copied
+databases against it. The private root must exclude concurrent external path
+replacement; path checks are not a same-user OS sandbox. General process-tree
+containment, cross-restart stop proof, Pause/Resume, Terminal, Files UI, GC, and
+external integration remain out of scope.
+
+`controlled-process.ts` is an isolated trusted process-driver seam. Synthetic
+fixtures exercise stop uncertainty and crashes without adding another Provider
+conformance engine.
+
 `@torsor/agent-runtime` consumes durable Kernel work and runs one provider
 process for each Activation. The Kernel remains authoritative for Attention,
 Run, RunInput, provenance, revisions, terminal state, and outbox delivery.
@@ -33,17 +96,18 @@ The runtime provides:
 - An Activation-scoped capability bridge that binds Agent identity, Run,
   Activation, ProviderAttempt, revisions, and provenance on the server side.
 
-Provider session IDs are diagnostic only. Recovery always rebuilds provider
-input from Kernel projections and never treats a provider session as
-authoritative state. Provider delivery failures park Runs through one atomic
-Kernel command, and expired Attention executions are discovered through
-bounded targeted projections rather than public-event history scans. Recovery
-captures an authoritative recovery snapshot, supplies only its revision to
-every bounded keyset page, and restarts from a fresh snapshot on stale pages
-or a changed final revision. Finished Attention Activations are not reclaimed
-before their expiry horizon, so a provider that has committed its decision but
-is still returning retains the cross-runtime domain fence. Superseded recovery
-work is discarded rather than settled from a stale page.
+Provider session IDs are process-local diagnostic correlation only and do not
+enter durable/public projections. Recovery always rebuilds provider input from
+Kernel projections and never treats a provider session as authoritative state.
+Provider delivery failures park Runs through one atomic Kernel command, and
+expired Attention executions are discovered through bounded targeted
+projections rather than public-event history scans. Recovery captures an
+authoritative recovery snapshot, supplies only its revision to every bounded
+keyset page, and restarts from a fresh snapshot on stale pages or a changed
+final revision. Finished Attention Activations are not reclaimed before their
+expiry horizon, so a provider that has committed its decision but is still
+returning retains the cross-runtime domain fence. Superseded recovery work is
+discarded rather than settled from a stale page.
 
 Runtime-local queues preserve bounded Project/domain fairness and serialize
 same-domain work within one process. Kernel Attention claims provide the
@@ -85,9 +149,22 @@ the caller explicitly enables the unsafe development option used by test
 fixtures. Child stdin write, end, EOF, and pipe failures are folded into the
 same provider failure and cleanup path.
 
+The Runtime is the diagnostic boundary before Kernel persistence. Adapter
+failures carry a stable diagnostic code and outcome, but public Run,
+Activation, and ProviderAttempt details use only an allowlisted bounded
+summary. Raw stderr, provider-authored error text, process launch details,
+machine paths, credentials, complete environments, prompts, model output, and
+nested cause messages are never copied into durable/public fields. The
+Copilot adapter drains bounded process diagnostics only to classify failure;
+it does not publish or retain them after execution. The independent ACP
+conformance transcript policy remains separate from this production path.
+Public details use `<code>: <generic summary>`, are capped at 160 characters,
+and are selected from the stable `ProviderDiagnosticCode` union.
+
 Copilot returns a bounded JSON action envelope rather than invoking Kernel
-commands directly. Frame, stream, persisted activity, pending write, JSON
-depth, action, target, and field limits are enforced before unbounded effects.
+commands directly. Frame, aggregate stdout, model stream, stderr, persisted
+activity, pending write, JSON depth, action, target, and field limits are
+enforced before unbounded effects.
 The bridge then applies only server-bound Kernel capabilities; provider output
 cannot choose provenance, Agent identity, Activation identity, or
 ProviderAttempt identity.

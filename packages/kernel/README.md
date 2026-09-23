@@ -1,5 +1,57 @@
 # `@torsor/kernel`
 
+## Physical execution records (schema 17)
+
+`RegisterPhysicalWorktree`, `StartWorktreeExecution`, `RecordWorktreeExecution`,
+`RevokeWorktreeExecutionAuthority`, and `RecoverWorktreeExecution` are trusted Runtime-only commands.
+`GetPhysicalWorktree`, `ListPhysicalWorktrees`, and `GetWorktreeStorageIdentity`
+are likewise local Runtime-only queries; their paths, process receipts, and
+storage identity are not public Thread events or HTTP resources.
+
+`physical_worktrees` binds an immutable repository/base/Run/directory identity.
+`worktree_executions` and append-only `worktree_execution_events` retain source
+Activation, executor incarnation, lease generation, process identity, and stop
+evidence. `worktree_storage_identity` binds managed roots to this database.
+Unsettled physical execution independently blocks the existing lease
+acquire/release/quarantine-resolution commands. Expiry alone cannot unblock it.
+Physical `Ready` means the binding is not quarantined, not that it is idle:
+an unsettled execution still blocks reuse independently.
+
+The trusted synchronous `performWorktreeMutation` boundary checks live lease,
+receipt, Activation, and Run under `BEGIN IMMEDIATE`. Its callback must return
+`undefined` without awaiting; it is not a general capability or an OS
+transaction. A previously committed intent survives OS or transaction failure.
+Only the local executor checks paths and attests original-handle stop evidence;
+Kernel never interprets a PID or increasing generation as physical safety.
+
+`checkWorktreePublication` additionally requires confirmed normal stop. Every Agent
+mutation (including replay), Runtime activity/success and trusted report finalization
+checks its Activation's durable Writer fence. Authority loss is irreversible and
+returns `WriterAuthorityLost`; late close cannot restore publication. Stop/failure/
+Unknown reconciliation remains available. A clean probe retains its lease through
+result publication, then scope cleanup releases it. Reads retain Artifact authorization.
+
+`revokeLocalWorktreeAuthority` accepts only the original locally retained receipt
+and Runtime identity. It adds a process-local denial without touching SQLite, so
+stopping an owned child never waits for a writer lock. It grants no authority and
+does not replace durable revocation or conservative restart recovery.
+
+The first `performWorktreeMutation` opts this Kernel instance into nonblocking
+supervision until close. All synchronous database scopes then use no-wait lock
+admission and restore the configured busy timeout in `finally`; none crosses an
+`await`. This includes ordinary commands, queries and Artifact Writer checks, so
+their contention cannot starve physical deadlines on the shared event loop.
+Contention is an explicit failure, not mutation permission. `checkWorktreeAuthority`
+uses a short rollback-only snapshot for monitoring, discarding even tentative
+expiry/revocation writes. Real mutations and publications retain their write
+transactions and full fences. Durable stop/revocation retries remain the executor's
+responsibility; production's configured 5000ms timeout and schema are unchanged.
+
+Earlier schemas, including versions 14 and 15, intentionally fail to open. Stop old processes and recreate
+the disposable database **and use a fresh managed root**; no migration or
+automatic deletion is performed. The normative contracts are MVP §§22, 24, 38,
+and 43.1 in both languages.
+
 `@torsor/kernel` is the durable local state boundary for the first Torsor
 implementation slice. It stores collaboration and execution facts in SQLite
 while keeping SQL and provider details behind consumer operations:
@@ -299,13 +351,15 @@ clock-derived expiry, and
 release, expiry, quarantine, and reconciliation ledger. These primitives do
 not perform filesystem mutation, process execution, or shell execution.
 
-The current direct schema version is 15. It combines trusted Artifact byte
+The current direct schema version is 17. It combines the physical records and
+irreversible Writer publication fences above with trusted Artifact byte
 length and source Thread provenance (replacing caller-provided storage
 locations) with durable server-owned causal limits, immutable Run root/parent/depth,
 and the root-scoped nonterminal admission index. Defaults remain inclusive depth
-4 and at most 50 nonterminal Runs per root. Both earlier schema 14 layouts
-(causal-only and independently developed Artifact-only) are rejected before
-DDL/bootstrap. There is no version-only compatibility shortcut or migration.
+4 and at most 50 nonterminal Runs per root. Schema 16 is rejected because it
+can contain pre-redaction public Provider diagnostics. Earlier schema 14 layouts
+(causal-only, Artifact-only and Worktree-only) and schema 15 are also rejected
+before DDL/bootstrap. There is no version-only compatibility shortcut or migration.
 Artifacts trace causality through their producer Run; equal content in parent
 and child Runs shares a blob, not descriptor identity, authorization or a Run slot.
 Version 13 adds durable Worktree
@@ -320,10 +374,10 @@ recovery mutation revision, incremental provider/domain counters, and durable
 Agent/Project/Channel/Thread execution fences.
 This pre-release schema is intentionally breaking: stop old processes and
 explicitly recreate disposable databases rather than migrating earlier versions,
-including either schema 14 layout. Opening an older database fails without
+and use fresh managed roots. Opening an older database fails without
 modifying its version, schema, or data.
 
-Version 15 alone is not compatibility proof. An existing file is checked with a
+Version 16 alone is not compatibility proof. An existing file is checked with a
 read-only connection before any writable open, then rechecked under the schema
 initialization lock. A reference schema in isolated memory supplies a SHA-256
 fingerprint of SQLite object definitions, column/FK/index pragmas and STRICT
@@ -332,5 +386,5 @@ quoted literals, operator boundaries, CHECK predicates and trigger bodies.
 Missing, altered or extra-incompatible objects fail unchanged, including files
 with an uncheckpointed WAL; no `CREATE IF NOT EXISTS` repairs are attempted.
 SQLite-owned statistics are excluded. Integrity and required durable config
-rows are checked too. Only an empty version-0 database runs DDL/config/bootstrap,
+rows and Worktree storage identity are checked too. Only an empty version-0 database runs DDL/config/bootstrap,
 atomically; a valid reopen never reapplies bootstrap.

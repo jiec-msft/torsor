@@ -205,7 +205,6 @@ export interface StartProviderAttemptCommand extends IdempotentCommand {
   readonly capabilitySnapshot: JsonValue;
   readonly runInputIds: readonly string[];
   readonly requestIdempotencyKey: string;
-  readonly diagnosticSessionId?: string;
 }
 
 export interface FinishProviderAttemptCommand extends IdempotentCommand {
@@ -330,11 +329,87 @@ export interface AcquireWorktreeWriterLeaseCommand extends IdempotentCommand {
   readonly leaseDurationMs: number;
 }
 
-interface WorktreeWriterLeaseAuthorityCommand extends IdempotentCommand {
+export interface WorktreeLeaseAuthority {
   readonly worktreeId: string;
   readonly generation: number;
   readonly fencingToken: number;
   readonly leaseToken: string;
+}
+
+interface WorktreeWriterLeaseAuthorityCommand extends IdempotentCommand, WorktreeLeaseAuthority {}
+
+export interface PhysicalWorktreeBinding {
+  readonly worktreeId: string;
+  readonly runId: string;
+  readonly repositoryId: string;
+  readonly repositoryPath: string;
+  readonly baseRevision: string;
+  readonly directoryPath: string;
+  readonly directoryIdentity: string;
+}
+
+export interface RegisterPhysicalWorktreeCommand extends IdempotentCommand, PhysicalWorktreeBinding {
+  readonly type: "RegisterPhysicalWorktree";
+}
+
+export interface StartWorktreeExecutionCommand extends WorktreeWriterLeaseAuthorityCommand {
+  readonly type: "StartWorktreeExecution";
+  readonly activationId: string;
+  readonly executorId: string;
+}
+
+export interface WorktreeExecutionReceipt {
+  readonly executionId: string;
+  readonly executorId: string;
+  readonly executionToken: string;
+}
+
+export interface WorktreeMutationAuthority extends WorktreeLeaseAuthority, WorktreeExecutionReceipt {}
+
+export type WorktreeExecutionState =
+  | "Starting" | "Running" | "StopRequested"
+  | "StopConfirmed" | "ForceTerminated" | "Uncertain";
+
+export interface RecordWorktreeExecutionCommand extends IdempotentCommand, WorktreeExecutionReceipt {
+  readonly type: "RecordWorktreeExecution";
+  readonly state: Exclude<WorktreeExecutionState, "Starting">;
+  readonly pid?: number;
+  readonly evidence: string;
+  readonly preservePublicationAuthority?: boolean;
+}
+
+export interface RevokeWorktreeExecutionAuthorityCommand extends IdempotentCommand, WorktreeExecutionReceipt {
+  readonly type: "RevokeWorktreeExecutionAuthority";
+  readonly reason: string;
+}
+
+export interface RecoverWorktreeExecutionCommand extends IdempotentCommand {
+  readonly type: "RecoverWorktreeExecution";
+  readonly executionId: string;
+  readonly reason: string;
+}
+
+export interface WorktreeExecutionView {
+  readonly id: string;
+  readonly activationId: string;
+  readonly executorId: string;
+  readonly runtimePrincipalId: string;
+  readonly generation: number;
+  readonly fencingToken: number;
+  readonly state: WorktreeExecutionState;
+  readonly pid: number | null;
+  readonly authorityRevokedAt: string | null;
+  readonly authorityRevocationReason: string | null;
+  readonly events: readonly {
+    readonly state: WorktreeExecutionState;
+    readonly evidence: string;
+    readonly occurredAt: string;
+  }[];
+}
+
+export interface PhysicalWorktreeView extends PhysicalWorktreeBinding {
+  readonly state: "Ready" | "Quarantined";
+  readonly latestExecution: WorktreeExecutionView | null;
 }
 
 export interface RenewWorktreeWriterLeaseCommand
@@ -394,6 +469,11 @@ export type KernelCommand =
   | WaitRunCommand
   | FailRunCommand
   | RecordLateOutputCommand
+  | RegisterPhysicalWorktreeCommand
+  | StartWorktreeExecutionCommand
+  | RecordWorktreeExecutionCommand
+  | RevokeWorktreeExecutionAuthorityCommand
+  | RecoverWorktreeExecutionCommand
   | AcquireWorktreeWriterLeaseCommand
   | RenewWorktreeWriterLeaseCommand
   | ReleaseWorktreeWriterLeaseCommand
@@ -515,6 +595,9 @@ export interface ListWorktreeWriterLeaseEventsQuery {
 }
 
 export type KernelQuery =
+  | { readonly type: "GetWorktreeStorageIdentity" }
+  | { readonly type: "ListPhysicalWorktrees"; readonly afterWorktreeId?: string; readonly limit?: number }
+  | { readonly type: "GetPhysicalWorktree"; readonly worktreeId: string }
   | GetArtifactQuery
   | GetBootstrapQuery
   | GetThreadProjectionQuery
@@ -633,7 +716,6 @@ export interface ProviderAttemptView {
   readonly capabilitySnapshot: JsonValue;
   readonly runInputIds: readonly string[];
   readonly requestIdempotencyKey: string;
-  readonly diagnosticSessionId: string | null;
   readonly status: ProviderAttemptStatus;
   readonly detail: string | null;
   readonly startedAt: string;
@@ -844,6 +926,9 @@ export interface WorktreeWriterLeaseEventPage {
 }
 
 export interface QueryResultMap {
+  readonly GetWorktreeStorageIdentity: { readonly identity: string };
+  readonly ListPhysicalWorktrees: { readonly items: readonly PhysicalWorktreeView[]; readonly hasMore: boolean };
+  readonly GetPhysicalWorktree: PhysicalWorktreeView;
   readonly GetArtifact: ArtifactView;
   readonly GetBootstrap: BootstrapProjection;
   readonly GetThreadProjection: ThreadProjection;
@@ -877,5 +962,6 @@ export interface CommandResult {
   readonly leaseGeneration?: number;
   readonly fencingToken?: number;
   readonly quarantineToken?: string;
+  readonly executionToken?: string;
   readonly worktreeWriterLease?: WorktreeWriterLeaseView;
 }

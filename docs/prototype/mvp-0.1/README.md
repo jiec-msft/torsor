@@ -113,6 +113,12 @@ Streaming output is not automatically a public Message. The Run composer is
 the explicit bridge: it publishes a Thread Message and assigns that exact
 Message revision to the selected Run.
 
+Provider failure diagnostics must be converted to an allowlisted public form
+before entering these projections: a stable error code and outcome plus a
+bounded generic summary. Raw stderr, process or launch errors, environments,
+credentials, machine paths, prompts, model output, provider-authored prose,
+and nested cause messages are not public Timeline or HTTP/Web status.
+
 ## Ordered evidence
 
 The evidence set mixes full desktop views with narrower close-ups so Tool Call

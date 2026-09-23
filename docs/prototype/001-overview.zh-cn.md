@@ -902,6 +902,27 @@ Unknown
 - 开始和结束时间
 - 结果或 Unknown 原因
 
+Provider 失败诊断的持久化和公开边界采用白名单投影。Run、Activation、
+ProviderAttempt、Timeline、HTTP 和 Web 只能包含稳定错误码、结果状态，以及
+由 Runtime 明确定义且有长度上限的通用摘要。Provider stderr、原始进程错误、
+启动命令和环境、机器路径、Credential、Prompt、模型输出、任意 Provider
+错误文本及嵌套 cause 消息不得进入这些字段。Runtime 必须在持久化前按错误类型
+映射到固定诊断；不能以正则替换 Secret 作为主要边界，也不能静默吞掉失败。
+若没有具备明确所有权和显式 opt-in 的私有诊断通道，原始诊断只可在有界内存中
+短暂存在并在执行结束后丢弃。
+
+当前稳定错误码为：`provider_process_start_failed`、
+`provider_process_exited`、`provider_protocol_error`、
+`provider_policy_violation`、`provider_output_limit`、
+`provider_stderr_limit`、`provider_io_error`、`provider_timeout`、
+`provider_cancelled`、`provider_cleanup_failed`、
+`provider_runtime_monitor_failed`、`provider_not_started`、
+`provider_worktree_execution_failed`、`provider_worktree_authority_lost`、
+`provider_recovered_worktree_authority_lost`、
+`provider_recovered_failed`、`provider_recovered_unknown` 和
+`provider_execution_failed`。公开详情采用 `<code>: <generic summary>`
+格式，总长度不超过 160 个字符。
+
 ### 20.3 Provider 能力
 
 Adapter 暴露带版本的 capability profile，例如：
@@ -1016,14 +1037,16 @@ Artifact 和原始 provenance，不重复发布事件。新 Activation 只有在
 阻止新 descriptor；已提交 descriptor 仍由当前获授权的 Human/Runtime 查询。
 首片不自动删除 orphan 或 staging 文件，避免与并发固化竞争；清理留给停机维护。
 
-持久因果限制与可信 Artifact 的整合数据库使用 schema **15**，同时保留第 25 节的
+持久因果限制、可信 Artifact、物理 Worktree 与 Provider 诊断边界的整合数据库使用 schema **17**，同时保留第 25 节的
 Run root/parent/depth、不可变约束、准入索引及持久配置，以及第 23 节的可信报告
-descriptor。此前 causal-only schema 14 和独立开发的 Artifact-only schema 14
-均不兼容；不得因版本数字相同而接受另一套布局。打开任何旧版或未版本化的非空
+descriptor，并加入第 22 节的物理身份、执行记录及不可逆的 Writer publication fence。
+schema 16 可能包含诊断边界修复前公开持久化的 Provider 原始诊断，因此必须拒绝并重建；
+更早的 causal-only、Artifact-only、Worktree-only schema 14 及整合 schema 15
+同样不兼容。不得因版本数字相同而接受另一套布局。打开任何旧版或未版本化的非空
 开发数据库必须在应用 DDL/Bootstrap 前明确拒绝，不迁移、不改写版本、不删除数据。
-停止旧进程后由操作者显式重建可丢弃数据库。schema 15 重开仍校验持久 causal 配置。
+停止旧进程后由操作者显式重建可丢弃数据库和新的 managed root。schema 17 重开仍校验持久 causal 配置及 Worktree storage identity。
 
-`user_version = 15` 不是布局证明。已有数据库必须在任何 DDL、Bootstrap 或配置写入
+`user_version = 17` 不是布局证明。已有数据库必须在任何 DDL、Bootstrap 或配置写入
 之前，以只读方式对照由可信 DDL 在隔离内存库生成的完整 schema 指纹：对象集合、
 列/type/not-null/default/PK/FK、索引/唯一性/partial predicate、trigger、CHECK
 和 STRICT 等约束。比较 SQLite 解析后的 metadata 与保留 literal/operator 语义的
@@ -1031,7 +1054,7 @@ SQL token；只忽略空白、注释和未引用 keyword/identifier 大小写，
 缺失、额外不兼容、部分、损坏、前驱形状或未来布局必须拒绝，保持原文件字节及逻辑
 状态不变，不用 `CREATE IF NOT EXISTS` 修补。SQLite 自有统计对象不属于应用布局。
 只有没有持久对象的 version 0 数据库可在同一事务内执行 DDL、初始配置及 Bootstrap；
-失败完整回滚。有效 schema 15 重开不重新应用 Bootstrap，也不修改持久 causal 配置。
+失败完整回滚。有效 schema 17 重开不重新应用 Bootstrap，也不修改持久 causal 配置或 storage identity。
 
 Runtime Host 调度恢复 pass 时，连续执行的 pass 数量必须有界，并在继续前让出事件循环并重新检查关闭请求。积压处理不得饿死 HTTP、timer、signal 或关闭处理。空闲轮询等待必须可被关闭请求中断；无论等待还是关闭先完成，都必须移除对应 listener 并取消不再需要的 timer。
 
@@ -1044,6 +1067,20 @@ Runtime Host 调度恢复 pass 时，连续执行的 pass 数量必须有界，�
 3. 一个 Worktree 同时只有一个平台认可的 Writer Authority；Human 可以强制接管，但系统必须报告旧进程仍未停止的风险。
 4. Lease 带单调递增的 fencing token。
 
+首个物理执行切片进一步限定：
+
+5. Kernel 持久化不可重绑定的 `PhysicalWorktree` 运行记录：repository identity、
+   canonical repository path、完整 base commit、source Run、opaque worktree ID、
+   canonical directory path 和 filesystem identity。路径只是本地 Runtime 的 handle，
+   不进入公开 Thread 事件或 Provider 上下文。不同 Run 不得注册同一个目录、路径别名
+   或 filesystem identity；本切片也不允许把旧目录转交给另一个 Run。
+   已注册目录之间也不得互为祖先/后代，避免隐式嵌套共享。
+6. 每次执行在产生外部副作用**之前**持久化 intent，绑定 source Activation、
+   Runtime Principal、executor incarnation、lease generation、fencing token 和
+   不公开的 execution receipt。PID 是诊断信息，不是可在重启后恢复的进程控制权。
+7. Writer Lease 的 generation 是逻辑授权序号，不是物理隔离证明。只有受信任的
+   executor 能把授权转换为文件/进程操作；Agent、HTTP 和 ACP 不获得通用写入入口。
+
 ### 22.2 创建
 
 1. writable Run 不必立即创建 Worktree。
@@ -1053,6 +1090,72 @@ Runtime Host 调度恢复 pass 时，连续执行的 pass 数量必须有界，�
    - base commit/content revision
    - Run
    - Worktree generation
+
+首个切片不实现通用 provisioning。可信本地 Host 预先提供 dedicated root 下、
+固定到完整 commit 的 detached Git worktree；executor 校验真实路径、目录 identity、
+Git common directory 和 detached HEAD 后注册。Git hooks、filters、仓库内脚本、
+checkout、网络和任意命令不属于 executor 能力。
+
+managed root 以 exclusive-create 的本地 owner marker 绑定唯一 Kernel storage identity。
+另一个数据库不得复用该 root；复制数据库后同时运行不受支持，重建开发数据库需提供
+新的 root，不能自动删除 marker 或接管旧目录。
+该 marker 是 Worktree 之外的 Host 存储归属元数据，本身不授予 Run 写权限。
+
+唯一的受控 tracer 是 `write-probe-v1`：独占创建固定 probe 文件，再启动固定 Node
+child 处理该内容并返回 digest。使用明确 executable 和 argument vector，
+`shell: false`，不继承 `NODE_OPTIONS` 等代码注入配置，不执行仓库内容。
+child 不派生后代；该受审计的固定协议是本切片能用直接 child handle 确认停止的
+前提，不能推广为任意进程树隔离。测试用 process driver/fixture 保持独立窄接口，
+以后接入 Provider Conformance Harness，不另建一套 Provider 引擎。
+
+每次平台介导的 Worktree 内文件创建或 spawn 都必须重新校验 lease token、generation、
+fencing token、当前 Activation/Run、execution receipt 及目录 identity。
+授权校验与同步发起副作用在同一个 Kernel 写事务锁内完成；此前已提交的 intent
+不得因文件或进程失败被抹除。SQLite 与 OS 不构成原子事务，崩溃窗口按不确定处理，
+不承诺任意外部副作用 exactly-once。
+
+Writer publication fence 同时覆盖该 Activation 的 Agent Kernel 命令（含幂等重放）、
+`AppendRunActivity`、报告固化以及 Runtime 的成功结束记录；在事务内验证当前
+generation、fencing、holder、expiry 和 physical quarantine。失效不能由新 token、
+晚到 `close`、时钟回拨或旧 Activation 再次 acquisition 撤销；恢复需要新的合法
+Activation。Human 的停止与 Runtime 的失败/Unknown、进程停止及 reconciliation
+记录仍允许提交，但不能代替旧 Writer 发布成功或原始输出。授权读取及新 Activation
+对已提交 Artifact 的幂等恢复继续遵守第 23 节。
+
+`CompleteRun` 和 Runtime 的成功结束还要求所有关联物理执行已正常 `StopConfirmed`。
+若该 Activation 在有效授权下已经提交自己的 `CompleteRun`、`FailRun` 或 `WaitRun`，
+Kernel 对 Activation 的逻辑撤销不阻止 Runtime 确认**该已提交决策**；但必须仍匹配
+当前 Run generation/状态、未过期的 lease 和 Activation、正常停止证据，且没有
+publication revocation。此例外只允许结束记录，不重新授予 Agent mutation authority。
+即使物理停止已经确认，executor 重启也撤销遗留 publication window；不将旧成功
+返回值当作恢复后的写权限。
+
+恢复不得从已提交的 `ProviderAttempt.Completed` 推导出重启后的 Writer 成功权限。
+若孤立 Activation 的 `FinishActivation(Completed)` 被 `WriterAuthorityLost` 拒绝，
+Runtime 以独立幂等键提交 `FinishActivation(Expired)` 和固定的 authority-lost
+reconciliation 说明，再确认已恢复的 outbox delivery。保留已提交的 Run、
+ProviderAttempt、Reply、Artifact、activity 和因果容量事实，不重发 Provider、不重发
+成功、不把已完成 Run 改成失败。已有 Failed/Unknown、Waiting 和旧 generation 的
+恢复仍遵守各自状态规则；已终结 Activation 不重复结束。第二次重启不产生重复事实。
+若 authority-lost 的 `Expired` settlement 因另一个 Host 并发结束同一 Activation
+而发生 `Conflict`，只在重新读取权威 Run projection 确认该 Activation 已有
+`finishedAt` 后接受其既有终态并继续确认 delivery，不覆盖 outcome。
+Activation 仍未结束、读取失败或其他冲突必须继续报错，不能泛化为吞掉 `Conflict`。
+
+正常 `probe` 只在固定 digest 匹配、正常退出已确认、写权限仍有效时返回成功。
+正常 drain 不提前释放 lease：保留到该 Activation 的公开结果/状态提交结束后，
+由 `stopActivation`/Host 关闭释放；因此 publication 与另一 Writer acquisition
+仍由同一 Kernel 写锁串行化。取消、超时、强制终止、异常、恢复或不确定结果会
+不可逆撤销此执行的 publication authority；`StopConfirmed` 只证明停止，不恢复授权。
+报告输出仅经已授权的 `publish_report` / `finalizeReport` 接收字节，保持现有
+1 MiB/4096 chunk 限制、当前 scope、来源、幂等和存储确认；不直接提交 descriptor。
+
+受控 child 的结果通道最多 65 bytes（一个 SHA-256 hex 加换行），stderr 最多
+1024 bytes 且不保留内容。多余、畸形、超限输出或非正常退出必须失败，不能截断成
+成功；不用会先反序列化任意大小对象的结果 IPC。环境仅允许必需的 OS 项，不继承
+凭据或注入配置。公开错误使用固定说明；本地路径、PID、receipt、原始进程错误、
+输出及环境不进入 Timeline、报告或 ACP Transcript。完整本地诊断只在 Runtime-only
+记录中保留；不改变 ACP 生产拒绝工具策略或 Harness 的独立白名单契约。
 
 ### 22.3 Lease 过期
 
@@ -1067,9 +1170,20 @@ Lease 超时
 
 必须：
 
-1. 确认旧进程已停止；或
-2. 将旧目录标记 `Suspect/Quarantined`；并
-3. 从已知 base/checkpoint 创建新的 Worktree generation。
+1. 只有确切停止证据才能允许同一 Run 再使用原目录；或
+2. 将旧目录标记 `Quarantined`，禁止任何新的平台写入或 Writer acquisition。
+3. 后续切片可以从已知 base/checkpoint 创建**不同物理目录**；增加 generation、
+   改名、换 token 或从嫌疑目录复制文件都不是隔离证明。
+
+`Starting` intent、运行中进程、`StopRequested` 或 `Uncertain` 都阻止 lease
+释放/重新分配，即使 lease 已过期。独立 Kernel 连接的竞争 acquisition 也遵守此规则。
+启动恢复时，旧 executor incarnation 的未结束 intent 一律隔离；不能通过 PID 存在性、
+PID 消失、旧进程的退出码缓存或重新启动 Host 来清除隔离。
+
+本切片只接受仍持有原始 child handle 的 executor 所观察到的 `close`（或明确的
+spawn 未发生）作为直接 child 停止证据。晚到确认使用原 execution receipt
+条件更新自己的记录，不能修改后继执行。handle 丢失后保持隔离；跨重启 OS containment
+证明和人工解除隔离协议尚未实现，不能用一段 resolution 文本绕过。
 
 ### 22.4 Pause、Cancel 和 GC
 
@@ -1083,6 +1197,39 @@ Lease 超时
    - 必要 Artifact 已固化
    - 保留期结束
    - 无调查或保留要求
+
+本切片的 Host 关闭必须等待已接纳的受控操作停止或持久化隔离，再关闭 Kernel。
+恢复期间收到关闭请求后，不得再打开 HTTP listener 或接纳新的 Runtime 执行。
+停止控制属于已有进程 handle 的安全权限，不要求已经失效的写 lease 仍然有效。
+停止入口必须先不可逆地撤销本 executor 的本地权限，并独立使用原 handle 发起停止、
+有界等待及必要的强制停止；不得等待 SQLite 写锁、revocation 或 `StopRequested`
+持久化成功才发停止请求。正常 drain 也先执行物理停止，再持久化证据。数据库忙、
+启动失败、取消、超时、输出超限和关闭均遵守此顺序。
+
+`DatabaseSync` 即使位于 Promise API 内也会同步阻塞调用线程；不能让 authority
+monitor、其他 Kernel 命令或清理重试的 SQLite busy wait 占用执行 deadline、
+AbortSignal 和关闭回调的事件循环。首次物理副作用之前，该 Kernel 实例进入保守的
+nonblocking supervision 模式，直到实例关闭：每个同步数据库操作作用域使用
+no-wait lock admission，并在 `finally` 恢复配置的 busy timeout（生产默认 5000ms）；
+作用域内不跨 `await`。竞争明确失败，持久化可按原幂等协议重试，不降低 Writer 校验。
+monitor 使用只回滚的短 snapshot 观察，不能凭观察结果发起 mutation/publication；
+实际副作用仍在 `BEGIN IMMEDIATE` 内重新验证完整授权。持有原 handle 的 deadline
+及停止链独立运行；一个执行的持久化重试也不能阻塞其他执行的停止。
+验收使用未缩短的生产 timeout、独立连接持续 6500ms 的写锁及独立进程存活观察，
+证明 1000ms lease 的停止请求在 deadline 附近发出，并在解锁后持久化收敛；
+同时覆盖排队的取消/显式停止、executor/Host 关闭和多个 handle。
+
+本地停止/证据与 durable revocation、quarantine/stop disposition、lease release
+分别幂等：同一个 handle 不重复成功发送停止/强制信号；保留原始 close 证据。
+缓存只合并进行中的持久化尝试，失败后必须允许重试，不把 rejected promise 当作清理完成。
+deadline 只能由仍有效的清理重试路径替代；每次失败显式返回错误并安排有界间隔的重试，
+直到撤权及停止 disposition 持久化。无法确认停止则持久化 Uncertain/quarantine，
+不根据锁释放推断停止。原 handle 晚到的 close 可按既有 receipt reconciliation。
+关闭清理必须等待所有已接纳 handle 的停止尝试；持久化失败时 Host 保留 Kernel
+供重试且保持关闭、不再接纳工作，后续 `close` 必须重试，不永久缓存失败。进程意外退出
+仍依赖启动时对旧 intent 的保守恢复。schema 保持 16，不增加迁移或新的 Run 状态。
+未确认停止时不删除目录、不释放为可复用资源。Pause/Resume、Human Terminal、
+controller lease、Files UI、保留策略和 GC 均不在本切片内。
 
 ## 23. Artifact 和集成
 
@@ -1204,6 +1351,20 @@ Artifact 通过 Thread 中的 Message 或卡片引用，再将该 Message revisi
 3. 再异步请求 Provider 停止。
 4. UI 独立显示逻辑状态和 Provider 执行状态。
 
+物理执行独立记录以下事实，而不新增 Run 状态：
+
+| 事实 | 含义 |
+|---|---|
+| `Starting` / `Running` | 已持久化 intent / 已观察到 child 启动；都不是完成 |
+| `StopRequested` | 已禁止后续写操作并请求停止；不是停止证据 |
+| `StopConfirmed` | 原 handle 确认退出（不表示成功），或明确未 spawn；可以安全结束该执行 |
+| `ForceTerminated` | 已请求强制终止，且原 handle 随后确认退出；kill 返回成功不够 |
+| `Uncertain` | 到截止时间仍无确认、handle 丢失或启动窗口崩溃；目录必须隔离 |
+
+记录请求时间、观察时间、PID（若有）、原因和停止证据；保留转换历史。
+Provider timeout、AbortSignal、协议 cancel acknowledgement、Run 终态和 lease expiry
+都不能自动转换为 `StopConfirmed`。受控 child 结束不自动 complete Run。
+
 ### 24.3 Provider 不支持 Cancel
 
 Run仍可立即逻辑 Cancel：
@@ -1212,6 +1373,10 @@ Run仍可立即逻辑 Cancel：
 - Worktree 被隔离
 - Provider termination 显示 pending/unknown
 - 晚到输出不能自动发布、改变 Run 或处理 RunInput
+
+同样适用于声称支持 Cancel 却没有物理确认的 Provider。第一切片不开放该 Provider
+对 Worktree 的 native shell/write tools；通用后代进程控制和 OS 级隔离尚未完成时，
+只能使用受控 tracer，不能把逻辑 fencing 宣称为恶意同用户进程的安全沙箱。
 
 ### 24.4 Unknown 是否重试
 
@@ -1302,6 +1467,10 @@ result
 ```
 
 敏感 Prompt 和隐藏思维不默认写入审计日志。
+
+Provider 或进程诊断同样不默认进入公开审计或持久投影。公开诊断只保留稳定
+错误码、结果状态和白名单通用摘要；本地开发日志不得隐式打印 Credential 或
+完整环境。
 
 ### 28.2 基础指标
 
@@ -1680,15 +1849,30 @@ sequence 升序返回，`nextCursor` 指向该页最早 sequence。同时提供�
 
 Files Tab 是 Worktree 的读取投影，不是新的 File 领域对象。
 
-规则：
+### 38.1 根目录和身份
 
-1. 文件树根目录固定在当前 Run 的 Worktree 或只读 Project snapshot。
-2. 不暴露 Host 任意文件系统。
-3. Human 可以在 Agent工作时查看文件和 diff。
-4. 文件内容可能随 Agent写入变化；读取结果带 Worktree generation、path 和内容 hash。
-5. Client 可以提示文件已变化并刷新。
-6. MVP Files Tab 默认只读。
-7. Human编辑文件需要获得当前 Worktree Writer Lease，或进入单独派生的 Worktree。
+根目录固定在当前 Run 的 Worktree 或只读 Project snapshot；不暴露 Host 任意路径。
+Runtime 使用已注册的 opaque handle，不能让 Provider 提交任意 cwd。
+
+### 38.2 路径安全
+
+平台文件操作拒绝绝对路径、`..`、两种分隔符的 traversal、symlink/junction/reparse
+别名和逃逸。校验 canonical containment 以及各级目录 identity；固定 probe 文件
+以 exclusive-create 打开，不跟随已存在 symlink，不覆盖文件或 hard link。
+路径检查不等于 OS sandbox：本切片只支持可信 Host 控制、无并发外部改名/链接替换的
+private root；无法保证该前提时不启用 executor。敌对同用户进程的 TOCTOU 防护需要
+后续 OS handle-relative/containment 实现。
+
+### 38.3 读取投影
+
+Human 可以在 Agent 工作时查看文件和 diff；读取带 Worktree generation、path 和
+content hash，Client 可提示变化并刷新。本切片不增加 Files API/UI。
+
+### 38.4 写权限
+
+MVP Files Tab 默认只读。Human 编辑需要当前 Writer Authority 或另一个派生 Worktree。
+平台介导写入遵守 §22；旧 token、旧 generation、停止请求后的执行和隔离目录必须失败。
+文件内容不能作为执行权限或自动确认 Run 完成的依据。
 
 ## 39. TerminalSession
 
@@ -2087,6 +2271,12 @@ Torsor 必须保证：
 - revision、幂等、Lease、fencing 和终态不被绕过；
 - 失败、冲突、晚到结果和外部操作结果不会静默丢失；
 - Human 可以观察、指导、接管和停止。
+
+上述是平台契约，不是对尚未实现的 OS containment 的声明。首个 lease-backed
+physical execution 切片只连接 Kernel、Runtime 和受控 Worktree executor；
+物理身份与停止证据必须独立于逻辑 lease 存在。默认关闭此可选 tracer；不开放 ACP
+native shell/write tools，不实现 Human Terminal/controller lease、Files UI、GC
+或 GitHub 集成。未具备安全隔离证据时宁可保留不可复用的隔离目录，也不扩大执行面。
 
 ### 43.2 PR 和真实集成
 
