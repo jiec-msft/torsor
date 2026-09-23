@@ -135,6 +135,15 @@ describe("durable Live Timeline public path", () => {
         status: "Unknown",
         detail: expectedDiagnostic,
       });
+      expect(durable.providerAttempts.at(-1)).not.toHaveProperty(
+        "diagnosticSessionId",
+      );
+      expect(http.providerAttempts.at(-1)).not.toHaveProperty(
+        "diagnosticSessionId",
+      );
+      expect(web.providerAttempts.at(-1)).not.toHaveProperty(
+        "diagnosticSessionId",
+      );
       expect(expectedDiagnostic.length).toBeLessThanOrEqual(160);
       for (const surface of publicSurfaces) {
         expect(surface).toContain(expectedDiagnostic);
@@ -146,6 +155,7 @@ describe("durable Live Timeline public path", () => {
           "synthetic private prompt",
           "synthetic private model output",
           "COPILOT_PROVIDER_API_KEY",
+          "diagnostic-session",
         ]) {
           expect(surface).not.toContain(privateValue);
         }

@@ -22,6 +22,7 @@ describe("integrated schema contract (MVP 21.5, 22, 23.1, 25.1-25.2)", () => {
     { name: "missing Worktree acquisition index", after: "DROP INDEX worktree_unsettled_execution_idx;" },
     { name: "missing Writer publication index", after: "DROP INDEX worktree_execution_activation_idx;" },
     { name: "missing Writer revocation trigger", after: "DROP TRIGGER worktree_publication_revocation_immutable;" },
+    { name: "legacy Provider diagnostic session column", after: "ALTER TABLE provider_attempts ADD COLUMN diagnostic_session_id TEXT;" },
     { name: "missing Worktree storage identity", after: "DELETE FROM worktree_storage_identity;" },
     { name: "invalid Worktree storage identity", after: "UPDATE worktree_storage_identity SET identity = 'invalid';" },
     { name: "altered Worktree uniqueness", replace: ["directory_identity TEXT NOT NULL UNIQUE", "directory_identity TEXT NOT NULL"] },

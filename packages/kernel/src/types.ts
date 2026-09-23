@@ -205,7 +205,6 @@ export interface StartProviderAttemptCommand extends IdempotentCommand {
   readonly capabilitySnapshot: JsonValue;
   readonly runInputIds: readonly string[];
   readonly requestIdempotencyKey: string;
-  readonly diagnosticSessionId?: string;
 }
 
 export interface FinishProviderAttemptCommand extends IdempotentCommand {
@@ -717,7 +716,6 @@ export interface ProviderAttemptView {
   readonly capabilitySnapshot: JsonValue;
   readonly runInputIds: readonly string[];
   readonly requestIdempotencyKey: string;
-  readonly diagnosticSessionId: string | null;
   readonly status: ProviderAttemptStatus;
   readonly detail: string | null;
   readonly startedAt: string;
