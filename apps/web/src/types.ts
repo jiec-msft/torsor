@@ -38,6 +38,8 @@ export interface MessageRevision {
   readonly id: string;
   readonly revision: number;
   readonly body: string;
+  readonly tombstone: boolean;
+  readonly targetAgentIds: readonly string[];
   readonly createdAt: string;
 }
 
@@ -227,5 +229,18 @@ export function latestMessageBody(message: Message | undefined): string {
     )?.body ??
     message.revisions.at(-1)?.body ??
     ""
+  );
+}
+
+export function latestMessageRevision(
+  message: Message | undefined,
+): MessageRevision | undefined {
+  if (!message) {
+    return undefined;
+  }
+  return (
+    message.revisions.find(
+      (revision) => revision.revision === message.latestRevision,
+    ) ?? message.revisions.at(-1)
   );
 }

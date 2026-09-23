@@ -26,6 +26,10 @@ const defaultSessionDurationMs = 86_400_000;
 const commandTypes = {
   "start-thread": "StartThread",
   "reply-to-thread": "ReplyToThread",
+  "edit-message": "EditMessage",
+  "delete-message": "DeleteMessage",
+  "update-agent-config": "UpdateAgentConfig",
+  "adopt-run-config": "AdoptRunConfig",
   "send-to-run": "SendToRun",
   "cancel-run": "CancelRun",
   "withdraw-run-input": "WithdrawRunInput",

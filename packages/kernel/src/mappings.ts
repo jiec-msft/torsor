@@ -50,11 +50,16 @@ export function mapAgent(row: Row): BootstrapAgent {
   };
 }
 
-export function mapMessageRevision(row: Row): MessageRevisionView {
+export function mapMessageRevision(
+  row: Row,
+  targetAgentIds: readonly string[],
+): MessageRevisionView {
   return {
     id: text(row.id),
     revision: integer(row.revision),
     body: text(row.body),
+    tombstone: integer(row.tombstone) === 1,
+    targetAgentIds,
     createdAt: text(row.created_at),
   };
 }

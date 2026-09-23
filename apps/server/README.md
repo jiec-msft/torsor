@@ -171,7 +171,7 @@ same completed Thread, Run, and activity from SQLite.
 ## HTTP contract
 
 - `GET /health`
-- `POST /api/v1/commands/{start-thread|reply-to-thread|send-to-run|cancel-run|withdraw-run-input}`
+- `POST /api/v1/commands/{start-thread|reply-to-thread|edit-message|delete-message|send-to-run|cancel-run|withdraw-run-input|update-agent-config|adopt-run-config}`
 - `GET /api/v1/projects/:projectId/bootstrap`
 - `GET /api/v1/projects/:projectId/channels`
 - `GET /api/v1/channels/:channelId/threads?projectId=...&after=...&snapshot=...&limit=...`
@@ -195,7 +195,11 @@ pages use the same authentication and Run visibility rules as that projection.
 Command bodies contain Kernel command fields except `type`, which the route
 owns. Principal and author provenance are never accepted from the request
 body. The authenticated local credential supplies the complete
-`PrincipalContext`.
+`PrincipalContext`. Message edits and tombstones require the original Human
+author and expected Message revision. Agent configuration updates and explicit
+nonterminal Run adoption require their respective expected revisions. All
+command routes retain principal-scoped idempotency, so a retry with the same
+identity can recover a committed response after a lost connection.
 
 Artifact routes recheck current Kernel visibility; content downloads also
 recheck browser-session validity after storage I/O. Download responses are

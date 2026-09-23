@@ -972,6 +972,8 @@ describe("WebController", () => {
                     id: "revision-reply",
                     revision: 1,
                     body: "Commit this reply once.",
+                    tombstone: false,
+                    targetAgentIds: ["agent-orbit"],
                     createdAt: "2026-09-22T04:03:00.000Z",
                   },
                 ],
@@ -1064,6 +1066,8 @@ describe("WebController", () => {
                     id: "revision-auth-reply",
                     revision: 1,
                     body: "Reply once across reauthentication.",
+                    tombstone: false,
+                    targetAgentIds: [],
                     createdAt: "2026-09-22T04:03:00.000Z",
                   },
                 ],
@@ -1950,6 +1954,30 @@ describe("WebController", () => {
       expect(harness.counts.run).toBe(baseline.run + 1);
       expect(harness.counts.runs).toBe(baseline.runs + 1);
       expect(harness.counts.agents).toBe(baseline.agents + 1);
+    });
+  });
+
+  it("refreshes bootstrap and Agent projections for Agent configuration events", async () => {
+    const harness = createHarness();
+    await harness.controller.exchangeSession("local-secret", "project-sample");
+    const baseline = { ...harness.counts };
+
+    FakeEventSource.instances[0]!.emit(
+      publicEvent({
+        type: "AgentConfigUpdated",
+        entityType: "Agent",
+        entityId: "agent-orbit",
+        payload: {
+          previousConfigRevision: 1,
+          configRevision: 2,
+        },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(harness.counts.bootstrap).toBe(baseline.bootstrap + 1);
+      expect(harness.counts.agents).toBe(baseline.agents + 1);
+      expect(harness.counts.attentions).toBe(baseline.attentions + 1);
     });
   });
 

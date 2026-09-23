@@ -14,6 +14,21 @@ are not Kernel objects and are not synchronized across windows. Server facts
 are refreshed from durable SSE events and broadcast as invalidations to other
 windows without copying view state.
 
+An original Human author can append an edited Message revision or confirm a
+tombstone without erasing history or provenance. The conversation renders the
+latest projection and exposes immutable revision history, including each
+revision's Mention set. Agent-authored Messages and another Human's Messages
+do not expose these controls. Human operators can also create the next Agent
+JSON configuration revision and explicitly adopt the current newer revision
+for a nonterminal Run; already running Activations remain pinned to their
+recorded revision.
+
+These commands use expected revisions and recover unknown outcomes by retrying
+the exact request with its original idempotency key. Definite conflicts and
+permission failures remain visible rather than being treated as success.
+Agent configuration content is held only for the active request/retry and is
+not persisted in browser recovery metadata.
+
 Run detail's Live Agent Timeline retains loaded `RunActivityEvent` history,
 loads older items in explicit 100-item pages, and fills reconnect gaps through
 the authenticated activity API. It follows output only while at the bottom;

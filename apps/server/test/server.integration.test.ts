@@ -170,6 +170,164 @@ describe("Torsor HTTP and SSE service", () => {
     });
   });
 
+  it("serves durable Message and Agent config revision operations", async () => {
+    const directory = await temporaryDirectory();
+    const databasePath = join(directory, "torsor.sqlite");
+    const seeded = await seedRun(databasePath, "collaboration-http");
+    const first = await startHarness({ databasePath });
+
+    const foreignEdit = await command(
+      first.origin,
+      "edit-message",
+      {
+        idempotencyKey: "foreign-message-edit",
+        messageId: seeded.threadId,
+        expectedMessageRevision: 1,
+        body: "Riley must not rewrite this Message.",
+      },
+      "riley-token",
+    );
+    expect(foreignEdit.status).toBe(403);
+    expect(await foreignEdit.json()).toMatchObject({
+      error: { code: "forbidden" },
+    });
+
+    const editRequest = {
+      idempotencyKey: "http-message-edit",
+      messageId: seeded.threadId,
+      expectedMessageRevision: 1,
+      body: "Revised through the authenticated HTTP command.",
+      targetAgentIds: ["agent-orbit"],
+    };
+    const edited = await command(first.origin, "edit-message", editRequest);
+    expect(edited.status).toBe(200);
+    const editedBody = await edited.json();
+    const editReplay = await command(
+      first.origin,
+      "edit-message",
+      editRequest,
+    );
+    expect(await editReplay.json()).toEqual(editedBody);
+    const staleEdit = await command(first.origin, "edit-message", {
+      ...editRequest,
+      idempotencyKey: "http-message-edit-stale",
+      body: "This stale revision must fail.",
+    });
+    expect(staleEdit.status).toBe(409);
+    expect(await staleEdit.json()).toMatchObject({
+      error: {
+        code: "stale_revision",
+        details: { expectedRevision: 1, actualRevision: 2 },
+      },
+    });
+
+    const deleted = await command(first.origin, "delete-message", {
+      idempotencyKey: "http-message-delete",
+      messageId: seeded.threadId,
+      expectedMessageRevision: 2,
+    });
+    expect(deleted.status).toBe(200);
+    const deleteBody = await deleted.json();
+
+    const configRequest = {
+      idempotencyKey: "http-config-update",
+      agentId: "agent-orbit",
+      expectedAgentConfigRevision: 3,
+      config: { model: "http-synthetic-v2", mode: "read-only" },
+    };
+    const config = await command(
+      first.origin,
+      "update-agent-config",
+      configRequest,
+    );
+    expect(config.status).toBe(200);
+    expect(await config.json()).toMatchObject({
+      result: { entityId: "agent-orbit", revision: 4 },
+    });
+
+    const adopted = await command(first.origin, "adopt-run-config", {
+      idempotencyKey: "http-config-adoption",
+      runId: seeded.runId,
+      expectedRunRevision: 1,
+      expectedAgentConfigRevision: 4,
+      targetAgentConfigRevision: 4,
+    });
+    expect(adopted.status).toBe(200);
+    const staleAdoption = await command(first.origin, "adopt-run-config", {
+      idempotencyKey: "http-config-adoption-stale",
+      runId: seeded.runId,
+      expectedRunRevision: 1,
+      expectedAgentConfigRevision: 4,
+      targetAgentConfigRevision: 4,
+    });
+    expect(staleAdoption.status).toBe(409);
+    expect(await staleAdoption.json()).toMatchObject({
+      error: {
+        code: "stale_revision",
+        details: { expectedRevision: 1, actualRevision: 2 },
+      },
+    });
+
+    await first.service.close();
+    const second = await startHarness({ databasePath });
+    const deleteReplay = await command(
+      second.origin,
+      "delete-message",
+      {
+        idempotencyKey: "http-message-delete",
+        messageId: seeded.threadId,
+        expectedMessageRevision: 2,
+      },
+    );
+    expect(await deleteReplay.json()).toEqual(deleteBody);
+    const configReplay = await command(
+      second.origin,
+      "update-agent-config",
+      configRequest,
+    );
+    expect(await configReplay.json()).toMatchObject({
+      result: { entityId: "agent-orbit", revision: 4 },
+    });
+    const thread = await jsonRequest<{
+      thread: {
+        cursor: number;
+        messages: ReadonlyArray<{
+          latestRevision: number;
+          targetAgentIds: readonly string[];
+          revisions: ReadonlyArray<{
+            body: string;
+            tombstone: boolean;
+            targetAgentIds: readonly string[];
+          }>;
+        }>;
+      };
+    }>(`${second.origin}/api/v1/threads/${seeded.threadId}`);
+    expect(thread.thread.messages[0]).toMatchObject({
+      latestRevision: 3,
+      targetAgentIds: [],
+      revisions: [
+        {
+          body: "Orbit, create a durable Run.",
+          tombstone: false,
+          targetAgentIds: ["agent-orbit"],
+        },
+        {
+          body: "Revised through the authenticated HTTP command.",
+          tombstone: false,
+          targetAgentIds: ["agent-orbit"],
+        },
+        { body: "", tombstone: true, targetAgentIds: [] },
+      ],
+    });
+    const run = await jsonRequest<{
+      run: { run: { revision: number; agentConfigRevision: number } };
+    }>(`${second.origin}/api/v1/runs/${seeded.runId}`);
+    expect(run.run.run).toMatchObject({
+      revision: 2,
+      agentConfigRevision: 4,
+    });
+  });
+
   it("hands off bootstrap to SSE without missing durable events", async () => {
     const harness = await startHarness();
     await command(harness.origin, "start-thread", {
@@ -1283,7 +1441,7 @@ async function seedRun(
   databasePath: string,
   prefix = "seed",
   clock?: () => Date,
-): Promise<{ readonly runId: string }> {
+): Promise<{ readonly runId: string; readonly threadId: string }> {
   const kernel = TorsorKernel.open({
     databasePath,
     bootstrap,
@@ -1343,7 +1501,7 @@ async function seedRun(
       },
     );
     expect(thread.entityId).toBeTruthy();
-    return { runId: run.entityId };
+    return { runId: run.entityId, threadId: thread.entityId };
   } finally {
     kernel.close();
   }

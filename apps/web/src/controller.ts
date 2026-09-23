@@ -18,12 +18,27 @@ import type {
   PublicEvent,
   RunProjection,
   ThreadProjection,
+  JsonValue,
 } from "./types";
 
 type Fetch = typeof fetch;
 type EventSourceFactory = (url: string) => EventSource;
 type BroadcastChannelFactory = (name: string) => BroadcastChannel;
-type HumanCommand = "start-thread" | "reply-to-thread" | "send-to-run" | "cancel-run" | "withdraw-run-input";
+type HumanCommand =
+  | "start-thread"
+  | "reply-to-thread"
+  | "edit-message"
+  | "delete-message"
+  | "update-agent-config"
+  | "adopt-run-config"
+  | "send-to-run"
+  | "cancel-run"
+  | "withdraw-run-input";
+
+export interface CollaborationCommandOutcome {
+  readonly committed: true;
+  readonly refreshed: boolean;
+}
 
 export type SessionState =
   | "signed-out"
@@ -121,6 +136,12 @@ interface PendingReply {
   activeAttempts: number;
 }
 
+interface PendingCollaborationOperation {
+  readonly request: Readonly<Record<string, unknown>>;
+  uncertain: boolean;
+  activeAttempts: number;
+}
+
 interface DeferredBoolean {
   readonly promise: Promise<boolean>;
   readonly resolve: (value: boolean) => void;
@@ -198,6 +219,10 @@ export class WebController {
   #projectionErrors = new Map<string, string>();
   #pendingStartThreads = new Map<string, PendingStartThread>();
   #pendingReplies = new Map<string, PendingReply>();
+  #pendingCollaborationOperations = new Map<
+    string,
+    PendingCollaborationOperation
+  >();
   #pendingCommandIds = new Set<number>();
   #nextCommandId = 0;
   #sessionGeneration = 0;
@@ -796,6 +821,96 @@ export class WebController {
     }
   }
 
+  editMessage(input: {
+    readonly messageId: string;
+    readonly threadRootId: string;
+    readonly expectedMessageRevision: number;
+    readonly body: string;
+    readonly targetAgentIds?: readonly string[];
+  }): Promise<CollaborationCommandOutcome> {
+    return this.#collaborationCommand(
+      "edit-message",
+      {
+        messageId: input.messageId,
+        expectedMessageRevision: input.expectedMessageRevision,
+        body: input.body,
+        targetAgentIds: [...(input.targetAgentIds ?? [])],
+      },
+      async () =>
+        this.#threadId === input.threadRootId
+          ? this.loadThread(input.threadRootId)
+          : true,
+    );
+  }
+
+  deleteMessage(input: {
+    readonly messageId: string;
+    readonly threadRootId: string;
+    readonly expectedMessageRevision: number;
+  }): Promise<CollaborationCommandOutcome> {
+    return this.#collaborationCommand(
+      "delete-message",
+      {
+        messageId: input.messageId,
+        expectedMessageRevision: input.expectedMessageRevision,
+      },
+      async () =>
+        this.#threadId === input.threadRootId
+          ? this.loadThread(input.threadRootId)
+          : true,
+    );
+  }
+
+  updateAgentConfig(input: {
+    readonly agentId: string;
+    readonly expectedAgentConfigRevision: number;
+    readonly config: JsonValue;
+  }): Promise<CollaborationCommandOutcome> {
+    return this.#collaborationCommand(
+      "update-agent-config",
+      {
+        agentId: input.agentId,
+        expectedAgentConfigRevision: input.expectedAgentConfigRevision,
+        config: input.config,
+      },
+      async () => {
+        const [bootstrap, agents] = await Promise.all([
+          this.#refreshBootstrap(),
+          this.#refreshAttentionAndAgents(),
+        ]);
+        return bootstrap && agents;
+      },
+    );
+  }
+
+  adoptRunConfig(input: {
+    readonly runId: string;
+    readonly threadRootId: string;
+    readonly expectedRunRevision: number;
+    readonly expectedAgentConfigRevision: number;
+    readonly targetAgentConfigRevision: number;
+  }): Promise<CollaborationCommandOutcome> {
+    return this.#collaborationCommand(
+      "adopt-run-config",
+      {
+        runId: input.runId,
+        expectedRunRevision: input.expectedRunRevision,
+        expectedAgentConfigRevision: input.expectedAgentConfigRevision,
+        targetAgentConfigRevision: input.targetAgentConfigRevision,
+      },
+      async () => {
+        const [run, runs, thread] = await Promise.all([
+          this.#runId === input.runId ? this.loadRun(input.runId) : true,
+          this.#refreshRuns(),
+          this.#threadId === input.threadRootId
+            ? this.loadThread(input.threadRootId)
+            : true,
+        ]);
+        return run && runs && thread;
+      },
+    );
+  }
+
   async sendToRun(runId: string): Promise<void> {
     const run = this.#state.run?.run;
     if (!run || run.id !== runId || this.#runId !== runId || !this.#principalId) {
@@ -808,6 +923,60 @@ export class WebController {
     );
     if (submitted && this.#runId === runId && this.#state.session === "ready") {
       await this.refreshRunComposer(runId);
+    }
+  }
+
+  async #collaborationCommand(
+    slug: Extract<
+      HumanCommand,
+      | "edit-message"
+      | "delete-message"
+      | "update-agent-config"
+      | "adopt-run-config"
+    >,
+    body: Readonly<Record<string, unknown>>,
+    refresh: () => Promise<boolean>,
+  ): Promise<CollaborationCommandOutcome> {
+    const fingerprint = `${slug}:${JSON.stringify(body)}`;
+    const pending =
+      this.#pendingCollaborationOperations.get(fingerprint) ??
+      ({
+        request: {
+          idempotencyKey: crypto.randomUUID(),
+          ...body,
+        },
+        uncertain: false,
+        activeAttempts: 0,
+      } satisfies PendingCollaborationOperation);
+    this.#pendingCollaborationOperations.set(fingerprint, pending);
+    pending.activeAttempts += 1;
+    try {
+      await this.#command(slug, pending.request);
+    } catch (error) {
+      pending.activeAttempts -= 1;
+      if (isUncertainCommandError(error)) {
+        pending.uncertain = true;
+      }
+      if (
+        this.#pendingCollaborationOperations.get(fingerprint) === pending &&
+        pending.activeAttempts === 0 &&
+        !isUncertainCommandError(error) &&
+        !(pending.uncertain && isAuthenticationCommandError(error))
+      ) {
+        this.#pendingCollaborationOperations.delete(fingerprint);
+      }
+      throw error;
+    }
+    try {
+      return { committed: true, refreshed: await refresh() };
+    } finally {
+      pending.activeAttempts -= 1;
+      if (
+        pending.activeAttempts === 0 &&
+        this.#pendingCollaborationOperations.get(fingerprint) === pending
+      ) {
+        this.#pendingCollaborationOperations.delete(fingerprint);
+      }
     }
   }
 
@@ -1123,7 +1292,15 @@ export class WebController {
       );
     } catch (error) {
       if (
-        (slug === "send-to-run" || slug === "cancel-run" || slug === "withdraw-run-input") &&
+        (
+          slug === "send-to-run" ||
+          slug === "cancel-run" ||
+          slug === "withdraw-run-input" ||
+          slug === "edit-message" ||
+          slug === "delete-message" ||
+          slug === "update-agent-config" ||
+          slug === "adopt-run-config"
+        ) &&
         error instanceof ApiError && error.status === 401 &&
         this.#csrfRevision !== csrfRevision && this.#csrfToken &&
         this.#principalId === principalId
@@ -1435,7 +1612,11 @@ export class WebController {
         () => this.#refreshAttentionAndAgents(),
       );
     }
-    if (event.entityType === "Channel" || event.entityType === "Project") {
+    if (
+      event.entityType === "Agent" ||
+      event.entityType === "Channel" ||
+      event.entityType === "Project"
+    ) {
       queue("bootstrap", () => this.#refreshBootstrap());
     }
     try {
@@ -2074,7 +2255,9 @@ function affectsRuns(event: PublicEvent): boolean {
 }
 
 function affectsAttentionOrAgents(event: PublicEvent): boolean {
-  return ["Attention", "Run", "ActivationAttempt"].includes(event.entityType);
+  return ["Agent", "Attention", "Run", "ActivationAttempt"].includes(
+    event.entityType,
+  );
 }
 
 function affectsSelectedRunDetail(event: PublicEvent): boolean {

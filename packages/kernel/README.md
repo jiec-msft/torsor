@@ -174,6 +174,21 @@ carry durable Activation or ProviderAttempt provenance. Provider session IDs
 are diagnostic only; provider delivery never changes RunInput disposition or
 other semantic state.
 
+`EditMessage` and `DeleteMessage` require the original Human author and the
+expected latest Message revision. Editing appends an immutable revision with a
+complete replacement body and Mention set; deleting appends a terminal
+tombstone revision. Revision history, original provenance, prior Attention and
+RunInput references, and revision-specific Mentions remain queryable.
+
+`UpdateAgentConfig` creates the next immutable JSON configuration revision for
+an Agent after checking the expected current revision. `AdoptRunConfig`
+explicitly pins a nonterminal Run to a valid newer revision after checking both
+the Run revision and current Agent configuration revision. Existing
+Activations keep their recorded revision; only later Activations use the
+adopted revision. Configuration content is not included in public event
+payloads. These operations use the existing schema 17 revision tables and
+pointers.
+
 An Attention wakes its target Agent but does not choose a Run. A claimed
 Attention Activation can use `IgnoreAttention`, attach the triggering Message
 revision to an eligible same-Project, same-Channel, same-Thread Run with

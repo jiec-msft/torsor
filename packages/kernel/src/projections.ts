@@ -99,13 +99,18 @@ export function getThreadProjection(
   const thread = invariants.requireThread(kernel, threadRootId);
   const messageRows = db.allRows(kernel, "SELECT * FROM messages WHERE thread_root_id = ? ORDER BY thread_sequence", threadRootId);
   const messages = messageRows.map((message) => {
-    const revisions = db.allRows(kernel, "SELECT * FROM message_revisions WHERE message_id = ? ORDER BY revision", text(message.id)).map(mapMessageRevision);
-    const mentions = db.allRows(kernel, `SELECT m.target_agent_id
-           FROM mentions m
-           JOIN message_revisions r ON r.id = m.message_revision_id
-          WHERE r.message_id = ?
-          ORDER BY m.target_agent_id`, text(message.id)).map((row) => text(row.target_agent_id));
-    return mapMessage(message, revisions, mentions);
+    const revisions = db.allRows(
+      kernel,
+      "SELECT * FROM message_revisions WHERE message_id = ? ORDER BY revision",
+      text(message.id),
+    ).map((revision) => mapMessageRevision(
+      revision,
+      revisionMentionTargets(kernel, text(revision.id)),
+    ));
+    const latest = revisions.find(
+      (revision) => revision.revision === integer(message.latest_revision),
+    );
+    return mapMessage(message, revisions, latest?.targetAgentIds ?? []);
   });
   return {
     projectId: text(thread.project_id),
@@ -180,20 +185,18 @@ export function getThreadProjectionAt(
         ORDER BY revision`,
       text(message.id),
       snapshotEventSequence,
-    ).map(mapMessageRevision);
-    const mentions = db.allRows(
-      kernel,
-      `SELECT mention.target_agent_id
-         FROM mentions AS mention
-         JOIN message_revisions AS revision
-           ON revision.id = mention.message_revision_id
-        WHERE revision.message_id = ?
-          AND mention.created_event_sequence <= ?
-        ORDER BY mention.target_agent_id`,
-      text(message.id),
-      snapshotEventSequence,
-    ).map((row) => text(row.target_agent_id));
-    return mapMessage(message, revisions, mentions);
+    ).map((revision) => mapMessageRevision(
+      revision,
+      revisionMentionTargets(
+        kernel,
+        text(revision.id),
+        snapshotEventSequence,
+      ),
+    ));
+    const latest = revisions.find(
+      (revision) => revision.revision === integer(message.latest_revision),
+    );
+    return mapMessage(message, revisions, latest?.targetAgentIds ?? []);
   });
   return {
     projectId: text(thread.project_id),
@@ -256,6 +259,29 @@ export function getThreadProjectionAt(
       threadRootId, snapshotEventSequence,
     }).map(mapArtifact),
   };
+}
+
+function revisionMentionTargets(
+  kernel: db.KernelContext,
+  messageRevisionId: string,
+  snapshotEventSequence?: number,
+): readonly string[] {
+  const snapshotClause =
+    snapshotEventSequence === undefined
+      ? ""
+      : " AND created_event_sequence <= ?";
+  const parameters =
+    snapshotEventSequence === undefined
+      ? [messageRevisionId]
+      : [messageRevisionId, snapshotEventSequence];
+  return db.allRows(
+    kernel,
+    `SELECT target_agent_id
+       FROM mentions
+      WHERE message_revision_id = ?${snapshotClause}
+      ORDER BY target_agent_id`,
+    ...parameters,
+  ).map((row) => text(row.target_agent_id));
 }
 
 export function getRunProjectionAt(
