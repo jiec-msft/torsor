@@ -124,6 +124,7 @@ the full scenario set and explicit real-provider opt-in rules.
 ## Documentation
 
 - [Independent ACP provider conformance harness](packages/acp-conformance/README.md) ([简体中文](packages/acp-conformance/README.zh-cn.md))
+- [Deterministic Torsor system scenarios](packages/system-scenarios/README.md) ([简体中文](packages/system-scenarios/README.zh-cn.md))
 
 - [Product definition](docs/product.md) ([简体中文](docs/product.zh-cn.md))
 - [MVP 0.1 core and interactive prototype](docs/prototype/001-overview.md) ([简体中文](docs/prototype/001-overview.zh-cn.md))

@@ -3,6 +3,12 @@
 Production Human-facing React 19 client for the local `@torsor/server` HTTP and
 SSE API.
 
+`@torsor/web/controller` is the supported headless composition entry point
+(`npm run build:controller`). It exports `WebController`, `WebControllerOptions`,
+`WebState` and the minimal `WebEventSource` port. System tests use this entry
+instead of importing app-private files; native browser EventSource remains the
+default. See the paired system-scenario specification, SS-1.2.
+
 The interface preserves Torsor's context projection:
 
 ```text
