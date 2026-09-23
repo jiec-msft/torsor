@@ -43,7 +43,7 @@ dynamically.
 
 The bootstrap file uses `KernelBootstrap` JSON. It is applied with schema/config
 creation in one transaction only for an empty version-0 database, never reapplied
-on reopen. Existing schema 16 files undergo complete read-only schema-contract
+on reopen. Existing schema 17 files undergo complete read-only schema-contract
 validation before a writable connection is opened. Incompatible or partial
 development schemas fail unchanged; the host does not repair or migrate them.
 
@@ -53,6 +53,13 @@ production composition path. `createTorsorHttpService` remains available for
 HTTP-only embedding; when passed a shared Kernel, the caller retains Kernel
 shutdown ownership.
 
+An embedding Host may explicitly supply `worktreeExecutorFactory(kernel)` to
+enable the fixed controlled Worktree tracer. The Host recovers physical
+execution intents before listening and stops or quarantines admitted work before
+closing Kernel. No environment flag, HTTP route, or ACP native tool enables
+arbitrary Worktree execution. See the agent-runtime implementation reference and
+MVP §§22, 24, 38, and 43.1 for the private-root and process-handle limitations.
+
 Report Artifacts are opt-in. Set `TORSOR_ARTIFACT_ROOT` to a private local
 directory with an existing trusted parent, outside Provider/Worktree write
 scope. Library callers supply `artifactStorage` to `createLocalRuntimeHost`
@@ -60,12 +67,13 @@ or to the owned Kernel options of `createTorsorHttpService`; shared-Kernel
 embedding configures the adapter on that Kernel. The executable uses
 `LocalArtifactStorage`, whose storage/crash boundary is documented in the
 Kernel package and paired MVP sections 21/23. Never expose this directory as
-a static web root. Integrated schema 16 retains causal limits and trusted
-Artifact descriptors. Prior schema 15 is rejected because it may contain
-public provider diagnostics written before the allowlisted boundary; both
-schema 14 layouts are also rejected before
-DDL/bootstrap: stop old processes and explicitly recreate the disposable
-database, without migration, version rewriting, or silent deletion.
+a static web root. Integrated schema 17 retains causal limits, trusted
+Artifact descriptors, physical Worktree execution/publication fences, and the
+allowlisted Provider diagnostic boundary. Schema 16 is rejected because it can
+contain pre-redaction public Provider diagnostics; all earlier development
+schemas are also rejected before DDL/bootstrap. Stop old processes and
+explicitly recreate the disposable
+database and a fresh managed root, without migration, version rewriting, or silent deletion.
 
 Clients authenticate with `Authorization: Bearer <local-secret>`. Browsers can
 exchange that credential at `POST /api/v1/session` for an HttpOnly,

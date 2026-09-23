@@ -89,6 +89,11 @@ import {
 } from "./runs.js";
 import { mapPublicEvent } from "./mappings.js";
 import {
+  assertWriterCommandAuthority, assertWriterContextAuthority,
+  assertWorktreeMutation, assertWorktreePublication, getPhysicalWorktree, physicalWorktreeCommand,
+  resolveCachedWorktreeExecution,
+} from "./physical-worktrees.js";
+import {
   acquireWorktreeWriterLease,
   getWorktreeWriterLease,
   listWorktreeWriterLeaseEvents,
@@ -109,11 +114,14 @@ import type {
   PrincipalContext,
   PublicEventEnvelope,
   QueryResult,
+  WorktreeMutationAuthority,
+  WorktreeExecutionReceipt,
 } from "./types.js";
 import {
   assertNever,
   boundedLimit,
   hashPayload,
+  integer,
   text,
   type Row,
 } from "./values.js";
@@ -134,7 +142,11 @@ export { KernelError } from "./errors.js";
 export class TorsorKernel {
   readonly #context: KernelContext;
   readonly #artifactStorage: ArtifactStorage | undefined;
+  readonly #localWorktreeExecutions = new Map<string, WorktreeExecutionReceipt & {
+    readonly principalId: string; readonly activationId: string;
+  }>();
   #closed = false;
+  #supervisesWorktrees = false;
 
   private constructor(options: KernelOpenOptions) {
     this.#context = openKernelContext(options);
@@ -152,6 +164,39 @@ export class TorsorKernel {
     }
   }
 
+  /**
+   * Trusted executor only. The durable execution intent must already exist.
+   * Never await or perform unbounded work while holding this local write lock.
+   */
+  performWorktreeMutation(
+    authority: WorktreeMutationAuthority,
+    context: PrincipalContext,
+    effect: () => undefined,
+  ): void {
+    this.#supervisesWorktrees = true;
+    this.#writerCheck(() => {
+      const principal = requirePrincipal(this.#context, context.principalId);
+      assertWorktreeMutation(this.#context, authority, principal);
+      const result = effect();
+      if (result !== undefined) {
+        throw new Error("Worktree mutations must be synchronous and return undefined.");
+      }
+    });
+  }
+
+  /** A rollback-only observation, never authorization for a later external effect. */
+  checkWorktreeAuthority(authority: WorktreeMutationAuthority, context: PrincipalContext): void {
+    this.#withDatabaseAccess(() => {
+      this.#context.database.exec("BEGIN");
+      try {
+        assertWorktreeMutation(this.#context, authority, requirePrincipal(this.#context, context.principalId));
+      } finally {
+        // Validation can tentatively record expiry/revocation; only the stop path persists it.
+        this.#context.database.exec("ROLLBACK");
+      }
+    });
+  }
+
   async execute<C extends KernelCommand>(
     command: C,
     principalContext: PrincipalContext,
@@ -159,7 +204,58 @@ export class TorsorKernel {
     if (command.type === "PublishArtifact") {
       throw new KernelError("Forbidden", "Artifact descriptors require trusted byte finalization.");
     }
-    return this.#execute(command, principalContext);
+    const localBinding = command.type === "StartWorktreeExecution"
+      ? { principalId: principalContext.principalId, activationId: command.activationId, executorId: command.executorId }
+      : undefined;
+    const result = await this.#execute(command, principalContext);
+    if (localBinding && result.executionToken) {
+      this.#localWorktreeExecutions.set(result.entityId, {
+        ...localBinding, executionId: result.entityId, executionToken: result.executionToken,
+      });
+    }
+    return result;
+  }
+
+  revokeLocalWorktreeAuthority(receipt: WorktreeExecutionReceipt, context: PrincipalContext): void {
+    const binding = this.#localWorktreeExecutions.get(receipt.executionId);
+    if (!binding || binding.principalId !== context.principalId ||
+        binding.executorId !== receipt.executorId || binding.executionToken !== receipt.executionToken) {
+      throw new KernelError("Forbidden", "Original local execution receipt is required.");
+    }
+    // Denial only: never consult a contended database before stopping an owned child.
+    this.#context.localWorktreeRevocations.add(binding.activationId);
+  }
+
+  checkWorktreePublication(authority: WorktreeMutationAuthority, context: PrincipalContext): void {
+    this.#writerCheck(() => assertWorktreePublication(
+      this.#context, authority, requirePrincipal(this.#context, context.principalId),
+    ));
+  }
+
+  #writerCheck(check: () => void): void {
+    this.#withDatabaseAccess(() => {
+      this.#context.database.exec("BEGIN IMMEDIATE");
+      try {
+        check();
+        this.#context.database.exec("COMMIT");
+      } catch (error) {
+        this.#context.database.exec(error instanceof DurableKernelError ? "COMMIT" : "ROLLBACK");
+        throw translateError(error);
+      }
+    });
+  }
+
+  #withDatabaseAccess<T>(operation: () => T): T {
+    this.#assertOpen();
+    if (!this.#supervisesWorktrees) return operation();
+    const timeout = integer(getRow(this.#context, "PRAGMA busy_timeout")!.timeout);
+    this.#context.database.exec("PRAGMA busy_timeout = 0");
+    try {
+      // These scopes never cross await: DatabaseSync must not starve owned-child timers.
+      return operation();
+    } finally {
+      this.#context.database.exec(`PRAGMA busy_timeout = ${timeout}`);
+    }
   }
 
   get reportArtifactsEnabled(): boolean {
@@ -176,9 +272,15 @@ export class TorsorKernel {
     // Capture caller-owned context and fields before awaiting an untrusted stream.
     const actor = { ...context };
     const { runId, expectedRunRevision, idempotencyKey } = input;
-    authorizeReport(this.#context, runId, actor);
+    const checkWriter = () => assertWriterContextAuthority(
+      this.#context, requirePrincipal(this.#context, actor.principalId), actor,
+    );
+    this.#writerCheck(checkWriter);
+    this.#withDatabaseAccess(() => authorizeReport(this.#context, runId, actor));
     const content = await collectReport(input.content);
     const contentDigest = artifactDigest(content);
+    this.#writerCheck(checkWriter);
+    this.#withDatabaseAccess(() => authorizeReport(this.#context, runId, actor));
     await storage.put(contentDigest, content);
     return this.#execute(
       {
@@ -219,6 +321,10 @@ export class TorsorKernel {
     command: KernelCommand,
     principalContext: PrincipalContext,
   ): Promise<CommandResult> {
+    return this.#withDatabaseAccess(() => this.#executeTransaction(command, principalContext));
+  }
+
+  #executeTransaction(command: KernelCommand, principalContext: PrincipalContext): CommandResult {
     this.#assertOpen();
     const principal = requirePrincipal(
       this.#context,
@@ -239,6 +345,7 @@ export class TorsorKernel {
     const payloadHash = hashPayload(command);
     this.#context.database.exec("BEGIN IMMEDIATE");
     try {
+      assertWriterCommandAuthority(this.#context, command, principal, effectiveContext);
       const cached = getRow(
         this.#context,
         `SELECT payload_hash, result_json
@@ -259,6 +366,11 @@ export class TorsorKernel {
           );
         }
         const result = JSON.parse(text(cached.result_json)) as CommandResult;
+        if (command.type === "StartWorktreeExecution") {
+          const current = resolveCachedWorktreeExecution(this.#context, command, result, principal);
+          this.#context.database.exec("COMMIT");
+          return current;
+        }
         if (command.type === "PublishArtifact") {
           getArtifact(this.#context, result.entityId, effectiveContext);
         }
@@ -438,6 +550,10 @@ export class TorsorKernel {
     query: Q,
     principalContext: PrincipalContext,
   ): Promise<QueryResult<Q>> {
+    return this.#withDatabaseAccess(() => this.#queryTransaction(query, principalContext));
+  }
+
+  #queryTransaction<Q extends KernelQuery>(query: Q, principalContext: PrincipalContext): QueryResult<Q> {
     this.#assertOpen();
     const principal = requirePrincipal(
       this.#context,
@@ -456,6 +572,25 @@ export class TorsorKernel {
     try {
       let result: unknown;
       switch (query.type) {
+        case "GetWorktreeStorageIdentity":
+          requireKind(this.#context, principal, "runtime");
+          result = { identity: text(getRow(this.#context, "SELECT identity FROM worktree_storage_identity")!.identity) };
+          break;
+        case "ListPhysicalWorktrees": {
+          requireKind(this.#context, principal, "runtime");
+          const limit = boundedLimit(query.limit);
+          const rows = allRows(this.#context,
+            "SELECT worktree_id FROM physical_worktrees WHERE worktree_id > ? ORDER BY worktree_id LIMIT ?",
+            query.afterWorktreeId ?? "", limit + 1);
+          result = {
+            items: rows.slice(0, limit).map((row) => getPhysicalWorktree(this.#context, text(row.worktree_id), principal)),
+            hasMore: rows.length > limit,
+          };
+          break;
+        }
+        case "GetPhysicalWorktree":
+          result = getPhysicalWorktree(this.#context, query.worktreeId, principal);
+          break;
         case "GetArtifact": {
           result = getArtifact(this.#context, query.artifactId, principalContext);
           break;
@@ -787,6 +922,10 @@ export class TorsorKernel {
     afterEventId: string | null,
     limit: number,
   ): Promise<readonly PublicEventEnvelope[]> {
+    return this.#withDatabaseAccess(() => this.#readEvents(afterEventId, limit));
+  }
+
+  #readEvents(afterEventId: string | null, limit: number): readonly PublicEventEnvelope[] {
     this.#assertOpen();
     const afterSequence = afterEventId
       ? eventSequence(this.#context, afterEventId)
@@ -1003,6 +1142,12 @@ export class TorsorKernel {
           principal,
           correlationId,
         );
+      case "RegisterPhysicalWorktree":
+      case "StartWorktreeExecution":
+      case "RecordWorktreeExecution":
+      case "RevokeWorktreeExecutionAuthority":
+      case "RecoverWorktreeExecution":
+        return physicalWorktreeCommand(this.#context, command, principal, correlationId);
       case "RenewWorktreeWriterLease":
         return renewWorktreeWriterLease(
           this.#context,

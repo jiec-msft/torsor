@@ -1,5 +1,12 @@
 export { KernelActivationCapabilityBridge } from "./capability-bridge.js";
 export {
+  LocalWorktreeExecutor,
+  type LocalWorktreeExecutorOptions,
+  type WorktreeExecutor,
+  type WorktreeProbeInput,
+} from "./worktree-executor.js";
+export type { WorktreeRegistration } from "./worktree-paths.js";
+export {
   CopilotAcpAdapter,
   type CopilotAcpAdapterOptions,
   type CopilotAcpLaunchConfiguration,

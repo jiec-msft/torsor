@@ -1,5 +1,68 @@
 # `@torsor/agent-runtime`
 
+## Controlled physical Worktree tracer
+
+The optional `LocalWorktreeExecutor` implements only `write-probe-v1`, governed by
+MVP §§22.1–22.4, 24.2–24.3, 38.1–38.4, and 43.1. It registers a trusted,
+pre-provisioned detached Git worktree under a private managed root, exclusively
+creates `torsor-probe.txt`, and runs a fixed Node child to digest the content.
+It does not provision Git worktrees, execute repository code, run arbitrary
+commands, or grant ACP native shell/write tools.
+
+`register` binds immutable physical/repository/Run facts; `start` and `probe`
+require a live Run Activation. Every mediated mutation is checked under the
+Kernel write lock after a durable execution intent. `stopActivation`, `recover`,
+and `close` bound the lifecycle. Runtime gives explicitly enabled trusted
+adapters only `context.worktree.probe(worktreeId)`, never a path or executable.
+Attention contexts have no such capability.
+
+Clean `probe` requires the fixed digest, normal child close and a current Writer
+fence; it retains the lease until Activation publication/settlement ends. Kernel
+guards activity, report finalization, terminal effects and cached mutation results.
+Cancellation, uncertainty, expiry or restart irreversibly revokes publication,
+even if a late child close makes the directory physically reusable. Reports go
+through the existing authorized `publishReport` capability, never raw descriptors.
+The fixed stdout protocol is bounded to 65 bytes, stderr to 1024 discarded bytes;
+the child inherits no credentials or injection settings. Provider-facing failures
+are fixed `Unknown` diagnostics, not local paths or raw process output.
+
+Logical lease expiry is not process exit. An unsettled execution blocks lease
+release and reacquisition. Unconfirmed stop quarantines the directory; only
+original-handle close evidence permits local reconciliation. A restart that
+loses that handle leaves quarantine in place even when the old PID disappears.
+There is no manual text-based physical quarantine override.
+
+Stopping an owned child does not wait for SQLite persistence. Local receipt-bound
+authority is revoked immediately; physical stop/force and retained close evidence
+are independent of durable revocation/disposition/release. Persistence failures
+surface to callers and retain a retry timer; repeated stop/close retries writes
+without resending successful signals. Host keeps Kernel open on cleanup failure
+until a later close succeeds. Recovery of already committed Provider completion
+uses an `Expired` Activation settlement if Writer authority is lost, preserves
+the committed result, and acknowledges the recovered outbox without rerunning work.
+If another Host wins that settlement, only the specific already-finished conflict
+plus a fresh authoritative terminal Activation permits acknowledging delivery;
+unrelated conflicts and unfinished Activations remain errors.
+
+The monitor uses Kernel's rollback-only authority observation, not a write lock.
+Before the first physical effect, the Kernel instance opts into no-wait synchronous
+database scopes for the rest of its lifetime, restoring the configured production
+busy timeout after each call. This covers commands, publications and cleanup
+retries as well as monitoring, so SQLite contention cannot starve another handle's
+deadline, queued cancellation or shutdown. Every actual mutation still rechecks
+authority transactionally; observational snapshots grant no effect permission.
+
+The managed root is bound to one database storage identity by `.torsor-owner`.
+Use a fresh root after recreating the database. Do not concurrently run copied
+databases against it. The private root must exclude concurrent external path
+replacement; path checks are not a same-user OS sandbox. General process-tree
+containment, cross-restart stop proof, Pause/Resume, Terminal, Files UI, GC, and
+external integration remain out of scope.
+
+`controlled-process.ts` is an isolated trusted process-driver seam. Synthetic
+fixtures exercise stop uncertainty and crashes without adding another Provider
+conformance engine.
+
 `@torsor/agent-runtime` consumes durable Kernel work and runs one provider
 process for each Activation. The Kernel remains authoritative for Attention,
 Run, RunInput, provenance, revisions, terminal state, and outbox delivery.

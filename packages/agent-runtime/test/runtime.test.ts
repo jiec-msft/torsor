@@ -4356,6 +4356,34 @@ describe("AgentRuntime", () => {
     }
   });
 
+  it("publishes a stable code when controlled Worktree authority is lost", async () => {
+    const kernel = openKernel(":memory:");
+    const privateMarker = "SYNTHETIC_PRIVATE_WORKTREE_AUTHORITY_DETAIL";
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+        return;
+      }
+      throw new KernelError("WriterAuthorityLost", privateMarker);
+    });
+    try {
+      await mentionAgent(kernel, "worktree-authority-lost");
+      const runtime = createRuntime(kernel, adapter);
+
+      await expect(runtime.drainUntilIdle()).rejects.toMatchObject({
+        diagnosticCode: "provider_worktree_authority_lost",
+        outcome: "Unknown",
+      });
+      const run = await getOnlyRun(kernel);
+      expect(run.providerAttempts.at(-1)?.detail).toBe(
+        "provider_worktree_authority_lost: Controlled Worktree publication authority was lost.",
+      );
+      expect(JSON.stringify(run)).not.toContain(privateMarker);
+    } finally {
+      kernel.close();
+    }
+  });
+
   it("rejects an unrecognized diagnostic code from an older adapter contract", async () => {
     const kernel = openKernel(":memory:");
     const privateMarker = "SYNTHETIC_PRIVATE_OLD_ADAPTER_MESSAGE";

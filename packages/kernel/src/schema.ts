@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 16;
+export const CURRENT_SCHEMA_VERSION = 17;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -519,6 +519,75 @@ CREATE TABLE IF NOT EXISTS worktree_writer_lease_events (
 
 CREATE INDEX IF NOT EXISTS worktree_writer_lease_events_worktree_idx
   ON worktree_writer_lease_events(worktree_id, sequence);
+
+CREATE TABLE IF NOT EXISTS physical_worktrees (
+  worktree_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  repository_id TEXT NOT NULL,
+  repository_path TEXT NOT NULL,
+  base_revision TEXT NOT NULL,
+  directory_path TEXT NOT NULL UNIQUE,
+  directory_identity TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK (state IN ('Ready', 'Quarantined')),
+  created_at TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS worktree_storage_identity (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  identity TEXT NOT NULL
+) STRICT;
+INSERT OR IGNORE INTO worktree_storage_identity VALUES (1, lower(hex(randomblob(32))));
+
+CREATE TABLE IF NOT EXISTS worktree_executions (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  worktree_id TEXT NOT NULL REFERENCES physical_worktrees(worktree_id),
+  activation_id TEXT NOT NULL REFERENCES activation_attempts(id),
+  runtime_principal_id TEXT NOT NULL REFERENCES principals(id),
+  executor_id TEXT NOT NULL,
+  execution_token TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation > 0),
+  fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+  operation TEXT NOT NULL CHECK (operation = 'write-probe-v1'),
+  state TEXT NOT NULL CHECK (state IN
+    ('Starting', 'Running', 'StopRequested', 'StopConfirmed', 'ForceTerminated', 'Uncertain')),
+  pid INTEGER CHECK (pid > 0),
+  authority_revoked_at TEXT,
+  authority_revocation_reason TEXT,
+  created_at TEXT NOT NULL,
+  CHECK ((authority_revoked_at IS NULL) = (authority_revocation_reason IS NULL))
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS worktree_unsettled_execution_idx
+  ON worktree_executions(worktree_id)
+  WHERE state NOT IN ('StopConfirmed', 'ForceTerminated');
+
+CREATE INDEX IF NOT EXISTS worktree_execution_history_idx
+  ON worktree_executions(worktree_id, sequence);
+
+CREATE INDEX IF NOT EXISTS worktree_execution_activation_idx
+  ON worktree_executions(activation_id, sequence);
+
+CREATE TRIGGER IF NOT EXISTS worktree_publication_revocation_immutable
+BEFORE UPDATE OF authority_revoked_at, authority_revocation_reason ON worktree_executions
+WHEN OLD.authority_revoked_at IS NOT NULL AND (
+  NEW.authority_revoked_at IS NOT OLD.authority_revoked_at OR
+  NEW.authority_revocation_reason IS NOT OLD.authority_revocation_reason
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Worktree publication revocation is irreversible');
+END;
+
+CREATE TABLE IF NOT EXISTS worktree_execution_events (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  execution_id TEXT NOT NULL REFERENCES worktree_executions(id),
+  state TEXT NOT NULL,
+  evidence TEXT NOT NULL,
+  occurred_at TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS worktree_execution_events_idx
+  ON worktree_execution_events(execution_id, sequence);
 
 CREATE TABLE IF NOT EXISTS public_events (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,

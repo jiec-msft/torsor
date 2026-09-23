@@ -10,6 +10,7 @@ import type {
   RunView,
   ThreadProjection,
 } from "@torsor/kernel";
+import type { WorktreeExecutor } from "./worktree-executor.js";
 
 export interface ProviderCapabilityProfile {
   readonly acceptsInputWhileRunning: boolean;
@@ -86,6 +87,9 @@ export interface ProviderExecutionContext {
   readonly cause: ProviderCause;
   readonly capabilities: ActivationCapabilityBridge;
   readonly signal: AbortSignal;
+  readonly worktree?: {
+    probe(worktreeId: string): ReturnType<WorktreeExecutor["probe"]>;
+  };
 }
 
 export type ProviderExecutionResult = Readonly<Record<never, never>>;
@@ -119,6 +123,12 @@ const providerDiagnosticSummaries = {
   provider_stderr_limit:
     "Provider diagnostic output exceeded a configured safety limit.",
   provider_timeout: "Provider execution exceeded its allowed time.",
+  provider_worktree_execution_failed:
+    "Controlled Worktree execution did not complete.",
+  provider_worktree_authority_lost:
+    "Controlled Worktree publication authority was lost.",
+  provider_recovered_worktree_authority_lost:
+    "Runtime recovered an Activation after Worktree authority was lost.",
 } as const;
 
 export type ProviderDiagnosticCode = keyof typeof providerDiagnosticSummaries;

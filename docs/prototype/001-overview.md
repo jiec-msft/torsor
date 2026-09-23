@@ -701,6 +701,8 @@ The current stable codes are `provider_process_start_failed`,
 `provider_stderr_limit`, `provider_io_error`, `provider_timeout`,
 `provider_cancelled`, `provider_cleanup_failed`,
 `provider_runtime_monitor_failed`, `provider_not_started`,
+`provider_worktree_execution_failed`, `provider_worktree_authority_lost`,
+`provider_recovered_worktree_authority_lost`,
 `provider_recovered_failed`, `provider_recovered_unknown`, and
 `provider_execution_failed`. Public detail uses
 `<code>: <generic summary>` and is at most 160 characters.
@@ -786,9 +788,9 @@ A report finalization request is identified by `(principal_id, run_id, idempoten
 
 This slice uses caller-driven retry, not background replay of Provider output. A crash during staging leaves only an invisible temporary file; content publication before database commit leaves only an invisible content-addressed blob; a lost response after commit is recoverable from durable idempotency results and Run/Thread projections. Retry verifies and reuses the blob and rechecks current authorization, Activation, and Run revision in the transaction. Revocation or a terminal Run blocks new descriptors; currently authorized Humans/Runtime may still query committed descriptors. No automatic orphan/staging deletion is included: cleanup is offline maintenance, avoiding races with concurrent finalization.
 
-The integrated durable-causal-limit, trusted-Artifact, and provider-diagnostic-boundary database uses schema **16**. It retains section 25's Run root/parent/depth, immutable constraints, admission index and durable configuration alongside section 23's trusted report descriptors. Both the former causal-only schema 14 and the independently developed Artifact-only schema 14 are incompatible. Schema 15 is also rejected and recreated because it may contain raw provider diagnostics publicly persisted before this boundary. Equal version numbers must not authorize different layouts. Opening any older or unversioned nonempty development database must fail explicitly before applying DDL/bootstrap, without migration, version rewriting, or data deletion. Operators stop old processes and explicitly recreate disposable databases. Schema 16 reopen still validates durable causal configuration.
+The integrated durable-causal-limit, trusted-Artifact, physical-Worktree, and provider-diagnostic-boundary database uses schema **17**. It retains section 25's Run root/parent/depth, immutable constraints, admission index and durable configuration alongside section 23's trusted report descriptors, adding section 22's physical identities, executions and irreversible Writer publication fence. Schema 16 is rejected and recreated because it may contain raw provider diagnostics publicly persisted before this boundary; the former causal-only, Artifact-only and Worktree-only schema 14 layouts and integrated schema 15 are also incompatible. Equal version numbers must not authorize different layouts. Opening any older or unversioned nonempty development database must fail explicitly before applying DDL/bootstrap, without migration, version rewriting, or data deletion. Operators stop old processes and explicitly recreate disposable databases and fresh managed roots. Schema 17 reopen still validates durable causal configuration and Worktree storage identity.
 
-`user_version = 16` is not layout proof. Before any DDL, bootstrap or configuration write, existing databases undergo read-only comparison against a complete schema fingerprint generated from trusted DDL in an isolated memory database: object sets, columns/types/nullability/defaults/PKs/FKs, indexes/uniqueness/partial predicates, triggers, CHECK and STRICT constraints. Compare SQLite-parsed metadata and SQL tokens that preserve literal/operator semantics; ignore only whitespace, comments and unquoted keyword/identifier case, never whitespace inside strings. Reject missing, extra-incompatible, partial, corrupt, predecessor-shaped or future layouts without changing file bytes or logical state; never repair with `CREATE IF NOT EXISTS`. SQLite-owned statistics objects are outside the application layout. Only version 0 with no persistent objects may execute DDL, initial configuration and bootstrap in one transaction, with complete rollback on failure. Valid schema 16 reopen does not reapply bootstrap or modify durable causal configuration.
+`user_version = 17` is not layout proof. Before any DDL, bootstrap or configuration write, existing databases undergo read-only comparison against a complete schema fingerprint generated from trusted DDL in an isolated memory database: object sets, columns/types/nullability/defaults/PKs/FKs, indexes/uniqueness/partial predicates, triggers, CHECK and STRICT constraints. Compare SQLite-parsed metadata and SQL tokens that preserve literal/operator semantics; ignore only whitespace, comments and unquoted keyword/identifier case, never whitespace inside strings. Reject missing, extra-incompatible, partial, corrupt, predecessor-shaped or future layouts without changing file bytes or logical state; never repair with `CREATE IF NOT EXISTS`. SQLite-owned statistics objects are outside the application layout. Only version 0 with no persistent objects may execute DDL, initial configuration and bootstrap in one transaction, with complete rollback on failure. Valid schema 17 reopen does not reapply bootstrap or modify durable causal configuration or storage identity.
 
 The Runtime Host must bound consecutive recovery passes, yield to the event loop before continuing, and recheck shutdown. Backlog processing must not starve HTTP, timers, signals, or shutdown handling. Idle polling waits must be interruptible by shutdown and must remove their listener and cancel any no-longer-needed timer regardless of which side completes first.
 
@@ -801,15 +803,131 @@ The Runtime Host must bound consecutive recovery passes, yield to the event loop
 3. One Worktree has one platform-recognized Writer Authority; a Human may force takeover, but risk from an unstopped old process must be reported.
 4. Lease carries a monotonically increasing fencing token.
 
+The first physical execution slice further requires:
+
+5. Kernel persists an immutable `PhysicalWorktree` runtime record: repository identity,
+   canonical repository path, full base commit, source Run, opaque worktree ID,
+   canonical directory path, and filesystem identity. Paths are local Runtime handles,
+   not public Thread events or Provider context. Different Runs cannot register the same
+   directory, path alias, or filesystem identity; this slice never transfers an old directory
+   to another Run.
+   Registered directories cannot be ancestors/descendants of one another either,
+   preventing implicit nested sharing.
+6. Before external effects, persist an execution intent binding source Activation,
+   Runtime Principal, executor incarnation, lease generation, fencing token, and a private
+   execution receipt. A PID is diagnostic information, not recoverable process authority.
+7. Lease generation is a logical authority sequence, not physical isolation evidence.
+   Only a trusted executor converts authority into file/process operations; Agents, HTTP,
+   and ACP receive no general write entry point.
+
 ### 22.2 Creation
 
 1. A writable Run need not create a Worktree immediately.
 2. Create it lazily on first write.
 3. Pin repository identity, base commit/content revision, Run, and Worktree generation.
 
+The first slice does not implement general provisioning. A trusted local Host supplies a
+detached Git worktree pinned to a full commit under a dedicated root; the executor validates
+real paths, directory identity, Git common directory, and detached HEAD before registration.
+Git hooks, filters, repository scripts, checkout, networking, and arbitrary commands are
+outside its capabilities.
+
+An exclusive-create local owner marker binds the managed root to one Kernel storage identity.
+Another database cannot reuse it. Concurrent operation of database copies is unsupported;
+recreating a development database requires a fresh root, never automatic marker deletion or
+takeover of old directories.
+This marker is Host storage-ownership metadata outside the Worktree, not Run write authority.
+
+The sole controlled tracer is `write-probe-v1`: exclusively create a fixed probe file, then
+start a fixed Node child to process its content and return a digest. Use an exact executable
+and argument vector, `shell: false`, no inherited code-injection settings such as
+`NODE_OPTIONS`, and no execution of repository content. The child creates no descendants;
+this audited fixed protocol is the precondition for direct-child stop confirmation, not a
+claim of arbitrary process-tree isolation. Test process drivers/fixtures stay behind a narrow
+isolated seam for later Provider Conformance Harness adoption, not another Provider engine.
+
+Before every platform-mediated file creation inside a Worktree or spawn, recheck lease token, generation,
+fencing token, current Activation/Run, execution receipt, and directory identity.
+Authorization and synchronous effect initiation share a Kernel write transaction lock;
+the previously committed intent must survive file/process failure. SQLite and the OS do not
+form one atomic transaction: crash windows remain uncertain, with no arbitrary external
+effect exactly-once promise.
+
+The Writer publication fence also covers the Activation's Agent Kernel commands (including
+idempotent replay), `AppendRunActivity`, report finalization and Runtime success settlement.
+Check current generation, fencing, holder, expiry and physical quarantine inside the
+transaction. New tokens, late `close`, clock rollback or acquisition by the old Activation
+cannot undo lost authority; recovery requires a new authorized Activation. Human stop and
+Runtime failure/Unknown, process stop and reconciliation records remain available, but
+cannot publish success or raw output on the old Writer's behalf. Authorized reads and a
+new Activation's idempotent recovery of committed Artifacts retain section 23's rules.
+
+`CompleteRun` and Runtime success settlement additionally require every associated physical
+execution to have normally reached `StopConfirmed`. If this Activation already committed
+its own `CompleteRun`, `FailRun` or `WaitRun` under valid authority, logical Activation
+revocation does not prevent Runtime acknowledgement of **that committed decision**.
+It still requires matching current Run generation/state, unexpired lease and Activation,
+normal stop evidence, and no publication revocation. This exception permits settlement
+only, never renewed Agent mutation authority. Executor restart revokes a leftover
+publication window even after confirmed physical stop; an old successful return value
+does not grant post-recovery write authority.
+
+Recovery must not derive post-restart Writer success authority from a committed
+`ProviderAttempt.Completed`. If `FinishActivation(Completed)` for an orphaned Activation
+is rejected with `WriterAuthorityLost`, Runtime submits `FinishActivation(Expired)` with
+a separate idempotency key and fixed authority-lost reconciliation detail, then acknowledges
+the recovered outbox delivery. Preserve committed Run, ProviderAttempt, Reply, Artifact,
+activity and causal-capacity facts: do not rerun the Provider, republish success or change
+a completed Run into failure. Existing Failed/Unknown, Waiting and stale-generation
+recovery follows its respective state rules; finished Activations are not finished again.
+A second restart produces no duplicate facts.
+If the authority-lost `Expired` settlement conflicts because another Host concurrently
+finished the same Activation, reread its authoritative Run projection. Only an existing
+`finishedAt` permits preserving that terminal outcome and acknowledging delivery without
+overwriting it. An unfinished Activation, failed read or other conflict still fails;
+this is not blanket suppression of `Conflict`.
+
+A normal `probe` succeeds only with the expected fixed digest, confirmed normal exit and
+still-current write authority. Normal drain retains the lease through the Activation's
+public result/state commits; `stopActivation`/Host shutdown releases it afterward.
+Publication and competing Writer acquisition therefore remain serialized by the Kernel
+write lock. Cancellation, timeout, force termination, failure, recovery or uncertainty
+irreversibly revokes that execution's publication authority. `StopConfirmed` proves stop,
+not restored authorization. Reports accept bytes only through authorized `publish_report` /
+`finalizeReport`, preserving the existing 1 MiB/4096-chunk bounds, current scope, provenance,
+idempotency and storage acknowledgement; never submit descriptors directly.
+
+The controlled child's result channel permits at most 65 bytes (one SHA-256 hex plus
+newline); stderr is limited to 1024 bytes and its contents are discarded. Extra, malformed,
+oversized output or abnormal exit fails instead of truncating into success. Do not use
+result IPC that first deserializes arbitrarily large objects. The environment permits
+only necessary OS entries, not inherited credentials or injection settings. Public errors
+use fixed descriptions; local paths, PIDs, receipts, raw process errors/output and
+environment never enter Timeline, reports or ACP transcripts. Full local diagnostics stay
+in Runtime-only records. ACP production tool denial and the independent harness's
+allowlisted contract remain unchanged.
+
 ### 22.3 Lease expiry
 
-Expiry does not prove the old process stopped. Never hand the same directory to a new Writer solely because a Lease timed out. Confirm process stop, or mark the old directory `Suspect/Quarantined` and create a new generation from a known base/checkpoint.
+Expiry does not prove the old process stopped. Never hand the same directory to a new Writer
+solely because a Lease timed out:
+
+1. Only exact stop evidence permits the same Run to reuse its directory; otherwise
+2. mark the directory `Quarantined`, rejecting new platform writes and Writer acquisition.
+3. A later slice may create a **different physical directory** from a known base/checkpoint.
+   Increasing generation, renaming, replacing a token, or copying a suspect directory is
+   not isolation evidence.
+
+`Starting` intents, running processes, `StopRequested`, and `Uncertain` block lease release
+and reassignment even after expiry, including competing acquisition through independent
+Kernel connections. Startup recovery quarantines unfinished intents from an old executor
+incarnation. PID presence/absence, cached exit codes, or Host restart cannot clear quarantine.
+
+This slice accepts only `close` observed by the executor retaining the original child handle
+(or definite evidence that spawn never happened) as direct-child stop evidence. Late
+confirmation conditionally updates its own execution using the original receipt, never a
+successor. Losing the handle leaves quarantine in place; cross-restart OS containment proof
+and manual clearance are not implemented and cannot be bypassed with resolution text.
 
 ### 22.4 Pause, Cancel, and GC
 
@@ -818,6 +936,48 @@ Expiry does not prove the old process stopped. Never hand the same directory to 
 3. Cancel does not immediately delete Worktree.
 4. Stop processes and preserve required patch/log before retention.
 5. GC only after terminal Run, no active/suspect Writer, required Artifacts finalized, retention elapsed, and no investigation/hold requirement.
+
+In this slice Host shutdown waits for admitted controlled operations to stop or persist
+quarantine before closing Kernel. A shutdown request during recovery must prevent subsequent
+HTTP listener startup and new Runtime admission. Stop control is safety authority over an existing process
+handle and does not require an expired write lease to remain live.
+Stop entry irreversibly revokes this executor's local authority and independently uses the
+original handle to request stop, wait within bounds and force stop if necessary. Never wait
+for a SQLite write lock, durable revocation or `StopRequested` persistence before requesting
+physical stop. Normal drain also stops physically before persisting evidence. Database
+contention, startup failure, cancellation, timeout, output limits and shutdown follow this order.
+
+`DatabaseSync` blocks its calling thread even behind a Promise API. SQLite busy waits in
+the authority monitor, other Kernel commands or cleanup retries must not occupy the event
+loop responsible for deadlines, AbortSignal and shutdown callbacks. Before the first
+physical effect, that Kernel instance enters conservative nonblocking supervision until
+it closes: each synchronous database operation scope uses no-wait lock admission and
+restores the configured busy timeout (5000ms in production) in `finally`, without crossing
+an `await`. Contention fails explicitly; persistence can retry with existing idempotency
+without weakening Writer checks. Monitoring uses a short rollback-only snapshot, never
+authority to initiate mutation/publication; real effects still revalidate full authority
+inside `BEGIN IMMEDIATE`. Original-handle deadlines and stop remain independent, including
+when another execution retries persistence. Acceptance uses the unshortened production
+timeout, an independent connection holding a writer lock for 6500ms and independent
+process-liveness observation: a 1000ms lease requests stop near its deadline and converges
+durably after unlock. Cover queued cancellation/explicit stop, executor/Host shutdown
+and multiple handles as well.
+
+Local stop/evidence and durable revocation, quarantine/stop disposition and lease release
+are separately idempotent: do not resend successful stop/force signals on the same handle;
+retain original close evidence. Cached promises coalesce in-flight persistence only;
+failures remain retryable, never completed cleanup. Replace the deadline only with an
+active cleanup retry path. Each failure explicitly returns an error and schedules retries
+at bounded intervals until revocation and stop disposition are durable. Missing stop
+confirmation persists Uncertain/quarantine; releasing a database lock is not stop evidence.
+Late original-handle close retains existing receipt-based reconciliation.
+Shutdown waits for all admitted handles' stop attempts. If persistence fails, Host retains
+Kernel for retries, stays closing and admits no work; later `close` retries instead of
+permanently caching failure. Unexpected process exit still relies on conservative startup
+recovery of old intents. Schema remains 16, with no migration or new Run state.
+Unconfirmed stop never
+deletes the directory or releases it for reuse. Pause/Resume, Human Terminal, controller lease,
+Files UI, retention policy, and GC are outside this slice.
 
 ## 23. Artifact and integration
 
@@ -886,9 +1046,28 @@ References use finalized Artifact IDs only. References, report text, and Provide
 3. Request Provider stop asynchronously.
 4. UI displays logical state separately from Provider execution state.
 
+Physical execution records independent facts, not new Run states:
+
+| Fact | Meaning |
+|---|---|
+| `Starting` / `Running` | Durable intent / observed child start; neither means completion |
+| `StopRequested` | Further writes prohibited and stop requested; not stop evidence |
+| `StopConfirmed` | Original handle confirms exit (not success), or definite no-spawn evidence |
+| `ForceTerminated` | Force termination requested and original handle subsequently confirms exit; successful kill alone is insufficient |
+| `Uncertain` | No confirmation by deadline, lost handle, or crash in the spawn window; quarantine is mandatory |
+
+Record request and observation times, PID when available, reason, stop evidence, and transition
+history. Provider timeout, AbortSignal, protocol cancel acknowledgement, terminal Run state,
+and lease expiry never imply `StopConfirmed`. Controlled-child exit never completes a Run.
+
 ### 24.3 Provider without Cancel
 
 The Run may still cancel immediately: reject old capabilities, isolate Worktree, show termination as pending/unknown, and prevent late output from publishing or changing Run/RunInput automatically.
+
+The same applies to Providers claiming Cancel support without physical confirmation. The first
+slice does not grant such Providers native Worktree shell/write tools. Until general descendant
+control and OS isolation exist, only the controlled tracer is permitted; logical fencing is
+not a security sandbox against hostile same-user processes.
 
 ### 24.4 Retrying Unknown
 
@@ -1292,13 +1471,32 @@ Activity identity and order use server-assigned `id` and monotonic per-Run `sequ
 
 Files Tab is a Worktree read projection, not a File domain object.
 
-1. Root it at the current Run Worktree or read-only Project snapshot.
-2. Do not expose arbitrary Host filesystem paths.
-3. Human may inspect files and diffs while an Agent works.
-4. Reads carry Worktree generation, path, and content hash.
-5. Client may report change and refresh.
-6. MVP Files Tab is read-only by default.
-7. Human edits require current Writer Lease or a separate derived Worktree.
+### 38.1 Root and identity
+
+Root it at the current Run Worktree or read-only Project snapshot; never expose arbitrary Host
+paths. Runtime uses a registered opaque handle, not a Provider-supplied cwd.
+
+### 38.2 Path safety
+
+Platform file operations reject absolute paths, `..`, traversal using either separator,
+symlink/junction/reparse aliases, and escapes. Validate canonical containment and directory
+identities along the path. Exclusive creation of the fixed probe file never follows an existing
+symlink or overwrites a file or hard link. Path checks are not an OS sandbox: this slice
+requires a trusted Host-controlled private root without concurrent external renames or link
+replacement; do not enable the executor without that precondition. Hostile same-user TOCTOU
+protection requires later OS handle-relative/containment support.
+
+### 38.3 Read projection
+
+Humans may inspect files and diffs during Agent work. Reads carry Worktree generation, path,
+and content hash; Clients may report changes and refresh. This slice adds no Files API/UI.
+
+### 38.4 Write authority
+
+MVP Files Tab is read-only by default. Human edits require current Writer Authority or a separate
+derived Worktree. Platform-mediated writes follow §22: stale tokens/generations, stop-requested
+executions, and quarantined directories must fail. File contents neither grant execution
+authority nor automatically confirm Run completion.
 
 ## 39. TerminalSession
 
@@ -1546,6 +1744,13 @@ GitHub etc.       external hosting, CI, protection, final resource state
 Torsor does not decide whether a Message deserves action, whether to continue/create/Fork/replace/Ignore, whether another Review is needed, when work is semantically complete, or whether to Reply, publish, create a PR, or ask a Human.
 
 Torsor guarantees unforgeable identity/capability, provenance to Message/Run/Worktree, one automated Writer per Worktree, revision/idempotency/Lease/fencing/terminal protection, durable failure/conflict/late/external-operation facts, and Human observation/guidance/takeover/stop.
+
+These are platform contracts, not claims that OS containment already exists. The first
+lease-backed physical execution slice connects only Kernel, Runtime, and a controlled Worktree
+executor; physical identity and stop evidence exist independently of logical leases. This
+optional tracer is disabled by default. It exposes no ACP native shell/write tools and implements
+no Human Terminal/controller lease, Files UI, GC, or GitHub integration. Without safe isolation
+evidence, retain an unusable quarantined directory instead of widening execution authority.
 
 ### 43.2 PR and real integration
 
