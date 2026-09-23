@@ -1613,6 +1613,37 @@ GC 不得改变领域状态。
 - Workflow DAG
 - Artifact 全局 Accepted 状态
 
+### 31.1 MVP 0.1 单开发者本地风险相称审查边界
+
+MVP 0.1 首个受支持部署是：一名开发者在自己的计算机上部署和使用 Torsor，并显式选择
+trusted-local 策略。Provider 以该开发者的本机权限运行；分配的 Worktree cwd 和
+Writer Lease 提供平台认可的权限与协调保证，不是 hostile-code sandbox。MVP 不承诺
+多租户隔离、防御恶意本机 owner 或已失陷主机、阻止主动 daemonize 并逃离受控进程树的
+程序，也不承诺外部 MCP/API 副作用 exactly-once。这些非目标不能用于弱化第 14 节的
+身份、来源和终态边界、第 22 节的 Lease/fencing/停止/quarantine、第 27 节的隐私与
+最小上下文，或既有 authorization、当前 schema 18 和失败显式化契约。
+
+对其余 MVP 工作，release-blocking finding 必须落在可重复的受支持路径上，说明可信的
+用户或数据完整性影响，并给出最小验收测试。即使构造输入罕见，只要能够证明违反已承诺的
+信任或数据完整性边界，仍可阻塞发布；成本低的 fail-closed 验证值得加入。重点阻塞：
+
+- 同一 Worktree 出现两个平台认可或仍可写入的 Writer。
+- Cancel、Lease 过期或停止结果 Unknown 后，旧 child 仍可写入或目录被错误复用。
+- stale output/result 被公开，或未安全完成的 delivery 被确认。
+- 错误 authentication、authorization 或 provenance，或 Credential/私密正文进入持久日志或公开投影。
+- 新用户无法按第 45 节从干净 Checkout 安装并启动受支持的 Package/Quick start。
+
+仅有严重级别标签不能替代 likelihood、实际 exposure、用户影响和修复成本。针对恶意本机
+owner 的推测攻击、未跨越边界且受支持路径不可达的畸形输入、未来多用户/hostile-code
+能力、样式问题或穷举式 adversarial 枚举，不自动阻塞 MVP；有持续价值时记录为后续事项。
+
+合并前保留独立的 EXACT-HEAD review，并要求相关 hosted CI 在同一最终 SHA 上为绿色。
+finding 修复后，新 review 聚焦最终 SHA 上的 delta、原始复现和邻近不变量；运行最小有意义
+测试并结合 hosted CI，只有变更确实影响更广范围时才重复完整套件。真实边界缺陷未解决时
+不得称 PR clean；在上述信任假设内已无可复现阻塞项时，也不得让每个 MVP PR 陷入无限的
+perfect-security review 循环。本准则适用于所有剩余 MVP 0.1 工作，不只适用于
+trusted-local 实现。
+
 ## 32. 仍需 Human Review 的少量产品选择
 
 以下问题无法仅靠技术原则得到唯一答案。本文已经给出推荐默认值：

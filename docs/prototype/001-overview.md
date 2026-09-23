@@ -1314,6 +1314,51 @@ No current evidence requires:
 - Workflow DAG.
 - Global Artifact `Accepted` state.
 
+### 31.1 Risk-proportionate local single-developer review boundary for MVP 0.1
+
+The initial supported MVP 0.1 deployment is one developer deploying and using
+Torsor on their own computer under an explicitly selected trusted-local policy.
+The Provider runs with that developer's local privileges. The assigned Worktree
+cwd and Writer Lease provide platform-recognized authority and coordination, not
+a hostile-code sandbox. MVP does not promise multi-tenant isolation, defense
+against a malicious local owner or compromised Host, containment of programs
+that deliberately daemonize and escape the owned process tree, or exactly-once
+external MCP/API effects. These non-goals do not weaken section 14 identity,
+provenance, and terminal boundaries; section 22 Lease, fencing, stop, and
+quarantine contracts; section 27 privacy and minimum-context rules; or existing
+authorization, current schema 18, and explicit-failure contracts.
+
+For the remaining MVP work, a release-blocking finding must have a reproducible
+supported path, credible user or data-integrity impact, and a minimal acceptance
+test. A demonstrable violation of a promised trust or data-integrity boundary may
+block even when crafted input is rare, and inexpensive fail-closed validation is
+worth adding. Priority blockers are:
+
+- Two platform-recognized or still-writing Writers in one Worktree.
+- An old child still writing, or its directory being reused, after cancellation,
+  Lease expiry, or an Unknown stop result.
+- Stale output/results being published, or delivery being acknowledged without
+  safe completion.
+- Incorrect authentication, authorization, or provenance, or credentials/private
+  text entering durable logs or public projections.
+- A new user being unable to install and start the supported package/quick start
+  from a clean checkout as required by section 45.
+
+A severity label alone does not replace likelihood, actual exposure, user impact,
+and fix cost. Speculative attacks by a malicious local owner, malformed inputs
+unreachable on a supported path without crossing a boundary, future multi-user
+or hostile-code capabilities, style issues, and exhaustive adversarial enumeration
+do not automatically block MVP. Record them as follow-up only when useful.
+
+Before merge, retain independent EXACT-HEAD review and green relevant hosted CI
+on the same final SHA. After a finding is fixed, fresh review focuses on the final
+SHA's delta, original reproduction, and nearby invariants. Run the smallest
+meaningful tests plus hosted CI, repeating full suites only when the change
+warrants their scope. Do not call a PR clean while a real boundary defect remains;
+once no reproducible blocker remains within these trust assumptions, do not freeze
+each MVP PR in an endless perfect-security review loop. This criterion applies to
+all remaining MVP 0.1 work, not only trusted-local implementation.
+
 ## 32. Product choices still requiring Human Review
 
 1. **Whether an ordinary Reply wakes previous Thread participants.** Recommended MVP default: Mention-only.
