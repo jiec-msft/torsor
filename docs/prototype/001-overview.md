@@ -1961,16 +1961,19 @@ working MVP without model credentials or network access.
    uses bootstrap, database, and Artifact paths that resolve correctly from
    that cwd; the root quick-start example resolves its own default state from
    the repository root.
-7. The Web development server may explicitly proxy `/api` and `/health` to the
-   local Host. Static preview may provide the same local smoke proxy, but must
-   be described as local preview rather than a production reverse proxy or
-   deployment promise.
+7. The root `dev:web` and `preview:web` wrappers select the `@torsor/web`
+   workspace and forward Vite arguments supplied after `--` intact to the
+   workspace script. The Web development server may explicitly proxy `/api`
+   and `/health` to the local Host. Static preview may provide the same local
+   smoke proxy, but must be described as local preview rather than a
+   production reverse proxy or deployment promise.
 8. Every consumable public package includes a byte-identical copy of the
    repository Apache-2.0 `LICENSE` in `npm pack --dry-run`. Documentation and
    quick-start tests cover example files, root commands, cwd semantics, CLI
-   loopback rejection/acceptance, the end-to-end journey through real Host CLI
-   and Vite dev/preview processes, restart durability, and package license
-   contents. Process readiness, HTTP probes, and shutdown are bounded and
-   supervised. Vite receives allocated positive dynamic ports rather than
-   zero values that it may reinterpret as defaults, and tests clean up after
-   success or failure.
+   loopback rejection/acceptance, the end-to-end journey through the real Host
+   CLI and root Web wrappers, restart durability, and package license
+   contents. Tests prove that the wrappers select the correct workspace and
+   forward `host`, positive dynamic `port`, and `strictPort` arguments.
+   Process readiness, HTTP probes, and shutdown are bounded and supervised.
+   Vite does not receive zero values that it may reinterpret as defaults, and
+   tests clean up after success or failure.

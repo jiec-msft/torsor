@@ -12,8 +12,8 @@
   "scripts": {
     "check:docs": "node scripts/check-bilingual-docs.mjs",
     "test:docs": "node --test scripts/check-bilingual-docs.test.mjs",
-    "dev:web": "npm run dev --workspace @torsor/web",
-    "preview:web": "npm run preview --workspace @torsor/web",
+    "dev:web": "npm run dev --workspace @torsor/web --",
+    "preview:web": "npm run preview --workspace @torsor/web --",
     "quickstart:host": "npm run build --workspace @torsor/server && node examples/working-quickstart/host.mjs",
     "quickstart:http": "node examples/working-quickstart/http-journey.mjs",
     "test": "npm run test:docs && npm run test:kernel && npm run test:agent-runtime && npm run test:acp-conformance && npm run test:server && npm run test:quickstart && npm run test:web && npm run test:prototype",

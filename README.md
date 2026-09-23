@@ -92,6 +92,9 @@ Keep the synthetic Host running. The development server proxies `/api` and
 npm run dev:web
 ```
 
+Both root Web commands select the `@torsor/web` workspace and forward optional
+Vite arguments supplied after the outer `--` to the workspace script.
+
 Open the URL printed by Vite and use the local token `torsor-local-demo`. To
 exercise the built static files, use the same loopback-only smoke proxy:
 

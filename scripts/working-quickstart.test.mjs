@@ -16,7 +16,6 @@ const journeyCli = join(
   "working-quickstart",
   "http-journey.mjs",
 );
-const viteCli = join(root, "node_modules", "vite", "bin", "vite.js");
 const acpCli = join(
   root,
   "packages",
@@ -61,10 +60,13 @@ test("public quickstart files and root commands stay complete", async () => {
     packageJson.scripts["quickstart:http"],
     "node examples/working-quickstart/http-journey.mjs",
   );
-  assert.equal(packageJson.scripts["dev:web"], "npm run dev --workspace @torsor/web");
+  assert.equal(
+    packageJson.scripts["dev:web"],
+    "npm run dev --workspace @torsor/web --",
+  );
   assert.equal(
     packageJson.scripts["preview:web"],
-    "npm run preview --workspace @torsor/web",
+    "npm run preview --workspace @torsor/web --",
   );
   assert.equal(webPackageJson.scripts.dev, "vite");
   assert.equal(webPackageJson.scripts.preview, "vite preview");
@@ -192,7 +194,7 @@ test("documented CLIs survive restart with Vite default ports occupied", async (
     ]);
     assert.match(verified, /Verified synthetic Run/);
 
-    viteProcess = await startVite("dev", hostProcess.origin);
+    viteProcess = await startWebWrapper("dev", hostProcess.origin);
     assert.ok(
       !blockedVitePorts.includes(Number(new URL(viteProcess.origin).port)),
     );
@@ -204,10 +206,10 @@ test("documented CLIs survive restart with Vite default ports occupied", async (
       proxyResult,
     ]);
     assert.match(proxied, /Completed synthetic Run/);
-    await terminateManagedProcess(viteProcess.process);
+    await terminateWebWrapper(viteProcess);
     viteProcess = undefined;
 
-    viteProcess = await startVite("preview", hostProcess.origin);
+    viteProcess = await startWebWrapper("preview", hostProcess.origin);
     assert.ok(
       !blockedVitePorts.includes(Number(new URL(viteProcess.origin).port)),
     );
@@ -220,7 +222,7 @@ test("documented CLIs survive restart with Vite default ports occupied", async (
       "--verify",
     ]);
     assert.match(previewVerified, /Verified synthetic Run/);
-    await terminateManagedProcess(viteProcess.process);
+    await terminateWebWrapper(viteProcess);
     viteProcess = undefined;
 
     await shutdownHostProcess(hostProcess);
@@ -354,13 +356,18 @@ async function startHostCli(stateDirectory, host) {
   }
 }
 
-async function startVite(mode, proxyTarget) {
+async function startWebWrapper(mode, proxyTarget) {
   const port = await allocateTcpPort("127.0.0.1");
+  assert.ok(process.env.npm_execpath, "npm_execpath is required");
+  const script = mode === "preview" ? "preview:web" : "dev:web";
+  const workspaceScript = mode === "preview" ? "preview" : "dev";
   const managed = startManagedProcess(
     process.execPath,
     [
-      viteCli,
-      ...(mode === "preview" ? ["preview"] : []),
+      process.env.npm_execpath,
+      "run",
+      script,
+      "--",
       "--host",
       "127.0.0.1",
       "--port",
@@ -368,7 +375,8 @@ async function startVite(mode, proxyTarget) {
       "--strictPort",
     ],
     {
-      cwd: webRoot,
+      cwd: root,
+      processTree: true,
       env: {
         ...processEnv(),
         TORSOR_WEB_PROXY_TARGET: proxyTarget,
@@ -378,9 +386,21 @@ async function startVite(mode, proxyTarget) {
   try {
     const match = await managed.waitFor(/Local:\s+(http:\/\/\S+)/, 15_000);
     const origin = match[1].replace(/\/$/, "");
+    assert.match(
+      managed.output,
+      new RegExp(
+        `> npm run ${workspaceScript} --workspace @torsor/web -- --host 127\\.0\\.0\\.1 --port ${port} --strictPort`,
+      ),
+    );
+    assert.match(
+      managed.output,
+      new RegExp(
+        `> vite${mode === "preview" ? " preview" : ""} --host 127\\.0\\.0\\.1 --port ${port} --strictPort`,
+      ),
+    );
     assert.equal(Number(new URL(origin).port), port);
     assert.deepEqual(await fetchJson(`${origin}/health`), { status: "ok" });
-    return { process: managed, origin };
+    return { process: managed, origin, host: "127.0.0.1", port };
   } catch (error) {
     await forceStopManagedProcess(managed);
     throw error;
@@ -412,6 +432,7 @@ function startManagedProcess(executable, arguments_, options) {
     cwd: options.cwd,
     env: options.env ?? processEnv(),
     stdio: [options.stdin ?? "ignore", "pipe", "pipe"],
+    detached: options.processTree && process.platform !== "win32",
     windowsHide: true,
   });
   let output = "";
@@ -460,6 +481,7 @@ function startManagedProcess(executable, arguments_, options) {
   return {
     child,
     exit,
+    processTree: options.processTree ?? false,
     get output() {
       return output;
     },
@@ -529,7 +551,7 @@ async function terminateManagedProcess(process) {
     assert.equal(result.code, 0, process.output);
     return;
   }
-  assert.equal(process.child.kill("SIGTERM"), true);
+  assert.equal(signalManagedProcess(process, "SIGTERM"), true);
   let result;
   try {
     result = await process.waitForExit(5_000);
@@ -543,6 +565,16 @@ async function terminateManagedProcess(process) {
   );
 }
 
+async function terminateWebWrapper(webProcess) {
+  await terminateManagedProcess(webProcess.process);
+  const releasedPort = createTcpServer();
+  try {
+    await listen(releasedPort, webProcess.port, webProcess.host);
+  } finally {
+    await closeServer(releasedPort);
+  }
+}
+
 function isExpectedManagedTermination(result) {
   return (
     result.code === 0 ||
@@ -552,11 +584,101 @@ function isExpectedManagedTermination(result) {
 }
 
 async function forceStopManagedProcess(process) {
-  if (!process || process.child.exitCode !== null || process.child.signalCode) {
+  if (!process) {
     return;
   }
-  process.child.kill("SIGKILL");
-  await process.exit;
+  if (
+    !process.processTree &&
+    (process.child.exitCode !== null || process.child.signalCode)
+  ) {
+    return;
+  }
+  signalManagedProcess(process, "SIGKILL");
+  await withTimeout(
+    process.exit,
+    5_000,
+    `Forced process-tree exit timed out:\n${process.output}`,
+  );
+}
+
+function signalManagedProcess(managed, signal) {
+  if (!managed.processTree) {
+    return managed.child.kill(signal);
+  }
+  if (process.platform !== "win32") {
+    try {
+      process.kill(-managed.child.pid, signal);
+      return true;
+    } catch (error) {
+      if (error?.code === "ESRCH") {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  const descendants = listWindowsDescendantProcessIds(managed.child.pid);
+  const signaled = managed.child.kill(signal);
+  for (const processId of descendants) {
+    try {
+      process.kill(processId, "SIGKILL");
+    } catch (error) {
+      if (error?.code !== "ESRCH") {
+        throw error;
+      }
+    }
+  }
+  return signaled;
+}
+
+function listWindowsDescendantProcessIds(rootProcessId) {
+  const powershell = join(
+    process.env.SystemRoot ?? "C:\\Windows",
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+  const result = spawnSync(
+    powershell,
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress",
+    ],
+    {
+      encoding: "utf8",
+      timeout: 5_000,
+      windowsHide: true,
+    },
+  );
+  assert.equal(
+    result.status,
+    0,
+    `Failed to inspect the managed process tree:\n${result.stderr}`,
+  );
+  const processes = JSON.parse(result.stdout.replace(/^\uFEFF/, ""));
+  const rows = Array.isArray(processes) ? processes : [processes];
+  const descendants = [];
+  const pending = [{ processId: rootProcessId, depth: 0 }];
+  while (pending.length > 0) {
+    const parent = pending.shift();
+    for (const row of rows) {
+      if (Number(row.ParentProcessId) !== parent.processId) {
+        continue;
+      }
+      const child = {
+        processId: Number(row.ProcessId),
+        depth: parent.depth + 1,
+      };
+      descendants.push(child);
+      pending.push(child);
+    }
+  }
+  return descendants
+    .sort((left, right) => right.depth - left.depth)
+    .map(({ processId }) => processId);
 }
 
 async function fetchJson(url) {

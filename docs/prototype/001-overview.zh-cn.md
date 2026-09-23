@@ -2532,11 +2532,14 @@ Prototype 和 evidence 至少覆盖：
 6. Server Workspace 命令的当前工作目录是 `apps/server`。组件文档必须明确该语义，并对
    Bootstrap、数据库和 Artifact 路径使用能从该 cwd 正确解析的路径；根级 Quick start
    Example 则从仓库根目录解析自己的默认状态。
-7. Web 开发服务可以明确代理 `/api` 与 `/health` 到本机 Host。静态 Preview 可以提供同样的
-   本机 Smoke 代理，但必须标记为本地预览，而不是不存在的生产反向代理或部署承诺。
+7. 根级 `dev:web` 与 `preview:web` Wrapper 必须选择 `@torsor/web` Workspace，并把调用者
+   放在 `--` 后的 Vite 参数完整转发给 Workspace Script。Web 开发服务可以明确代理 `/api`
+   与 `/health` 到本机 Host。静态 Preview 可以提供同样的本机 Smoke 代理，但必须标记为
+   本地预览，而不是不存在的生产反向代理或部署承诺。
 8. 所有可消费公共 Package 都必须在 `npm pack --dry-run` 的文件清单中包含与仓库根目录
    完全相同的 Apache-2.0 `LICENSE`。文档/Quick start 测试应覆盖示例文件、根命令、cwd
-   语义、CLI Loopback 拒绝/接受、通过真实 Host CLI 与 Vite dev/preview 进程完成的端到端
-   Journey、重启持久性和 Package License 清单。进程 Readiness、HTTP Probe 和关闭必须
-   有界且受监督；Vite 使用已分配的正整数动态端口而不是会被解释为默认端口的 0，并在成功
-   或失败后清理。
+   语义、CLI Loopback 拒绝/接受、通过真实 Host CLI 与根级 Web Wrapper 完成的 Vite
+   dev/preview 端到端 Journey、重启持久性和 Package License 清单。测试必须证明 Wrapper
+   选择正确 Workspace，并转发 `host`、正整数动态 `port` 与 `strictPort` 参数。进程
+   Readiness、HTTP Probe 和关闭必须有界且受监督；Vite 不使用会被解释为默认端口的 0，
+   并在成功或失败后清理。

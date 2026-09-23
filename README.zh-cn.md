@@ -85,6 +85,9 @@ npm run quickstart:http -- --verify
 npm run dev:web
 ```
 
+两个根级 Web 命令都会选择 `@torsor/web` Workspace，并把外层 `--` 后的可选 Vite 参数
+转发给 Workspace Script。
+
 打开 Vite 输出的 URL，使用本地 Token `torsor-local-demo`。若要检查构建后的静态文件，
 使用同样仅面向本机 Smoke 的 Preview 代理：
 
