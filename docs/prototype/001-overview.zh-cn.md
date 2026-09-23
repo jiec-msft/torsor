@@ -579,20 +579,54 @@ Provider 或 Agent 请求中的同名字段不能成为权威事实。
 
 ### 15.4 Agent 配置版本
 
-1. Run 创建时固定 `agent_config_revision`。
-2. 每次 Activation 记录实际使用的配置版本。
-3. Agent 配置更新不自动改变已存在 Run。
-4. 现有 Run 采用新配置必须显式执行 `adopt_config_revision`。
+1. Agent 配置 revision 是 append-only 的不可变记录；Agent 的 `current_config_revision`
+   只指向最新记录。仅 Human 可以通过显式、幂等的 `update_agent_config` 创建下一条
+   revision；命令必须携带观察到的 `expected_agent_config_revision`，新 revision 必须
+   恰好为当前 revision 加一。并发更新只有一个成功，stale 请求不得写入部分记录。
+2. `update_agent_config` 只接受该 Project 中可公开给协作者和执行面的非秘密配置。
+   Provider 凭据、Token、私有环境值和 Host 私密材料不属于 Agent config，不能写入该
+   对象。公开事件、命令回执、错误和 Client 恢复元数据只记录 Agent ID、revision 和
+   请求身份，不复制完整配置正文；持久事件中的 actor 和时间提供更新来源。
+3. Run 创建时固定 `agent_config_revision`。每次 Activation 记录实际使用的配置版本。
+   Agent 配置更新不自动改变已存在 Run、已开始 Activation、ProviderAttempt、Lease
+   或运行中的进程。
+4. 现有非终态 Run 采用新配置必须由 Human 显式执行、幂等的
+   `adopt_config_revision`，并携带 `expected_run_revision`、
+   `expected_agent_config_revision` 和 `target_agent_config_revision`。
+   expected Agent revision 必须仍是 owner Agent 的当前 revision；target 必须属于
+   owner Agent、存在、严格新于 Run 已固定的 revision，且不高于 expected Agent
+   revision。终态 Run、stale Run、并发 Agent config 更新、未知/其他 Agent revision
+   或相同/更旧 target 均在事务中拒绝。
+5. 成功采用只更新 Run 固定的 config revision 并增加 Run revision；不撤销、不重启、
+   不重写已存在 Activation。之后授权创建的 Activation 记录并使用新 revision。
+   幂等重放返回原回执，即使 Run 或 Agent 随后已继续推进。
 
 ## 16. Message 和 Thread
 
 ### 16.1 Message revision
 
-1. Message 使用 append-only revision。
-2. 编辑命令必须携带 expected Message revision。
-3. UI 默认显示最新 revision，并允许查看历史。
-4. MVP 删除只创建 tombstone，不抹除历史引用。
-5. 已创建的 Attention、RunInput 和 ProviderAttempt 不因编辑或删除被秘密撤销。
+1. Message 使用 append-only revision。每条 revision 固定正文、tombstone 标志、
+   Mention 集合、创建时间和稳定 ID；Message 原始作者、Agent/Run/Attention 来源、
+   Thread 位置和创建时间永不因后续 revision 改写。
+2. 只有原始 `author_principal_id` 可以修改 Message。MVP Human Web 只为当前 Human
+   自己创建的 Message 提供编辑和删除；Human 不能改写 Agent 或其他 Human 的表达。
+   本切片不新增 Agent 自编辑入口；未来如新增，仍必须由同一原始 Agent Principal
+   及其当前有效 capability 授权，不能引入 Human override。
+3. 显式、幂等的 `edit_message` 必须携带 `expected_message_revision`、完整的新正文和
+   完整的新 Mention 目标集合。成功在同一事务追加 revision、更新 latest projection、
+   为该 revision 的每个有效 Mention 至多创建一个 Attention，并将 Thread cursor
+   增加一次。并发编辑只有一个 expected revision 成功；失败不创建 revision、
+   Mention、Attention 或 Thread 事件。
+4. 显式、幂等的 `delete_message` 必须携带 `expected_message_revision`。成功只追加
+   一条正文为空、Mention 集合为空的 tombstone revision，更新 latest projection，
+   并将 Thread cursor 增加一次；不物理删除任何 Message/revision。tombstone 是 MVP
+   的终态，不提供恢复或继续编辑。使用同一请求身份的重放返回原回执；新的重复删除
+   或 stale 请求明确失败。
+5. UI 默认显示最新 revision；tombstone 显示明确的已删除占位，不显示为空白成功，
+   并允许查看完整 revision 历史、各 revision 的 Mention 和 tombstone 状态。历史
+   Attention、RunInput、ProviderAttempt、公开事件及其特定 `message_revision_id`
+   引用保持可解析，不重定向到 latest revision。
+6. 已创建的 Attention、RunInput 和 ProviderAttempt 不因编辑或删除被秘密撤销。
 
 ### 16.2 Thread 结构
 
@@ -684,7 +718,9 @@ Attention 决议记录：
 
 ### 17.5 Message 编辑的影响
 
-1. 新 revision 新增 Mention 时，创建新 Attention。
+1. 非 tombstone 新 revision 中的每个 Mention 按
+   `(message_revision_id, target_agent_id, trigger_kind)` 创建一次新 Attention；
+   同一 Agent 在旧 revision 中出现过不阻止新 revision 的 Attention。
 2. 移除 Mention 或 tombstone 不自动撤销已有 Attention。
 3. Activation 同时获得触发 revision 和当前最新 revision。
 4. Human 如需停止已触发工作，使用显式取消或停止操作。
@@ -2441,6 +2477,52 @@ Also published in #torsor-core / current Thread
 6. 成功或同身份恢复确认后刷新 Run、home Thread 和现有 Timeline 历史，不伪造事件或乐观 disposition。已确认提交后的读取失败在 Run 控件内显示 `Committed; projections could not be refreshed`，保留回执并提供只读刷新，不重发命令。旧 Run / Session 的迟到读取不替换当前选择或抢焦点。
 7. 始终区分逻辑 `Cancelled`、异步停止请求、物理 `StopConfirmed` 和 Worktree quarantine。提交成功只确认逻辑取消；不以 ProviderAttempt 结束、取消应答、Run 终态或 lease 撤销推断物理停止。当前公开 Run 投影不暴露物理执行 / quarantine 事实，必须明确说明无法在此确认；不声称 Worktree 已安全释放或实际处于 quarantine。已有 Provider stop-unconfirmed 提示继续显示。此切片不增加物理控制、quarantine 解除或 Trusted Local 执行。
 8. 使用原生具名按钮，支持 Tab、Enter 和 Space、可见焦点、disabled / busy 状态和可感知状态 / 错误区域；withdraw label 包含输入 sequence 和 ID。恢复与只读刷新在窄屏 modal 内可访问，异步结果不抢焦点。确定性 controller 和渲染测试覆盖成功、eligibility、重复激活、响应丢失、revision / conflict、权限 / CSRF / session expiry、reload / reopen，以及物理停止未确认或 Worktree 已隔离时的逻辑取消。
+
+### 44.2.2 Human Message revision 控件
+
+1. Conversation 为当前 Human 原始创作且 latest revision 不是 tombstone 的 Message
+   提供 `Edit message` 和带显式确认的 `Delete message`。其他 Human 或 Agent
+   Message 只读；Client 隐藏操作不代替服务端 author 检查。
+2. 编辑器从观察到的 latest revision 初始化，提交完整正文、Mention 集合和
+   `expectedMessageRevision` 到 `edit-message`。删除向 `delete-message` 提交观察到的
+   revision；确认文案明确说明 Message 将显示为 tombstone，而历史引用、Attention
+   和 RunInput 不会被删除或取消。
+3. 每次操作在发送前冻结 Message ID、expected revision、正文/Mention（如适用）和
+   idempotency key。Pending 时禁止重复激活；响应丢失或不可验证时显示
+   `Outcome unknown`，只允许重试同一请求。明确 stale/permission/conflict 保留编辑
+   草稿或删除意图，刷新后由 Human 重新审阅并创建新请求，不能自动换 revision。
+4. 成功或同身份重放确认后刷新 Thread，不乐观伪造 revision、tombstone、Mention 或
+   Attention。已确认提交后的读取失败显示 `Committed; projections could not be
+   refreshed`，只允许重试读取。旧 Thread/Session 的迟到结果不得覆盖当前选择或焦点。
+5. Message 正文不是 Client 恢复日志。当前 Window 可在内存中跨认证恢复保留冻结请求；
+   不把正文、凭据或 CSRF 写入公开事件、命令回执或持久恢复元数据。原身份未知结果
+   遇到认证/权限失败仍保持未知，直到同 Principal 的幂等重放确认。
+6. 默认正文区域显示 latest revision；tombstone 使用可感知占位。`Revision history`
+   展开后按顺序显示 revision 编号、时间、正文或 tombstone 及 Mention，且不把历史
+   revision 当成当前可编辑草稿。控件支持键盘、可见焦点、确认取消和窄视口。
+
+### 44.2.3 Human Agent config 和 Run adoption 控件
+
+1. Agents 视图显示 Agent 当前 config revision 和非秘密 JSON 配置，并为已认证 Human
+   提供 `Update config`。编辑器提交完整配置及观察到的
+   `expectedAgentConfigRevision` 到 `update-agent-config`；成功创建下一条不可变
+   revision，不修改已有 Run。
+2. Run detail 显示 Run 固定 revision 与 owner Agent 当前 revision。仅非终态且存在
+   更高当前 revision 时提供 `Adopt current config`；请求向
+   `adopt-run-config` 提交观察到的 `expectedRunRevision`、
+   `expectedAgentConfigRevision` 和该当前 target revision。运行中的 Activation 明确
+   标注继续使用其自身记录的 revision；成功只影响之后的 Activation。
+3. 两类操作均冻结目标、expected/target revision、请求正文（仅 update）和
+   idempotency key，复用 `Outcome unknown`、`Retry same action`、同 Principal
+   认证恢复、明确 conflict 后刷新审阅及已提交后只读刷新语义。不得自动采用刚观察到
+   的更高 revision，也不得在 stale 后静默改写 target。
+4. Config 正文不得进入公开事件、命令回执、错误文本或持久 Client 恢复元数据。
+   当前 Window 可在内存中保留未知 update 请求以便同身份重放；浏览器重载后若无法
+   保留完整原请求，必须显示无法恢复，不能以新 key 猜测重发。adoption 恢复元数据
+   只包含公开 ID/revision/key。
+5. 成功 update 刷新 Agents/bootstrap 投影；成功 adoption 刷新 Run、Run 列表和来源
+   Thread。读取失败不撤销回执或重发命令。原生按钮、JSON 输入 label、错误区域、
+   busy/disabled 状态、键盘和窄视口均可访问。
 
 ### 44.3 Tool Call 展开和失败
 
