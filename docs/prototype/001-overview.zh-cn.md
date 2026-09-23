@@ -905,6 +905,27 @@ Unknown
 - 开始和结束时间
 - 结果或 Unknown 原因
 
+Provider 失败诊断的持久化和公开边界采用白名单投影。Run、Activation、
+ProviderAttempt、Timeline、HTTP 和 Web 只能包含稳定错误码、结果状态，以及
+由 Runtime 明确定义且有长度上限的通用摘要。Provider stderr、原始进程错误、
+启动命令和环境、机器路径、Credential、Prompt、模型输出、任意 Provider
+错误文本及嵌套 cause 消息不得进入这些字段。Runtime 必须在持久化前按错误类型
+映射到固定诊断；不能以正则替换 Secret 作为主要边界，也不能静默吞掉失败。
+若没有具备明确所有权和显式 opt-in 的私有诊断通道，原始诊断只可在有界内存中
+短暂存在并在执行结束后丢弃。
+
+当前稳定错误码为：`provider_process_start_failed`、
+`provider_process_exited`、`provider_protocol_error`、
+`provider_policy_violation`、`provider_output_limit`、
+`provider_stderr_limit`、`provider_io_error`、`provider_timeout`、
+`provider_cancelled`、`provider_cleanup_failed`、
+`provider_runtime_monitor_failed`、`provider_not_started`、
+`provider_worktree_execution_failed`、`provider_worktree_authority_lost`、
+`provider_recovered_worktree_authority_lost`、
+`provider_recovered_failed`、`provider_recovered_unknown` 和
+`provider_execution_failed`。公开详情采用 `<code>: <generic summary>`
+格式，总长度不超过 160 个字符。
+
 ### 20.3 Provider 能力
 
 Adapter 暴露带版本的 capability profile，例如：
@@ -1019,15 +1040,16 @@ Artifact 和原始 provenance，不重复发布事件。新 Activation 只有在
 阻止新 descriptor；已提交 descriptor 仍由当前获授权的 Human/Runtime 查询。
 首片不自动删除 orphan 或 staging 文件，避免与并发固化竞争；清理留给停机维护。
 
-持久因果限制、可信 Artifact 与物理 Worktree 的整合数据库使用 schema **16**，同时保留第 25 节的
+持久因果限制、可信 Artifact、物理 Worktree 与 Provider 诊断边界的整合数据库使用 schema **17**，同时保留第 25 节的
 Run root/parent/depth、不可变约束、准入索引及持久配置，以及第 23 节的可信报告
 descriptor，并加入第 22 节的物理身份、执行记录及不可逆的 Writer publication fence。
-此前 causal-only、Artifact-only、Worktree-only schema 14 以及整合 schema 15
-均不兼容；不得因版本数字相同而接受另一套布局。打开任何旧版或未版本化的非空
+schema 16 可能包含诊断边界修复前公开持久化的 Provider 原始诊断，因此必须拒绝并重建；
+更早的 causal-only、Artifact-only、Worktree-only schema 14 及整合 schema 15
+同样不兼容。不得因版本数字相同而接受另一套布局。打开任何旧版或未版本化的非空
 开发数据库必须在应用 DDL/Bootstrap 前明确拒绝，不迁移、不改写版本、不删除数据。
-停止旧进程后由操作者显式重建可丢弃数据库和新的 managed root。schema 16 重开仍校验持久 causal 配置及 Worktree storage identity。
+停止旧进程后由操作者显式重建可丢弃数据库和新的 managed root。schema 17 重开仍校验持久 causal 配置及 Worktree storage identity。
 
-`user_version = 16` 不是布局证明。已有数据库必须在任何 DDL、Bootstrap 或配置写入
+`user_version = 17` 不是布局证明。已有数据库必须在任何 DDL、Bootstrap 或配置写入
 之前，以只读方式对照由可信 DDL 在隔离内存库生成的完整 schema 指纹：对象集合、
 列/type/not-null/default/PK/FK、索引/唯一性/partial predicate、trigger、CHECK
 和 STRICT 等约束。比较 SQLite 解析后的 metadata 与保留 literal/operator 语义的
@@ -1035,7 +1057,7 @@ SQL token；只忽略空白、注释和未引用 keyword/identifier 大小写，
 缺失、额外不兼容、部分、损坏、前驱形状或未来布局必须拒绝，保持原文件字节及逻辑
 状态不变，不用 `CREATE IF NOT EXISTS` 修补。SQLite 自有统计对象不属于应用布局。
 只有没有持久对象的 version 0 数据库可在同一事务内执行 DDL、初始配置及 Bootstrap；
-失败完整回滚。有效 schema 16 重开不重新应用 Bootstrap，也不修改持久 causal 配置或 storage identity。
+失败完整回滚。有效 schema 17 重开不重新应用 Bootstrap，也不修改持久 causal 配置或 storage identity。
 
 Runtime Host 调度恢复 pass 时，连续执行的 pass 数量必须有界，并在继续前让出事件循环并重新检查关闭请求。积压处理不得饿死 HTTP、timer、signal 或关闭处理。空闲轮询等待必须可被关闭请求中断；无论等待还是关闭先完成，都必须移除对应 listener 并取消不再需要的 timer。
 
@@ -1448,6 +1470,10 @@ result
 ```
 
 敏感 Prompt 和隐藏思维不默认写入审计日志。
+
+Provider 或进程诊断同样不默认进入公开审计或持久投影。公开诊断只保留稳定
+错误码、结果状态和白名单通用摘要；本地开发日志不得隐式打印 Credential 或
+完整环境。
 
 ### 28.2 基础指标
 
@@ -2408,6 +2434,17 @@ Also published in #torsor-core / current Thread
 9. Thread 与 Run 的投影读取各自拥有 replacement、loading 和错误归属，组合刷新不得以共享 freshness 条件丢弃仍有效的一半。某一半被单独刷新或另一组合刷新替代时，只交接该投影的归属；仍有效的一半必须完成或明确失败。替代失败必须传递给等待者；旧响应不得清除新选择、新 Session 或新 Project 的 loading、错误或事实。两半仍有效且成功时一起发布；两半仍有效但任一读取失败时保留原投影并结束 loading，允许重试读取。
 10. 已确认提交后的任一投影读取失败，必须在该 Run 的 Composer 内显示可感知的 `Committed; projections could not be refreshed`，包括窄屏 modal；不能只在 modal 外的 inert 主区域报告。Composer 内现有刷新操作只重试读取，不重新提交命令。保留已确认请求的幂等身份与回执，和未确认请求的恢复身份分开；刷新失败不把已提交状态变成未知或可重发命令。刷新状态按 Run 和刷新尝试隔离，跨 Pane 重新挂载保留；旧刷新结果不覆盖较新的刷新，异步状态不抢走 Human 焦点。
 
+### 44.2.1 Human Cancel 和 Withdraw 控件
+
+1. 生产 Human Web 的 Run detail 提供 `Cancel Run` 和逐条 `Withdraw Input`。仅 `Active` / `Waiting` Run 可取消；仅属于当前 Run、由当前 Human 分配且 disposition 为 `Pending` 的 RunInput 可撤回。未加载匹配投影、正在刷新、未认证、终态、其他分配者或已处置输入不提供可执行的新操作，并说明原因。服务端仍是权限和 eligibility 的权威。
+2. 控件复用 Run Composer 的请求、幂等重放、认证恢复、回执和投影刷新状态机，不另造 retry 协议。调用既有 `cancel-run` / `withdraw-run-input`，使用观察到的 Run revision；撤回还携带 disposition revision。使用当前 session/CSRF，固定公开原因 `Cancelled by Human from Run controls.` / `Withdrawn by Human from Run controls.`，不编辑或删除 Message。
+3. 每个操作在请求前冻结目标、revision、原因和 idempotency key；双击或重复键盘激活不能创建第二个请求。丢失响应、不可验证回执或不确定服务错误显示 `Outcome unknown`，仅允许显式 `Retry same action`。即使刷新后 Run 已终态或输入已处置，也允许原身份重放以确认原结果，不将投影猜测当作该请求的回执。
+4. 明确的 stale revision / conflict 拒绝保留原因并要求刷新、重新审阅，由 Human 显式开始新操作；不自动以新 revision 重发。首次明确权限拒绝不声称成功。认证或 CSRF 失败要求重新连接；此前未知的结果遇到权限或认证失败仍保持未知。只能由原 Human 恢复，不能把原请求借给其他身份。已由其他请求取消或处置的目标显示当前持久事实，不重复产生逻辑效果。
+5. 操作状态按 Run 和输入身份隔离，跨 Pane 关闭、Run 切换、重新认证保留。当前 Window 的 `sessionStorage` 仅保存这些控件的恢复元数据和已确认回执（目标 ID、principal ID、revision、key、固定原因），不保存正文、凭据、CSRF、Provider payload 或错误文本。浏览器重载将进行中请求视为未知；重新打开读取持久投影，不自动重发。存储不可用或恢复数据损坏时明确报告并禁用新控件命令，而不是丢弃未知身份后重新发送。此要求不扩大 Composer 草稿的重载保证。
+6. 成功或同身份恢复确认后刷新 Run、home Thread 和现有 Timeline 历史，不伪造事件或乐观 disposition。已确认提交后的读取失败在 Run 控件内显示 `Committed; projections could not be refreshed`，保留回执并提供只读刷新，不重发命令。旧 Run / Session 的迟到读取不替换当前选择或抢焦点。
+7. 始终区分逻辑 `Cancelled`、异步停止请求、物理 `StopConfirmed` 和 Worktree quarantine。提交成功只确认逻辑取消；不以 ProviderAttempt 结束、取消应答、Run 终态或 lease 撤销推断物理停止。当前公开 Run 投影不暴露物理执行 / quarantine 事实，必须明确说明无法在此确认；不声称 Worktree 已安全释放或实际处于 quarantine。已有 Provider stop-unconfirmed 提示继续显示。此切片不增加物理控制、quarantine 解除或 Trusted Local 执行。
+8. 使用原生具名按钮，支持 Tab、Enter 和 Space、可见焦点、disabled / busy 状态和可感知状态 / 错误区域；withdraw label 包含输入 sequence 和 ID。恢复与只读刷新在窄屏 modal 内可访问，异步结果不抢焦点。确定性 controller 和渲染测试覆盖成功、eligibility、重复激活、响应丢失、revision / conflict、权限 / CSRF / session expiry、reload / reopen，以及物理停止未确认或 Worktree 已隔离时的逻辑取消。
+
 ### 44.3 Tool Call 展开和失败
 
 默认时间线只显示：
@@ -2472,3 +2509,40 @@ Prototype 和 evidence 至少覆盖：
 13. Activity Center 聚合跨 Thread 工作，并返回来源 Thread/Run。
 14. 一个稳定 Agent 身份在多个 Thread 中并发拥有独立 Run。
 15. 多 Client 共享服务端事实，但各自保持独立 Panel、Tab、草稿和滚动状态。
+
+## 45. 公开可工作 Quick start
+
+公开仓库必须提供一条从干净 Checkout 可重复执行的最小纵向路径，使首次贡献者在受支持
+的 Node.js 上不需要模型凭据或网络即可验证工作中的 MVP。
+
+1. 根 README 提供受支持 Node.js 版本、`npm ci`、聚焦验证、完整 CI、Synthetic Host、
+   最小 HTTP Journey、Web 开发/静态预览和 ACP Mock 命令。命令从仓库根目录复制执行；
+   Windows PowerShell 是明确验证环境，路径在可行时保持跨平台。
+2. Quick start Bootstrap 是已提交、完整且机器无关的 JSON，至少包含 Human Principal、
+   Runtime Principal、Agent Principal、对应 Agent 配置、Project 和 Channel，只使用合成数据。
+3. 无凭据 Host 是单独的 Example/Development 入口。它通过公开
+   `createLocalRuntimeHost` 与 `DeterministicFakeAdapter` 使用生产组合路径，只允许显式
+   IPv4/IPv6 Loopback 字面量 `127.0.0.1` 或 `::1`，拒绝 Wildcard、非 Loopback 地址和
+   Hostname；不通过环境变量切换生产 CLI，不启用任意 Adapter、命令、工具或宽松权限。
+4. 最小 HTTP Journey 必须实际验证 `/health`、Bearer 到 HttpOnly Session Cookie 的交换、
+   Session CSRF、Project Bootstrap、`start-thread`、生成的 Run、Run Activity 和终态完成。
+   动态 ID 由受检脚本从响应中取得，不在文档中硬编码。
+5. Host 的正常关闭必须关闭 HTTP、Runtime 和 Kernel；使用同一个状态目录重启后，先前完成
+   的 Thread、Run 和 Activity 仍可读取。Example CLI 提供显式选择加入的
+   `--shutdown-stdin` 控制，只接受 `shutdown` 行并调用与信号处理相同的关闭路径；成功退出
+   前必须完成关闭并返回状态码 0。测试使用该协作式路径证明正常关闭，而不是把强制终止当作
+   正常关闭证据。测试使用独立临时目录和动态端口，不留下进程、端口、数据库或生成文件。
+6. Server Workspace 命令的当前工作目录是 `apps/server`。组件文档必须明确该语义，并对
+   Bootstrap、数据库和 Artifact 路径使用能从该 cwd 正确解析的路径；根级 Quick start
+   Example 则从仓库根目录解析自己的默认状态。
+7. 根级 `dev:web` 与 `preview:web` Wrapper 必须选择 `@torsor/web` Workspace，并把调用者
+   放在 `--` 后的 Vite 参数完整转发给 Workspace Script。Web 开发服务可以明确代理 `/api`
+   与 `/health` 到本机 Host。静态 Preview 可以提供同样的本机 Smoke 代理，但必须标记为
+   本地预览，而不是不存在的生产反向代理或部署承诺。
+8. 所有可消费公共 Package 都必须在 `npm pack --dry-run` 的文件清单中包含与仓库根目录
+   完全相同的 Apache-2.0 `LICENSE`。文档/Quick start 测试应覆盖示例文件、根命令、cwd
+   语义、CLI Loopback 拒绝/接受、通过真实 Host CLI 与根级 Web Wrapper 完成的 Vite
+   dev/preview 端到端 Journey、重启持久性和 Package License 清单。测试必须证明 Wrapper
+   选择正确 Workspace，并转发 `host`、正整数动态 `port` 与 `strictPort` 参数。进程
+   Readiness、HTTP Probe 和关闭必须有界且受监督；Vite 不使用会被解释为默认端口的 0，
+   并在成功或失败后清理。

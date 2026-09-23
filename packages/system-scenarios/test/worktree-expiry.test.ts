@@ -61,7 +61,9 @@ it("SS-3.8.2: exact expiry fences a live Writer; unknown stop quarantines until 
     expect(child.live).toBe(true);
     await system.expectRuntimeFailure(draining, (error) => {
       expect(error).toMatchObject({
-        outcome: "Unknown", message: "Controlled Worktree execution did not complete with current authority.",
+        diagnosticCode: "provider_worktree_execution_failed",
+        outcome: "Unknown",
+        message: "provider_worktree_execution_failed: Controlled Worktree execution did not complete.",
       });
     });
     expect(await system.kernel.query({ type: "GetPhysicalWorktree", worktreeId }, system.runtimePrincipal))

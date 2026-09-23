@@ -683,7 +683,32 @@ Failed
 Unknown
 ```
 
-Record adapter/version, capability snapshot, Activation, input RunInput IDs, request idempotency key, start/end time, and result or Unknown reason.
+Record adapter/version, capability snapshot, Activation, input RunInput IDs,
+request idempotency key, start/end time, and result or Unknown reason.
+
+Persisted and public provider-failure diagnostics use an allowlisted
+projection. Run, Activation, ProviderAttempt, Timeline, HTTP, and Web may
+contain only a stable error code, outcome, and a bounded generic summary
+explicitly defined by the Runtime. Provider stderr, raw process errors, launch
+commands and environments, machine paths, credentials, prompts, model output,
+arbitrary provider error text, and nested cause messages must not enter those
+fields. The Runtime maps error types to fixed diagnostics before persistence;
+secret-pattern replacement is not the primary boundary, and failures are not
+silently swallowed. Unless a private diagnostic channel has explicit
+ownership and opt-in, raw diagnostics may exist only briefly in bounded memory
+and are discarded when execution ends.
+
+The current stable codes are `provider_process_start_failed`,
+`provider_process_exited`, `provider_protocol_error`,
+`provider_policy_violation`, `provider_output_limit`,
+`provider_stderr_limit`, `provider_io_error`, `provider_timeout`,
+`provider_cancelled`, `provider_cleanup_failed`,
+`provider_runtime_monitor_failed`, `provider_not_started`,
+`provider_worktree_execution_failed`, `provider_worktree_authority_lost`,
+`provider_recovered_worktree_authority_lost`,
+`provider_recovered_failed`, `provider_recovered_unknown`, and
+`provider_execution_failed`. Public detail uses
+`<code>: <generic summary>` and is at most 160 characters.
 
 ### 20.3 Provider capabilities
 
@@ -766,9 +791,9 @@ A report finalization request is identified by `(principal_id, run_id, idempoten
 
 This slice uses caller-driven retry, not background replay of Provider output. A crash during staging leaves only an invisible temporary file; content publication before database commit leaves only an invisible content-addressed blob; a lost response after commit is recoverable from durable idempotency results and Run/Thread projections. Retry verifies and reuses the blob and rechecks current authorization, Activation, and Run revision in the transaction. Revocation or a terminal Run blocks new descriptors; currently authorized Humans/Runtime may still query committed descriptors. No automatic orphan/staging deletion is included: cleanup is offline maintenance, avoiding races with concurrent finalization.
 
-The integrated durable-causal-limit, trusted-Artifact and physical-Worktree database uses schema **16**. It retains section 25's Run root/parent/depth, immutable constraints, admission index and durable configuration alongside section 23's trusted report descriptors, adding section 22's physical identities, executions and irreversible Writer publication fence. The former causal-only, Artifact-only and Worktree-only schema 14 layouts and integrated schema 15 are incompatible; equal version numbers must not authorize different layouts. Opening any older or unversioned nonempty development database must fail explicitly before applying DDL/bootstrap, without migration, version rewriting, or data deletion. Operators stop old processes and explicitly recreate disposable databases and fresh managed roots. Schema 16 reopen still validates durable causal configuration and Worktree storage identity.
+The integrated durable-causal-limit, trusted-Artifact, physical-Worktree, and provider-diagnostic-boundary database uses schema **17**. It retains section 25's Run root/parent/depth, immutable constraints, admission index and durable configuration alongside section 23's trusted report descriptors, adding section 22's physical identities, executions and irreversible Writer publication fence. Schema 16 is rejected and recreated because it may contain raw provider diagnostics publicly persisted before this boundary; the former causal-only, Artifact-only and Worktree-only schema 14 layouts and integrated schema 15 are also incompatible. Equal version numbers must not authorize different layouts. Opening any older or unversioned nonempty development database must fail explicitly before applying DDL/bootstrap, without migration, version rewriting, or data deletion. Operators stop old processes and explicitly recreate disposable databases and fresh managed roots. Schema 17 reopen still validates durable causal configuration and Worktree storage identity.
 
-`user_version = 16` is not layout proof. Before any DDL, bootstrap or configuration write, existing databases undergo read-only comparison against a complete schema fingerprint generated from trusted DDL in an isolated memory database: object sets, columns/types/nullability/defaults/PKs/FKs, indexes/uniqueness/partial predicates, triggers, CHECK and STRICT constraints. Compare SQLite-parsed metadata and SQL tokens that preserve literal/operator semantics; ignore only whitespace, comments and unquoted keyword/identifier case, never whitespace inside strings. Reject missing, extra-incompatible, partial, corrupt, predecessor-shaped or future layouts without changing file bytes or logical state; never repair with `CREATE IF NOT EXISTS`. SQLite-owned statistics objects are outside the application layout. Only version 0 with no persistent objects may execute DDL, initial configuration and bootstrap in one transaction, with complete rollback on failure. Valid schema 16 reopen does not reapply bootstrap or modify durable causal configuration or storage identity.
+`user_version = 17` is not layout proof. Before any DDL, bootstrap or configuration write, existing databases undergo read-only comparison against a complete schema fingerprint generated from trusted DDL in an isolated memory database: object sets, columns/types/nullability/defaults/PKs/FKs, indexes/uniqueness/partial predicates, triggers, CHECK and STRICT constraints. Compare SQLite-parsed metadata and SQL tokens that preserve literal/operator semantics; ignore only whitespace, comments and unquoted keyword/identifier case, never whitespace inside strings. Reject missing, extra-incompatible, partial, corrupt, predecessor-shaped or future layouts without changing file bytes or logical state; never repair with `CREATE IF NOT EXISTS`. SQLite-owned statistics objects are outside the application layout. Only version 0 with no persistent objects may execute DDL, initial configuration and bootstrap in one transaction, with complete rollback on failure. Valid schema 17 reopen does not reapply bootstrap or modify durable causal configuration or storage identity.
 
 The Runtime Host must bound consecutive recovery passes, yield to the event loop before continuing, and recheck shutdown. Backlog processing must not starve HTTP, timers, signals, or shutdown handling. Idle polling waits must be interruptible by shutdown and must remove their listener and cancel any no-longer-needed timer regardless of which side completes first.
 
@@ -1130,6 +1155,11 @@ result
 ```
 
 Sensitive Prompt content and hidden reasoning are not stored by default.
+
+Provider and process diagnostics likewise do not enter public audit or durable
+projections by default. Public diagnostics retain only stable error codes,
+outcomes, and allowlisted generic summaries; local developer logs must not
+implicitly print credentials or complete environments.
 
 ### 28.2 Base metrics
 
@@ -1831,6 +1861,17 @@ It uses atomic `send_to_run` from section 36 independently of Live Timeline impl
 9. Thread and Run reads own their replacement, loading, and error state independently. A paired refresh must not discard a still-current half through a shared freshness predicate. A single or paired replacement takes over only its own projection; the remaining current half must complete or explicitly fail. Replacement failure propagates to waiters; old responses must not clear loading, errors, or facts for a newer selection, Session, or Project. Publish both halves together when both remain current and succeed; if both remain current but either read fails, retain the original projections, settle loading, and allow read retry.
 10. Failure of either projection read after an acknowledged commit must expose a perceivable `Committed; projections could not be refreshed` inside that Run's Composer, including narrow-screen modals, not only in inert content outside the modal. The existing Composer refresh action retries reads only, never the command. Retain the acknowledged request's idempotency identity and receipt separately from unconfirmed recovery identity; refresh failure must not turn a committed submission into unknown or a retryable command. Scope refresh state by Run and attempt and retain it across pane remounts; older refresh results must not overwrite newer refreshes or steal Human focus.
 
+### 44.2.1 Human Cancel and Withdraw controls
+
+1. Production Human Web Run detail exposes `Cancel Run` and per-input `Withdraw Input`. Only `Active` / `Waiting` Runs are cancellable; only a `Pending` RunInput belonging to the selected Run and assigned by the current Human is withdrawable. Missing matching projections, refresh in progress, missing authentication, terminal Runs, other assigners, and settled inputs have no executable new action and explain why. The server remains authoritative for permission and eligibility.
+2. Reuse the Run Composer request, idempotent replay, authentication recovery, receipt, and projection-refresh state machine, not a separate retry protocol. Call existing `cancel-run` / `withdraw-run-input` with the observed Run revision and, for withdrawal, disposition revision. Use the current session/CSRF and fixed public reasons `Cancelled by Human from Run controls.` / `Withdrawn by Human from Run controls.`; do not edit or delete Messages.
+3. Freeze each operation's target, revisions, reason, and idempotency key before requesting. Double clicks or repeated keyboard activation cannot create a second request. Lost responses, unverifiable receipts, and uncertain server failures display `Outcome unknown` with explicit `Retry same action` only. Even after refresh shows a terminal Run or settled input, allow original-identity replay to confirm its outcome; projections are not receipts for that request.
+4. Definite stale-revision / conflict rejection retains the reason and requires refresh and review before the Human explicitly starts a new operation; never automatically resend with a new revision. Initial definite permission rejection must not claim success. Authentication or CSRF failure requires reconnecting; permission or authentication failure after an unknown outcome preserves uncertainty. Only the original Human may recover a request, never another identity. Targets already cancelled or settled by another request show current durable facts without duplicating logical effects.
+5. Scope action state by Run and input identity across pane closure, Run switching, and reauthentication. Window `sessionStorage` retains only these controls' recovery metadata and acknowledged receipts (target IDs, principal ID, revisions, key, fixed reason), not message bodies, credentials, CSRF, Provider payloads, or error text. Reload treats in-flight requests as unknown; reopening reads durable projections without automatic resubmission. Unavailable storage or corrupt recovery data explicitly disables new control commands instead of discarding an unknown identity and resending. This does not extend Composer draft reload guarantees.
+6. Success or confirmed same-identity recovery refreshes the Run, home Thread, and existing Timeline history without fabricated events or optimistic dispositions. Read failure after acknowledged commit displays `Committed; projections could not be refreshed` inside Run controls, retains the receipt, and provides read-only refresh, never command resubmission. Late reads from old Runs / Sessions cannot replace the current selection or steal focus.
+7. Always distinguish logical `Cancelled`, asynchronous stop requests, physical `StopConfirmed`, and Worktree quarantine. Success confirms logical cancellation only; ProviderAttempt settlement, cancel acknowledgement, terminal Run state, or lease revocation is not physical-stop evidence. The current public Run projection exposes no physical execution / quarantine facts: explicitly state that confirmation is unavailable here, without claiming safe Worktree release or actual quarantine. Preserve existing Provider stop-unconfirmed notices. This slice adds no physical controls, quarantine release, or Trusted Local execution.
+8. Use named native buttons supporting Tab, Enter, Space, visible focus, disabled / busy states, and perceivable status / error regions; withdrawal labels include input sequence and ID. Recovery and read-only refresh remain accessible inside narrow-screen modals without asynchronous focus theft. Deterministic controller and rendered tests cover success, eligibility, repeated activation, lost response, revision / conflict, permission / CSRF / session expiry, reload / reopen, and logical cancellation with unconfirmed physical stop or quarantined Worktrees.
+
 ### 44.3 Tool Call expansion and failure
 
 Collapsed timeline examples:
@@ -1882,3 +1923,60 @@ The prototype and evidence cover at least:
 13. Activity Center aggregates across Threads and links back to source Thread/Run.
 14. One stable Agent identity owns independent concurrent Runs across Threads.
 15. Multiple Clients share server facts but keep independent Panels, Tabs, drafts, and scroll positions.
+
+## 45. Public working quick start
+
+The public repository must provide a repeatable minimum vertical path from a
+clean checkout so a first-time contributor on supported Node.js can verify the
+working MVP without model credentials or network access.
+
+1. The root README provides the supported Node.js version plus `npm ci`,
+   focused validation, full CI, synthetic Host, minimum HTTP journey, Web
+   development/static preview, and ACP mock commands. Commands are copied from
+   the repository root; Windows PowerShell is an explicitly verified
+   environment, with portable paths where practical.
+2. The quick-start bootstrap is a committed, complete, machine-independent
+   JSON file containing at least a Human Principal, Runtime Principal, Agent
+   Principal and matching Agent configuration, Project, and Channel, using
+   synthetic data only.
+3. The credential-free Host is a separate example/development entry point. It
+   uses the production composition path through public
+   `createLocalRuntimeHost` and `DeterministicFakeAdapter`, accepts only the
+   explicit IPv4/IPv6 loopback literals `127.0.0.1` or `::1`, rejects wildcard,
+   non-loopback addresses, and hostnames, does not switch the production CLI
+   through an environment flag, and does not enable arbitrary adapters,
+   commands, tools, or relaxed permissions.
+4. The minimum HTTP journey actually verifies `/health`, bearer exchange for
+   an HttpOnly session cookie, session CSRF, Project bootstrap, `start-thread`,
+   the resulting Run, Run activity, and terminal completion. A checked script
+   obtains dynamic IDs from responses instead of hard-coding them in prose.
+5. Normal Host shutdown closes HTTP, Runtime, and Kernel. Restarting with the
+   same state directory keeps the completed Thread, Run, and activity
+   readable. The example CLI provides an explicit opt-in `--shutdown-stdin`
+   control that accepts only a `shutdown` line and invokes the same close path
+   as signal handling; shutdown must finish and exit with status 0 before
+   reporting success. Tests use that cooperative path as normal-shutdown
+   evidence rather than treating forced termination as graceful shutdown.
+   Tests use isolated temporary directories and dynamic ports and leave no
+   processes, ports, databases, or generated files behind.
+6. Server workspace commands run with `apps/server` as their current working
+   directory. Component documentation states that semantic explicitly and
+   uses bootstrap, database, and Artifact paths that resolve correctly from
+   that cwd; the root quick-start example resolves its own default state from
+   the repository root.
+7. The root `dev:web` and `preview:web` wrappers select the `@torsor/web`
+   workspace and forward Vite arguments supplied after `--` intact to the
+   workspace script. The Web development server may explicitly proxy `/api`
+   and `/health` to the local Host. Static preview may provide the same local
+   smoke proxy, but must be described as local preview rather than a
+   production reverse proxy or deployment promise.
+8. Every consumable public package includes a byte-identical copy of the
+   repository Apache-2.0 `LICENSE` in `npm pack --dry-run`. Documentation and
+   quick-start tests cover example files, root commands, cwd semantics, CLI
+   loopback rejection/acceptance, the end-to-end journey through the real Host
+   CLI and root Web wrappers, restart durability, and package license
+   contents. Tests prove that the wrappers select the correct workspace and
+   forward `host`, positive dynamic `port`, and `strictPort` arguments.
+   Process readiness, HTTP probes, and shutdown are bounded and supervised.
+   Vite does not receive zero values that it may reinterpret as defaults, and
+   tests clean up after success or failure.

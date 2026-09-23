@@ -154,7 +154,6 @@ export const runProjection: RunProjection = {
       capabilitySnapshot: { tools: [] },
       runInputIds: ["run-input-1"],
       requestIdempotencyKey: "provider-request-1",
-      diagnosticSessionId: null,
       status: "Acknowledged",
       detail: null,
       startedAt: "2026-09-22T04:01:30.000Z",

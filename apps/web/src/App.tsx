@@ -35,6 +35,7 @@ import {
 import type { WebController, WebState } from "./controller";
 import { LiveTimeline } from "./LiveTimeline";
 import { RunComposer } from "./RunComposer";
+import { RunControls } from "./RunControls";
 import {
   readRoute,
   type ViewName,
@@ -547,6 +548,7 @@ function SessionGate({
             The browser session expired or was revoked. Connect again.
             Run drafts and submission identities are retained in this window.
             A lost response may have committed; reconnect to recover it.
+            Run control recovery is retained across reconnect and reload in this window.
           </div>
         ) : null}
         {state.authError ? (
@@ -1224,7 +1226,8 @@ function DetailPanel({
       </div>
       {route.detailPanel === "run" && route.runId ? (
         <>
-          <RunDetail state={state} onLoadEarlier={onLoadEarlier} onRefresh={onRefreshRun} />
+          <RunDetail state={state} onLoadEarlier={onLoadEarlier} onRefresh={onRefreshRun}
+            controls={<RunControls key={route.runId} controller={controller} state={state} runId={route.runId} />} />
           <RunComposer
             key={route.runId}
             controller={controller}
@@ -1357,27 +1360,32 @@ function StatusDetail({
   );
 }
 
-function RunDetail({ state, onLoadEarlier, onRefresh }: {
+function RunDetail({ state, onLoadEarlier, onRefresh, controls }: {
   readonly state: WebState;
   readonly onLoadEarlier: () => void;
   readonly onRefresh: () => void;
+  readonly controls: ReactNode;
 }) {
   if (state.loadingRun && !state.run) {
-    return <FullLoading label="Loading atomic Run projection" />;
+    return <div className="detail-scroll run-detail">{controls}<FullLoading label="Loading atomic Run projection" /></div>;
   }
   const projection = state.run;
   if (!projection) {
     return (
-      <EmptyState
-        icon={<CircleDot aria-hidden="true" />}
-        title="Run unavailable"
-        detail="Select a Run from the conversation or project status."
-      />
+      <div className="detail-scroll run-detail">
+        {controls}
+        <EmptyState
+          icon={<CircleDot aria-hidden="true" />}
+          title="Run unavailable"
+          detail="Select a Run from the conversation or project status."
+        />
+      </div>
     );
   }
   const agent = agentName(state.agents, projection.run.ownerAgentId);
   return (
     <div className="detail-scroll run-detail">
+      {controls}
       <section className="run-summary">
         <div className="run-summary-title">
           <Avatar label={agent} />

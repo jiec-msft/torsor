@@ -103,6 +103,6 @@ Windows/Node 24 的一次三轮 fresh-process 测量为每轮 **13/13**，
 **9.151–9.548 秒**（不含构建）；Worktree 场景约 **0.56–1.18 秒**。
 外层进程使用真实单调时钟，hosted runner 可能更慢；CI 日志保留每轮实际值。
 
-SS-3.8 已集成 schema 16 的固定 `write-probe-v1`。可信本地真实 Agent 工作负载、
+SS-3.8 已集成 schema 17 的固定 `write-probe-v1`。可信本地真实 Agent 工作负载、
 通用 shell/write 和跨重启进程树隔离仍未集成；不以 fake/fixed process 场景替代
 这些能力的生产验收或最终 exact-head 独立审查。

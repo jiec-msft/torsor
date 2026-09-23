@@ -81,7 +81,7 @@ numbers trace implementation and tests; domain semantics come from the paired
 | SS-3.5 | Depth 4 admitted, 5 rejected; root nonterminal cap 50 includes Waiting and releases only on terminal commit. Retry after release admits once with unchanged provenance | 25.1–25.2 |
 | SS-3.6 | Trusted report digest, finalization, reopen and retry; equal bytes in different Runs retain independent descriptors; parent/child or sibling isolation, indistinguishable absent/out-of-scope reads | 21.3–21.5, 23 |
 | SS-3.7 | Crash/reopen preserves committed facts, not uncommitted work; a fresh Runtime continues from durable inputs without long-lived Agent memory | 20–21 |
-| SS-3.8 | Public schema-16 lease execution: old-generation/fenced/expired live processes cannot publish mutations, descriptors, success activity or completion; new generation wins, late output is rejected/quarantined, restart/reconciliation is deterministic | 21.5, 22, 24, 38 |
+| SS-3.8 | Public schema-17 lease execution: old-generation/fenced/expired live processes cannot publish mutations, descriptors, success activity or completion; new generation wins, late output is rejected/quarantined, restart/reconciliation is deterministic | 21.5, 22, 24, 38 |
 
 **SS-3.8.1** Use public `LocalWorktreeExecutor`, with Human/Runtime Run creation,
 to execute the fixed `write-probe-v1` child in a synthetic detached Git worktree.
@@ -98,6 +98,9 @@ activity (including idempotent replay), Reply, Artifact finalization and success
 settlement. Expiry, stop request and force request do not prove stop. Missing close
 means `Uncertain`/quarantine and denied same-directory acquisition. Late original-
 handle close may reconcile physical state but never revive the old Writer.
+Runtime failure assertions match only the stable allowlisted diagnostic code and
+generic summary defined by section 20.2, never raw process errors, paths, commands,
+environments, or Provider text.
 
 **SS-3.8.3** Open an independent Kernel/Runtime/HTTP/Web composition on the same
 SQLite database, with controlled interleaving representing executor restart and

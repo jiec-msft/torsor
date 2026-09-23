@@ -70,7 +70,7 @@ runner 同时控制 `performance.now()` 与应用 timer；磁盘或 CPU 延迟�
 | SS-3.5 | depth 4 可准入、5 拒绝；root 同时非终态上限 50，Waiting 占位，只有终态提交释放；释放后重试不重复准入且保持来源 | 25.1–25.2 |
 | SS-3.6 | 可信报告 digest、固化、重开和重试；相同字节在不同 Run 保留独立 descriptor；父子或兄弟不可互读，不存在与越界读取不可区分 | 21.3–21.5、23 |
 | SS-3.7 | 崩溃/重开保留已提交事实，不保留未提交工作；新 Runtime 只从持久输入继续，不需要长寿命 Agent 内存 | 20–21 |
-| SS-3.8 | schema 16 的公开 lease execution：旧 generation、fenced/expired 活进程不能发布变更、descriptor、成功活动或完成；新 generation 胜出，晚到输出拒绝/隔离，重启与 reconciliation 确定 | 21.5、22、24、38 |
+| SS-3.8 | schema 17 的公开 lease execution：旧 generation、fenced/expired 活进程不能发布变更、descriptor、成功活动或完成；新 generation 胜出，晚到输出拒绝/隔离，重启与 reconciliation 确定 | 21.5、22、24、38 |
 
 **SS-3.8.1** 使用公开 `LocalWorktreeExecutor`，由 Human/Runtime 创建 Run，
 在合成 detached Git worktree 执行固定 `write-probe-v1` child。只有固定 digest、
@@ -84,6 +84,8 @@ probe 的 result、stop request、force request 与原 handle close。逻辑时�
 拒绝活动（含幂等重放）、Reply、Artifact 固化及成功结束；expiry、stop request
 或 force request 本身不证明停止。没有 close 则 `Uncertain`/quarantine，拒绝
 同目录 acquisition；晚到原 handle close 可收敛物理状态，但不能复活旧 Writer。
+Runtime 失败断言只匹配第 20.2 节定义的稳定 allowlisted diagnostic code 和通用说明，
+不得依赖或暴露原始 process error、路径、命令、环境或 Provider 文本。
 
 **SS-3.8.3** 在同一 SQLite 上打开独立 Kernel/Runtime/HTTP/Web composition，
 以受控交错代表 executor 重启与并发恢复；不 mock Kernel、不复用 Agent 内存。

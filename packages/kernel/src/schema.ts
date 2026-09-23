@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 16;
+export const CURRENT_SCHEMA_VERSION = 17;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -266,7 +266,6 @@ CREATE TABLE IF NOT EXISTS provider_attempts (
   capability_snapshot_json TEXT NOT NULL,
   run_input_ids_json TEXT NOT NULL,
   request_idempotency_key TEXT NOT NULL,
-  diagnostic_session_id TEXT,
   status TEXT NOT NULL CHECK (status IN ('Started', 'Acknowledged', 'Completed', 'Failed', 'Unknown')),
   detail TEXT,
   created_event_sequence INTEGER REFERENCES public_events(sequence),

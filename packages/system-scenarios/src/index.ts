@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { setImmediate } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import {
-  AgentRuntime, DeterministicFakeAdapter, type DeterministicFakeHandler,
+  AgentRuntime, DeterministicFakeAdapter, ProviderExecutionError,
+  type DeterministicFakeHandler,
 } from "@torsor/agent-runtime";
 import { LocalArtifactStorage, TorsorKernel, type KernelBootstrap } from "@torsor/kernel";
 import { createTorsorHttpService, type TorsorHttpService } from "@torsor/server";
@@ -100,7 +101,12 @@ class SystemScenario {
       ...(worktrees ? { worktreeExecutor: worktrees.executor } : {}),
       adapter: new DeterministicFakeAdapter(async (context) => {
         try { await this.#handler(context); }
-        catch (error) { this.#failures.push(error); throw error; }
+        catch (error) {
+          // Runtime work tracks normalized provider failures; retain only
+          // independent scenario-script errors for cleanup verification.
+          if (!(error instanceof ProviderExecutionError)) this.#failures.push(error);
+          throw error;
+        }
       }),
     });
     this.http = new HttpTransport(origin);

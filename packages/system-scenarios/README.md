@@ -115,7 +115,7 @@ each round in **9.151–9.548 seconds**, excluding builds; Worktree scenarios to
 about **0.56–1.18 seconds**. The outer process measures real monotonic time.
 Hosted runners may be slower; CI logs retain each actual measurement.
 
-SS-3.8 now integrates schema-16 fixed `write-probe-v1`. Trusted-local real Agent
+SS-3.8 now integrates schema-17 fixed `write-probe-v1`. Trusted-local real Agent
 workloads, general shell/write and cross-restart process-tree isolation remain
 unintegrated. Fake/fixed-process scenarios do not replace their production
 acceptance or the eventual independent exact-head review.

@@ -13,6 +13,7 @@
   },
   "scripts": {
     "dev": "vite",
+    "preview": "vite preview",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build:controller": "tsc -p tsconfig.controller.json",

@@ -1,29 +1,35 @@
 import { ApiError } from "./api.js";
 import type { Run } from "./types.js";
 
-export interface SendToRunRequest {
+export interface RunCommandRequest {
   readonly idempotencyKey: string;
   readonly runId: string;
-  readonly body: string;
   readonly expectedRunRevision: number;
 }
 
-export interface RunComposerEntry {
+export interface SendToRunRequest extends RunCommandRequest {
+  readonly body: string;
+}
+
+export interface RunCommandEntry<Request extends RunCommandRequest, Receipt> {
   readonly draft: string;
   readonly status: "draft" | "submitting" | "unknown" | "auth-required" | "rejected" | "submitted";
-  readonly request: SendToRunRequest | null;
+  readonly request: Request | null;
   readonly principalId: string | null;
   readonly uncertain: boolean;
   readonly error: string | null;
   readonly rejectionCode: string | null;
   readonly rejectedRevision: number | null;
+  readonly reviewRequired: boolean;
   readonly acknowledged: {
-    readonly request: SendToRunRequest;
+    readonly request: Request;
     readonly principalId: string;
-    readonly receipt: SendToRunReceipt;
+    readonly receipt: Receipt;
   } | null;
   readonly projectionStatus: "idle" | "refreshing" | "failed";
 }
+
+export type RunComposerEntry = RunCommandEntry<SendToRunRequest, SendToRunReceipt>;
 
 interface SendToRunReceipt {
   readonly messageId: string;
@@ -33,7 +39,7 @@ interface SendToRunReceipt {
   readonly revision: number;
 }
 
-export const emptyRunComposer: RunComposerEntry = {
+export const emptyRunCommand: RunCommandEntry<never, never> = {
   draft: "",
   status: "draft",
   request: null,
@@ -42,25 +48,38 @@ export const emptyRunComposer: RunComposerEntry = {
   error: null,
   rejectionCode: null,
   rejectedRevision: null,
+  reviewRequired: false,
   acknowledged: null,
   projectionStatus: "idle",
 };
+
+export const emptyRunComposer: RunComposerEntry = emptyRunCommand;
 
 export function isTerminalRun(run: Run): boolean {
   return ["Completed", "Failed", "Cancelled"].includes(run.state);
 }
 
-export function needsRunRefresh(entry: RunComposerEntry, run: Run): boolean {
+export function needsRunRefresh(entry: Pick<RunComposerEntry, "rejectionCode" | "rejectedRevision">, run: Run): boolean {
   return entry.rejectionCode === "stale_revision" && entry.rejectedRevision === run.revision;
 }
 
-/** Window-local drafts outlive the mounted pane and browser authentication. */
-export class RunComposerModel {
+/** Shared immutable request, receipt, and recovery lifecycle for Human Run commands. */
+export class RunCommandModel<Request extends RunCommandRequest, Receipt> {
   readonly #listeners = new Set<() => void>();
-  #entries: Readonly<Record<string, RunComposerEntry>> = {};
+  #entries: Readonly<Record<string, RunCommandEntry<Request, Receipt>>> = {};
   readonly #refreshVersions = new Map<string, number>();
 
-  getSnapshot = (): Readonly<Record<string, RunComposerEntry>> => this.#entries;
+  constructor(readonly receipt: (value: unknown, request: Request) => Receipt) {}
+
+  getSnapshot = (): Readonly<Record<string, RunCommandEntry<Request, Receipt>>> => this.#entries;
+
+  protected restore(entries: Readonly<Record<string, RunCommandEntry<Request, Receipt>>>): void {
+    this.#entries = entries;
+  }
+
+  protected changed(): void {}
+
+  protected assertWritable(): void {}
 
   subscribe = (listener: () => void): (() => void) => {
     this.#listeners.add(listener);
@@ -68,11 +87,11 @@ export class RunComposerModel {
   };
 
   edit(runId: string, draft: string): void {
-    const entry = this.#entries[runId] ?? emptyRunComposer;
+    const entry = this.#entries[runId] ?? emptyRunCommand;
     if (entry.request) {
       throw new Error("Recover the original submission before editing its draft.");
     }
-    this.#set(runId, {
+    this.set(runId, {
       ...entry,
       draft,
       ...(entry.status === "submitted" ? { status: "draft", error: null } as const : {}),
@@ -82,59 +101,56 @@ export class RunComposerModel {
   beginRefresh(runId: string): (succeeded: boolean) => void {
     const version = (this.#refreshVersions.get(runId) ?? 0) + 1;
     this.#refreshVersions.set(runId, version);
-    this.#set(runId, {
-      ...(this.#entries[runId] ?? emptyRunComposer), projectionStatus: "refreshing",
+    this.set(runId, {
+      ...(this.#entries[runId] ?? emptyRunCommand), projectionStatus: "refreshing",
     });
     return (succeeded) => {
       if (this.#refreshVersions.get(runId) !== version) return;
-      this.#set(runId, {
+      this.set(runId, {
         ...this.#entries[runId]!, projectionStatus: succeeded ? "idle" : "failed",
+        ...(succeeded ? { reviewRequired: false } : {}),
       });
     };
   }
 
-  async submit(
-    run: Run,
+  protected async submitRequest(
+    key: string,
     principalId: string,
-    send: (request: SendToRunRequest) => Promise<unknown>,
+    create: () => Request | string,
+    send: (request: Request) => Promise<unknown>,
   ): Promise<boolean> {
-    const entry = this.#entries[run.id] ?? emptyRunComposer;
+    this.assertWritable();
+    const entry = this.#entries[key] ?? emptyRunCommand;
     if (entry.status === "submitting") return false;
     if (entry.request && entry.principalId !== principalId) {
-      this.#set(run.id, {
+      this.set(key, {
         ...entry,
         error: "Reconnect as the original Human to recover this submission.",
       });
       return false;
     }
-    if (!entry.request && (isTerminalRun(run) || needsRunRefresh(entry, run) || !entry.draft.trim())) {
-      this.#set(run.id, {
-        ...entry,
-        error: isTerminalRun(run)
-          ? "This Run is terminal. Request follow-up in the public Thread."
-          : needsRunRefresh(entry, run)
-            ? "Refresh the Run revision and review it before sending again."
-            : "Enter a Run input before sending.",
-      });
+    const request = entry.request ?? create();
+    if (typeof request === "string") {
+      this.set(key, { ...entry, error: request });
       return false;
     }
-    const request = entry.request ?? {
-      idempotencyKey: crypto.randomUUID(),
-      runId: run.id,
-      body: entry.draft.trim(),
-      expectedRunRevision: run.revision,
-    };
-    const pending: RunComposerEntry = {
+    const pending: RunCommandEntry<Request, Receipt> = {
       ...entry, request, principalId, status: "submitting", error: null,
       rejectionCode: null, rejectedRevision: null,
     };
-    this.#set(run.id, pending);
+    this.set(key, pending);
+    try {
+      this.assertWritable();
+    } catch (error) {
+      this.set(key, entry);
+      throw error;
+    }
     try {
       const response = await send(request);
-      const receipt = requireSendToRunReceipt(response, request);
-      this.#refreshVersions.set(run.id, (this.#refreshVersions.get(run.id) ?? 0) + 1);
-      this.#set(run.id, {
-        ...emptyRunComposer, status: "submitted",
+      const receipt = this.receipt(response, request);
+      this.#refreshVersions.set(key, (this.#refreshVersions.get(key) ?? 0) + 1);
+      this.set(key, {
+        ...emptyRunCommand, status: "submitted",
         acknowledged: { request, principalId, receipt },
       });
       return true;
@@ -151,14 +167,15 @@ export class RunComposerModel {
         (["forbidden", "not_found", "invalid_request", "conflict"].includes(error.code) ||
           (error.status === 413 && error.code === "payload_too_large"));
       if (domainRejection || initialRejection) {
-        this.#set(run.id, {
+        this.set(key, {
           ...pending, status: "rejected", request: null, uncertain: false,
           error: message, rejectionCode: error.code,
           rejectedRevision: request.expectedRunRevision,
+          reviewRequired: true,
         });
       } else {
         const uncertain = pending.uncertain || !authentication;
-        this.#set(run.id, {
+        this.set(key, {
           ...pending, status: uncertain ? "unknown" : "auth-required",
           uncertain, error: message,
         });
@@ -167,9 +184,30 @@ export class RunComposerModel {
     }
   }
 
-  #set(runId: string, entry: RunComposerEntry): void {
+  protected set(runId: string, entry: RunCommandEntry<Request, Receipt>): void {
     this.#entries = { ...this.#entries, [runId]: entry };
+    this.changed();
     for (const listener of this.#listeners) listener();
+  }
+}
+
+/** Window-local drafts outlive the mounted pane and browser authentication. */
+export class RunComposerModel extends RunCommandModel<SendToRunRequest, SendToRunReceipt> {
+  constructor() {
+    super(requireSendToRunReceipt);
+  }
+
+  submit(run: Run, principalId: string, send: (request: SendToRunRequest) => Promise<unknown>): Promise<boolean> {
+    return this.submitRequest(run.id, principalId, () => {
+      const entry = this.getSnapshot()[run.id] ?? emptyRunComposer;
+      if (isTerminalRun(run)) return "This Run is terminal. Request follow-up in the public Thread.";
+      if (needsRunRefresh(entry, run)) return "Refresh the Run revision and review it before sending again.";
+      if (!entry.draft.trim()) return "Enter a Run input before sending.";
+      return {
+        idempotencyKey: crypto.randomUUID(), runId: run.id,
+        body: entry.draft.trim(), expectedRunRevision: run.revision,
+      };
+    }, send);
   }
 }
 
