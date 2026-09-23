@@ -11,6 +11,7 @@ import { TorsorKernel, type KernelBootstrap } from "@torsor/kernel";
 import { describe, expect, it, vi } from "vitest";
 import { createTorsorHttpService } from "../../server/src/index";
 import { WebController } from "./controller";
+import { timelineItems } from "./timeline-model";
 import type { PublicEvent, RunProjection, ThreadProjection } from "./types";
 import type { ActivityPage } from "./timeline-history";
 
@@ -26,6 +27,147 @@ const seed: KernelBootstrap = {
 };
 
 describe("durable Live Timeline public path", () => {
+  it("publishes only an allowlisted diagnostic when a real ACP child exposes private stderr", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "torsor-private-diagnostic-"));
+    const databasePath = join(directory, "timeline.sqlite");
+    const kernel = TorsorKernel.open({ databasePath, bootstrap: seed });
+    const service = createTorsorHttpService({
+      databasePath, bootstrap: seed, port: 0,
+      credentials: [{ token: "synthetic-human", principalContext: { principalId: "human" } }],
+    });
+    const origin = await service.listen();
+    let cookie = "";
+    const browserFetch: typeof fetch = async (url, init) => {
+      const headers = new Headers(init?.headers);
+      if (cookie) headers.set("Cookie", cookie);
+      const response = await fetch(url, { ...init, headers });
+      const setCookie = response.headers.get("set-cookie");
+      if (setCookie) cookie = setCookie.split(";")[0]!;
+      return response;
+    };
+    const controller = new WebController({
+      apiBase: origin, fetch: browserFetch,
+      sessionStorage: {
+        getItem: () => null,
+        setItem() {},
+        removeItem() {},
+      },
+      eventSourceFactory: (url) => new ReplaySource(url) as unknown as EventSource,
+      broadcastChannelFactory: () => ({
+        postMessage() {}, close() {}, onmessage: null,
+      }) as unknown as BroadcastChannel,
+    });
+    try {
+      await controller.exchangeSession("synthetic-human", "project");
+      await controller.startThread({
+        channelId: "channel",
+        body: "Create a synthetic Run for the diagnostic boundary.",
+        targetAgentIds: ["agent"],
+      });
+      const runtimeOptions = {
+        kernel,
+        runtimePrincipalId: "runtime",
+        projectIds: ["project"],
+        outboxBatchSize: 1,
+      };
+      await new AgentRuntime({
+        ...runtimeOptions,
+        adapter: new DeterministicFakeAdapter(),
+      }).runOnce();
+      const runPage = await kernel.query(
+        { type: "ListRunProjections", projectId: "project" },
+        { principalId: "human" },
+      );
+      const runId = runPage.items[0]!.run.id;
+      const adapter = new CopilotAcpAdapter({
+        command: process.execPath,
+        commandArgs: [
+          fileURLToPath(new URL("../../../packages/agent-runtime/test/fixtures/mock-acp-server.mjs", import.meta.url)),
+          "private-diagnostics-exit",
+        ],
+        unsafeAllowCustomCommandArgs: true,
+        cwd: process.cwd(),
+        environment: {
+          COPILOT_PROVIDER_API_KEY: "synthetic-provider-credential",
+        },
+      });
+
+      let failure: unknown;
+      try {
+        await new AgentRuntime({ ...runtimeOptions, adapter }).runOnce();
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toMatchObject({
+        diagnosticCode: "provider_process_exited",
+        outcome: "Unknown",
+      });
+
+      const durable = await kernel.query(
+        { type: "GetRunProjection", runId },
+        { principalId: "human" },
+      );
+      const events = await kernel.readEvents(null, 500);
+      const response = await browserFetch(`${origin}/api/v1/runs/${runId}`);
+      expect(response.status).toBe(200);
+      const http = (await response.json() as { run: RunProjection }).run;
+      await controller.loadRun(runId);
+      const web = controller.getSnapshot().run!;
+      const timeline = timelineItems(web);
+      const publicSurfaces = [
+        JSON.stringify(durable),
+        JSON.stringify(events),
+        JSON.stringify(http),
+        JSON.stringify(web),
+        JSON.stringify(timeline),
+        String(failure),
+      ];
+      const expectedDiagnostic =
+        "provider_process_exited: Provider process exited before completion.";
+      expect(durable.run).toMatchObject({
+        state: "Waiting",
+      });
+      expect(durable.activations.at(-1)).toMatchObject({
+        outcome: "Failed",
+        detail: expectedDiagnostic,
+      });
+      expect(durable.providerAttempts.at(-1)).toMatchObject({
+        status: "Unknown",
+        detail: expectedDiagnostic,
+      });
+      expect(durable.providerAttempts.at(-1)).not.toHaveProperty(
+        "diagnosticSessionId",
+      );
+      expect(http.providerAttempts.at(-1)).not.toHaveProperty(
+        "diagnosticSessionId",
+      );
+      expect(web.providerAttempts.at(-1)).not.toHaveProperty(
+        "diagnosticSessionId",
+      );
+      expect(expectedDiagnostic.length).toBeLessThanOrEqual(160);
+      for (const surface of publicSurfaces) {
+        expect(surface).toContain(expectedDiagnostic);
+        for (const privateValue of [
+          "SYNTHETIC_PRIVATE_MARKER",
+          "C:\\synthetic-private\\workspace\\provider.log",
+          "ghp_SYNTHETIC_TOKEN_VALUE",
+          "synthetic-provider-credential",
+          "synthetic private prompt",
+          "synthetic private model output",
+          "COPILOT_PROVIDER_API_KEY",
+          "diagnostic-session",
+        ]) {
+          expect(surface).not.toContain(privateValue);
+        }
+      }
+    } finally {
+      controller.dispose();
+      await service.close();
+      kernel.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("projects real ACP deltas through SQLite, paged HTTP and replayed SSE without implicit Messages or completion", async () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-timeline-"));
     const databasePath = join(directory, "timeline.sqlite");

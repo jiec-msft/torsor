@@ -680,7 +680,32 @@ Failed
 Unknown
 ```
 
-Record adapter/version, capability snapshot, Activation, input RunInput IDs, request idempotency key, start/end time, and result or Unknown reason.
+Record adapter/version, capability snapshot, Activation, input RunInput IDs,
+request idempotency key, start/end time, and result or Unknown reason.
+
+Persisted and public provider-failure diagnostics use an allowlisted
+projection. Run, Activation, ProviderAttempt, Timeline, HTTP, and Web may
+contain only a stable error code, outcome, and a bounded generic summary
+explicitly defined by the Runtime. Provider stderr, raw process errors, launch
+commands and environments, machine paths, credentials, prompts, model output,
+arbitrary provider error text, and nested cause messages must not enter those
+fields. The Runtime maps error types to fixed diagnostics before persistence;
+secret-pattern replacement is not the primary boundary, and failures are not
+silently swallowed. Unless a private diagnostic channel has explicit
+ownership and opt-in, raw diagnostics may exist only briefly in bounded memory
+and are discarded when execution ends.
+
+The current stable codes are `provider_process_start_failed`,
+`provider_process_exited`, `provider_protocol_error`,
+`provider_policy_violation`, `provider_output_limit`,
+`provider_stderr_limit`, `provider_io_error`, `provider_timeout`,
+`provider_cancelled`, `provider_cleanup_failed`,
+`provider_runtime_monitor_failed`, `provider_not_started`,
+`provider_worktree_execution_failed`, `provider_worktree_authority_lost`,
+`provider_recovered_worktree_authority_lost`,
+`provider_recovered_failed`, `provider_recovered_unknown`, and
+`provider_execution_failed`. Public detail uses
+`<code>: <generic summary>` and is at most 160 characters.
 
 ### 20.3 Provider capabilities
 
@@ -763,9 +788,9 @@ A report finalization request is identified by `(principal_id, run_id, idempoten
 
 This slice uses caller-driven retry, not background replay of Provider output. A crash during staging leaves only an invisible temporary file; content publication before database commit leaves only an invisible content-addressed blob; a lost response after commit is recoverable from durable idempotency results and Run/Thread projections. Retry verifies and reuses the blob and rechecks current authorization, Activation, and Run revision in the transaction. Revocation or a terminal Run blocks new descriptors; currently authorized Humans/Runtime may still query committed descriptors. No automatic orphan/staging deletion is included: cleanup is offline maintenance, avoiding races with concurrent finalization.
 
-The integrated durable-causal-limit, trusted-Artifact and physical-Worktree database uses schema **16**. It retains section 25's Run root/parent/depth, immutable constraints, admission index and durable configuration alongside section 23's trusted report descriptors, adding section 22's physical identities, executions and irreversible Writer publication fence. The former causal-only, Artifact-only and Worktree-only schema 14 layouts and integrated schema 15 are incompatible; equal version numbers must not authorize different layouts. Opening any older or unversioned nonempty development database must fail explicitly before applying DDL/bootstrap, without migration, version rewriting, or data deletion. Operators stop old processes and explicitly recreate disposable databases and fresh managed roots. Schema 16 reopen still validates durable causal configuration and Worktree storage identity.
+The integrated durable-causal-limit, trusted-Artifact, physical-Worktree, and provider-diagnostic-boundary database uses schema **17**. It retains section 25's Run root/parent/depth, immutable constraints, admission index and durable configuration alongside section 23's trusted report descriptors, adding section 22's physical identities, executions and irreversible Writer publication fence. Schema 16 is rejected and recreated because it may contain raw provider diagnostics publicly persisted before this boundary; the former causal-only, Artifact-only and Worktree-only schema 14 layouts and integrated schema 15 are also incompatible. Equal version numbers must not authorize different layouts. Opening any older or unversioned nonempty development database must fail explicitly before applying DDL/bootstrap, without migration, version rewriting, or data deletion. Operators stop old processes and explicitly recreate disposable databases and fresh managed roots. Schema 17 reopen still validates durable causal configuration and Worktree storage identity.
 
-`user_version = 16` is not layout proof. Before any DDL, bootstrap or configuration write, existing databases undergo read-only comparison against a complete schema fingerprint generated from trusted DDL in an isolated memory database: object sets, columns/types/nullability/defaults/PKs/FKs, indexes/uniqueness/partial predicates, triggers, CHECK and STRICT constraints. Compare SQLite-parsed metadata and SQL tokens that preserve literal/operator semantics; ignore only whitespace, comments and unquoted keyword/identifier case, never whitespace inside strings. Reject missing, extra-incompatible, partial, corrupt, predecessor-shaped or future layouts without changing file bytes or logical state; never repair with `CREATE IF NOT EXISTS`. SQLite-owned statistics objects are outside the application layout. Only version 0 with no persistent objects may execute DDL, initial configuration and bootstrap in one transaction, with complete rollback on failure. Valid schema 16 reopen does not reapply bootstrap or modify durable causal configuration or storage identity.
+`user_version = 17` is not layout proof. Before any DDL, bootstrap or configuration write, existing databases undergo read-only comparison against a complete schema fingerprint generated from trusted DDL in an isolated memory database: object sets, columns/types/nullability/defaults/PKs/FKs, indexes/uniqueness/partial predicates, triggers, CHECK and STRICT constraints. Compare SQLite-parsed metadata and SQL tokens that preserve literal/operator semantics; ignore only whitespace, comments and unquoted keyword/identifier case, never whitespace inside strings. Reject missing, extra-incompatible, partial, corrupt, predecessor-shaped or future layouts without changing file bytes or logical state; never repair with `CREATE IF NOT EXISTS`. SQLite-owned statistics objects are outside the application layout. Only version 0 with no persistent objects may execute DDL, initial configuration and bootstrap in one transaction, with complete rollback on failure. Valid schema 17 reopen does not reapply bootstrap or modify durable causal configuration or storage identity.
 
 The Runtime Host must bound consecutive recovery passes, yield to the event loop before continuing, and recheck shutdown. Backlog processing must not starve HTTP, timers, signals, or shutdown handling. Idle polling waits must be interruptible by shutdown and must remove their listener and cancel any no-longer-needed timer regardless of which side completes first.
 
@@ -1127,6 +1152,11 @@ result
 ```
 
 Sensitive Prompt content and hidden reasoning are not stored by default.
+
+Provider and process diagnostics likewise do not enter public audit or durable
+projections by default. Public diagnostics retain only stable error codes,
+outcomes, and allowlisted generic summaries; local developer logs must not
+implicitly print credentials or complete environments.
 
 ### 28.2 Base metrics
 

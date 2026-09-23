@@ -96,17 +96,18 @@ The runtime provides:
 - An Activation-scoped capability bridge that binds Agent identity, Run,
   Activation, ProviderAttempt, revisions, and provenance on the server side.
 
-Provider session IDs are diagnostic only. Recovery always rebuilds provider
-input from Kernel projections and never treats a provider session as
-authoritative state. Provider delivery failures park Runs through one atomic
-Kernel command, and expired Attention executions are discovered through
-bounded targeted projections rather than public-event history scans. Recovery
-captures an authoritative recovery snapshot, supplies only its revision to
-every bounded keyset page, and restarts from a fresh snapshot on stale pages
-or a changed final revision. Finished Attention Activations are not reclaimed
-before their expiry horizon, so a provider that has committed its decision but
-is still returning retains the cross-runtime domain fence. Superseded recovery
-work is discarded rather than settled from a stale page.
+Provider session IDs are process-local diagnostic correlation only and do not
+enter durable/public projections. Recovery always rebuilds provider input from
+Kernel projections and never treats a provider session as authoritative state.
+Provider delivery failures park Runs through one atomic Kernel command, and
+expired Attention executions are discovered through bounded targeted
+projections rather than public-event history scans. Recovery captures an
+authoritative recovery snapshot, supplies only its revision to every bounded
+keyset page, and restarts from a fresh snapshot on stale pages or a changed
+final revision. Finished Attention Activations are not reclaimed before their
+expiry horizon, so a provider that has committed its decision but is still
+returning retains the cross-runtime domain fence. Superseded recovery work is
+discarded rather than settled from a stale page.
 
 Runtime-local queues preserve bounded Project/domain fairness and serialize
 same-domain work within one process. Kernel Attention claims provide the
@@ -148,9 +149,22 @@ the caller explicitly enables the unsafe development option used by test
 fixtures. Child stdin write, end, EOF, and pipe failures are folded into the
 same provider failure and cleanup path.
 
+The Runtime is the diagnostic boundary before Kernel persistence. Adapter
+failures carry a stable diagnostic code and outcome, but public Run,
+Activation, and ProviderAttempt details use only an allowlisted bounded
+summary. Raw stderr, provider-authored error text, process launch details,
+machine paths, credentials, complete environments, prompts, model output, and
+nested cause messages are never copied into durable/public fields. The
+Copilot adapter drains bounded process diagnostics only to classify failure;
+it does not publish or retain them after execution. The independent ACP
+conformance transcript policy remains separate from this production path.
+Public details use `<code>: <generic summary>`, are capped at 160 characters,
+and are selected from the stable `ProviderDiagnosticCode` union.
+
 Copilot returns a bounded JSON action envelope rather than invoking Kernel
-commands directly. Frame, stream, persisted activity, pending write, JSON
-depth, action, target, and field limits are enforced before unbounded effects.
+commands directly. Frame, aggregate stdout, model stream, stderr, persisted
+activity, pending write, JSON depth, action, target, and field limits are
+enforced before unbounded effects.
 The bridge then applies only server-bound Kernel capabilities; provider output
 cannot choose provenance, Agent identity, Activation identity, or
 ProviderAttempt identity.

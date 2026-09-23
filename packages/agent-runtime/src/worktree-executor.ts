@@ -509,7 +509,10 @@ export class ControlledWorktreeProcess {
 }
 
 function controlledFailure(): ProviderExecutionError {
-  return new ProviderExecutionError("Controlled Worktree execution did not complete with current authority.", "Unknown");
+  return new ProviderExecutionError(
+    "provider_worktree_execution_failed",
+    "Unknown",
+  );
 }
 
 function positive(value: number): number {

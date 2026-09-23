@@ -147,6 +147,16 @@ function handlePrompt() {
     case "oversized-frame":
       process.stdout.write(`${"x".repeat(parameter || 1024)}\n`);
       return;
+    case "oversized-stdout": {
+      const frame = `${JSON.stringify({ jsonrpc: "2.0", id: 999, result: {} })}\n`;
+      process.stdout.write(frame.repeat(Math.ceil((parameter || 1024) / frame.length)));
+      return;
+    }
+    case "oversized-stderr":
+      process.stderr.write(
+        `SYNTHETIC_PRIVATE_STDERR_${"x".repeat(parameter || 1024)}`,
+      );
+      return;
     case "deep-json":
       sendActions([
         {
@@ -194,10 +204,28 @@ function handlePrompt() {
       send({
         jsonrpc: "2.0",
         id: promptId,
-        error: { code: -32000, message: "mock prompt failure" },
+        error: {
+          code: -32000,
+          message: "SYNTHETIC_PRIVATE_PROVIDER_ERROR",
+          data: {
+            prompt: "synthetic private prompt",
+            modelOutput: "synthetic private model output",
+          },
+        },
       });
       return;
     case "exit":
+      process.exit(7);
+      return;
+    case "private-diagnostics-exit":
+      process.stderr.write([
+        "SYNTHETIC_PRIVATE_MARKER",
+        "C:\\synthetic-private\\workspace\\provider.log",
+        "ghp_SYNTHETIC_TOKEN_VALUE",
+        "COPILOT_PROVIDER_API_KEY=synthetic-provider-credential",
+        "prompt=synthetic private prompt",
+        "model_output=synthetic private model output",
+      ].join("\n"));
       process.exit(7);
       return;
     case "wait":

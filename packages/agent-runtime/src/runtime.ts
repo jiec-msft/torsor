@@ -16,6 +16,8 @@ import {
 import { KernelActivationCapabilityBridge } from "./capability-bridge.js";
 import type { WorktreeExecutor } from "./worktree-executor.js";
 import {
+  normalizeProviderExecutionError,
+  providerPublicDiagnostic,
   ProviderExecutionError,
   ProviderProtocolError,
   type ProviderAdapter,
@@ -108,7 +110,11 @@ const ATTENTION_PROJECT_QUEUE_RESERVE = 1;
 const ATTENTION_RECOVERY_SWEEP_LIMIT = 10_000;
 const DEFAULT_ACTIVATION_DURATION_MS = 300_000;
 const PROVIDER_NOT_STARTED_DETAIL =
-  "Runtime did not start provider execution because the authoritative lease budget was exhausted.";
+  providerPublicDiagnostic("provider_not_started");
+const PROVIDER_RECOVERED_FAILED_DETAIL =
+  providerPublicDiagnostic("provider_recovered_failed");
+const PROVIDER_RECOVERED_UNKNOWN_DETAIL =
+  providerPublicDiagnostic("provider_recovered_unknown");
 
 export class AgentRuntime {
   readonly #kernel: TorsorKernel;
@@ -729,7 +735,6 @@ export class AgentRuntime {
       await this.#settleUncertainAttempt(
         currentProjection,
         activationView.id,
-        priorAttempt.status,
       );
       currentProjection = await this.#kernel.query(
         { type: "GetRunProjection", runId: currentProjection.run.id },
@@ -1003,7 +1008,7 @@ export class AgentRuntime {
       () => bridge.terminalAction !== null,
     );
     try {
-      const result = await executeWithAbort(
+      await executeWithAbort(
         this.#adapter.execute({
           activationId: input.activationId,
           providerAttemptId: attempt.entityId,
@@ -1041,7 +1046,6 @@ export class AgentRuntime {
         providerAttemptId: attempt.entityId,
         idempotencyKey: `${attempt.entityId}:completed`,
         status: "Completed",
-        ...(result.detail === undefined ? {} : { detail: result.detail }),
       });
       if (input.cause.type === "run") {
         await this.#kernel.execute(
@@ -1050,11 +1054,6 @@ export class AgentRuntime {
             idempotencyKey: `${input.activationId}:completed`,
             activationId: input.activationId,
             outcome: "Completed",
-            ...(result.diagnosticSessionId
-              ? {
-                  detail: `Provider diagnostic session: ${result.diagnosticSessionId}`,
-                }
-              : {}),
           },
           this.#runtimeContext,
         );
@@ -1062,11 +1061,12 @@ export class AgentRuntime {
       return true;
     } catch (error) {
       const providerError =
-        error instanceof ProviderExecutionError
-          ? error
-          : error instanceof KernelError && error.code === "WriterAuthorityLost"
-            ? new ProviderExecutionError("Controlled Worktree publication authority was lost.", "Unknown")
-            : new ProviderExecutionError(errorMessage(error), "Failed");
+        error instanceof KernelError && error.code === "WriterAuthorityLost"
+          ? new ProviderExecutionError(
+              "provider_worktree_authority_lost",
+              "Unknown",
+            )
+          : normalizeProviderExecutionError(error);
       if (input.cause.type === "run" && bridge.terminalAction === null) {
         const latest = await this.#kernel.query(
           { type: "GetRunProjection", runId: input.cause.run.run.id },
@@ -1082,9 +1082,7 @@ export class AgentRuntime {
           activation.runActivationGeneration === latest.run.activationGeneration
         ) {
           try {
-            await bridge.wait(
-              `Provider delivery did not complete: ${providerError.message}`,
-            );
+            await bridge.wait(providerError.message);
           } catch (waitError) {
             if (
               !(
@@ -1145,7 +1143,7 @@ export class AgentRuntime {
     const timeout = setTimeout(() => {
       controller.abort(
         new ProviderExecutionError(
-          `Provider execution exceeded its ${executionBudgetMs}ms lease budget.`,
+          "provider_timeout",
           "Unknown",
         ),
       );
@@ -1177,7 +1175,7 @@ export class AgentRuntime {
         ) {
           controller.abort(
             new ProviderExecutionError(
-              "Run Activation was superseded while the provider was executing.",
+              "provider_cancelled",
               "Unknown",
             ),
           );
@@ -1186,7 +1184,7 @@ export class AgentRuntime {
         if (projection.run.state !== "Active") {
           controller.abort(
             new ProviderExecutionError(
-              `Run entered ${projection.run.state} while the provider was executing.`,
+              "provider_cancelled",
               "Unknown",
             ),
           );
@@ -1195,7 +1193,7 @@ export class AgentRuntime {
       } catch (error) {
         controller.abort(
           new ProviderExecutionError(
-            `Cancellation monitor failed: ${errorMessage(error)}`,
+            "provider_runtime_monitor_failed",
             "Unknown",
           ),
         );
@@ -1267,8 +1265,7 @@ export class AgentRuntime {
         idempotencyKey: `${activationId}:lease-budget-exhausted`,
         activationId,
         outcome: "Expired",
-        detail:
-          "The authoritative lease budget was exhausted before provider execution started.",
+        detail: PROVIDER_NOT_STARTED_DETAIL,
       },
       this.#runtimeContext,
     );
@@ -1334,7 +1331,6 @@ export class AgentRuntime {
   async #settleUncertainAttempt(
     projection: RunProjection,
     activationId: string,
-    status: ProviderAttemptStatus,
   ): Promise<void> {
     const attempt = projection.providerAttempts.find(
       (candidate) => candidate.activationId === activationId,
@@ -1348,7 +1344,7 @@ export class AgentRuntime {
         idempotencyKey: `${attempt.id}:recovered-unknown`,
         providerAttemptId: attempt.id,
         status: "Unknown",
-        detail: `Runtime recovered an unfinished ${status} attempt for a non-idempotent adapter.`,
+        detail: PROVIDER_RECOVERED_UNKNOWN_DETAIL,
       },
       this.#runtimeContext,
     );
@@ -1360,7 +1356,7 @@ export class AgentRuntime {
           idempotencyKey: `${activationId}:recovered-expired`,
           activationId,
           outcome: "Expired",
-          detail: "The owning runtime process was replaced.",
+          detail: PROVIDER_RECOVERED_UNKNOWN_DETAIL,
         },
         this.#runtimeContext,
       );
@@ -1417,13 +1413,13 @@ export class AgentRuntime {
         (candidate) => candidate.activationId === activation.id,
       );
       let outcome: "Completed" | "Failed" | "Expired" = "Expired";
-      let detail = "The owning runtime process was replaced.";
+      let detail = PROVIDER_RECOVERED_UNKNOWN_DETAIL;
       if (attempt?.status === "Completed") {
         outcome = "Completed";
         detail = "Recovered a completed ProviderAttempt.";
       } else if (attempt?.status === "Failed") {
         outcome = "Failed";
-        detail = attempt.detail ?? "Recovered a failed ProviderAttempt.";
+        detail = PROVIDER_RECOVERED_FAILED_DETAIL;
       } else if (
         attempt &&
         (attempt.status === "Started" || attempt.status === "Acknowledged")
@@ -1434,12 +1430,11 @@ export class AgentRuntime {
             idempotencyKey: `${attempt.id}:reconciled-unknown`,
             providerAttemptId: attempt.id,
             status: "Unknown",
-            detail:
-              "Runtime recovered an unfinished ProviderAttempt after its Run stopped being Active.",
+            detail: PROVIDER_RECOVERED_UNKNOWN_DETAIL,
           },
           this.#runtimeContext,
         );
-        detail = "Recovered an uncertain ProviderAttempt.";
+        detail = PROVIDER_RECOVERED_UNKNOWN_DETAIL;
       }
       await this.#finishRecoveredActivation(
         projection.run.id,
@@ -1473,7 +1468,9 @@ export class AgentRuntime {
           idempotencyKey: `${command.activationId}:reconciled-authority-lost`,
           activationId: command.activationId,
           outcome: "Expired",
-          detail: "Recovered orphaned Activation after Worktree authority was lost; committed results were preserved.",
+          detail: providerPublicDiagnostic(
+            "provider_recovered_worktree_authority_lost",
+          ),
         }, this.#runtimeContext);
       } catch (settlementError) {
         if (!(settlementError instanceof KernelError && settlementError.code === "Conflict" &&
@@ -1556,8 +1553,7 @@ export class AgentRuntime {
   ): Promise<number> {
     let recoveries = 0;
     let outcome: "Completed" | "Failed" | "Expired" = "Expired";
-    let detail =
-      "The Attention Activation expired before it was reconciled.";
+    let detail = PROVIDER_RECOVERED_UNKNOWN_DETAIL;
     const latestAttempt = execution.providerAttempts.at(-1);
     let latestStatus = latestAttempt?.status;
     const unsettledAttempts = execution.providerAttempts.filter(
@@ -1577,9 +1573,7 @@ export class AgentRuntime {
       detail = "Recovered a completed Attention ProviderAttempt.";
     } else if (latestStatus === "Failed") {
       outcome = "Failed";
-      detail = "Recovered a failed Attention ProviderAttempt.";
-    } else if (unsettledAttempts.length > 0) {
-      detail = "Recovered an uncertain expired Attention ProviderAttempt.";
+      detail = PROVIDER_RECOVERED_FAILED_DETAIL;
     }
     if (execution.activation.finishedAt === null) {
       if (unsettledAttempts.length === 0) {
@@ -1621,8 +1615,7 @@ export class AgentRuntime {
         providerAttemptId: attempt.id,
         idempotencyKey: `${attempt.id}:attention-reconciled-unknown`,
         status: "Unknown",
-        detail:
-          "Runtime recovered an unfinished expired Attention ProviderAttempt.",
+        detail: PROVIDER_RECOVERED_UNKNOWN_DETAIL,
       });
       recoveries += 1;
       if (attempt.id === latestAttempt?.id) {
@@ -1975,10 +1968,6 @@ function requireProviderStatus(payload: JsonValue): ProviderAttemptStatus {
   return status;
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 function requireIntegerAtLeast(
   value: number,
   minimum: number,
@@ -2015,7 +2004,8 @@ async function executeWithAbort<T>(
 }
 
 function abortReason(signal: AbortSignal): Error {
-  return signal.reason instanceof Error
-    ? signal.reason
-    : new ProviderExecutionError("Provider execution was aborted.", "Unknown");
+  if (signal.reason === undefined) {
+    return new ProviderExecutionError("provider_cancelled", "Unknown");
+  }
+  return normalizeProviderExecutionError(signal.reason, "Unknown");
 }
