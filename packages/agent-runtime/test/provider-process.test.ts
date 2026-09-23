@@ -5,7 +5,9 @@ import { isAbsolute, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { buildCopilotProviderEnvironment } from "../src/copilot-provider-environment.js";
 import { OwnedProviderProcess } from "../src/provider-process.js";
+import { resolveProviderPolicy } from "../src/provider-policy.js";
 
 async function ready(owner: OwnedProviderProcess): Promise<unknown> {
   const output = once(owner.processHandle.stdout, "data").then(([chunk]) => chunk);
@@ -77,7 +79,13 @@ describe("retained native process-tree owner", () => {
       const owner = new OwnedProviderProcess({
         command: "synthetic-provider",
         cwd: process.cwd(),
-        environment: { pAtH: root, PaThExT: ".EXE" },
+        environment: buildCopilotProviderEnvironment(
+          resolveProviderPolicy({
+            kind: "trusted-local",
+            permissionMode: "provider-default",
+          }),
+          { pAtH: root, PaThExT: ".EXE" },
+        ),
         args: [
           "-e",
           "process.stdout.write('ready:'+process.argv[1]);process.stdin.resume();",
@@ -90,6 +98,49 @@ describe("retained native process-tree owner", () => {
         owner.requestStop();
         await Promise.allSettled([owner.closed]);
         rmSync(root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  it.runIf(process.platform === "win32")(
+    "rejects an injected Windows environment block before owner or provider start",
+    async () => {
+      let owner: OwnedProviderProcess | undefined;
+      let rejection: unknown;
+      try {
+        try {
+          owner = new OwnedProviderProcess({
+            command: process.execPath,
+            cwd: process.cwd(),
+            environment: buildCopilotProviderEnvironment(
+              resolveProviderPolicy({
+                kind: "trusted-local",
+                permissionMode: "provider-default",
+              }),
+              {
+                SYNTHETIC_SAFE:
+                  "value\0TORSOR_AUTH_TOKEN=synthetic-smuggled",
+              },
+            ),
+            args: [
+              "-e",
+              "process.stdout.write(process.env.TORSOR_AUTH_TOKEN??'missing');process.stdin.resume();",
+            ],
+          });
+        } catch (error) {
+          rejection = error;
+        }
+        if (owner) {
+          expect(String(await ready(owner))).toBe("missing");
+        }
+        expect(rejection).toMatchObject({
+          message: "Invalid provider environment.",
+        });
+        expect(owner).toBeUndefined();
+      } finally {
+        owner?.forceStop();
+        if (owner) await Promise.allSettled([owner.closed]);
       }
     },
     30_000,

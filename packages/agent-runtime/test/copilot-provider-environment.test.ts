@@ -86,12 +86,16 @@ describe("Copilot provider environment strategies", () => {
       "TORSOR_COPILOT_COMMAND", "TORSOR_ARTIFACT_ROOT", "TORSOR_BOOTSTRAP_PATH",
       "TORSOR_PROJECT_IDS", "TORSOR_HOST", "TORSOR_PORT",
       "TORSOR_RUNTIME_POLL_INTERVAL_MS", "torsor_future_control", "ToRsOr_",
-      "COPILOT_ALLOW_ALL", "copilot_allow_all", "Copilot_Assisted_Approval",
+      "COPILOT_ALLOW_ALL", "Copilot_Assisted_Approval",
     ].map((name) => [name, "synthetic-control-value"]));
     expect(buildCopilotProviderEnvironment(policy, controls)).toEqual({});
     expect(buildCopilotProviderEnvironment(policy, {}, controls)).toEqual({});
     expect(buildCopilotProviderEnvironment(policy, { PATH: "synthetic-path" }, controls))
       .toEqual({ PATH: "synthetic-path" });
+    expect(buildCopilotProviderEnvironment(policy, {
+      copilot_allow_all: "synthetic-control-value",
+      copilot_assisted_approval: "synthetic-control-value",
+    })).toEqual({});
     expect(buildCopilotProviderEnvironment(policy, {})).toEqual({});
     expect(policy.permissionMode).not.toBe("deny");
   });
@@ -109,6 +113,48 @@ describe("Copilot provider environment strategies", () => {
       tOrSoR_AUTH_TOKEN: "synthetic-control",
     }, { Path: "synthetic-override" }))
       .toEqual({ Path: "synthetic-override", gH_tOkEn: "synthetic-credential" });
+  });
+
+  it.each([
+    { inherited: { "": "synthetic-value" }, overrides: {} },
+    { inherited: { "INVALID=NAME": "synthetic-value" }, overrides: {} },
+    { inherited: { "SYNTHETIC\0NAME": "synthetic-value" }, overrides: {} },
+    { inherited: { SYNTHETIC_SAFE: "value\0TORSOR_AUTH_TOKEN=synthetic-smuggled" }, overrides: {} },
+    { inherited: { TORSOR_AUTH_TOKEN: "value\0SYNTHETIC_SECOND=entry" }, overrides: {} },
+    { inherited: { "INVALID\0UNSET": undefined }, overrides: {} },
+    { inherited: {}, overrides: { "COPILOT_PROVIDER_\0NAME": "synthetic-value" } },
+    { inherited: {}, overrides: { COPILOT_PROVIDER_SAFE: "value\0SYNTHETIC_SECOND=entry" } },
+  ])("rejects malformed environment input without echo or truncation (%#)", ({ inherited, overrides }) => {
+    expect(() => buildCopilotProviderEnvironment(trusted, inherited, overrides))
+      .toThrow(/^Invalid provider environment\.$/);
+  });
+
+  it.runIf(process.platform === "win32")(
+    "rejects case-insensitive duplicate Windows names while preserving exact override replacement",
+    () => {
+      expect(() => buildCopilotProviderEnvironment(trusted, {
+        Path: "synthetic-first",
+        PATH: "synthetic-second",
+      })).toThrow(/^Invalid provider environment\.$/);
+      expect(() => buildCopilotProviderEnvironment(trusted, {
+        Path: "synthetic-first",
+      }, {
+        PATH: "synthetic-second",
+      })).toThrow(/^Invalid provider environment\.$/);
+      expect(buildCopilotProviderEnvironment(trusted, {
+        Path: "synthetic-first",
+      }, {
+        Path: "synthetic-second",
+      })).toEqual({ Path: "synthetic-second" });
+    },
+  );
+
+  it("preserves legitimate Unicode, quotes, delimiters, and equals signs in values", () => {
+    expect(buildCopilotProviderEnvironment(trusted, {}, {
+      CUSTOM_SETTING: "引号 \"quoted\" ; delimiter = value",
+    })).toEqual({
+      CUSTOM_SETTING: "引号 \"quoted\" ; delimiter = value",
+    });
   });
 
   it("revalidates policy before preparing environment instead of trusting structural types", () => {

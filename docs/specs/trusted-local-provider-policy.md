@@ -68,9 +68,18 @@ The Copilot seam also removes inherited or overridden `COPILOT_ALLOW_ALL` and
 selection. Even for `allow-all`, preparation must not inject authorization variables;
 the future adapter must apply intent through supported launch/ACP configuration.
 Name filtering is case-insensitive; retained key spelling is preserved, undefined
-values are omitted, and an override replaces an inherited value with the same
-spelling. This retains current restricted key handling; this layer does not
-normalize multiple keys differing only in case.
+values are omitted, and an override replaces an inherited value with the same spelling.
+
+Before any allowlist/reserved-name filtering or process launch, environment
+preparation must validate inherited and override inputs through one boundary. Every
+name is non-empty and contains neither NUL nor `=`; every defined value is a string
+without NUL. A malformed field fails with a fixed error that echoes neither name nor
+value even when later filtering would have removed it; preparation never silently
+drops or truncates it, nor interprets content after NUL as another environment entry.
+On Windows, names differing only by case are also rejected across inputs; the exact
+same spelling across inputs retains the override rule above. Valid Unicode and
+quotes, `=`, spaces, and platform delimiters inside values are preserved. This common
+boundary governs both restricted/plain spawn and the trusted-local native owner path.
 
 Environment is not public serializable configuration. Credentials remain
 provider-owned and flow only through the local execution boundary, never into

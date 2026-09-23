@@ -61,8 +61,15 @@ Copilot seam 还必须移除继承或覆盖输入中的 `COPILOT_ALLOW_ALL` 和
 `COPILOT_ASSISTED_APPROVAL`，使环境不能替代显式 permission-mode 选择。
 即使选择 `allow-all`，环境准备也不得注入授权变量；未来 Adapter 必须通过受支持的
 启动/ACP 配置应用意图。名称过滤不区分大小写；保留原始键拼写，undefined 值省略，
-同一拼写的 override 替换 inherited 值。这延续当前受限环境的键处理方式；
-本层不规范化多个仅大小写不同的键。
+同一拼写的 override 替换 inherited 值。
+
+环境准备必须在任何 allowlist/保留名过滤和进程启动之前统一验证 inherited 与 override
+输入。所有名称必须非空且不含 NUL 或 `=`；所有已定义值必须是字符串且不含 NUL。
+即使非法字段随后本会被过滤，也必须以不回显名称或值的固定错误拒绝，不能静默删除、
+截断或把 NUL 后内容解释成第二个环境项。Windows 上还必须拒绝输入间仅大小写不同的
+重复名称；跨输入的完全相同拼写仍按上述 override 规则替换。合法 Unicode 以及值中的
+引号、`=`、空格和平台分隔符保持不变。该统一边界同时约束 restricted/plain spawn 与
+trusted-local 原生 owner 路径。
 
 环境不是公开可序列化配置。凭据始终归 Provider 所有，只能在本地执行边界流转；
 不得复制到持久状态、Prompt、公开诊断或测试产物。测试只使用合成值，

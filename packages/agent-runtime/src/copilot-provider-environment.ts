@@ -24,10 +24,12 @@ export function buildCopilotProviderEnvironment(
   overrides: Readonly<Record<string, string>> = {},
 ): Record<string, string> {
   const validated = parseProviderPolicy(policy);
-  const inheritedEntries = Object.entries(inherited).filter(
+  const inheritedInput = Object.entries(inherited);
+  const overrideEntries = Object.entries(overrides);
+  validateEnvironmentInput(inheritedInput, overrideEntries);
+  const inheritedEntries = inheritedInput.filter(
     (entry): entry is [string, string] => entry[1] !== undefined,
   );
-  const overrideEntries = Object.entries(overrides);
 
   if (validated.environment === "restricted-allowlist") {
     for (const [name] of overrideEntries) {
@@ -55,4 +57,37 @@ export function isRestrictedCopilotEnvironmentOverride(name: string): boolean {
   const upper = name.toUpperCase();
   return upper.startsWith("COPILOT_PROVIDER_") ||
     upper === "COPILOT_PROVIDERS_CONFIG" || upper === "COPILOT_HOME";
+}
+
+function validateEnvironmentInput(
+  inherited: readonly (readonly [string, unknown])[],
+  overrides: readonly (readonly [string, unknown])[],
+): void {
+  for (const [name, value] of [...inherited, ...overrides]) {
+    if (
+      name.length === 0 ||
+      name.includes("\0") ||
+      name.includes("=") ||
+      value !== undefined && (
+        typeof value !== "string" ||
+        value.includes("\0")
+      )
+    ) {
+      throw invalidEnvironment();
+    }
+  }
+  if (process.platform !== "win32") return;
+  const spellings = new Map<string, string>();
+  for (const [name] of [...inherited, ...overrides]) {
+    const upper = name.toUpperCase();
+    const existing = spellings.get(upper);
+    if (existing !== undefined && existing !== name) {
+      throw invalidEnvironment();
+    }
+    spellings.set(upper, name);
+  }
+}
+
+function invalidEnvironment(): Error {
+  return new Error("Invalid provider environment.");
 }

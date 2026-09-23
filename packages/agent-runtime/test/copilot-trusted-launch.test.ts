@@ -32,4 +32,18 @@ describe("Copilot explicit policy launch boundary", () => {
     // @ts-expect-error Restricted profiles cannot request Allow All.
     expect(() => new CopilotAcpAdapter({ policy: { kind: "restricted", permissionMode: "allow-all" } })).toThrow();
   });
+
+  it.each([
+    {
+      policy: { kind: "restricted" } as const,
+      userEnvironment: { PATH: "safe\0TORSOR_AUTH_TOKEN=synthetic-smuggled" },
+    },
+    {
+      policy: { kind: "trusted-local", permissionMode: "provider-default" } as const,
+      userEnvironment: { SYNTHETIC_SAFE: "safe\0TORSOR_AUTH_TOKEN=synthetic-smuggled" },
+    },
+  ])("rejects malformed environment before either launch path is available (%#)", (options) => {
+    expect(() => new CopilotAcpAdapter(options))
+      .toThrow(/^Invalid provider environment\.$/);
+  });
 });
