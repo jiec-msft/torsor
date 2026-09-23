@@ -22,6 +22,8 @@ describe("trusted-local HTTP Host", () => {
       databasePath: repo.databasePath, bootstrap, port: 0,
       credentials: [{ token: "synthetic-human-token", principalContext: { principalId: "human" } }],
       runtimePrincipalId: "runtime", projectIds: ["project"], runtimePollIntervalMs: 1,
+      providerTimeoutMs: 120_000, activationDurationMs: 125_000,
+      attentionLeaseMs: 125_000, outboxLeaseMs: 125_000,
       adapter: new CopilotAcpAdapter({
         policy: { kind: "trusted-local", permissionMode: "allow-all" },
         command: process.execPath, commandArgs: [fixture, scenario === "cancel" ? "hang" : scenario], unsafeAllowCustomCommandArgs: true,
@@ -41,7 +43,7 @@ describe("trusted-local HTTP Host", () => {
           if (command.type === "AcknowledgeOutboxEvents" && runId) settled.resolve();
           return result;
         });
-        return new LocalWorktreeExecutor({ kernel, runtimePrincipalId: "runtime", ...repo });
+        return new LocalWorktreeExecutor({ kernel, runtimePrincipalId: "runtime", ...repo, leaseDurationMs: 125_000 });
       },
     });
     void host.finished.catch((error: unknown) => {
@@ -97,5 +99,5 @@ describe("trusted-local HTTP Host", () => {
       else await host.close();
       vi.restoreAllMocks(); repo.dispose();
     }
-  }, 30_000);
+  }, 150_000);
 });

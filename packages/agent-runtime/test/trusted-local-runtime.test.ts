@@ -17,9 +17,11 @@ const providerFile = fileURLToPath(new URL("./fixtures/native-acp-provider.mjs",
 async function setup(scenario = "success", permissionMode: "provider-default" | "allow-all" = "allow-all") {
   const repo = syntheticRepository();
   let now = new Date();
-  const kernel = TorsorKernel.open({ databasePath: repo.databasePath, bootstrap, clock: () => now });
+  const kernel = TorsorKernel.open({
+    databasePath: repo.databasePath, bootstrap, clock: () => now, activationDurationMs: 125_000,
+  });
   const executor = new LocalWorktreeExecutor({
-    kernel, runtimePrincipalId: "runtime", ...repo, leaseDurationMs: 30_000,
+    kernel, runtimePrincipalId: "runtime", ...repo, leaseDurationMs: 125_000,
     stopGraceMs: 1_000, forceGraceMs: 1_000,
   });
   const adapter = new CopilotAcpAdapter({
@@ -32,7 +34,10 @@ async function setup(scenario = "success", permissionMode: "provider-default" | 
   });
   const runtime = new AgentRuntime({
     kernel, runtimePrincipalId: "runtime", projectIds: ["project"], adapter, worktreeExecutor: executor,
-    providerTimeoutMs: 20_000, activationDurationMs: 30_000, outboxLeaseMs: 30_000,
+    // Use the shipped trusted-local startup budget; hosted Windows cold starts
+    // are slower than local ones. Physical-stop latency assertions stay unchanged.
+    providerTimeoutMs: 120_000, activationDurationMs: 125_000, outboxLeaseMs: 125_000,
+    attentionLeaseMs: 125_000,
     cancellationPollMs: 10,
     clock: () => now,
   });
@@ -42,7 +47,7 @@ async function setup(scenario = "success", permissionMode: "provider-default" | 
   }, { principalId: "human" });
   return {
     repo, kernel, executor, runtime, threadId: thread.entityId,
-    expire: () => { now = new Date(now.getTime() + 31_000); },
+    expire: () => { now = new Date(now.getTime() + 126_000); },
   };
 }
 
@@ -71,7 +76,7 @@ describe("trusted-local Runtime integration", () => {
       expect(await f.kernel.query({ type: "GetWorktreeWriterLease", worktreeId: tree.worktreeId }, runtimeContext))
         .toMatchObject({ status: "Released" });
     } finally { await f.executor.close(); f.kernel.close(); f.repo.dispose(); }
-  }, 30_000);
+  }, 150_000);
 
   it("does not grant unattended permissions under provider-default", async () => {
     const f = await setup("permission", "provider-default");
@@ -83,7 +88,7 @@ describe("trusted-local Runtime integration", () => {
       expect(run.activity.items.filter((item) => item.kind.startsWith("tool_"))).toEqual([]);
       expect(run.providerAttempts.at(-1)?.detail).toContain("provider_cancelled");
     } finally { await f.executor.close(); f.kernel.close(); f.repo.dispose(); }
-  }, 30_000);
+  }, 150_000);
 
   it.each(["cancel", "expiry", "shutdown"] as const)(
     "physically stops on %s and rejects the provider's late final actions", async (reason) => {
@@ -125,7 +130,7 @@ describe("trusted-local Runtime integration", () => {
       await f.executor.close(); await Promise.allSettled([running]);
       vi.restoreAllMocks(); f.kernel.close(); f.repo.dispose();
     }
-  }, 30_000);
+  }, 150_000);
 
   it("stops the native process tree promptly during SQLite contention without waiting for settlement", async () => {
     const f = await setup("hang");
@@ -180,5 +185,5 @@ describe("trusted-local Runtime integration", () => {
       await f.executor.close(); await running;
       vi.restoreAllMocks(); f.kernel.close(); f.repo.dispose();
     }
-  }, 30_000);
+  }, 150_000);
 });

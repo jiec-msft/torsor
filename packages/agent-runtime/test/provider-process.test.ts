@@ -23,7 +23,7 @@ describe("retained native process-tree owner", () => {
         process.stdin.on("end",()=>process.exit(0));
       `],
     });
-    const timeout = setTimeout(() => owner.forceStop(), 8_000);
+    const timeout = setTimeout(() => owner.forceStop(), 30_000);
     try {
       const chunk = await ready(owner);
       const pid = Number(String(chunk).trim());
@@ -46,14 +46,14 @@ describe("retained native process-tree owner", () => {
       owner.forceStop();
       await Promise.allSettled([owner.closed]);
     }
-  }, 10_000);
+  }, 45_000);
 
   it("does not treat abrupt owner loss as whole-tree stop confirmation", async () => {
     const owner = new OwnedProviderProcess({
       command: process.execPath, cwd: process.cwd(), environment: {},
       args: ["-e", "process.stdout.write('ready');process.stdin.resume();"],
     });
-    const timeout = setTimeout(() => owner.forceStop(), 8_000);
+    const timeout = setTimeout(() => owner.forceStop(), 30_000);
     try {
       await ready(owner);
       owner.forceStop();
@@ -63,5 +63,5 @@ describe("retained native process-tree owner", () => {
       owner.forceStop();
       await Promise.allSettled([owner.closed]);
     }
-  }, 10_000);
+  }, 45_000);
 });
