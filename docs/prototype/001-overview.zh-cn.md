@@ -1585,7 +1585,7 @@ Writer Lease 提供平台认可的权限与协调保证，不是 hostile-code sa
 多租户隔离、防御恶意本机 owner 或已失陷主机、阻止主动 daemonize 并逃离受控进程树的
 程序，也不承诺外部 MCP/API 副作用 exactly-once。这些非目标不能用于弱化第 14 节的
 身份、来源和终态边界、第 22 节的 Lease/fencing/停止/quarantine、第 27 节的隐私与
-最小上下文，或既有 authorization、schema 和失败显式化契约。
+最小上下文，或既有 authorization、当前 schema 18 和失败显式化契约。
 
 对其余 MVP 工作，release-blocking finding 必须落在可重复的受支持路径上，说明可信的
 用户或数据完整性影响，并给出最小验收测试。即使构造输入罕见，只要能够证明违反已承诺的

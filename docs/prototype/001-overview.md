@@ -1272,7 +1272,7 @@ that deliberately daemonize and escape the owned process tree, or exactly-once
 external MCP/API effects. These non-goals do not weaken section 14 identity,
 provenance, and terminal boundaries; section 22 Lease, fencing, stop, and
 quarantine contracts; section 27 privacy and minimum-context rules; or existing
-authorization, schema, and explicit-failure contracts.
+authorization, current schema 18, and explicit-failure contracts.
 
 For the remaining MVP work, a release-blocking finding must have a reproducible
 supported path, credible user or data-integrity impact, and a minimal acceptance
