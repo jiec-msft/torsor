@@ -146,6 +146,13 @@ test("Host CLI accepts the documented IPv4 and IPv6 loopback literals", async ()
     let hostProcess;
     try {
       hostProcess = await startHostCli(stateDirectory, host);
+      assert.equal(
+        hostProcess.process.child.spawnargs[
+          hostProcess.process.child.spawnargs.indexOf("--port") + 1
+        ],
+        "0",
+      );
+      assert.ok(hostProcess.port > 0);
       const health = await fetchJson(`${hostProcess.origin}/health`);
       assert.deepEqual(health, { status: "ok" });
       await shutdownHostProcess(hostProcess);
@@ -231,6 +238,33 @@ test("documented CLIs survive restart with Vite default ports occupied", async (
     await forceStopManagedProcess(viteProcess?.process);
     await forceStopManagedProcess(hostProcess?.process);
     await Promise.all(portBlockers.map(closeServer));
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("Web wrappers recover when an allocated port is taken before Vite binds", async () => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "torsor-vite-race-"));
+  const blocker = createTcpServer();
+  let hostProcess;
+  let viteProcess;
+  try {
+    await listen(blocker, 0, "127.0.0.1");
+    const address = blocker.address();
+    assert.ok(address && typeof address === "object");
+    hostProcess = await startHostCli(stateDirectory, "127.0.0.1");
+    for (const mode of ["dev", "preview"]) {
+      viteProcess = await startWebWrapper(mode, hostProcess.origin, address.port);
+      assert.notEqual(viteProcess.port, address.port);
+      await probeWebRoot(viteProcess.origin);
+      await terminateWebWrapper(viteProcess);
+      viteProcess = undefined;
+    }
+    await shutdownHostProcess(hostProcess);
+    hostProcess = undefined;
+  } finally {
+    await forceStopManagedProcess(viteProcess?.process);
+    await forceStopManagedProcess(hostProcess?.process);
+    await closeServer(blocker);
     await rm(stateDirectory, { recursive: true, force: true });
   }
 });
@@ -463,7 +497,6 @@ async function runNpm(args, cwd, timeout) {
 }
 
 async function startHostCli(stateDirectory, host) {
-  const port = await allocateTcpPort(host);
   const managed = startManagedProcess(
     process.execPath,
     [
@@ -473,7 +506,7 @@ async function startHostCli(stateDirectory, host) {
       "--host",
       host,
       "--port",
-      String(port),
+      "0",
       "--shutdown-stdin",
     ],
     { cwd: root, stdin: "pipe" },
@@ -483,6 +516,8 @@ async function startHostCli(stateDirectory, host) {
       /Torsor synthetic quickstart listening at (http:\/\/\S+)/,
       15_000,
     );
+    const port = Number(new URL(match[1]).port);
+    assert.ok(Number.isInteger(port) && port > 0);
     return { process: managed, origin: match[1], host, port };
   } catch (error) {
     await forceStopManagedProcess(managed);
@@ -490,8 +525,25 @@ async function startHostCli(stateDirectory, host) {
   }
 }
 
-async function startWebWrapper(mode, proxyTarget) {
-  const port = await allocateTcpPort("127.0.0.1");
+async function startWebWrapper(mode, proxyTarget, firstPort) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const port = attempt === 0 && firstPort !== undefined
+      ? firstPort
+      : await allocateTcpPort("127.0.0.1");
+    try {
+      return await startWebWrapperOnPort(mode, proxyTarget, port);
+    } catch (error) {
+      if (
+        attempt === 2 ||
+        !String(error).includes(`Error: Port ${port} is already in use`)
+      ) {
+        throw error;
+      }
+    }
+  }
+}
+
+async function startWebWrapperOnPort(mode, proxyTarget, port) {
   assert.ok(process.env.npm_execpath, "npm_execpath is required");
   const script = mode === "preview" ? "preview:web" : "dev:web";
   const workspaceScript = mode === "preview" ? "preview" : "dev";
@@ -701,11 +753,20 @@ async function terminateManagedProcess(process) {
 
 async function terminateWebWrapper(webProcess) {
   await terminateManagedProcess(webProcess.process);
-  const releasedPort = createTcpServer();
-  try {
-    await listen(releasedPort, webProcess.port, webProcess.host);
-  } finally {
-    await closeServer(releasedPort);
+  const deadline = Date.now() + 2_000;
+  while (true) {
+    const releasedPort = createTcpServer();
+    try {
+      await listen(releasedPort, webProcess.port, webProcess.host);
+      return;
+    } catch (error) {
+      if (error?.code !== "EADDRINUSE" || Date.now() >= deadline) {
+        throw error;
+      }
+    } finally {
+      await closeServer(releasedPort);
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
   }
 }
 
