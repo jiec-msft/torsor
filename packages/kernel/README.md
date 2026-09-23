@@ -186,8 +186,8 @@ explicitly pins a nonterminal Run to a valid newer revision after checking both
 the Run revision and current Agent configuration revision. Existing
 Activations keep their recorded revision; only later Activations use the
 adopted revision. Configuration content is not included in public event
-payloads. These operations use the existing schema 17 revision tables and
-pointers.
+payloads. These operations use the revision tables and pointers retained by
+schema 18.
 
 An Attention wakes its target Agent but does not choose a Run. A claimed
 Attention Activation can use `IgnoreAttention`, attach the triggering Message
