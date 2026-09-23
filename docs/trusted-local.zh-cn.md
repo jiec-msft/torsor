@@ -9,6 +9,7 @@
 Object 支持；Linux 需要可读 `/proc`。其他平台目前拒绝 native launch。
 Windows 的 `TORSOR_COPILOT_COMMAND` 应指向原生可执行文件，而不是 `.cmd`/`.ps1` shim。
 依赖安装和构建不启动真实模型。使用可信的仓库、用户配置、自定义指令和 MCP server。
+Linux 工具后代必须留在原进程组中；主动 daemonize/脱离进程组的工具不受支持。
 
 `restricted` 是默认、确定性 deny-by-default 工具配置；`trusted-local` 必须显式选择。
 后者让 Provider 使用普通 shell、文件、URL、自定义指令、已配置 MCP 和正常用户环境。

@@ -1,0 +1,35 @@
+name: Trusted local execution
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build --workspace @torsor/kernel
+      - run: npm run build --workspace @torsor/agent-runtime
+      - name: Native ownership and lifecycle fixtures
+        run: npm exec --workspace @torsor/agent-runtime -- vitest run test/provider-process.test.ts test/trusted-local-runtime.test.ts test/worktree-provider.test.ts
+      - name: Host and Human cancellation
+        run: npm exec --workspace @torsor/server -- vitest run test/trusted-local-host.integration.test.ts test/provider-configuration.test.ts
+      - name: Synthetic smoke and real-provider refusal gate
+        run: npm run test:trusted-local-smoke

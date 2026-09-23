@@ -1114,6 +1114,7 @@ export class AgentRuntime {
               "Unknown",
             )
           : normalizeProviderExecutionError(error);
+      let cancelledNativeRun = false;
       if (input.cause.type === "run" && bridge.terminalAction === null) {
         const latest = await this.#kernel.query(
           { type: "GetRunProjection", runId: input.cause.run.run.id },
@@ -1122,6 +1123,7 @@ export class AgentRuntime {
         const activation = latest.activations.find(
           (candidate) => candidate.id === input.activationId,
         );
+        cancelledNativeRun = nativeHandle !== undefined && latest.run.state === "Cancelled";
         if (
           latest.run.state === "Active" &&
           activation?.finishedAt === null &&
@@ -1174,6 +1176,9 @@ export class AgentRuntime {
           this.#runtimeContext,
         );
       }
+      // A committed Human cancellation is handled work, not a successful
+      // Provider attempt and not a reason to tear down the observation Host.
+      if (cancelledNativeRun) return true;
       throw providerError;
     } finally {
       worktreeScopeOpen = false;

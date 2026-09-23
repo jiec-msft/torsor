@@ -148,7 +148,10 @@ Linux process group with `/proc` membership observation. Other platforms explici
 reject native launch rather than falling back to single-PID kill. Windows creates
 the provider suspended, assigns the Job, then resumes; closing the Job kills its
 members. The Linux owner retains the original group identity until observing an
-empty group. Provider exit stops remaining members; lost/forced owners without
+empty group. Supported Linux tools must keep descendants in the original group;
+deliberately escaping daemons or hostile programs are outside this execution
+contract, and group stop is not isolation proof for them.
+Provider exit stops remaining members; lost/forced owners without
 whole-tree evidence remain uncertain. Configuration crosses a private stdin
 handshake, never supervisor command arguments or disk configuration files.
 Stop evidence must cover the entire owned tree, not merely
@@ -162,6 +165,13 @@ revalidates Writer Authority inside the Kernel transaction. Trusted-local cannot
 publish without an execution binding. Success requires normal physical stop and
 a still-valid execution receipt. Concurrent recovery and nonblocking supervision
 remain intact.
+
+After a committed Human `CancelRun`, the native attempt retains its `Unknown` / `Failed` outcome
+and stops/quarantines its original process. Runtime acknowledges the handled
+delivery after settlement, without reporting Provider success or closing the
+observation Host for that expected cancellation. HTTP/Web still claim only logical
+cancellation, never physical safety from its receipt. Other Provider failures and
+Host-initiated shutdown retain the existing error-propagation semantics.
 
 Schema 18 extends schema 17's diagnostic privacy contract with explicit native
 execution ProviderAttempt/policy binding. `StartWorktreeExecution.provider`

@@ -169,4 +169,55 @@ describe("native provider Worktree ownership", () => {
       expect((await f.kernel.query({ type: "ListPhysicalWorktrees" }, runtimeContext)).items).toEqual([]);
     } finally { await f.executor.close(); f.kernel.close(); f.repo.dispose(); }
   });
+
+  it("quarantines a running receipt on restart and admits a replacement only after original-tree confirmation", async () => {
+    const f = await fixture();
+    const owned = child(true);
+    const reopened = TorsorKernel.open({ databasePath: f.repo.databasePath });
+    const replacement = new LocalWorktreeExecutor({
+      kernel: reopened, runtimePrincipalId: runtimeContext.principalId, ...f.repo,
+    });
+    try {
+      const original = await f.executor.startProvider({
+        runId: f.run.runId, activationId: f.run.activationId,
+        providerAttemptId: f.providerAttemptId, policy, start: () => owned.value,
+      });
+      await replacement.recover();
+      const tree = (await reopened.query({ type: "ListPhysicalWorktrees" }, runtimeContext)).items[0]!;
+      expect(tree).toMatchObject({ state: "Quarantined", latestExecution: { state: "Uncertain" } });
+      expect(() => original.assertPublication()).toThrow();
+      const activation = await reopened.execute({
+        type: "StartActivation", idempotencyKey: "replacement-activation", runId: f.run.runId,
+        expectedRunRevision: 1, outboxEventId: f.run.outboxEventId, outboxLeaseToken: f.run.outboxLeaseToken,
+      }, runtimeContext);
+      const attempt = await reopened.execute({
+        type: "StartProviderAttempt", idempotencyKey: "replacement-attempt", activationId: activation.entityId,
+        outboxEventId: f.run.outboxEventId, outboxLeaseToken: f.run.outboxLeaseToken,
+        adapter: "fixed-provider", adapterVersion: "1", capabilitySnapshot: {},
+        requestIdempotencyKey: "replacement-request", runInputIds: [f.run.runInputId],
+      }, runtimeContext);
+      const spawn = vi.fn(() => child().value);
+      const input = {
+        runId: f.run.runId, activationId: activation.entityId, providerAttemptId: attempt.entityId,
+        policy, start: spawn,
+      };
+      await expect(replacement.startProvider(input)).rejects.toThrow();
+      expect(spawn).not.toHaveBeenCalled();
+      owned.confirm();
+      await owned.value.closed;
+      await original.reconcile();
+      const next = await replacement.startProvider(input);
+      expect(spawn).toHaveBeenCalledOnce();
+      expect(await next.finish()).toBe("StopConfirmed");
+      expect(() => original.assertPublication()).toThrow();
+      expect((await reopened.query({ type: "GetPhysicalWorktree", worktreeId: tree.worktreeId }, runtimeContext))
+        .latestExecution).toMatchObject({
+        activationId: activation.entityId, generation: 2, fencingToken: 2, state: "StopConfirmed",
+      });
+    } finally {
+      owned.confirm();
+      await f.executor.close(); await replacement.close();
+      reopened.close(); f.kernel.close(); f.repo.dispose();
+    }
+  });
 });

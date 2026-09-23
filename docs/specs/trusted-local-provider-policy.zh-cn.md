@@ -123,6 +123,8 @@ ProviderAttempt 和策略，Executor 从 Run 派生唯一物理目录，不接�
 Windows 使用 Job Object，Linux 使用独立进程组和 `/proc` 成员观察。其他平台明确拒绝
 native launch；不降级为单 PID kill。Windows 在 suspended 创建后先加入 Job 再 resume，
 Job 关闭会终止所有成员；Linux owner 在观察组清空之前保留原始 group identity。
+Linux 受支持的工具必须把后代保留在原进程组内；主动脱离该组的 daemon 或 hostile
+程序不在此执行契约内，不能把组停止当作这类进程的隔离证明。
 Provider 退出后停止剩余成员；owner 丢失或强制停止而没有完整树证明时保持不确定。
 进程配置只经私有 stdin 握手传递，不放入 supervisor 命令行或磁盘配置文件。
 停止证据必须覆盖整个所拥有的树，
@@ -133,6 +135,11 @@ Provider 退出后停止剩余成员；owner 丢失或强制停止而没有完�
 Run 的每个公开 capability 在本地拒绝已撤销/过期的执行，并在 Kernel 事务中再次验证
 Writer Authority。无执行绑定的 trusted-local 调用不得发布。成功必须有正常的物理停止
 和仍有效的 execution receipt。并发恢复和非阻塞监督保持不变。
+
+Human 已提交 `CancelRun` 后，native attempt 保留 `Unknown` / `Failed` 结果并停止/隔离原进程；
+Runtime 在 settlement 后确认已处理的 delivery，不把逻辑取消报告为 Provider 成功，
+也不因这一预期取消关闭观察 Host。HTTP/Web 仍只声明逻辑取消，不凭 receipt 宣称物理安全。
+其他 Provider 失败以及 Host 主动关闭的错误传播保持原有语义。
 
 Schema 18 在 schema 17 的诊断隐私契约上增加 native execution 的显式
 ProviderAttempt/策略绑定：`StartWorktreeExecution.provider` 只接受

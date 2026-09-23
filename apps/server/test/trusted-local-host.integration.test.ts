@@ -13,9 +13,10 @@ const fixture = fileURLToPath(new URL(
 const headers = { Authorization: "Bearer synthetic-human-token", "Content-Type": "application/json" };
 
 describe("trusted-local HTTP Host", () => {
-  it.each(["success", "hang"])("publishes safe Timeline facts and closes its owned process: %s", async (scenario) => {
+  it.each(["success", "hang", "cancel"])("publishes safe Timeline facts and closes its owned process: %s", async (scenario) => {
     const repo = syntheticRepository();
     const observed = deferred<string>();
+    const settled = deferred<void>();
     let runId: string | undefined;
     const host = createLocalRuntimeHost({
       databasePath: repo.databasePath, bootstrap, port: 0,
@@ -23,7 +24,7 @@ describe("trusted-local HTTP Host", () => {
       runtimePrincipalId: "runtime", projectIds: ["project"], runtimePollIntervalMs: 1,
       adapter: new CopilotAcpAdapter({
         policy: { kind: "trusted-local", permissionMode: "allow-all" },
-        command: process.execPath, commandArgs: [fixture, scenario], unsafeAllowCustomCommandArgs: true,
+        command: process.execPath, commandArgs: [fixture, scenario === "cancel" ? "hang" : scenario], unsafeAllowCustomCommandArgs: true,
         userEnvironment: {},
       }),
       worktreeExecutorFactory: (kernel) => {
@@ -32,16 +33,22 @@ describe("trusted-local HTTP Host", () => {
           const result = await execute(command, context);
           if (command.type === "AppendRunActivity" && command.kind === "tool_started") {
             runId = command.runId;
-            if (scenario === "hang") observed.resolve(runId);
+            if (scenario !== "success") observed.resolve(runId);
           }
           if (command.type === "FinishProviderAttempt" && command.status === "Completed" && runId) {
             observed.resolve(runId);
           }
+          if (command.type === "AcknowledgeOutboxEvents" && runId) settled.resolve();
           return result;
         });
         return new LocalWorktreeExecutor({ kernel, runtimePrincipalId: "runtime", ...repo });
       },
     });
+    void host.finished.catch((error: unknown) => {
+      observed.reject(error);
+      settled.reject(error);
+    });
+    void settled.promise.catch(() => undefined);
     try {
       const origin = await host.start();
       const response = await fetch(`${origin}/api/v1/commands/start-thread`, {
@@ -60,6 +67,20 @@ describe("trusted-local HTTP Host", () => {
       expect(body).not.toContain("synthetic-private");
       expect(body).not.toContain("diagnosticSessionId");
       if (scenario === "success") expect(body).toContain("tool_completed");
+      if (scenario === "cancel") {
+        const projection = JSON.parse(body);
+        const cancellation = await fetch(`${origin}/api/v1/commands/cancel-run`, {
+          method: "POST", headers, body: JSON.stringify({
+            idempotencyKey: "human-native-cancel", runId: id,
+            expectedRunRevision: projection.run.run.revision, reason: "Synthetic Human cancellation.",
+          }),
+        });
+        expect(cancellation.status).toBe(200);
+        await settled.promise;
+        const refresh = await fetch(`${origin}/api/v1/runs/${id}`, { headers });
+        expect(refresh.status).toBe(200);
+        expect((await refresh.json()).run.run.state).toBe("Cancelled");
+      }
       if (scenario === "hang") await expect(host.close()).rejects.toMatchObject({ diagnosticCode: "provider_cancelled" });
       else await host.close();
       const reopened = TorsorKernel.open({ databasePath: repo.databasePath });

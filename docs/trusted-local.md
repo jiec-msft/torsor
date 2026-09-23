@@ -11,6 +11,8 @@ Other platforms currently reject native launch. On Windows,
 `TORSOR_COPILOT_COMMAND` should name a native executable, not a `.cmd`/`.ps1` shim.
 Installation/build do not start a real model. Trust the repository, user
 configuration, custom instructions, and MCP servers.
+Linux tool descendants must remain in the original process group; tools that
+deliberately daemonize/escape it are unsupported.
 
 `restricted` is the default deterministic deny-by-default tool profile.
 `trusted-local` is explicit and enables normal provider shell, file, URL,

@@ -1,4 +1,5 @@
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { OwnedProviderProcess } from "../src/provider-process.js";
 
@@ -22,7 +23,16 @@ describe("retained native process-tree owner", () => {
       process.kill(pid, 0);
       owner.requestStop();
       await expect(owner.closed).resolves.toEqual({ code: 0, signal: null, error: null });
-      expect(() => process.kill(pid, 0)).toThrow();
+      if (process.platform === "linux") {
+        let state: string | undefined;
+        try {
+          const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+          state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+        } catch (error) {
+          if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+        }
+        expect([undefined, "Z", "X"]).toContain(state);
+      } else expect(() => process.kill(pid, 0)).toThrow();
     } finally {
       clearTimeout(timeout);
       owner.forceStop();
