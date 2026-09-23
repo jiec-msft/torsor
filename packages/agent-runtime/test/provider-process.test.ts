@@ -1,5 +1,8 @@
+import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
+import { isAbsolute } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { OwnedProviderProcess } from "../src/provider-process.js";
 
@@ -12,6 +15,58 @@ async function ready(owner: OwnedProviderProcess): Promise<unknown> {
 }
 
 describe("retained native process-tree owner", () => {
+  it.runIf(process.platform === "win32")(
+    "uses one fixed packaged owner module for concurrent Windows launches",
+    async () => {
+      const owners = Array.from({ length: 2 }, () => new OwnedProviderProcess({
+        command: process.execPath, cwd: process.cwd(), environment: {},
+        args: ["-e", "process.stdout.write('ready');process.stdin.resume();"],
+      }));
+      try {
+        const ownerModules = owners.map((owner) => owner.processHandle.spawnargs[1]);
+        expect(new Set(ownerModules).size).toBe(1);
+        expect(ownerModules[0]).toSatisfy(
+          (value: unknown) => typeof value === "string" && isAbsolute(value),
+        );
+        for (const owner of owners) {
+          expect(owner.processHandle.spawnfile).toBe(process.execPath);
+          expect(owner.processHandle.spawnargs.join("\n")).toMatch(
+            /provider-process-windows-owner\.js/,
+          );
+          expect(owner.processHandle.spawnargs.join("\n")).not.toMatch(
+            /powershell|Add-Type|TypeDefinition/i,
+          );
+        }
+        await Promise.all(owners.map(ready));
+      } finally {
+        for (const owner of owners) owner.forceStop();
+        await Promise.all(owners.map((owner) => Promise.allSettled([owner.closed])));
+      }
+    },
+    150_000,
+  );
+
+  it.runIf(process.platform === "win32")(
+    "fails closed on a corrupt Windows owner handshake",
+    async () => {
+      const ownerModule = fileURLToPath(new URL(
+        "../dist/provider-process-windows-owner.js",
+        import.meta.url,
+      ));
+      const owner = spawn(process.execPath, [ownerModule], {
+        cwd: process.cwd(),
+        env: {},
+        shell: false,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      owner.stdin.end(Buffer.from([0xff, 0xff, 0x7f, 0x00]));
+      const [code, signal] = await once(owner, "close");
+      expect({ code, signal }).toEqual({ code: 125, signal: null });
+    },
+    30_000,
+  );
+
   it("stops descendants before confirming normal parent completion", async () => {
     const owner = new OwnedProviderProcess({
       command: process.execPath, cwd: process.cwd(), environment: {},

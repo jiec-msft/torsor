@@ -8,6 +8,7 @@ import {
 import { buildCopilotProviderEnvironment, isRestrictedCopilotEnvironmentOverride } from "./copilot-provider-environment.js";
 import { OwnedProviderProcess } from "./provider-process.js";
 import { CopilotToolActivity } from "./copilot-tool-activity.js";
+import { isNativeRunCancellationInterruption } from "./native-run-cancellation.js";
 import type { ControlledWorktreeProcess } from "./worktree-executor.js";
 
 import {
@@ -1402,6 +1403,12 @@ function normalizeExecutionError(
   error: unknown,
   signal: AbortSignal,
 ): Error {
+  if (
+    isNativeRunCancellationInterruption(signal.reason) &&
+    !isNativeRunCancellationInterruption(error)
+  ) {
+    return normalizeProviderExecutionError(error, "Unknown");
+  }
   if (signal.aborted) {
     return abortReason(signal);
   }
@@ -1411,6 +1418,9 @@ function normalizeExecutionError(
 function abortReason(signal: AbortSignal): Error {
   if (signal.reason === undefined) {
     return new ProviderExecutionError("provider_cancelled", "Unknown");
+  }
+  if (isNativeRunCancellationInterruption(signal.reason)) {
+    return signal.reason;
   }
   return normalizeProviderExecutionError(signal.reason, "Unknown");
 }

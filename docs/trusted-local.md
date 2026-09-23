@@ -6,8 +6,10 @@
 
 Use Node.js 22.13+, Git, and an installed Copilot CLI authenticated separately
 (or configured with BYOK), then `npm ci` and `npm run build`. Windows requires
-Windows PowerShell/.NET and Job Objects; Linux requires readable `/proc`.
-Other platforms currently reject native launch. On Windows,
+Job Objects and the package-installed `koffi` native binding; it no longer requires
+Windows PowerShell/.NET or a runtime compiler. Linux requires readable `/proc`.
+Missing or unloadable native bindings fail launch explicitly without PID discovery
+or kill fallback. Other platforms currently reject native launch. On Windows,
 `TORSOR_COPILOT_COMMAND` should name a native executable, not a `.cmd`/`.ps1` shim.
 Installation/build do not start a real model. Trust the repository, user
 configuration, custom instructions, and MCP servers.
@@ -50,8 +52,13 @@ that does not grant Kernel authority or bypass stop/publication fences.
 
 Run `npm run start --workspace @torsor/server`. Before the first provider write,
 acquire the Writer Lease and receipt binding Activation, Run, ProviderAttempt,
-generation, fencing, and original process tree. Cancellation, expiry, and shutdown
-stop physically before persisting evidence. Unknown stop quarantines the directory
+generation, fencing, and original process tree. Windows launches only the fixed
+deep Node owner module inside the package; environment,
+`PATH`, the current directory, and mutable caches cannot select an owner. The module
+uses `CreateProcessW(CREATE_SUSPENDED)`, assigns the Provider to a
+`KILL_ON_JOB_CLOSE` Job Object, and only then resumes its original thread.
+Cancellation, expiry, and shutdown stop physically before persisting evidence.
+Unknown stop quarantines the directory
 and blocks replacement. Restart does not clear quarantine after losing the original
 handle. Schema 18 is current; schema 17 is rejected. Stop old processes
 and explicitly use a fresh disposable database and fresh managed root; no migration

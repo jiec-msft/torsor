@@ -21,6 +21,7 @@ describe("trusted-local HTTP Host", () => {
     { phase: "running-receipt", cancel: true, failure: "persistence" },
     { phase: "before-return", cancel: true, failure: "spawn" },
     { phase: "before-return", cancel: true, failure: "provider" },
+    { phase: "before-return", cancel: true, failure: "process-exit" },
     { phase: "before-return", cancel: true, failure: "settlement" },
     { phase: "before-return", cancel: false, failure: "authority" },
   ] as const)("settles native launch before delivery and preserves observation: $phase / $failure", async ({ phase, cancel, failure }) => {
@@ -84,6 +85,7 @@ describe("trusted-local HTTP Host", () => {
           returned = true;
           if (failure === "spawn") throw new ProviderExecutionError("provider_process_start_failed", "Failed");
           if (failure === "provider") throw new ProviderExecutionError("provider_protocol_error", "Failed");
+          if (failure === "process-exit") throw new ProviderExecutionError("provider_process_exited", "Unknown");
           if (failure === "authority") throw new KernelError("WriterAuthorityLost", "Synthetic fencing loss.");
           return handle;
         });
@@ -166,6 +168,7 @@ describe("trusted-local HTTP Host", () => {
         else await expect(host.finished).rejects.toMatchObject({
           diagnosticCode: failure === "spawn" ? "provider_process_start_failed"
             : failure === "provider" ? "provider_protocol_error"
+            : failure === "process-exit" ? "provider_process_exited"
             : failure === "persistence" ? "provider_execution_failed" : "provider_worktree_authority_lost",
         });
         await expect(fetch(`${origin}/health`, { signal: AbortSignal.timeout(2_000) })).rejects.toThrow();
@@ -194,6 +197,144 @@ describe("trusted-local HTTP Host", () => {
       } finally { reopened.close(); repo.dispose(); }
       if (phase === "forced-before-return") expect(observation?.status).toBe("rejected");
       if (failure === "none") expect(closed.status).toBe("fulfilled");
+    }
+  }, 150_000);
+
+  it("propagates independent fencing loss after Human cancellation without acknowledging delivery", async () => {
+    const repo = syntheticRepository();
+    const running = deferred<string>();
+    const release = deferred<void>();
+    const aborted = deferred<void>();
+    const childClosed = deferred<void>();
+    let kernel: TorsorKernel | undefined;
+    let leaseAuthority: {
+      readonly worktreeId: string;
+      readonly generation: number;
+      readonly fencingToken: number;
+      readonly leaseToken: string;
+    } | undefined;
+    const host = createLocalRuntimeHost({
+      databasePath: repo.databasePath, bootstrap, port: 0,
+      credentials: [{ token: "synthetic-human-token", principalContext: { principalId: "human" } }],
+      runtimePrincipalId: "runtime", projectIds: ["project"], runtimePollIntervalMs: 1,
+      providerTimeoutMs: 120_000, activationDurationMs: 125_000,
+      attentionLeaseMs: 125_000, outboxLeaseMs: 125_000, cancellationPollMs: 5,
+      adapter: new CopilotAcpAdapter({
+        policy: { kind: "trusted-local", permissionMode: "allow-all" },
+        command: process.execPath, commandArgs: [fixture, "hang"],
+        unsafeAllowCustomCommandArgs: true, userEnvironment: {},
+      }),
+      worktreeExecutorFactory: (ownedKernel) => {
+        kernel = ownedKernel;
+        const execute = ownedKernel.execute.bind(ownedKernel);
+        vi.spyOn(ownedKernel, "execute").mockImplementation(async (command, context) => {
+          const result = await execute(command, context);
+          if (command.type === "AcquireWorktreeWriterLease") {
+            leaseAuthority = {
+              worktreeId: command.worktreeId,
+              generation: result.leaseGeneration!,
+              fencingToken: result.fencingToken!,
+              leaseToken: result.leaseToken!,
+            };
+          }
+          return result;
+        });
+        const executor = new LocalWorktreeExecutor({
+          kernel: ownedKernel, runtimePrincipalId: "runtime", ...repo, leaseDurationMs: 125_000,
+        });
+        const start = executor.startProvider.bind(executor);
+        vi.spyOn(executor, "startProvider").mockImplementation(async (input) => {
+          input.signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
+          await start({
+            ...input,
+            start: (cwd) => {
+              const child = input.start(cwd);
+              void child.closed.finally(() => childClosed.resolve());
+              return child;
+            },
+          });
+          running.resolve(input.runId);
+          await release.promise;
+          throw new KernelError("WriterAuthorityLost", "Synthetic independent fencing loss.");
+        });
+        return executor;
+      },
+    });
+    void host.finished.catch((error: unknown) => running.reject(error));
+    try {
+      const origin = await host.start();
+      expect((await fetch(`${origin}/api/v1/commands/start-thread`, {
+        method: "POST", headers,
+        body: JSON.stringify({
+          idempotencyKey: "independent-fencing-loss", projectId: "project", channelId: "channel",
+          body: "Synthetic independent fencing loss.", targetAgentIds: ["orbit"],
+        }),
+      })).status).toBe(200);
+      const runId = await running.promise;
+      expect(leaseAuthority).toMatchObject({ generation: 1, fencingToken: 1 });
+      const quarantined = await kernel!.execute({
+        type: "QuarantineWorktreeWriterLease",
+        idempotencyKey: "independent-fencing-quarantine",
+        ...leaseAuthority!,
+        expectedGeneration: leaseAuthority!.generation,
+        expectedFencingToken: leaseAuthority!.fencingToken,
+        reason: "Synthetic independent fencing incident.",
+        evidence: { source: "synthetic-review-regression" },
+      }, { principalId: "runtime" });
+      expect(quarantined.worktreeWriterLease).toMatchObject({
+        status: "Quarantined", generation: 1, fencingToken: 2,
+      });
+      const projection = await kernel!.query({ type: "GetRunProjection", runId }, { principalId: "human" });
+      expect((await fetch(`${origin}/api/v1/commands/cancel-run`, {
+        method: "POST", headers,
+        body: JSON.stringify({
+          idempotencyKey: "cancel-after-independent-fencing-loss", runId,
+          expectedRunRevision: projection.run.revision, reason: "Synthetic Human cancellation.",
+        }),
+      })).status).toBe(200);
+      await aborted.promise;
+      release.resolve();
+      await expect(Promise.race([
+        host.finished,
+        new Promise<void>((_resolve, reject) => {
+          setTimeout(() => reject(new Error("Host did not reject independent fencing loss.")), 3_000);
+        }),
+      ])).rejects.toMatchObject({
+        diagnosticCode: "provider_worktree_authority_lost",
+        outcome: "Unknown",
+      });
+      await childClosed.promise;
+    } finally {
+      release.resolve();
+      await Promise.allSettled([host.close(), childClosed.promise]);
+      vi.restoreAllMocks();
+      const reopened = TorsorKernel.open({ databasePath: repo.databasePath });
+      try {
+        const trees = await reopened.query({ type: "ListPhysicalWorktrees" }, { principalId: "runtime" });
+        expect(trees.items).toHaveLength(1);
+        expect(trees.items[0]?.latestExecution).toMatchObject({ state: "StopConfirmed" });
+        expect(await reopened.query(
+          { type: "GetWorktreeWriterLease", worktreeId: trees.items[0]!.worktreeId },
+          { principalId: "runtime" },
+        )).toMatchObject({ status: "Quarantined", generation: 1, fencingToken: 2 });
+        const run = await reopened.query(
+          { type: "GetRunProjection", runId: trees.items[0]!.runId },
+          { principalId: "human" },
+        );
+        expect(run.run.state).toBe("Cancelled");
+        expect(run.providerAttempts.at(-1)?.status).toBe("Unknown");
+        const outbox = await reopened.query(
+          { type: "ListOutboxEvents", includeAcknowledged: true, limit: 500 },
+          { principalId: "runtime" },
+        );
+        expect(outbox.items.filter((event) =>
+          event.aggregateId === run.run.id &&
+          (event.topic === "run.activation-requested" || event.topic === "run-input.available")
+        ).every((event) => event.acknowledgedAt === null)).toBe(true);
+      } finally {
+        reopened.close();
+        repo.dispose();
+      }
     }
   }, 150_000);
 

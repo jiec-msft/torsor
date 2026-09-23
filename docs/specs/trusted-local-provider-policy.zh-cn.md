@@ -123,6 +123,10 @@ ProviderAttempt 和策略，Executor 从 Run 派生唯一物理目录，不接�
 Windows 使用 Job Object，Linux 使用独立进程组和 `/proc` 成员观察。其他平台明确拒绝
 native launch；不降级为单 PID kill。Windows 在 suspended 创建后先加入 Job 再 resume，
 Job 关闭会终止所有成员；Linux owner 在观察组清空之前保留原始 group identity。
+Windows owner 是 Package 内固定的深层 Node module，通过随 Package 安装的 MIT
+`koffi` 原生绑定调用 Win32 API；不启动 PowerShell、不运行时编译 C#，也不从环境、
+`PATH`、当前目录或可变缓存选择/生成 owner。绑定缺失或加载失败时必须在 Provider
+启动前明确失败。并发启动复用同一版本化 Package module，不产生竞态临时 Artifact。
 Linux 受支持的工具必须把后代保留在原进程组内；主动脱离该组的 daemon 或 hostile
 程序不在此执行契约内，不能把组停止当作这类进程的隔离证明。
 Provider 退出后停止剩余成员；owner 丢失或强制停止而没有完整树证明时保持不确定。
@@ -145,6 +149,10 @@ Runtime 在 settlement 后确认已处理的 delivery，不把逻辑取消报告
 而不是依据 handle 是否已返回。确认 delivery 前必须等待 pending launch 及物理停止/
 settlement；晚到的 launch 失败不能被取消竞态遮蔽。无关的 fencing/authority loss、
 spawn、Provider、持久化或停止错误仍传播；不得把 quarantine 当作已确认物理停止。
+预期取消只能由本次执行绑定的类型化内部 cause 证明：该 cause 必须来自权威
+`run_cancelled` 事实，或来自在相同 generation/fencing 的仍有效 Lease 下由该取消触发的
+原 handle 物理停止。仅凭 `provider_cancelled`、`provider_process_exited` 或
+`provider_worktree_authority_lost` 诊断码以及后来变成 `Cancelled` 的 Run 都不足以吞掉错误。
 
 Schema 18 在 schema 17 的诊断隐私契约上增加 native execution 的显式
 ProviderAttempt/策略绑定：`StartWorktreeExecution.provider` 只接受

@@ -148,7 +148,14 @@ Linux process group with `/proc` membership observation. Other platforms explici
 reject native launch rather than falling back to single-PID kill. Windows creates
 the provider suspended, assigns the Job, then resumes; closing the Job kills its
 members. The Linux owner retains the original group identity until observing an
-empty group. Supported Linux tools must keep descendants in the original group;
+empty group.
+The Windows owner is a fixed deep Node module inside the package and calls Win32
+through the package-installed MIT `koffi` native binding. It does not launch
+PowerShell, compile C# at runtime, or select/generate an owner from environment,
+`PATH`, the current directory, or a mutable cache. Missing or unloadable bindings
+fail before Provider launch. Concurrent launches reuse the same versioned package
+module and create no racing temporary owner artifact.
+Supported Linux tools must keep descendants in the original process group;
 deliberately escaping daemons or hostile programs are outside this execution
 contract, and group stop is not isolation proof for them.
 Provider exit stops remaining members; lost/forced owners without
@@ -179,6 +186,12 @@ Await pending launch and physical stop/settlement before acknowledging delivery;
 cancellation races must not mask late launch failures. Unrelated fencing/authority
 loss, spawn, Provider, persistence, and stop errors still propagate; quarantine
 does not establish confirmed physical stop.
+Expected cancellation requires a typed internal cause bound to this execution.
+That cause must come from the authoritative `run_cancelled` fact or from the
+original-handle physical stop caused by that cancellation while the same
+generation/fencing Lease remains valid. A `provider_cancelled`,
+`provider_process_exited`, or `provider_worktree_authority_lost` diagnostic code,
+or a Run that only later becomes `Cancelled`, is not sufficient to suppress an error.
 
 Schema 18 extends schema 17's diagnostic privacy contract with explicit native
 execution ProviderAttempt/policy binding. `StartWorktreeExecution.provider`

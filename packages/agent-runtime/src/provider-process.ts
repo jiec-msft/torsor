@@ -1,9 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { CopilotAcpLaunchConfiguration } from "./copilot-acp-adapter.js";
 import type { ChildCloseEvidence, ControlledChild } from "./controlled-process.js";
-import { windowsOwnerSource, linuxOwnerSource } from "./provider-process-owner.js";
+import { linuxOwnerSource } from "./provider-process-owner.js";
 import { ProviderExecutionError } from "./types.js";
 
 // The owner stays alive until the whole contained tree is stopped. Its exit alone
@@ -25,7 +25,7 @@ export class OwnedProviderProcess implements ControlledChild {
     if (process.platform === "win32") {
       const systemRoot = process.env.SystemRoot;
       if (!systemRoot) throw new ProviderExecutionError("provider_process_start_failed", "Failed");
-      command = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+      command = process.execPath;
       const commandLine = [launch.command, ...launch.args].map(quoteWindowsArgument).join(" ");
       const providerEnvironment = Object.entries({
         ...(!Object.keys(launch.environment).some((key) => key.toUpperCase() === "SYSTEMROOT")
@@ -33,10 +33,10 @@ export class OwnedProviderProcess implements ControlledChild {
       })
         .sort(([a], [b]) => a.localeCompare(b))
         .map(([name, value]) => `${name}=${value}\0`).join("") + "\0";
-      const source = `$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\ntry {\nAdd-Type -TypeDefinition @'\n${windowsOwnerSource}\n'@\n`
-        + `exit [TorsorProcessOwner]::Run()\n} catch { exit 125 }\n`;
-      args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
-        Buffer.from(source, "utf16le").toString("base64")];
+      args = [fileURLToPath(new URL(
+        "../dist/provider-process-windows-owner.js",
+        import.meta.url,
+      ))];
       environment = Object.fromEntries(Object.entries(process.env).filter(
         (entry): entry is [string, string] => entry[1] !== undefined &&
           ["SYSTEMROOT", "WINDIR", "TEMP", "TMP", "PATH", "PATHEXT"].includes(entry[0].toUpperCase()),

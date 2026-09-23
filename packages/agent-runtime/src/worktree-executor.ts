@@ -12,6 +12,7 @@ import { canonicalDirectory, inspectWorktree, readPlainFile, type WorktreeRegist
 import { ProviderExecutionError } from "./types.js";
 import { parseProviderPolicy, type ProviderPolicy } from "./provider-policy.js";
 import { createDetachedWorktree } from "./worktree-provisioning.js";
+import { NativeRunCancellationInterruption } from "./native-run-cancellation.js";
 
 export interface WorktreeProbeInput {
   readonly worktreeId: string;
@@ -24,6 +25,7 @@ export interface WorktreeProviderInput {
   readonly activationId: string;
   readonly providerAttemptId: string;
   readonly policy: ProviderPolicy;
+  readonly cancellationInterruption?: NativeRunCancellationInterruption;
   readonly signal?: AbortSignal;
   readonly start: (cwd: string) => ControlledChild;
 }
@@ -157,9 +159,18 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
     input.signal?.throwIfAborted();
     await this.recover();
     const run = await this.#kernel.query({ type: "GetRunProjection", runId: input.runId }, this.#context);
+    const activation = run.activations.find((candidate) => candidate.id === input.activationId);
+    if (
+      input.cancellationInterruption &&
+      run.run.state === "Cancelled" &&
+      activation?.revocationReason === "run_cancelled" &&
+      activation.runActivationGeneration === run.run.activationGeneration &&
+      activation.runActivationGeneration === input.cancellationInterruption.runActivationGeneration
+    ) {
+      throw input.cancellationInterruption;
+    }
     if (run.run.state !== "Active" ||
-        !run.activations.some((activation) => activation.id === input.activationId &&
-          activation.finishedAt === null && activation.revokedAt === null) ||
+        !activation || activation.finishedAt !== null || activation.revokedAt !== null ||
         !run.providerAttempts.some((attempt) => attempt.id === input.providerAttemptId &&
           attempt.activationId === input.activationId && ["Started", "Acknowledged"].includes(attempt.status))) {
       throw new ProviderExecutionError("provider_worktree_authority_lost", "Unknown");
@@ -238,6 +249,14 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
       kernel: this.#kernel, principalId: this.#context.principalId, authority,
       activationId: input.activationId, stopMs: this.#stopMs, forceMs: this.#forceMs,
       leaseDeadlineAt,
+      ...(provider?.cancellationInterruption
+        ? {
+            runCancellation: {
+              runId: provider.runId,
+              interruption: provider.cancellationInterruption,
+            },
+          }
+        : {}),
       ...(input.signal ? { signal: input.signal } : {}),
     });
     this.#handles.set(started.entityId, handle);
@@ -339,8 +358,20 @@ interface ProcessOptions {
   readonly stopMs: number;
   readonly forceMs: number;
   readonly leaseDeadlineAt: number;
+  readonly runCancellation?: {
+    readonly runId: string;
+    readonly interruption: NativeRunCancellationInterruption;
+  };
   readonly signal?: AbortSignal;
 }
+
+export type ControlledWorktreeAuthorityInterruption =
+  | { readonly type: "none" }
+  | {
+      readonly type: "run-cancelled";
+      readonly interruption: NativeRunCancellationInterruption;
+    }
+  | { readonly type: "classification-failed"; readonly error: unknown };
 
 export class ControlledWorktreeProcess {
   readonly activationId: string;
@@ -363,6 +394,7 @@ export class ControlledWorktreeProcess {
   #deadline: NodeJS.Timeout | undefined;
   #retry: NodeJS.Timeout | undefined;
   #removeAbort: (() => void) | undefined;
+  #authorityInterruption: Promise<ControlledWorktreeAuthorityInterruption> | undefined;
   readonly #finished: Promise<WorktreeExecutionState>;
   #resolveFinished!: (state: WorktreeExecutionState) => void;
   #rejectFinished!: (error: unknown) => void;
@@ -404,6 +436,10 @@ export class ControlledWorktreeProcess {
     }
   }
 
+  authorityInterruption(): Promise<ControlledWorktreeAuthorityInterruption> | undefined {
+    return this.#authorityInterruption;
+  }
+
   spawning(): void {
     if (this.#spawnAttempted || this.#state !== "Starting") throw new Error("Spawn intent cannot be reused.");
     this.#spawnAttempted = true;
@@ -443,6 +479,8 @@ export class ControlledWorktreeProcess {
         this.#options.kernel.checkWorktreeAuthority(this.#options.authority, this.#options);
       } catch {
         // A failed authority check can stop work, never grant a replacement writer.
+        this.#authorityInterruption ??= this.#classifyAuthorityInterruption();
+        void this.#authorityInterruption.catch(() => undefined);
         void this.stop("Worktree authority monitor failed.")
           .catch(() => undefined);
       }
@@ -521,6 +559,46 @@ export class ControlledWorktreeProcess {
 
   async reconcile(): Promise<WorktreeExecutionState> {
     return this.stop("Reconciliation requested.");
+  }
+
+  async #classifyAuthorityInterruption(): Promise<ControlledWorktreeAuthorityInterruption> {
+    const expected = this.#options.runCancellation;
+    if (!expected) return { type: "none" };
+    try {
+      const [run, lease] = await Promise.all([
+        this.#options.kernel.query(
+          { type: "GetRunProjection", runId: expected.runId },
+          this.#options,
+        ),
+        this.#options.kernel.query(
+          {
+            type: "GetWorktreeWriterLease",
+            worktreeId: this.#options.authority.worktreeId,
+          },
+          this.#options,
+        ),
+      ]);
+      const activation = run.activations.find(
+        (candidate) => candidate.id === this.activationId,
+      );
+      if (
+        run.run.state === "Cancelled" &&
+        activation?.revocationReason === "run_cancelled" &&
+        activation.runActivationGeneration === run.run.activationGeneration &&
+        activation.runActivationGeneration === expected.interruption.runActivationGeneration &&
+        lease.status === "Active" &&
+        lease.generation === this.#options.authority.generation &&
+        lease.fencingToken === this.#options.authority.fencingToken
+      ) {
+        return {
+          type: "run-cancelled",
+          interruption: expected.interruption,
+        };
+      }
+      return { type: "none" };
+    } catch (error) {
+      return { type: "classification-failed", error };
+    }
   }
 
   #observedStopState(): "StopConfirmed" | "ForceTerminated" {
