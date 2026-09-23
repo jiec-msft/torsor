@@ -3,6 +3,14 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { OwnedProviderProcess } from "../src/provider-process.js";
 
+async function ready(owner: OwnedProviderProcess): Promise<unknown> {
+  const output = once(owner.processHandle.stdout, "data").then(([chunk]) => chunk);
+  const exited = once(owner.processHandle, "exit").then(([code]) => {
+    throw new Error(`Synthetic process owner exited before readiness with code ${String(code)}.`);
+  });
+  return Promise.race([output, exited]);
+}
+
 describe("retained native process-tree owner", () => {
   it("stops descendants before confirming normal parent completion", async () => {
     const owner = new OwnedProviderProcess({
@@ -17,7 +25,7 @@ describe("retained native process-tree owner", () => {
     });
     const timeout = setTimeout(() => owner.forceStop(), 8_000);
     try {
-      const [chunk] = await once(owner.processHandle.stdout, "data");
+      const chunk = await ready(owner);
       const pid = Number(String(chunk).trim());
       expect(pid).toBeGreaterThan(0);
       process.kill(pid, 0);
@@ -47,7 +55,7 @@ describe("retained native process-tree owner", () => {
     });
     const timeout = setTimeout(() => owner.forceStop(), 8_000);
     try {
-      await once(owner.processHandle.stdout, "data");
+      await ready(owner);
       owner.forceStop();
       await expect(owner.closed).rejects.toMatchObject({ outcome: "Unknown" });
     } finally {

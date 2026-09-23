@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentRuntime, CopilotAcpAdapter, LocalWorktreeExecutor } from "@torsor/agent-runtime";
 import { TorsorKernel } from "@torsor/kernel";
 
 export async function runSmoke(fixture) {
-  const directory = mkdtempSync(join(tmpdir(), "torsor-native-smoke-"));
+  const directory = realpathSync.native(mkdtempSync(join(tmpdir(), "torsor-native-smoke-")));
   let kernel;
   let executor;
   let runtime;

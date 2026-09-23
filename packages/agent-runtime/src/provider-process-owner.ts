@@ -65,24 +65,24 @@ public static class TorsorProcessOwner {
     bool assigned = false;
     IntPtr env = IntPtr.Zero;
     try {
-      if (job == IntPtr.Zero) return 125;
+      if (job == IntPtr.Zero) return 121;
       Limits limits = new Limits();
       limits.basic.flags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-      if (!SetInformationJobObject(job, 9, ref limits, Marshal.SizeOf(typeof(Limits)))) return 125;
+      if (!SetInformationJobObject(job, 9, ref limits, Marshal.SizeOf(typeof(Limits)))) return 122;
       Startup startup = new Startup();
       startup.cb = Marshal.SizeOf(typeof(Startup)); startup.flags = 0x100;
       startup.input = GetStdHandle(-10); startup.output = GetStdHandle(-11); startup.error = GetStdHandle(-12);
       foreach (IntPtr handle in new [] { startup.input, startup.output, startup.error })
-        if (!SetHandleInformation(handle, 1, 1)) return 125;
+        if (!SetHandleInformation(handle, 1, 1)) return 123;
       env = Marshal.AllocHGlobal(bytes.Length + 2);
       Marshal.Copy(bytes, 0, env, bytes.Length);
       Marshal.WriteInt16(env, bytes.Length, 0);
       // No provider instruction runs outside the job: create suspended, assign, then resume.
       if (!CreateProcess(null, new StringBuilder(line), IntPtr.Zero, IntPtr.Zero, true,
-          0x08000404, env, directory, ref startup, out process)) return 125;
-      if (!AssignProcessToJobObject(job, process.process)) return 125;
+          0x08000404, env, directory, ref startup, out process)) return 124;
+      if (!AssignProcessToJobObject(job, process.process)) return 126;
       assigned = true;
-      if (ResumeThread(process.thread) == 0xffffffff) return 125;
+      if (ResumeThread(process.thread) == 0xffffffff) return 127;
       if (WaitForSingleObject(process.process, 0xffffffff) != 0) return 125;
       uint code;
       if (!GetExitCodeProcess(process.process, out code)) return 125;
