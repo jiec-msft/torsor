@@ -1908,8 +1908,13 @@ working MVP without model credentials or network access.
    obtains dynamic IDs from responses instead of hard-coding them in prose.
 5. Normal Host shutdown closes HTTP, Runtime, and Kernel. Restarting with the
    same state directory keeps the completed Thread, Run, and activity
-   readable. Tests use isolated temporary directories and dynamic ports and
-   leave no processes, ports, databases, or generated files behind.
+   readable. The example CLI provides an explicit opt-in `--shutdown-stdin`
+   control that accepts only a `shutdown` line and invokes the same close path
+   as signal handling; shutdown must finish and exit with status 0 before
+   reporting success. Tests use that cooperative path as normal-shutdown
+   evidence rather than treating forced termination as graceful shutdown.
+   Tests use isolated temporary directories and dynamic ports and leave no
+   processes, ports, databases, or generated files behind.
 6. Server workspace commands run with `apps/server` as their current working
    directory. Component documentation states that semantic explicitly and
    uses bootstrap, database, and Artifact paths that resolve correctly from
@@ -1924,5 +1929,7 @@ working MVP without model credentials or network access.
    quick-start tests cover example files, root commands, cwd semantics, CLI
    loopback rejection/acceptance, the end-to-end journey through real Host CLI
    and Vite dev/preview processes, restart durability, and package license
-   contents. Process readiness and shutdown are bounded and supervised, use
-   dynamic ports, and clean up after success or failure.
+   contents. Process readiness, HTTP probes, and shutdown are bounded and
+   supervised. Vite receives allocated positive dynamic ports rather than
+   zero values that it may reinterpret as defaults, and tests clean up after
+   success or failure.

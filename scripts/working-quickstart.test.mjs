@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer as createHttpServer } from "node:http";
+import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -90,6 +92,7 @@ test("public quickstart files and root commands stay complete", async () => {
     assert.doesNotMatch(readme, /packages\\acp-conformance/);
     assert.match(readme, /127\.0\.0\.1/);
     assert.match(readme, /::1/);
+    assert.match(readme, /--shutdown-stdin/);
   }
   assert.match(
     serverReadme,
@@ -115,8 +118,6 @@ test("Host CLI rejects wildcard, non-loopback, and hostname binds before startup
           stateDirectory,
           "--host",
           host,
-          "--port",
-          "0",
         ],
         {
           cwd: root,
@@ -145,20 +146,31 @@ test("Host CLI accepts the documented IPv4 and IPv6 loopback literals", async ()
       hostProcess = await startHostCli(stateDirectory, host);
       const health = await fetchJson(`${hostProcess.origin}/health`);
       assert.deepEqual(health, { status: "ok" });
+      await shutdownHostProcess(hostProcess);
+      hostProcess = undefined;
     } finally {
-      await stopManagedProcess(hostProcess?.process);
+      await forceStopManagedProcess(hostProcess?.process);
       await rm(stateDirectory, { recursive: true, force: true });
     }
   }
 });
 
-test("documented Host and HTTP CLIs survive restart through Vite dev and preview proxies", async () => {
+test("documented CLIs survive restart with Vite default ports occupied", async () => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "torsor-quickstart-"));
   const directResult = join(stateDirectory, "direct-run.json");
   const proxyResult = join(stateDirectory, "proxy-run.json");
+  const blockedVitePorts = [5173, 4173, 4174];
+  const portBlockers = [];
   let hostProcess;
   let viteProcess;
   try {
+    for (const port of blockedVitePorts) {
+      const blocker = await occupyTcpPort(port);
+      if (blocker) {
+        portBlockers.push(blocker);
+      }
+    }
+
     hostProcess = await startHostCli(stateDirectory, "127.0.0.1");
     const completed = await runNodeCli(journeyCli, [
       "--origin",
@@ -167,7 +179,7 @@ test("documented Host and HTTP CLIs survive restart through Vite dev and preview
       directResult,
     ]);
     assert.match(completed, /Completed synthetic Run/);
-    await stopManagedProcess(hostProcess.process);
+    await shutdownHostProcess(hostProcess);
     hostProcess = undefined;
 
     hostProcess = await startHostCli(stateDirectory, "127.0.0.1");
@@ -181,7 +193,10 @@ test("documented Host and HTTP CLIs survive restart through Vite dev and preview
     assert.match(verified, /Verified synthetic Run/);
 
     viteProcess = await startVite("dev", hostProcess.origin);
-    assert.equal((await fetch(`${viteProcess.origin}/`)).status, 200);
+    assert.ok(
+      !blockedVitePorts.includes(Number(new URL(viteProcess.origin).port)),
+    );
+    await probeWebRoot(viteProcess.origin);
     const proxied = await runNodeCli(journeyCli, [
       "--origin",
       viteProcess.origin,
@@ -189,11 +204,14 @@ test("documented Host and HTTP CLIs survive restart through Vite dev and preview
       proxyResult,
     ]);
     assert.match(proxied, /Completed synthetic Run/);
-    await stopManagedProcess(viteProcess.process);
+    await terminateManagedProcess(viteProcess.process);
     viteProcess = undefined;
 
     viteProcess = await startVite("preview", hostProcess.origin);
-    assert.equal((await fetch(`${viteProcess.origin}/`)).status, 200);
+    assert.ok(
+      !blockedVitePorts.includes(Number(new URL(viteProcess.origin).port)),
+    );
+    await probeWebRoot(viteProcess.origin);
     const previewVerified = await runNodeCli(journeyCli, [
       "--origin",
       viteProcess.origin,
@@ -202,10 +220,52 @@ test("documented Host and HTTP CLIs survive restart through Vite dev and preview
       "--verify",
     ]);
     assert.match(previewVerified, /Verified synthetic Run/);
+    await terminateManagedProcess(viteProcess.process);
+    viteProcess = undefined;
+
+    await shutdownHostProcess(hostProcess);
+    hostProcess = undefined;
   } finally {
-    await stopManagedProcess(viteProcess?.process);
-    await stopManagedProcess(hostProcess?.process);
+    await forceStopManagedProcess(viteProcess?.process);
+    await forceStopManagedProcess(hostProcess?.process);
+    await Promise.all(portBlockers.map(closeServer));
     await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("bounded Web root probe aborts a hanging response and releases its port", async () => {
+  let acceptRequest;
+  const requestAccepted = new Promise((resolveRequest) => {
+    acceptRequest = resolveRequest;
+  });
+  const server = createHttpServer(() => {
+    acceptRequest();
+  });
+  await listen(server, 0, "127.0.0.1");
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const port = address.port;
+  const probe = probeWebRoot(`http://127.0.0.1:${port}`, 250);
+  try {
+    await withTimeout(
+      requestAccepted,
+      1_000,
+      "Hanging fixture did not accept the root request.",
+    );
+    await assert.rejects(
+      probe,
+      (error) => error?.name === "TimeoutError",
+    );
+  } finally {
+    server.closeAllConnections();
+    await closeServer(server);
+  }
+
+  const rebound = createTcpServer();
+  try {
+    await listen(rebound, port, "127.0.0.1");
+  } finally {
+    await closeServer(rebound);
   }
 });
 
@@ -253,6 +313,7 @@ test("public package tarballs contain the repository Apache license", async () =
 });
 
 async function startHostCli(stateDirectory, host) {
+  const port = await allocateTcpPort(host);
   const managed = startManagedProcess(
     process.execPath,
     [
@@ -262,23 +323,25 @@ async function startHostCli(stateDirectory, host) {
       "--host",
       host,
       "--port",
-      "0",
+      String(port),
+      "--shutdown-stdin",
     ],
-    { cwd: root },
+    { cwd: root, stdin: "pipe" },
   );
   try {
     const match = await managed.waitFor(
       /Torsor synthetic quickstart listening at (http:\/\/\S+)/,
       15_000,
     );
-    return { process: managed, origin: match[1] };
+    return { process: managed, origin: match[1], host, port };
   } catch (error) {
-    await stopManagedProcess(managed);
+    await forceStopManagedProcess(managed);
     throw error;
   }
 }
 
 async function startVite(mode, proxyTarget) {
+  const port = await allocateTcpPort("127.0.0.1");
   const managed = startManagedProcess(
     process.execPath,
     [
@@ -287,7 +350,7 @@ async function startVite(mode, proxyTarget) {
       "--host",
       "127.0.0.1",
       "--port",
-      "0",
+      String(port),
       "--strictPort",
     ],
     {
@@ -301,10 +364,11 @@ async function startVite(mode, proxyTarget) {
   try {
     const match = await managed.waitFor(/Local:\s+(http:\/\/\S+)/, 15_000);
     const origin = match[1].replace(/\/$/, "");
+    assert.equal(Number(new URL(origin).port), port);
     assert.deepEqual(await fetchJson(`${origin}/health`), { status: "ok" });
     return { process: managed, origin };
   } catch (error) {
-    await stopManagedProcess(managed);
+    await forceStopManagedProcess(managed);
     throw error;
   }
 }
@@ -316,7 +380,7 @@ async function runNodeCli(script, arguments_) {
     { cwd: root },
   );
   try {
-    const result = await managed.waitForExit(15_000);
+    const result = await managed.waitForExit(30_000);
     assert.equal(
       result.code,
       0,
@@ -324,7 +388,7 @@ async function runNodeCli(script, arguments_) {
     );
     return managed.output;
   } catch (error) {
-    await stopManagedProcess(managed);
+    await forceStopManagedProcess(managed);
     throw error;
   }
 }
@@ -333,7 +397,7 @@ function startManagedProcess(executable, arguments_, options) {
   const child = spawn(executable, arguments_, {
     cwd: options.cwd,
     env: options.env ?? processEnv(),
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: [options.stdin ?? "ignore", "pipe", "pipe"],
     windowsHide: true,
   });
   let output = "";
@@ -416,23 +480,132 @@ function startManagedProcess(executable, arguments_, options) {
   };
 }
 
-async function stopManagedProcess(process) {
+async function shutdownHostProcess(hostProcess) {
+  const { process, host, port } = hostProcess;
+  assert.ok(process, "A running Host process is required.");
+  assert.equal(process.child.exitCode, null, process.output);
+  assert.equal(process.child.signalCode, null, process.output);
+  assert.ok(process.child.stdin, "Host stdin must be piped.");
+  process.child.stdin.end("shutdown\n");
+  let result;
+  try {
+    result = await process.waitForExit(5_000);
+  } catch (error) {
+    await forceStopManagedProcess(process);
+    throw error;
+  }
+  assert.equal(result.code, 0, process.output);
+  assert.equal(result.signal, null, process.output);
+  assert.match(
+    process.output,
+    /Torsor synthetic quickstart stopped cleanly/,
+  );
+  const releasedPort = createTcpServer();
+  try {
+    await listen(releasedPort, port, host);
+  } finally {
+    await closeServer(releasedPort);
+  }
+}
+
+async function terminateManagedProcess(process) {
+  assert.ok(process, "A managed process is required.");
+  if (process.child.exitCode !== null || process.child.signalCode) {
+    const result = await process.exit;
+    assert.equal(result.code, 0, process.output);
+    return;
+  }
+  assert.equal(process.child.kill("SIGTERM"), true);
+  let result;
+  try {
+    result = await process.waitForExit(5_000);
+  } catch (error) {
+    await forceStopManagedProcess(process);
+    throw error;
+  }
+  assert.ok(
+    result.code === 0 || result.signal === "SIGTERM",
+    `Unexpected managed-process exit ${result.code ?? result.signal}:\n${process.output}`,
+  );
+}
+
+async function forceStopManagedProcess(process) {
   if (!process || process.child.exitCode !== null || process.child.signalCode) {
     return;
   }
-  process.child.kill("SIGTERM");
-  try {
-    await process.waitForExit(5_000);
-  } catch {
-    process.child.kill("SIGKILL");
-    await process.exit;
-  }
+  process.child.kill("SIGKILL");
+  await process.exit;
 }
 
 async function fetchJson(url) {
   const response = await fetch(url, { signal: AbortSignal.timeout(5_000) });
   assert.equal(response.status, 200, `${url} returned ${response.status}`);
   return response.json();
+}
+
+async function probeWebRoot(origin, timeoutMs = 5_000) {
+  const url = `${origin}/`;
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  assert.equal(response.status, 200, `${url} returned ${response.status}`);
+  await response.text();
+}
+
+async function allocateTcpPort(host) {
+  const server = createTcpServer();
+  try {
+    await listen(server, 0, host);
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    return address.port;
+  } finally {
+    await closeServer(server);
+  }
+}
+
+async function occupyTcpPort(port) {
+  const server = createTcpServer((socket) => socket.end());
+  try {
+    await listen(server, port, "127.0.0.1");
+    return server;
+  } catch (error) {
+    if (error?.code === "EADDRINUSE") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+function listen(server, port, host) {
+  return new Promise((resolveListen, rejectListen) => {
+    const onError = (error) => {
+      server.removeListener("listening", onListening);
+      rejectListen(error);
+    };
+    const onListening = () => {
+      server.removeListener("error", onError);
+      resolveListen();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, host);
+  });
+}
+
+function closeServer(server) {
+  if (!server.listening) {
+    return Promise.resolve();
+  }
+  return new Promise((resolveClose, rejectClose) => {
+    server.close((error) => {
+      if (error) {
+        rejectClose(error);
+      } else {
+        resolveClose();
+      }
+    });
+  });
 }
 
 function withTimeout(promise, timeoutMs, message) {

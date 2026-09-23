@@ -72,6 +72,11 @@ npm run quickstart:http
 npm run quickstart:http -- --verify
 ```
 
+需要非交互式监督时，可用 `npm run quickstart:host -- --shutdown-stdin` 启动，并向标准输入
+写入一行 `shutdown`。该选择加入的控制会调用与信号处理相同的 HTTP/Runtime/Kernel
+关闭路径；完成后进程输出 `Torsor synthetic quickstart stopped cleanly` 并以状态码 0
+退出。
+
 ### Web 开发与本地静态预览
 
 保持 Synthetic Host 运行。开发服务器将 `/api` 和 `/health` 代理到本机 Host：

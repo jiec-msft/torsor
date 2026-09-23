@@ -2488,8 +2488,10 @@ Prototype 和 evidence 至少覆盖：
    Session CSRF、Project Bootstrap、`start-thread`、生成的 Run、Run Activity 和终态完成。
    动态 ID 由受检脚本从响应中取得，不在文档中硬编码。
 5. Host 的正常关闭必须关闭 HTTP、Runtime 和 Kernel；使用同一个状态目录重启后，先前完成
-   的 Thread、Run 和 Activity 仍可读取。测试使用独立临时目录和动态端口，不留下进程、
-   端口、数据库或生成文件。
+   的 Thread、Run 和 Activity 仍可读取。Example CLI 提供显式选择加入的
+   `--shutdown-stdin` 控制，只接受 `shutdown` 行并调用与信号处理相同的关闭路径；成功退出
+   前必须完成关闭并返回状态码 0。测试使用该协作式路径证明正常关闭，而不是把强制终止当作
+   正常关闭证据。测试使用独立临时目录和动态端口，不留下进程、端口、数据库或生成文件。
 6. Server Workspace 命令的当前工作目录是 `apps/server`。组件文档必须明确该语义，并对
    Bootstrap、数据库和 Artifact 路径使用能从该 cwd 正确解析的路径；根级 Quick start
    Example 则从仓库根目录解析自己的默认状态。
@@ -2498,5 +2500,6 @@ Prototype 和 evidence 至少覆盖：
 8. 所有可消费公共 Package 都必须在 `npm pack --dry-run` 的文件清单中包含与仓库根目录
    完全相同的 Apache-2.0 `LICENSE`。文档/Quick start 测试应覆盖示例文件、根命令、cwd
    语义、CLI Loopback 拒绝/接受、通过真实 Host CLI 与 Vite dev/preview 进程完成的端到端
-   Journey、重启持久性和 Package License 清单。进程 Readiness 和关闭必须有界且受监督，
-   使用动态端口，并在成功或失败后清理。
+   Journey、重启持久性和 Package License 清单。进程 Readiness、HTTP Probe 和关闭必须
+   有界且受监督；Vite 使用已分配的正整数动态端口而不是会被解释为默认端口的 0，并在成功
+   或失败后清理。

@@ -77,6 +77,12 @@ verify that same durable Run:
 npm run quickstart:http -- --verify
 ```
 
+For non-interactive supervision, start with
+`npm run quickstart:host -- --shutdown-stdin` and write one `shutdown` line to
+standard input. This opt-in control invokes the same HTTP/Runtime/Kernel close
+path as signal handling. After it finishes, the process prints
+`Torsor synthetic quickstart stopped cleanly` and exits with status 0.
+
 ### Web development and local static preview
 
 Keep the synthetic Host running. The development server proxies `/api` and

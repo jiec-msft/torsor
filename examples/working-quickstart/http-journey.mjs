@@ -12,6 +12,7 @@ const defaultResultPath = resolve(
   defaultQuickstartStateDirectory,
   "last-run.json",
 );
+const requestTimeoutMs = 15_000;
 
 export async function runQuickstartJourney(options = {}) {
   const origin = options.origin ?? "http://127.0.0.1:4317";
@@ -20,7 +21,7 @@ export async function runQuickstartJourney(options = {}) {
   const health = await requestJson(`${origin}/health`);
   assert(health.status === "ok", "/health did not report status=ok.");
 
-  const sessionResponse = await fetch(`${origin}/api/v1/session`, {
+  const sessionResponse = await fetchWithDeadline(`${origin}/api/v1/session`, {
     method: "POST",
     headers: { Authorization: `Bearer ${quickstartToken}` },
   });
@@ -154,9 +155,16 @@ async function waitForCompletedThread(origin, threadRootId, headers) {
 }
 
 async function requestJson(url, options) {
-  const response = await fetch(url, options);
+  const response = await fetchWithDeadline(url, options);
   await assertStatus(response, 200, url);
   return response.json();
+}
+
+function fetchWithDeadline(url, options = {}) {
+  return fetch(url, {
+    ...options,
+    signal: options.signal ?? AbortSignal.timeout(requestTimeoutMs),
+  });
 }
 
 async function assertStatus(response, expected, operation) {
