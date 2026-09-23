@@ -53,8 +53,9 @@ acquire the Writer Lease and receipt binding Activation, Run, ProviderAttempt,
 generation, fencing, and original process tree. Cancellation, expiry, and shutdown
 stop physically before persisting evidence. Unknown stop quarantines the directory
 and blocks replacement. Restart does not clear quarantine after losing the original
-handle. Schema 18 rejects older development databases: stop old processes and
-explicitly use a new database and root; no migration or automatic deletion.
+handle. Schema 18 is current; schema 17 is rejected. Stop old processes
+and explicitly use a fresh disposable database and fresh managed root; no migration
+or automatic deletion.
 
 Timeline retains only normalized Tool started/completed/failed facts and provenance,
 not raw tool IDs, arguments, results, command paths, stdout/stderr, or ACP session IDs.

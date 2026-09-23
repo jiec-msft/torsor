@@ -51,20 +51,11 @@ export interface CopilotAcpAdapterOptions {
   readonly limits?: Partial<CopilotAcpLimits>;
 }
 
-interface RpcResponse {
-  readonly jsonrpc: "2.0";
-  readonly id: number;
-  readonly result?: unknown;
-  readonly error?: {
-    readonly code: number;
-    readonly message: string;
-    readonly data?: unknown;
-  };
-}
+type RpcId = string | number;
 
 interface RpcRequest {
   readonly jsonrpc: "2.0";
-  readonly id?: number;
+  readonly id?: RpcId;
   readonly method: string;
   readonly params?: unknown;
 }
@@ -610,8 +601,9 @@ class NdjsonRpcConnection {
   #inputEnd: Promise<void> | null = null;
   #buffer = Buffer.alloc(0);
   #stdoutBytes = 0;
+  readonly #incoming = new Set<RpcId>();
   readonly #pending = new Map<
-    number,
+    RpcId,
     {
       readonly resolve: (value: unknown) => void;
       readonly reject: (error: Error) => void;
@@ -814,47 +806,70 @@ class NdjsonRpcConnection {
       throw new ProviderProtocolError("ACP process emitted invalid NDJSON.");
     }
     const record = getRecord(message, "ACP message");
-    if (typeof record.id === "number" && ("result" in record || "error" in record)) {
-      const response = record as unknown as RpcResponse;
-      const pending = this.#pending.get(response.id);
-      if (!pending) {
-        return;
+    if (record.jsonrpc !== "2.0") throw new ProviderProtocolError("Invalid ACP JSON-RPC version.");
+    const id = Object.hasOwn(record, "id") ? requireRpcId(record.id) : undefined;
+    const hasResult = Object.hasOwn(record, "result");
+    const hasError = Object.hasOwn(record, "error");
+    if (!Object.hasOwn(record, "method")) {
+      if (id === undefined || hasResult === hasError) {
+        throw new ProviderProtocolError("ACP response must have an ID and exactly one result or error.");
       }
-      this.#pending.delete(response.id);
-      if (response.error) {
+      const pending = this.#pending.get(id);
+      if (!pending) {
+        throw new ProviderProtocolError("ACP response ID is unknown or already completed.");
+      }
+      if (hasError) {
+        const error = getRecord(record.error, "ACP error");
+        if (!Number.isSafeInteger(error.code) || typeof error.message !== "string") {
+          throw new ProviderProtocolError("Invalid ACP error response.");
+        }
+      }
+      this.#pending.delete(id);
+      if (hasError) {
         pending.reject(
           new ProviderProtocolError("ACP request returned an error."),
         );
       } else {
-        pending.resolve(response.result);
+        pending.resolve(record.result);
       }
       return;
     }
-    const request = record as unknown as RpcRequest;
-    if (typeof request.method !== "string") {
-      throw new ProviderProtocolError("ACP request is missing method.");
+    if (typeof record.method !== "string" || hasResult || hasError) {
+      throw new ProviderProtocolError("Invalid ACP request or notification envelope.");
     }
-    if (typeof request.id !== "number") {
+    const request: RpcRequest = {
+      jsonrpc: "2.0", method: record.method,
+      ...(id !== undefined ? { id } : {}),
+      ...(Object.hasOwn(record, "params") ? { params: record.params } : {}),
+    };
+    if (request.method === "session/request_permission" && id === undefined ||
+        request.method === "session/update" && id !== undefined) {
+      throw new ProviderProtocolError("ACP session message has the wrong request/notification kind.");
+    }
+    if (id === undefined) {
       this.onNotification(request);
       return;
     }
+    if (this.#incoming.has(id)) throw new ProviderProtocolError("ACP request ID is already active.");
+    this.#incoming.add(id);
     void this.onRequest(request)
       .then(
         (result) => {
           if (this.#canRespond()) {
-            this.#send({ jsonrpc: "2.0", id: request.id, result });
+            this.#send({ jsonrpc: "2.0", id, result });
           }
         },
         (error: unknown) => {
           if (this.#canRespond()) {
             this.#send({
               jsonrpc: "2.0",
-              id: request.id,
+              id,
               error: { code: -32601, message: errorMessage(error) },
             });
           }
         },
       )
+      .finally(() => this.#incoming.delete(id))
       .catch((error: unknown) => {
         if (!this.#shuttingDown && !this.#closed && !this.#failed) {
           this.fail(
@@ -898,6 +913,11 @@ class NdjsonRpcConnection {
       throw failure;
     }
   }
+}
+
+function requireRpcId(value: unknown): RpcId {
+  if (typeof value === "string" || typeof value === "number" && Number.isSafeInteger(value)) return value;
+  throw new ProviderProtocolError("ACP request ID must be a string or safe integer.");
 }
 
 function buildPrompt(context: ProviderExecutionContext): string {

@@ -43,8 +43,8 @@ Trusted-local 禁止 `TORSOR_PROVIDER_CWD`。Runtime 从 Run 分配推导目录�
 运行 `npm run start --workspace @torsor/server`。首次写入前获取 Writer Lease 和 receipt，
 绑定 Activation、Run、ProviderAttempt、generation、fencing 和原进程树。
 取消、过期或关闭先停止进程，再持久化证据；未知停止隔离目录，禁止 replacement Writer。
-丢失原 handle 后重启不会清除隔离。schema 18 与旧开发数据库不兼容：停止旧进程，
-显式使用新数据库和新 root；不迁移、不自动删除。
+丢失原 handle 后重启不会清除隔离。当前使用 schema 18；schema 17 被拒绝。
+停止旧进程，显式使用新的可丢弃数据库和新的 managed root；不迁移、不自动删除。
 
 Timeline 只保留归一化 Tool started/completed/failed 与来源，不保留原始 Tool IDs、
 参数、结果、命令路径、stdout/stderr 或 ACP Session IDs。最终 Reply/报告是明确的公开

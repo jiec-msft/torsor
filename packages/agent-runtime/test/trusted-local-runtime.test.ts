@@ -52,13 +52,17 @@ async function setup(scenario = "success", permissionMode: "provider-default" | 
 }
 
 describe("trusted-local Runtime integration", () => {
-  it.each(["success", "permission", "tool-failed", "config-mode", "legacy-mode"])("runs fixed native shell/MCP tools with safe public facts: %s", async (scenario) => {
+  it.each(["success", "permission", "permission-string", "permission-ids", "tool-failed", "config-mode", "legacy-mode"])("runs fixed native shell/MCP tools with safe public facts: %s", async (scenario) => {
     const f = await setup(scenario);
     try {
       await f.runtime.drainUntilIdle();
       const trees = await f.kernel.query({ type: "ListPhysicalWorktrees" }, runtimeContext);
       expect(trees.items).toHaveLength(1);
       const tree = trees.items[0]!;
+      if (scenario.startsWith("permission")) {
+        expect(readFileSync(join(tree.directoryPath, "permission-response.txt"), "utf8"))
+          .toBe("Synthetic permission responses matched exactly.\n");
+      }
       expect(readFileSync(join(tree.directoryPath, "native-result.txt"), "utf8")).toBe("Synthetic native edit.\n");
       expect(tree.latestExecution).toMatchObject({
         state: "StopConfirmed", provider: { policy: "trusted-local", permissionMode: "allow-all" },
@@ -78,17 +82,33 @@ describe("trusted-local Runtime integration", () => {
     } finally { await f.executor.close(); f.kernel.close(); f.repo.dispose(); }
   }, 150_000);
 
-  it("does not grant unattended permissions under provider-default", async () => {
-    const f = await setup("permission", "provider-default");
+  it.each(["permission", "permission-string", "permission-ids"])("responds without granting unattended permissions under provider-default: %s", async (scenario) => {
+    const f = await setup(scenario, "provider-default");
     try {
       await expect(f.runtime.drainUntilIdle()).rejects.toMatchObject({ diagnosticCode: "provider_cancelled" });
       const tree = (await f.kernel.query({ type: "ListPhysicalWorktrees" }, runtimeContext)).items[0]!;
+      expect(readFileSync(join(tree.directoryPath, "permission-response.txt"), "utf8"))
+        .toBe("Synthetic permission responses matched exactly.\n");
       const run = await f.kernel.query({ type: "GetRunProjection", runId: tree.runId }, runtimeContext);
       expect(run.run.state).not.toBe("Completed");
       expect(run.activity.items.filter((item) => item.kind.startsWith("tool_"))).toEqual([]);
       expect(run.providerAttempts.at(-1)?.detail).toContain("provider_cancelled");
     } finally { await f.executor.close(); f.kernel.close(); f.repo.dispose(); }
   }, 150_000);
+
+  it.each(["null", "true", "{}", "[]", "0.5", "9007199254740992", "1e100", "notification"])(
+    "rejects invalid ACP request identity instead of silently dropping it: %s", async (id) => {
+      const f = await setup(id === "notification" ? "permission-notification" : `permission-invalid-${id}`);
+      try {
+        await expect(f.runtime.drainUntilIdle()).rejects.toMatchObject({ diagnosticCode: "provider_protocol_error" });
+        const tree = (await f.kernel.query({ type: "ListPhysicalWorktrees" }, runtimeContext)).items[0]!;
+        const run = await f.kernel.query({ type: "GetRunProjection", runId: tree.runId }, runtimeContext);
+        expect(run.providerAttempts.at(-1)?.status).toBe("Failed");
+        expect(run.activity.items.filter((item) => item.kind.startsWith("tool_"))).toEqual([]);
+        expect(JSON.stringify(await f.kernel.readEvents(null, 500))).not.toContain("synthetic-private");
+      } finally { await f.executor.close(); f.kernel.close(); f.repo.dispose(); }
+    }, 150_000,
+  );
 
   it.each(["cancel", "expiry", "shutdown"] as const)(
     "physically stops on %s and rejects the provider's late final actions", async (reason) => {

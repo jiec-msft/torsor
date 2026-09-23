@@ -172,6 +172,13 @@ delivery after settlement, without reporting Provider success or closing the
 observation Host for that expected cancellation. HTTP/Web still claim only logical
 cancellation, never physical safety from its receipt. Other Provider failures and
 Host-initiated shutdown retain the existing error-propagation semantics.
+This also covers native admission before `startProvider()` returns a handle:
+recognize expected interruption from explicit `trusted-local` policy and the
+authoritative Run/Activation's Human cancellation, not handle availability.
+Await pending launch and physical stop/settlement before acknowledging delivery;
+cancellation races must not mask late launch failures. Unrelated fencing/authority
+loss, spawn, Provider, persistence, and stop errors still propagate; quarantine
+does not establish confirmed physical stop.
 
 Schema 18 extends schema 17's diagnostic privacy contract with explicit native
 execution ProviderAttempt/policy binding. `StartWorktreeExecution.provider`
@@ -179,8 +186,9 @@ accepts only `providerAttemptId`, `policy: "trusted-local"`, and
 `permissionMode: "provider-default" | "allow-all"`. The ProviderAttempt must belong
 to the same Activation and remain executing. Persist this binding as a receipt
 fact, never arbitrary configuration. Omission still means the fixed probe.
-Stop old processes and recreate old development databases explicitly; do not
-migrate, automatically delete data, or restore diagnostic-session identifiers.
+Schema 17 is rejected. Stop old processes and explicitly use a fresh disposable
+database and fresh managed root; no migration, automatic data deletion, or
+restoration of diagnostic-session identifiers.
 
 Tool observation persists only `tool_started`, `tool_completed`, and `tool_failed`
 activities with payload fields `toolCallId` generated within this ProviderAttempt,
@@ -223,6 +231,14 @@ only an advertised ACP `allow_always` or `allow_once` permission option;
 Closing stdin is normal ACP close; cancellation sends `session/cancel` before
 stopping the original tree. See [Copilot ACP](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server)
 and [ACP config options](https://agentclientprotocol.com/protocol/session-config-options).
+
+ACP request IDs accept strings or safe-integer numbers only; responses preserve
+the original type and value, never conflating or coercing `500` and `"500"`.
+Messages without IDs are notifications; unknown notifications elicit no response.
+`session/request_permission` must be a request and `session/update` a notification.
+Invalid ID types or envelopes explicitly fail and stop execution instead of being
+silently dropped, without relaxing frame/stdout, timeout, cancellation, or privacy
+limits. Both trusted-local permission modes use the same rules.
 
 Ordinary CI runs the fixed native ACP smoke and opt-in gate tests without reading
 real provider configuration. Real smoke requires `--allow-real-provider`; missing

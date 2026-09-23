@@ -140,14 +140,19 @@ Human 已提交 `CancelRun` 后，native attempt 保留 `Unknown` / `Failed` 结
 Runtime 在 settlement 后确认已处理的 delivery，不把逻辑取消报告为 Provider 成功，
 也不因这一预期取消关闭观察 Host。HTTP/Web 仍只声明逻辑取消，不凭 receipt 宣称物理安全。
 其他 Provider 失败以及 Host 主动关闭的错误传播保持原有语义。
+此规则也覆盖 native admission 已开始但 `startProvider()` 尚未返回 handle 的窗口：
+根据显式 `trusted-local` 策略及权威 Run/Activation 的 Human 取消事实识别预期中断，
+而不是依据 handle 是否已返回。确认 delivery 前必须等待 pending launch 及物理停止/
+settlement；晚到的 launch 失败不能被取消竞态遮蔽。无关的 fencing/authority loss、
+spawn、Provider、持久化或停止错误仍传播；不得把 quarantine 当作已确认物理停止。
 
 Schema 18 在 schema 17 的诊断隐私契约上增加 native execution 的显式
 ProviderAttempt/策略绑定：`StartWorktreeExecution.provider` 只接受
 `providerAttemptId`、`policy: "trusted-local"` 和
 `permissionMode: "provider-default" | "allow-all"`。ProviderAttempt 必须属于同一
 Activation 且仍在执行；绑定作为 receipt 的持久事实，不含任意配置。
-未提供该字段继续表示固定 probe。旧开发数据库必须在停止旧进程后重新创建，
-不迁移、不自动删除；不得恢复 diagnostic session 标识。
+未提供该字段继续表示固定 probe。schema 17 被拒绝；停止旧进程后显式使用
+新的可丢弃数据库和新的 managed root，不迁移、不自动删除；不得恢复 diagnostic session 标识。
 
 Tool 观察只保存 `tool_started`、`tool_completed`、`tool_failed` 活动，payload
 只含本次 ProviderAttempt 内生成的 `toolCallId`、ACP 枚举 `kind` 和归一化 `status`。
@@ -182,6 +187,12 @@ permission 请求。优先使用声明的 `configOptions`，否则使用 legacy 
 关闭 stdin 是正常 ACP close；取消先发送 `session/cancel` 再停止原进程树。
 参见 [Copilot ACP](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server)
 及 [ACP config options](https://agentclientprotocol.com/protocol/session-config-options)。
+
+ACP request ID 只接受字符串或 safe-integer 数字，响应必须保持原始类型和值；
+`500` 与 `"500"` 不得合并或转换。无 ID 的消息是 notification，未知 notification
+不触发响应；`session/request_permission` 必须是 request，`session/update` 必须是
+notification。无效 ID 类型或 envelope 明确失败并停止执行，不能静默丢弃，也不能放宽
+frame/stdout、超时、取消或隐私边界。两个 trusted-local permission mode 使用同一规则。
 
 普通 CI 运行固定 native ACP smoke 与 opt-in gate 测试，不读取真实 Provider 配置。
 真实 smoke 必须显式传入 `--allow-real-provider`；缺少 opt-in 时，在读取环境、创建目录

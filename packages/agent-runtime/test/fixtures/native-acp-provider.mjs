@@ -7,7 +7,9 @@ const scenario = process.argv[2] ?? "success";
 const sessionId = "synthetic-private-session";
 const privateValue = "synthetic-private-tool-data";
 let promptId;
-let permissionPending = false;
+const permissionPending = new Set();
+let permissionWatchdog;
+let permissionDenied = false;
 let modeSelected = false;
 const send = (message) => process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
 const result = (id, value) => send({ id, result: value });
@@ -78,21 +80,35 @@ lines.on("line", (line) => {
       return;
     }
     if (["config-mode", "legacy-mode"].includes(scenario) && !modeSelected) process.exit(9);
-    if (scenario === "permission") {
-      permissionPending = true;
-      send({ id: 500, method: "session/request_permission", params: {
+    if (scenario.startsWith("permission")) {
+      const ids = scenario === "permission-string" ? ["synthetic-permission"]
+        : scenario === "permission-ids" ? [500, "500", "", 0, "0", 2, "2", -1, Number.MAX_SAFE_INTEGER]
+        : scenario.startsWith("permission-invalid-") ? [JSON.parse(scenario.slice("permission-invalid-".length))]
+        : [500];
+      send({ method: "synthetic/unknown_notification", params: { text: privateValue } });
+      permissionWatchdog = setTimeout(() => process.exit(12), 600);
+      for (const id of ids) {
+        permissionPending.add(id);
+        send({ ...(scenario === "permission-notification" ? {} : { id }), method: "session/request_permission", params: {
         sessionId, toolCall: { toolCallId: privateValue, title: privateValue },
         options: [
           { optionId: "once-choice", kind: "allow_once", name: privateValue },
           { optionId: "always-choice", kind: "allow_always", name: privateValue },
         ],
-      } });
+        } });
+      }
     } else work();
-  } else if (request.id === 500 && permissionPending) {
-    permissionPending = false;
-    if (request.result?.outcome?.outcome === "selected" &&
-        request.result.outcome.optionId === "always-choice") work();
-    else result(promptId, { stopReason: "cancelled" });
+  } else if (!Object.hasOwn(request, "method")) {
+    if (!permissionPending.delete(request.id)) process.exit(13);
+    const outcome = request.result?.outcome;
+    if (outcome?.outcome === "cancelled") permissionDenied = true;
+    else if (outcome?.outcome !== "selected" || outcome.optionId !== "always-choice") process.exit(14);
+    if (permissionPending.size === 0) {
+      clearTimeout(permissionWatchdog);
+      writeFileSync("permission-response.txt", "Synthetic permission responses matched exactly.\n");
+      if (permissionDenied) result(promptId, { stopReason: "cancelled" });
+      else work();
+    }
   } else if (request.method === "session/cancel" && promptId !== undefined) {
     final();
   }
