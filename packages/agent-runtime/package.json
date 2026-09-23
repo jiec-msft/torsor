@@ -16,9 +16,10 @@
     "dist"
   ],
   "scripts": {
-    "prepack": "npm --prefix ../kernel run build && npm --prefix ../operational-logging run build && npm run build",
+    "prepack": "npm run build",
     "test": "npm run build && vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "prebuild": "npm --prefix ../kernel run build && npm --prefix ../operational-logging run build",
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
