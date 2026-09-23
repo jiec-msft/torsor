@@ -338,6 +338,251 @@ describe("trusted-local HTTP Host", () => {
     }
   }, 150_000);
 
+  it("propagates an independently observed provider exit when Human cancellation follows it", async () => {
+    const repo = syntheticRepository();
+    const providerExited = deferred<string>();
+    const releaseClose = deferred<void>();
+    let kernel: TorsorKernel | undefined;
+    const host = createLocalRuntimeHost({
+      databasePath: repo.databasePath, bootstrap, port: 0,
+      credentials: [{ token: "synthetic-human-token", principalContext: { principalId: "human" } }],
+      runtimePrincipalId: "runtime", projectIds: ["project"], runtimePollIntervalMs: 1,
+      providerTimeoutMs: 120_000, activationDurationMs: 125_000,
+      attentionLeaseMs: 125_000, outboxLeaseMs: 125_000, cancellationPollMs: 5,
+      adapter: new CopilotAcpAdapter({
+        policy: { kind: "trusted-local", permissionMode: "allow-all" },
+        command: process.execPath, commandArgs: [fixture, "independent-exit"],
+        unsafeAllowCustomCommandArgs: true, userEnvironment: {},
+      }),
+      worktreeExecutorFactory: (ownedKernel) => {
+        kernel = ownedKernel;
+        const executor = new LocalWorktreeExecutor({
+          kernel: ownedKernel, runtimePrincipalId: "runtime", ...repo, leaseDurationMs: 125_000,
+        });
+        const start = executor.startProvider.bind(executor);
+        vi.spyOn(executor, "startProvider").mockImplementation((input) => start({
+          ...input,
+          start: (cwd) => {
+            const child = input.start(cwd);
+            const observed = "providerExit" in child && child.providerExit instanceof Promise
+              ? child.providerExit : child.closed;
+            void observed.then(() => providerExited.resolve(input.runId));
+            return {
+              pid: child.pid,
+              result: child.result,
+              ...("providerExit" in child ? { providerExit: child.providerExit } : {}),
+              closed: child.closed.then(async (evidence) => {
+                await releaseClose.promise;
+                return evidence;
+              }),
+              requestStop: () => child.requestStop(),
+              forceStop: () => child.forceStop(),
+            };
+          },
+        }));
+        return executor;
+      },
+    });
+    void host.finished.catch((error: unknown) => providerExited.reject(error));
+    try {
+      const origin = await host.start();
+      expect((await fetch(`${origin}/api/v1/commands/start-thread`, {
+        method: "POST", headers,
+        body: JSON.stringify({
+          idempotencyKey: "exit-before-cancel", projectId: "project", channelId: "channel",
+          body: "Synthetic independent provider exit.", targetAgentIds: ["orbit"],
+        }),
+      })).status).toBe(200);
+      const runId = await providerExited.promise;
+      const projection = await kernel!.query({ type: "GetRunProjection", runId }, { principalId: "human" });
+      expect((await fetch(`${origin}/api/v1/commands/cancel-run`, {
+        method: "POST", headers,
+        body: JSON.stringify({
+          idempotencyKey: "cancel-after-provider-exit", runId,
+          expectedRunRevision: projection.run.revision, reason: "Synthetic Human cancellation.",
+        }),
+      })).status).toBe(200);
+      releaseClose.resolve();
+      const finished = Promise.race([
+        host.finished,
+        new Promise<void>((_resolve, reject) => {
+          setTimeout(() => reject(new Error("Host did not reject independent provider exit.")), 3_000);
+        }),
+      ]);
+      await expect(finished).rejects.toMatchObject({
+        diagnosticCode: "provider_process_exited",
+        outcome: "Unknown",
+      });
+    } finally {
+      releaseClose.resolve();
+      await Promise.allSettled([host.close()]);
+      vi.restoreAllMocks();
+      const reopened = TorsorKernel.open({ databasePath: repo.databasePath });
+      try {
+        const trees = await reopened.query({ type: "ListPhysicalWorktrees" }, { principalId: "runtime" });
+        expect(trees.items).toHaveLength(1);
+        expect(trees.items[0]?.latestExecution).toMatchObject({ state: "StopConfirmed" });
+        const run = await reopened.query(
+          { type: "GetRunProjection", runId: trees.items[0]!.runId },
+          { principalId: "human" },
+        );
+        expect(run.run.state).toBe("Cancelled");
+        expect(run.providerAttempts.at(-1)?.status).toBe("Unknown");
+        const outbox = await reopened.query(
+          { type: "ListOutboxEvents", includeAcknowledged: true, limit: 500 },
+          { principalId: "runtime" },
+        );
+        expect(outbox.items.filter((event) =>
+          event.aggregateId === run.run.id &&
+          (event.topic === "run.activation-requested" || event.topic === "run-input.available")
+        ).every((event) => event.acknowledgedAt === null)).toBe(true);
+      } finally {
+        reopened.close();
+        repo.dispose();
+      }
+    }
+  }, 150_000);
+
+  it("rejects cancellation suppression when an independent quarantine advances the fence", async () => {
+    const repo = syntheticRepository();
+    const running = deferred<string>();
+    const settling = deferred<void>();
+    const releaseSettlement = deferred<void>();
+    let kernel: TorsorKernel | undefined;
+    let launchingRunId: string | undefined;
+    let leaseAuthority: {
+      readonly worktreeId: string;
+      readonly generation: number;
+      readonly fencingToken: number;
+      readonly leaseToken: string;
+    } | undefined;
+    const host = createLocalRuntimeHost({
+      databasePath: repo.databasePath, bootstrap, port: 0,
+      credentials: [{ token: "synthetic-human-token", principalContext: { principalId: "human" } }],
+      runtimePrincipalId: "runtime", projectIds: ["project"], runtimePollIntervalMs: 1,
+      providerTimeoutMs: 120_000, activationDurationMs: 125_000,
+      attentionLeaseMs: 125_000, outboxLeaseMs: 125_000, cancellationPollMs: 5,
+      adapter: new CopilotAcpAdapter({
+        policy: { kind: "trusted-local", permissionMode: "allow-all" },
+        command: process.execPath, commandArgs: [fixture, "hang"],
+        unsafeAllowCustomCommandArgs: true, userEnvironment: {},
+      }),
+      worktreeExecutorFactory: (ownedKernel) => {
+        kernel = ownedKernel;
+        const execute = ownedKernel.execute.bind(ownedKernel);
+        vi.spyOn(ownedKernel, "execute").mockImplementation(async (command, context) => {
+          if (command.type === "RecordWorktreeExecution" && command.state === "StopConfirmed") {
+            settling.resolve();
+            await releaseSettlement.promise;
+          }
+          const result = await execute(command, context);
+          if (command.type === "AcquireWorktreeWriterLease") {
+            leaseAuthority = {
+              worktreeId: command.worktreeId,
+              generation: result.leaseGeneration!,
+              fencingToken: result.fencingToken!,
+              leaseToken: result.leaseToken!,
+            };
+          }
+          if (command.type === "RecordWorktreeExecution" && command.state === "Running") {
+            running.resolve(launchingRunId!);
+          }
+          return result;
+        });
+        const executor = new LocalWorktreeExecutor({
+          kernel: ownedKernel, runtimePrincipalId: "runtime", ...repo, leaseDurationMs: 125_000,
+        });
+        const start = executor.startProvider.bind(executor);
+        vi.spyOn(executor, "startProvider").mockImplementation((input) => {
+          launchingRunId = input.runId;
+          return start(input);
+        });
+        return executor;
+      },
+    });
+    void host.finished.catch((error: unknown) => {
+      running.reject(error);
+      settling.reject(error);
+    });
+    try {
+      const origin = await host.start();
+      expect((await fetch(`${origin}/api/v1/commands/start-thread`, {
+        method: "POST", headers,
+        body: JSON.stringify({
+          idempotencyKey: "cancel-before-quarantine", projectId: "project", channelId: "channel",
+          body: "Synthetic inverse fencing race.", targetAgentIds: ["orbit"],
+        }),
+      })).status).toBe(200);
+      const runId = await running.promise;
+      expect(leaseAuthority).toMatchObject({ generation: 1, fencingToken: 1 });
+      const projection = await kernel!.query({ type: "GetRunProjection", runId }, { principalId: "human" });
+      expect((await fetch(`${origin}/api/v1/commands/cancel-run`, {
+        method: "POST", headers,
+        body: JSON.stringify({
+          idempotencyKey: "cancel-before-independent-quarantine", runId,
+          expectedRunRevision: projection.run.revision, reason: "Synthetic Human cancellation.",
+        }),
+      })).status).toBe(200);
+      await settling.promise;
+      const quarantined = await kernel!.execute({
+        type: "QuarantineWorktreeWriterLease",
+        idempotencyKey: "quarantine-after-cancellation-stop",
+        ...leaseAuthority!,
+        expectedGeneration: leaseAuthority!.generation,
+        expectedFencingToken: leaseAuthority!.fencingToken,
+        reason: "Synthetic independent fencing incident after cancellation.",
+        evidence: { source: "synthetic-inverse-review-regression" },
+      }, { principalId: "runtime" });
+      expect(quarantined.worktreeWriterLease).toMatchObject({
+        status: "Quarantined", generation: 1, fencingToken: 2,
+      });
+      releaseSettlement.resolve();
+      await expect(Promise.race([
+        host.finished,
+        new Promise<void>((_resolve, reject) => {
+          setTimeout(() => reject(new Error("Host did not reject the advanced fencing token.")), 3_000);
+        }),
+      ])).rejects.toMatchObject({
+        diagnosticCode: "provider_worktree_authority_lost",
+        outcome: "Unknown",
+      });
+    } finally {
+      releaseSettlement.resolve();
+      await Promise.allSettled([host.close()]);
+      vi.restoreAllMocks();
+      const reopened = TorsorKernel.open({ databasePath: repo.databasePath });
+      try {
+        const trees = await reopened.query({ type: "ListPhysicalWorktrees" }, { principalId: "runtime" });
+        expect(trees.items).toHaveLength(1);
+        expect(trees.items[0]).toMatchObject({
+          state: "Ready",
+          latestExecution: { state: "StopConfirmed", generation: 1, fencingToken: 1 },
+        });
+        expect(await reopened.query(
+          { type: "GetWorktreeWriterLease", worktreeId: trees.items[0]!.worktreeId },
+          { principalId: "runtime" },
+        )).toMatchObject({ status: "Quarantined", generation: 1, fencingToken: 2 });
+        const run = await reopened.query(
+          { type: "GetRunProjection", runId: trees.items[0]!.runId },
+          { principalId: "human" },
+        );
+        expect(run.run.state).toBe("Cancelled");
+        expect(run.providerAttempts.at(-1)?.status).toBe("Unknown");
+        const outbox = await reopened.query(
+          { type: "ListOutboxEvents", includeAcknowledged: true, limit: 500 },
+          { principalId: "runtime" },
+        );
+        expect(outbox.items.filter((event) =>
+          event.aggregateId === run.run.id &&
+          (event.topic === "run.activation-requested" || event.topic === "run-input.available")
+        ).every((event) => event.acknowledgedAt === null)).toBe(true);
+      } finally {
+        reopened.close();
+        repo.dispose();
+      }
+    }
+  }, 150_000);
+
   it.each(["success", "hang", "cancel"])("publishes safe Timeline facts and closes its owned process: %s", async (scenario) => {
     const repo = syntheticRepository();
     const observed = deferred<string>();

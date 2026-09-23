@@ -80,6 +80,7 @@ lines.on("line", (line) => {
       return;
     }
     if (["config-mode", "legacy-mode"].includes(scenario) && !modeSelected) process.exit(9);
+    if (scenario === "independent-exit") process.exit(23);
     if (scenario.startsWith("permission")) {
       const ids = scenario === "permission-string" ? ["synthetic-permission"]
         : scenario === "permission-ids" ? [500, "500", "", 0, "0", 2, "2", -1, Number.MAX_SAFE_INTEGER]

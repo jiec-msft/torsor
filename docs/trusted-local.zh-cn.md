@@ -9,7 +9,9 @@
 `koffi` 原生绑定，不再需要 Windows PowerShell/.NET 或运行时编译器；Linux 需要
 可读 `/proc`。原生绑定缺失或无法加载时明确拒绝启动，不降级到 PID 查找/终止。
 其他平台目前拒绝 native launch。
-Windows 的 `TORSOR_COPILOT_COMMAND` 应指向原生可执行文件，而不是 `.cmd`/`.ps1` shim。
+Windows 的 `TORSOR_COPILOT_COMMAND` 应指向原生可执行文件，而不是 `.cmd`/`.ps1` shim；
+bare command 只按 Provider environment 的 `PATH`/`PATHEXT` 解析为绝对路径，不使用
+Host/owner `PATH` 或当前目录。
 依赖安装和构建不启动真实模型。使用可信的仓库、用户配置、自定义指令和 MCP server。
 Linux 工具后代必须留在原进程组中；主动 daemonize/脱离进程组的工具不受支持。
 
@@ -48,6 +50,9 @@ Windows 只启动 Package 内固定的深层 Node owner module；不从环境、
 或可变缓存选择 owner。该 module 通过 `CreateProcessW(CREATE_SUSPENDED)` 创建
 Provider，先加入 `KILL_ON_JOB_CLOSE` Job Object，再恢复原线程。
 取消、过期或关闭先停止进程，再持久化证据；未知停止隔离目录，禁止 replacement Writer。
+从干净 checkout 执行 `npm pack --workspace @torsor/kernel` 或
+`npm pack --workspace @torsor/agent-runtime` 会先构建必要的 `dist`；安装两个 tarball 后
+可直接 import Agent Runtime root，且 Windows owner 随 Runtime Package 一起提供。
 丢失原 handle 后重启不会清除隔离。当前使用 schema 18；schema 17 被拒绝。
 停止旧进程，显式使用新的可丢弃数据库和新的 managed root；不迁移、不自动删除。
 

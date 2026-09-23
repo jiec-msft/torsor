@@ -30,6 +30,7 @@ function liveGroupMembers() {
     });
 }
 child.on("exit", (code, signal) => {
+  process.stderr.write(launch.exitMarker + (signal ? 137 : code) + "\n");
   // The living group leader pins the original process-group identity during stop.
   process.kill(-process.pid, "SIGTERM");
   const deadline = Date.now() + 750;

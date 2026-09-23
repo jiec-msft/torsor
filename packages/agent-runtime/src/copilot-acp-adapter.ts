@@ -387,7 +387,7 @@ export class CopilotAcpAdapter implements ProviderAdapter {
       if (owned) {
         await owned.started;
         void owned.providerExit.then(
-          () => connection.processExited(),
+          () => connection.processExited(worktree?.providerExitInterruption()),
           () => connection.fail(new ProviderExecutionError("provider_io_error", "Unknown")),
         );
       }
@@ -696,9 +696,9 @@ class NdjsonRpcConnection {
     this.#shuttingDown = true;
   }
 
-  processExited(): void {
+  processExited(error?: Error): void {
     if (!this.#allowProcessExit && !this.#closed && !this.#sealed && !this.#failed) {
-      this.fail(new ProviderExecutionError("provider_process_exited", "Unknown"));
+      this.fail(error ?? new ProviderExecutionError("provider_process_exited", "Unknown"));
     }
   }
 
@@ -1403,9 +1403,11 @@ function normalizeExecutionError(
   error: unknown,
   signal: AbortSignal,
 ): Error {
+  if (isNativeRunCancellationInterruption(error)) {
+    return error;
+  }
   if (
-    isNativeRunCancellationInterruption(signal.reason) &&
-    !isNativeRunCancellationInterruption(error)
+    isNativeRunCancellationInterruption(signal.reason)
   ) {
     return normalizeProviderExecutionError(error, "Unknown");
   }

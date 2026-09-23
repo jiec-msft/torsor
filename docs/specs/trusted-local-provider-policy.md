@@ -155,6 +155,18 @@ PowerShell, compile C# at runtime, or select/generate an owner from environment,
 `PATH`, the current directory, or a mutable cache. Missing or unloadable bindings
 fail before Provider launch. Concurrent launches reuse the same versioned package
 module and create no racing temporary owner artifact.
+On Windows, a bare Provider command resolves only through case-insensitive
+`PATH`/`PATHEXT` keys in the transient Provider environment. Empty entries,
+relative directories, the owner/Host `PATH`, the current directory, and shell
+expansion are excluded. The resolved absolute application path is passed to
+`CreateProcessW` separately from the correctly quoted argv command line; missing
+targets, duplicate case variants of environment keys, and non-files fail before
+spawn. Linux retains its platform-native command resolution.
+Running `npm pack` from clean tracked source deterministically builds Kernel and
+Agent Runtime `dist` through package lifecycle scripts. The Agent Runtime tarball
+contains its root entrypoint and fixed Windows owner module, publishing only the
+declared `dist`, license, and metadata—not `src`, tests, temporary material, or a
+Torsor-owned opaque binary. `koffi` remains an ordinary MIT dependency.
 Supported Linux tools must keep descendants in the original process group;
 deliberately escaping daemons or hostile programs are outside this execution
 contract, and group stop is not isolation proof for them.
@@ -187,9 +199,15 @@ cancellation races must not mask late launch failures. Unrelated fencing/authori
 loss, spawn, Provider, persistence, and stop errors still propagate; quarantine
 does not establish confirmed physical stop.
 Expected cancellation requires a typed internal cause bound to this execution.
-That cause must come from the authoritative `run_cancelled` fact or from the
-original-handle physical stop caused by that cancellation while the same
-generation/fencing Lease remains valid. A `provider_cancelled`,
+That cause must come from the authoritative `run_cancelled` fact. Once native
+admission creates a receipt, it must also bind the original execution ID, Lease
+generation, and fencing token, and record that its owned original-handle physical
+stop began before Provider-exit observation for that same execution. Cancellation
+after an independently observed Provider exit cannot rewrite the original error.
+After stop/settlement and before acknowledging delivery, Runtime revalidates the
+same execution and generation/fence and verifies that no independent Writer Lease
+quarantine or fence advance occurred; stronger execution/Worktree quarantine caused
+by this cancellation stop remains valid containment. A `provider_cancelled`,
 `provider_process_exited`, or `provider_worktree_authority_lost` diagnostic code,
 or a Run that only later becomes `Cancelled`, is not sufficient to suppress an error.
 

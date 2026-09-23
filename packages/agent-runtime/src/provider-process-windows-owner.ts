@@ -181,8 +181,10 @@ function activeProcessCount(value: unknown): number {
 }
 
 function run(): number {
+  const applicationName = terminatedUtf16(readField());
   const commandLine = terminatedUtf16(readField());
   const marker = readField().toString("utf16le");
+  const exitMarker = readField().toString("utf16le");
   const environment = terminatedUtf16(readField());
   const directory = terminatedUtf16(readField());
   const job = createJob(null, null);
@@ -233,7 +235,7 @@ function run(): number {
     };
     const created: Record<string, unknown> = {};
     if (!createProcess(
-      null,
+      applicationName,
       commandLine,
       null,
       null,
@@ -251,6 +253,7 @@ function run(): number {
     if (waitForSingleObject(process.Process, INFINITE) !== WAIT_OBJECT_0) return 125;
     const exitCode: number[] = [0];
     if (!getExitCode(process.Process, exitCode)) return 125;
+    writeSync(2, `${exitMarker}${Number(exitCode[0])}\n`);
     if (!terminateJob(job, 137)) return 125;
     for (let attempt = 0; attempt < 200; attempt += 1) {
       const accounting: Record<string, unknown> = {};
@@ -278,6 +281,7 @@ function run(): number {
       closeHandle(process.Process);
     }
     closeHandle(job);
+    applicationName.fill(0);
     commandLine.fill(0);
     environment.fill(0);
     directory.fill(0);

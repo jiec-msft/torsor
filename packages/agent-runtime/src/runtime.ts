@@ -1136,22 +1136,18 @@ export class AgentRuntime {
         try {
           // The abort race may finish before native admission returns. Observe
           // that launch before settlement; late failures must not become success.
-          await nativeLaunch;
+          nativeHandle ??= await nativeLaunch;
         } catch (launchError) {
           const launchFailure = normalizeWorktreeProviderError(launchError);
           if (!isNativeRunCancellation(launchFailure, nativeRunCancellation)) {
             providerError = launchFailure;
           }
         }
-        const authorityInterruption = await nativeHandle?.authorityInterruption();
-        if (
-          authorityInterruption?.type === "run-cancelled" &&
-          providerError.diagnosticCode === "provider_process_exited"
-        ) {
-          providerError = authorityInterruption.interruption;
-        } else if (authorityInterruption?.type === "classification-failed") {
+        const authorityClassificationError =
+          await nativeHandle?.authorityClassificationError();
+        if (authorityClassificationError !== undefined) {
           providerError = normalizeWorktreeProviderError(
-            authorityInterruption.error,
+            authorityClassificationError,
           );
         }
       }
@@ -1164,11 +1160,46 @@ export class AgentRuntime {
         const activation = latest.activations.find(
           (candidate) => candidate.id === input.activationId,
         );
-        cancelledNativeRun = policy.kind === "trusted-local" && !this.#stopped &&
+        const authoritativeCancellation = policy.kind === "trusted-local" && !this.#stopped &&
           latest.run.state === "Cancelled" && activation?.revocationReason === "run_cancelled" &&
           activation.runActivationGeneration === latest.run.activationGeneration &&
           activation.runActivationGeneration === input.cause.run.run.activationGeneration &&
           isNativeRunCancellation(providerError, nativeRunCancellation);
+        if (authoritativeCancellation && nativeRunCancellation) {
+          const identity = nativeRunCancellation.executionIdentity();
+          if (!identity) {
+            cancelledNativeRun = true;
+          } else {
+            try {
+              await worktreeStop;
+              const [tree, lease] = await Promise.all([
+                this.#kernel.query(
+                  { type: "GetPhysicalWorktree", worktreeId: identity.worktreeId },
+                  this.#runtimeContext,
+                ),
+                this.#kernel.query(
+                  { type: "GetWorktreeWriterLease", worktreeId: identity.worktreeId },
+                  this.#runtimeContext,
+                ),
+              ]);
+              cancelledNativeRun =
+                nativeRunCancellation.ownsPhysicalStop(identity) &&
+                tree.latestExecution?.id === identity.executionId &&
+                tree.latestExecution.generation === identity.leaseGeneration &&
+                tree.latestExecution.fencingToken === identity.fencingToken &&
+                lease.status !== "Quarantined" &&
+                lease.generation === identity.leaseGeneration &&
+                lease.fencingToken === identity.fencingToken;
+              if (!cancelledNativeRun) {
+                providerError = nativeRunCancellation.providerExitPrecededStop(identity)
+                  ? new ProviderExecutionError("provider_process_exited", "Unknown")
+                  : new ProviderExecutionError("provider_worktree_authority_lost", "Unknown");
+              }
+            } catch (stopError) {
+              providerError = normalizeWorktreeProviderError(stopError);
+            }
+          }
+        }
         if (
           latest.run.state === "Active" &&
           activation?.finishedAt === null &&

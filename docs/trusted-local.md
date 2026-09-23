@@ -10,7 +10,9 @@ Job Objects and the package-installed `koffi` native binding; it no longer requi
 Windows PowerShell/.NET or a runtime compiler. Linux requires readable `/proc`.
 Missing or unloadable native bindings fail launch explicitly without PID discovery
 or kill fallback. Other platforms currently reject native launch. On Windows,
-`TORSOR_COPILOT_COMMAND` should name a native executable, not a `.cmd`/`.ps1` shim.
+`TORSOR_COPILOT_COMMAND` should name a native executable, not a `.cmd`/`.ps1` shim;
+a bare command resolves to an absolute path only through the Provider environment's
+`PATH`/`PATHEXT`, never the Host/owner `PATH` or current directory.
 Installation/build do not start a real model. Trust the repository, user
 configuration, custom instructions, and MCP servers.
 Linux tool descendants must remain in the original process group; tools that
@@ -63,6 +65,10 @@ and blocks replacement. Restart does not clear quarantine after losing the origi
 handle. Schema 18 is current; schema 17 is rejected. Stop old processes
 and explicitly use a fresh disposable database and fresh managed root; no migration
 or automatic deletion.
+From a clean checkout, `npm pack --workspace @torsor/kernel` and
+`npm pack --workspace @torsor/agent-runtime` build their required `dist` first.
+Installing both tarballs provides an importable Agent Runtime root and its packaged
+Windows owner module.
 
 Timeline retains only normalized Tool started/completed/failed facts and provenance,
 not raw tool IDs, arguments, results, command paths, stdout/stderr, or ACP session IDs.

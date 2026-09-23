@@ -127,6 +127,15 @@ Windows owner 是 Package 内固定的深层 Node module，通过随 Package 安
 `koffi` 原生绑定调用 Win32 API；不启动 PowerShell、不运行时编译 C#，也不从环境、
 `PATH`、当前目录或可变缓存选择/生成 owner。绑定缺失或加载失败时必须在 Provider
 启动前明确失败。并发启动复用同一版本化 Package module，不产生竞态临时 Artifact。
+Windows Provider 的 bare command 只能按瞬时 Provider environment 中大小写不敏感的
+`PATH`/`PATHEXT` 解析；忽略空项、相对目录、owner/Host `PATH` 和当前目录，不做 shell
+展开。解析后把绝对 application path 与正确引用的 argv command line 分开传给
+`CreateProcessW`；找不到、重复的大小写环境键或不可执行目标必须在 spawn 前失败。
+Linux command 解析保持平台原生行为。
+从干净 tracked source 执行 `npm pack` 时，Kernel 与 Agent Runtime 的 package lifecycle
+必须先确定性构建各自 `dist`；Agent Runtime tarball 必须含 root entrypoint 和固定 Windows
+owner module，只发布声明的 `dist`/License/metadata，不发布 `src`、测试、临时文件或
+Torsor 自有 opaque binary。`koffi` 保持普通 MIT 依赖。
 Linux 受支持的工具必须把后代保留在原进程组内；主动脱离该组的 daemon 或 hostile
 程序不在此执行契约内，不能把组停止当作这类进程的隔离证明。
 Provider 退出后停止剩余成员；owner 丢失或强制停止而没有完整树证明时保持不确定。
@@ -150,8 +159,13 @@ Runtime 在 settlement 后确认已处理的 delivery，不把逻辑取消报告
 settlement；晚到的 launch 失败不能被取消竞态遮蔽。无关的 fencing/authority loss、
 spawn、Provider、持久化或停止错误仍传播；不得把 quarantine 当作已确认物理停止。
 预期取消只能由本次执行绑定的类型化内部 cause 证明：该 cause 必须来自权威
-`run_cancelled` 事实，或来自在相同 generation/fencing 的仍有效 Lease 下由该取消触发的
-原 handle 物理停止。仅凭 `provider_cancelled`、`provider_process_exited` 或
+`run_cancelled` 事实；一旦 native admission 产生 receipt，该 cause 还必须绑定原始
+execution ID、Lease generation 与 fencing token，并记录由该取消拥有的原 handle
+物理停止先于同一执行的 Provider-exit 观察开始。独立 Provider exit 已被观察后再发生的
+取消不得改写原错误。停止/settlement 后、确认 delivery 前必须再次确认同一 execution、
+generation/fencing，且 Writer Lease 未被独立 quarantine 或推进 fence；更强的、由本次
+取消停止产生的 execution/Worktree 隔离状态可以保留。仅凭 `provider_cancelled`、
+`provider_process_exited` 或
 `provider_worktree_authority_lost` 诊断码以及后来变成 `Cancelled` 的 Run 都不足以吞掉错误。
 
 Schema 18 在 schema 17 的诊断隐私契约上增加 native execution 的显式

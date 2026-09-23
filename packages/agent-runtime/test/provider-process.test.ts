@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { OwnedProviderProcess } from "../src/provider-process.js";
@@ -63,6 +64,33 @@ describe("retained native process-tree owner", () => {
       owner.stdin.end(Buffer.from([0xff, 0xff, 0x7f, 0x00]));
       const [code, signal] = await once(owner, "close");
       expect({ code, signal }).toEqual({ code: 125, signal: null });
+    },
+    30_000,
+  );
+
+  it.runIf(process.platform === "win32")(
+    "resolves a bare executable only through the provider PATH and PATHEXT",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "torsor provider 路径 "));
+      const executable = join(root, "synthetic-provider.EXE");
+      copyFileSync(process.execPath, executable);
+      const owner = new OwnedProviderProcess({
+        command: "synthetic-provider",
+        cwd: process.cwd(),
+        environment: { pAtH: root, PaThExT: ".EXE" },
+        args: [
+          "-e",
+          "process.stdout.write('ready:'+process.argv[1]);process.stdin.resume();",
+          "argument with 空格",
+        ],
+      });
+      try {
+        expect(String(await ready(owner))).toBe("ready:argument with 空格");
+      } finally {
+        owner.requestStop();
+        await Promise.allSettled([owner.closed]);
+        rmSync(root, { recursive: true, force: true });
+      }
     },
     30_000,
   );

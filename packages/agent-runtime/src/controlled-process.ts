@@ -10,6 +10,7 @@ export interface ControlledChild {
   readonly pid: number | undefined;
   readonly result: Promise<string>;
   readonly closed: Promise<ChildCloseEvidence>;
+  readonly providerExit?: Promise<void>;
   requestStop(): void;
   forceStop(): boolean;
 }
