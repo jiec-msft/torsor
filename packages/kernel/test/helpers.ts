@@ -106,7 +106,7 @@ export async function claimRunOutboxAuthority(
   throw new Error(`Outbox authority for Run ${runId} was not found.`);
 }
 
-export async function createRun(kernel: TorsorKernel, keySuffix = "") {
+export async function createRun(kernel: Pick<TorsorKernel, "query" | "execute">, keySuffix = "") {
   const thread = await kernel.execute(
     {
       type: "StartThread",

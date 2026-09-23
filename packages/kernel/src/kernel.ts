@@ -100,7 +100,7 @@ import { mapPublicEvent } from "./mappings.js";
 import {
   assertWriterCommandAuthority, assertWriterContextAuthority,
   assertWorktreeMutation, assertWorktreePublication, getPhysicalWorktree, physicalWorktreeCommand,
-  resolveCachedWorktreeExecution,
+  resolveCachedWorktreeExecution, validateWorktreeProviderBinding,
 } from "./physical-worktrees.js";
 import {
   acquireWorktreeWriterLease,
@@ -351,6 +351,9 @@ export class TorsorKernel {
       requireKind(this.#context, principal, "runtime");
     }
     rejectCausalOverrides(command);
+    if (command.type === "StartWorktreeExecution" && command.provider !== undefined) {
+      validateWorktreeProviderBinding(command.provider);
+    }
     const payloadHash = hashPayload(command);
     this.#context.database.exec("BEGIN IMMEDIATE");
     try {
@@ -587,10 +590,12 @@ export class TorsorKernel {
           break;
         case "ListPhysicalWorktrees": {
           requireKind(this.#context, principal, "runtime");
+          if (query.runId !== undefined) requireRun(this.#context, query.runId);
           const limit = boundedLimit(query.limit);
           const rows = allRows(this.#context,
-            "SELECT worktree_id FROM physical_worktrees WHERE worktree_id > ? ORDER BY worktree_id LIMIT ?",
-            query.afterWorktreeId ?? "", limit + 1);
+            `SELECT worktree_id FROM physical_worktrees
+             WHERE worktree_id > ? AND (? IS NULL OR run_id = ?) ORDER BY worktree_id LIMIT ?`,
+            query.afterWorktreeId ?? "", query.runId ?? null, query.runId ?? null, limit + 1);
           result = {
             items: rows.slice(0, limit).map((row) => getPhysicalWorktree(this.#context, text(row.worktree_id), principal)),
             hasMore: rows.length > limit,

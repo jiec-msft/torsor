@@ -16,12 +16,14 @@
     "dist"
   ],
   "scripts": {
+    "prepack": "npm --prefix ../kernel run build && npm run build",
     "test": "npm run build && vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@torsor/kernel": "0.1.0"
+    "@torsor/kernel": "0.1.0",
+    "koffi": "3.2.0"
   },
   "devDependencies": {
     "@types/node": "^24.10.0",
