@@ -3954,7 +3954,7 @@ describe("AgentRuntime", () => {
       new CopilotAcpAdapter({
         environment: { COPILOT_ALLOW_ALL: "true" },
       }),
-    ).toThrow("not in the explicit provider allowlist");
+    ).toThrow("Invalid restricted Copilot environment override.");
     expect(() =>
       new CopilotAcpAdapter({
         commandArgs: ["--acp"],

@@ -14,7 +14,8 @@ import {
 } from "@torsor/kernel";
 
 import { KernelActivationCapabilityBridge } from "./capability-bridge.js";
-import type { WorktreeExecutor } from "./worktree-executor.js";
+import type { ControlledWorktreeProcess, WorktreeExecutor } from "./worktree-executor.js";
+import { parseProviderPolicy, resolveProviderPolicy, type ProviderPolicy } from "./provider-policy.js";
 import {
   normalizeProviderExecutionError,
   providerPublicDiagnostic,
@@ -138,6 +139,8 @@ export class AgentRuntime {
     AttentionProjectDiscoveryContinuation
   >();
   #attentionProjectOffset = 0;
+  readonly #executions = new Set<AbortController>();
+  #stopped = false;
 
   constructor(options: AgentRuntimeOptions) {
     if (options.projectIds.length === 0) {
@@ -226,12 +229,22 @@ export class AgentRuntime {
     return result;
   }
 
+  stop(): void {
+    this.#stopped = true;
+    for (const controller of this.#executions) {
+      controller.abort(new ProviderExecutionError("provider_cancelled", "Unknown"));
+    }
+  }
+
   async #runPass(): Promise<RuntimePassExecution> {
+    if (this.#stopped) {
+      return { attentionsDispatched: 0, attentionsDeferred: 0, attentionRecoveries: 0, outboxEventsProcessed: 0 };
+    }
     await this.#refreshAgents();
     const attentionRecoveries =
       await this.#reconcileOrphanedAttentionExecutions();
     const attentionResult = await this.#dispatchOpenAttentions();
-    const outboxEventsProcessed = await this.#drainOutboxBatch();
+    const outboxEventsProcessed = this.#stopped ? 0 : await this.#drainOutboxBatch();
     return {
       attentionsDispatched: attentionResult.dispatched,
       attentionsDeferred: attentionResult.deferred,
@@ -867,7 +880,17 @@ export class AgentRuntime {
     readonly runInputIds: readonly string[];
     readonly requestIdempotencyKey: string;
   }): Promise<boolean> {
-    if (this.#providerExecutionBudget(input.authorityLeaseExpiresAt) <= 0) {
+    const policy = input.cause.type === "attention"
+      ? resolveProviderPolicy()
+      : parseProviderPolicy(this.#adapter.policy ?? resolveProviderPolicy());
+    let nativeHandle: ControlledWorktreeProcess | undefined;
+    let nativeStartRequested = false;
+    const assertPublication = () => {
+      if (policy.kind !== "trusted-local") return;
+      if (!nativeHandle) throw new ProviderExecutionError("provider_worktree_authority_lost", "Unknown");
+      nativeHandle.assertPublication();
+    };
+    if (this.#stopped || this.#providerExecutionBudget(input.authorityLeaseExpiresAt) <= 0) {
       await this.#finishActivationBeforeProvider(input.activationId);
       return false;
     }
@@ -883,7 +906,7 @@ export class AgentRuntime {
         : {}),
       adapter: this.#adapter.name,
       adapterVersion: this.#adapter.version,
-      capabilitySnapshot: providerCapabilitiesJson(this.#adapter),
+      capabilitySnapshot: providerCapabilitiesJson(this.#adapter, policy),
       runInputIds: input.runInputIds,
       requestIdempotencyKey: input.requestIdempotencyKey,
     } as const;
@@ -967,6 +990,7 @@ export class AgentRuntime {
             providerAttemptId: attempt.entityId,
             causeType: "run",
             projection: input.cause.run,
+            assertPublication,
           });
     const admission = await this.#kernel.execute(
       admissionCommand,
@@ -999,6 +1023,8 @@ export class AgentRuntime {
       return false;
     }
     const controller = new AbortController();
+    this.#executions.add(controller);
+    if (this.#stopped) controller.abort(new ProviderExecutionError("provider_cancelled", "Unknown"));
     let worktreeScopeOpen = true;
     const stopMonitor = this.#monitorExecution(
       input.cause,
@@ -1017,6 +1043,23 @@ export class AgentRuntime {
           cause: input.cause,
           capabilities: bridge,
           signal: controller.signal,
+          ...(policy.kind === "trusted-local" && input.cause.type === "run" ? {
+            nativeExecution: {
+              policy,
+              start: async (start: (cwd: string) => import("./controlled-process.js").ControlledChild) => {
+                if (!worktreeScopeOpen || nativeStartRequested || controller.signal.aborted ||
+                    !this.#worktreeExecutor?.startProvider || input.cause.type !== "run") {
+                  throw new ProviderExecutionError("provider_worktree_authority_lost", "Unknown");
+                }
+                nativeStartRequested = true;
+                nativeHandle = await this.#worktreeExecutor.startProvider({
+                  runId: input.cause.run.run.id, activationId: input.activationId,
+                  providerAttemptId: attempt.entityId, policy, start, signal: controller.signal,
+                });
+                return nativeHandle;
+              },
+            },
+          } : {}),
           ...(input.cause.type === "run" && this.#worktreeExecutor ? {
             worktree: {
               probe: (worktreeId: string) => {
@@ -1060,6 +1103,10 @@ export class AgentRuntime {
       }
       return true;
     } catch (error) {
+      if (nativeHandle) {
+        // Begin physical stop before any failure settlement can contend on SQLite.
+        void nativeHandle.stop("Provider execution failed.").catch(() => undefined);
+      }
       const providerError =
         error instanceof KernelError && error.code === "WriterAuthorityLost"
           ? new ProviderExecutionError(
@@ -1091,6 +1138,8 @@ export class AgentRuntime {
                   waitError.code === "Conflict" ||
                   waitError.code === "WriterAuthorityLost" ||
                   waitError.code === "TerminalRun")
+                || waitError instanceof ProviderExecutionError &&
+                  waitError.diagnosticCode === "provider_worktree_authority_lost"
               )
             ) {
               throw waitError;
@@ -1129,6 +1178,7 @@ export class AgentRuntime {
     } finally {
       worktreeScopeOpen = false;
       stopMonitor();
+      this.#executions.delete(controller);
       await this.#worktreeExecutor?.stopActivation(input.activationId);
     }
   }
@@ -1936,8 +1986,9 @@ function isTerminalProviderStatus(
   return status === "Completed" || status === "Failed" || status === "Unknown";
 }
 
-function providerCapabilitiesJson(adapter: ProviderAdapter): JsonValue {
+function providerCapabilitiesJson(adapter: ProviderAdapter, policy: ProviderPolicy): JsonValue {
   return {
+    ...(adapter.policy ? { policy } : {}),
     accepts_input_while_running:
       adapter.capabilities.acceptsInputWhileRunning,
     supports_cancel: adapter.capabilities.supportsCancel,

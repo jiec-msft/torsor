@@ -10,6 +10,8 @@ import {
 import { nodeProbeDriver, type ChildCloseEvidence, type ControlledChild, type ControlledProcessDriver } from "./controlled-process.js";
 import { canonicalDirectory, inspectWorktree, readPlainFile, type WorktreeRegistration } from "./worktree-paths.js";
 import { ProviderExecutionError } from "./types.js";
+import { parseProviderPolicy, type ProviderPolicy } from "./provider-policy.js";
+import { createDetachedWorktree } from "./worktree-provisioning.js";
 
 export interface WorktreeProbeInput {
   readonly worktreeId: string;
@@ -17,9 +19,19 @@ export interface WorktreeProbeInput {
   readonly signal?: AbortSignal;
 }
 
+export interface WorktreeProviderInput {
+  readonly runId: string;
+  readonly activationId: string;
+  readonly providerAttemptId: string;
+  readonly policy: ProviderPolicy;
+  readonly signal?: AbortSignal;
+  readonly start: (cwd: string) => ControlledChild;
+}
+
 export interface WorktreeExecutor {
   recover(): Promise<void>;
   probe(input: WorktreeProbeInput): Promise<{ readonly digest: string; readonly stop: WorktreeExecutionState }>;
+  startProvider?(input: WorktreeProviderInput): Promise<ControlledWorktreeProcess>;
   stopActivation(activationId: string): Promise<void>;
   close(): Promise<void>;
 }
@@ -29,6 +41,7 @@ export interface LocalWorktreeExecutorOptions {
   readonly runtimePrincipalId: string;
   readonly rootPath: string;
   readonly repositoryPath: string;
+  readonly baseRevision?: string;
   readonly leaseDurationMs?: number;
   readonly stopGraceMs?: number;
   readonly forceGraceMs?: number;
@@ -49,6 +62,7 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
   readonly #leaseMs: number;
   readonly #stopMs: number;
   readonly #forceMs: number;
+  readonly #baseRevision: string | undefined;
   readonly #handles = new Map<string, ControlledWorktreeProcess>();
   readonly #starts = new Map<Promise<ControlledWorktreeProcess>, string>();
   #recovery: Promise<void> | undefined;
@@ -60,6 +74,10 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
     this.#root = canonicalDirectory(options.rootPath);
     this.#repository = canonicalDirectory(options.repositoryPath);
     this.#driver = options.driver ?? nodeProbeDriver;
+    if (options.baseRevision !== undefined && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(options.baseRevision)) {
+      throw new Error("Native Worktree provisioning requires a full immutable base commit.");
+    }
+    this.#baseRevision = options.baseRevision;
     this.#leaseMs = positive(options.leaseDurationMs ?? 30_000);
     this.#stopMs = positive(options.stopGraceMs ?? 1_000);
     this.#forceMs = positive(options.forceGraceMs ?? 1_000);
@@ -123,11 +141,66 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
     return pending;
   }
 
-  async #start(input: WorktreeProbeInput): Promise<ControlledWorktreeProcess> {
+  startProvider(input: WorktreeProviderInput): Promise<ControlledWorktreeProcess> {
+    if (this.#closed) return Promise.reject(new Error("Worktree executor is closed."));
+    const pending = this.#prepareProvider(input);
+    this.#starts.set(pending, input.activationId);
+    void pending.finally(() => this.#starts.delete(pending)).catch(() => undefined);
+    return pending;
+  }
+
+  async #prepareProvider(input: WorktreeProviderInput): Promise<ControlledWorktreeProcess> {
+    const policy = parseProviderPolicy(input.policy);
+    if (policy.kind !== "trusted-local") {
+      throw new ProviderExecutionError("provider_policy_violation", "Failed");
+    }
+    input.signal?.throwIfAborted();
     await this.recover();
+    const run = await this.#kernel.query({ type: "GetRunProjection", runId: input.runId }, this.#context);
+    if (run.run.state !== "Active" ||
+        !run.activations.some((activation) => activation.id === input.activationId &&
+          activation.finishedAt === null && activation.revokedAt === null) ||
+        !run.providerAttempts.some((attempt) => attempt.id === input.providerAttemptId &&
+          attempt.activationId === input.activationId && ["Started", "Acknowledged"].includes(attempt.status))) {
+      throw new ProviderExecutionError("provider_worktree_authority_lost", "Unknown");
+    }
+    const page = await this.#kernel.query({
+      type: "ListPhysicalWorktrees", runId: input.runId, limit: 2,
+    }, this.#context);
+    if (page.hasMore || page.items.length > 1) {
+      throw new Error("Run has ambiguous physical Worktree assignments.");
+    }
+    let tree = page.items[0];
+    if (!tree) {
+      if (!this.#baseRevision) throw new Error("Native Worktree provisioning requires a pinned baseRevision.");
+      this.#checkRoots();
+      const directoryName = `run-${createHash("sha256").update(input.runId).digest("hex")}`;
+      await createDetachedWorktree({
+        rootPath: this.#root.path, repositoryPath: this.#repository.path,
+        directoryName, baseRevision: this.#baseRevision,
+        ...(input.signal ? { signal: input.signal } : {}),
+      });
+      await this.register({
+        worktreeId: directoryName, runId: input.runId, directoryName, baseRevision: this.#baseRevision,
+      });
+      tree = await this.#kernel.query({ type: "GetPhysicalWorktree", worktreeId: directoryName }, this.#context);
+    }
+    if (tree.runId !== input.runId) throw new Error("Physical Worktree belongs to another Run.");
+    return this.#start({
+      worktreeId: tree.worktreeId, activationId: input.activationId,
+      ...(input.signal ? { signal: input.signal } : {}),
+    }, { ...input, policy });
+  }
+
+  async #start(
+    input: WorktreeProbeInput,
+    provider?: WorktreeProviderInput & { readonly policy: Extract<ProviderPolicy, { kind: "trusted-local" }> },
+  ): Promise<ControlledWorktreeProcess> {
+    await this.recover();
+    if (this.#closed) throw new Error("Worktree executor is closed.");
     input.signal?.throwIfAborted();
     const tree = await this.#kernel.query({ type: "GetPhysicalWorktree", worktreeId: input.worktreeId }, this.#context);
-    this.#checkTree(tree);
+    this.#checkTree(tree, provider !== undefined);
     const requestId = randomUUID();
     const lease = await this.#kernel.execute({
       type: "AcquireWorktreeWriterLease", idempotencyKey: `${requestId}:acquire`,
@@ -145,6 +218,11 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
       started = await this.#kernel.execute({
         type: "StartWorktreeExecution", idempotencyKey: `${requestId}:intent`,
         ...leaseAuthority, activationId: input.activationId, executorId: this.#executorId,
+        ...(provider ? { provider: {
+          providerAttemptId: provider.providerAttemptId,
+          policy: "trusted-local" as const,
+          permissionMode: provider.policy.permissionMode,
+        } } : {}),
       }, this.#context);
     } catch (error) {
       await this.#kernel.execute({
@@ -164,24 +242,29 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
     });
     this.#handles.set(started.entityId, handle);
     try {
+      if (!provider) {
+        this.#kernel.performWorktreeMutation(authority, this.#context, () => {
+          handle.assertTimeBudget();
+          input.signal?.throwIfAborted();
+          this.#checkTree(tree);
+          const fd = openSync(join(tree.directoryPath, "torsor-probe.txt"), "wx", 0o600);
+          try { writeFileSync(fd, probeContent); } finally { closeSync(fd); }
+        });
+      }
       this.#kernel.performWorktreeMutation(authority, this.#context, () => {
         handle.assertTimeBudget();
         input.signal?.throwIfAborted();
-        this.#checkTree(tree);
-        const fd = openSync(join(tree.directoryPath, "torsor-probe.txt"), "wx", 0o600);
-        try { writeFileSync(fd, probeContent); } finally { closeSync(fd); }
-      });
-      this.#kernel.performWorktreeMutation(authority, this.#context, () => {
-        handle.assertTimeBudget();
-        input.signal?.throwIfAborted();
-        this.#checkTree(tree);
+        if (this.#closed) throw new Error("Worktree executor is closed.");
+        this.#checkTree(tree, provider !== undefined);
         handle.spawning();
-        handle.attach(this.#driver.start({ cwd: tree.directoryPath, content: probeContent }));
+        handle.attach(provider
+          ? provider.start(tree.directoryPath)
+          : this.#driver.start({ cwd: tree.directoryPath, content: probeContent }));
       });
       await handle.running();
       return handle;
     } catch (error) {
-      await handle.stop(`Controlled start failed: ${error instanceof Error ? error.message : String(error)}`);
+      await handle.stop("Controlled start failed.");
       throw error;
     }
   }
@@ -233,14 +316,14 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
     }
   }
 
-  #checkTree(tree: PhysicalWorktreeView): void {
+  #checkTree(tree: PhysicalWorktreeView, allowDetachedCommit = false): void {
     this.#checkRoots();
     if (dirname(tree.directoryPath) !== this.#root.path || tree.repositoryPath !== this.#repository.path) {
       throw new Error("Worktree is outside this executor's configured scope.");
     }
     const current = inspectWorktree(this.#root.path, this.#repository.path, {
       ...tree, directoryName: basename(tree.directoryPath),
-    });
+    }, allowDetachedCommit);
     if (current.directoryPath !== tree.directoryPath || current.directoryIdentity !== tree.directoryIdentity ||
         current.repositoryId !== tree.repositoryId) {
       throw new Error("Physical Worktree identity changed.");
@@ -310,6 +393,17 @@ export class ControlledWorktreeProcess {
     }
   }
 
+  assertPublication(): void {
+    if (this.#revocationReason || performance.now() >= this.#options.leaseDeadlineAt || this.#options.signal?.aborted) {
+      throw new ProviderExecutionError("provider_worktree_authority_lost", "Unknown");
+    }
+    if (this.#state === "StopConfirmed") {
+      this.#options.kernel.checkWorktreePublication(this.#options.authority, this.#options);
+    } else {
+      this.#options.kernel.checkWorktreeAuthority(this.#options.authority, this.#options);
+    }
+  }
+
   spawning(): void {
     if (this.#spawnAttempted || this.#state !== "Starting") throw new Error("Spawn intent cannot be reused.");
     this.#spawnAttempted = true;
@@ -347,9 +441,9 @@ export class ControlledWorktreeProcess {
     this.#monitor = setInterval(() => {
       try {
         this.#options.kernel.checkWorktreeAuthority(this.#options.authority, this.#options);
-      } catch (error) {
+      } catch {
         // A failed authority check can stop work, never grant a replacement writer.
-        void this.stop(`Authority monitor failed: ${error instanceof Error ? error.message : String(error)}`)
+        void this.stop("Worktree authority monitor failed.")
           .catch(() => undefined);
       }
     }, 25);
@@ -411,13 +505,13 @@ export class ControlledWorktreeProcess {
     }
     if (!this.#closeEvidence && !this.#stopSent) {
       this.#stopSent = true;
-      try { this.#child.requestStop(); } catch (error) { this.#stopErrors.push(String(error)); }
+      try { this.#child.requestStop(); } catch { this.#stopErrors.push("Original process stop request failed."); }
     }
     let evidence = this.#closeEvidence ?? await within(this.#closeObservation!, this.#options.stopMs);
     if (!evidence) {
       if (!this.#forceSent) {
         this.#forceSent = true;
-        try { this.#forced = this.#child.forceStop(); } catch (error) { this.#stopErrors.push(String(error)); }
+        try { this.#forced = this.#child.forceStop(); } catch { this.#stopErrors.push("Original process force stop failed."); }
       }
       evidence = await within(this.#closeObservation!, this.#options.forceMs);
     }
@@ -453,7 +547,9 @@ export class ControlledWorktreeProcess {
           await this.#record("StopRequested", "Original-handle stop requested.", true);
         }
         await this.#record(state, this.#closeEvidence
-          ? `Original child close: ${JSON.stringify(this.#closeEvidence)}`
+          ? `Original process tree stop confirmed; normal exit: ${
+            this.#closeEvidence.code === 0 && this.#closeEvidence.signal === null && this.#closeEvidence.error === null
+          }.`
           : this.#spawnAttempted
             ? `No original-handle close confirmation. ${this.#stopErrors.join("; ")}`
             : "No child was spawned.");

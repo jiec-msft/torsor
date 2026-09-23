@@ -5,9 +5,9 @@
 ## 1. 状态与设计宪章
 
 本规范对应 [#24](https://github.com/jiec-msft/torsor/issues/24)，定义 MVP 0.1
-在执行基础设施就绪后必须交付的切片，而不是已经支持的真实 Provider 启动方式。
-Phase 1 只提供可测试的策略意图和环境准备函数，不改变现有 Adapter 强制边界，
-不启动进程，不增加 Host 配置入口，也不授予 Writer Authority。
+的 trusted-local 执行。Phase 1 的策略意图和环境准备由 Phase 2 连接到已合并的
+Lease 执行；schema 18 保留 schema 17 公开诊断边界并添加 Provider receipt。
+策略本身仍不授予 Writer Authority。
 
 本规范遵循[设计基线](../prototype/001-overview.zh-cn.md)第 5、22、34、43 和
 44.4 节：Agent 可以直接使用获授权的 CLI、API、MCP 和 Provider-native
@@ -104,9 +104,80 @@ diagnostic-redaction 工作合入 main 并集成后，才能连接真实 Copilot
 插件市场、通用策略编辑器、凭据存储或外部 API/MCP 副作用的 exactly-once 保证。
 `restricted` 必须继续作为确定性、无真实模型/网络调用的 CI 模式。
 
-## 6. Phase 1 验收
+## 6. Phase 1 验收（历史范围）
 
 确定性单元测试覆盖默认受限策略、显式 trusted-local 与 Allow All、非法选择和组合、
 两种环境策略、内部控制变量移除、Provider 环境保留、输入不变性、固定有界配置和
 不含秘密的序列化。测试不启动 Provider、不发网络请求、不创建持久状态或真实凭据产物。
 现有 Adapter 启动强制边界保持原样；Phase 1 不代表 #24 的最终功能已经交付。
+
+## 7. Phase 2 启动与公开观察契约
+
+可信 Host 显式选择策略。Attention 判断没有 Run Worktree，必须继续使用
+`restricted`；只有 Run 执行可以采用 `trusted-local`。Runtime 绑定
+ProviderAttempt 和策略，Executor 从 Run 派生唯一物理目录，不接受 Provider cwd。
+首次执行可在配置的仓库固定 commit 上创建 detached Worktree，且不运行仓库 hooks；
+未登记的残留目录或不明确的归属必须失败，不能自动收养。已登记目录必须重新验证。
+
+取得 Lease 和持久 execution receipt 后才启动受控进程所有者；它保留原始进程树，
+Windows 使用 Job Object，Linux 使用独立进程组和 `/proc` 成员观察。其他平台明确拒绝
+native launch；不降级为单 PID kill。Windows 在 suspended 创建后先加入 Job 再 resume，
+Job 关闭会终止所有成员；Linux owner 在观察组清空之前保留原始 group identity。
+Provider 退出后停止剩余成员；owner 丢失或强制停止而没有完整树证明时保持不确定。
+进程配置只经私有 stdin 握手传递，不放入 supervisor 命令行或磁盘配置文件。
+停止证据必须覆盖整个所拥有的树，
+不能仅凭 Provider 主进程退出或旧 PID 判断。正常结束在最终 actions 发布前停止进程树，
+并保持 Lease 到 publication/settlement 完成。所有停止先发起 OS 操作，再等待 SQLite。
+未知终止使 Worktree quarantine，恢复不得使用 PID 重新获取进程权威。
+
+Run 的每个公开 capability 在本地拒绝已撤销/过期的执行，并在 Kernel 事务中再次验证
+Writer Authority。无执行绑定的 trusted-local 调用不得发布。成功必须有正常的物理停止
+和仍有效的 execution receipt。并发恢复和非阻塞监督保持不变。
+
+Schema 18 在 schema 17 的诊断隐私契约上增加 native execution 的显式
+ProviderAttempt/策略绑定：`StartWorktreeExecution.provider` 只接受
+`providerAttemptId`、`policy: "trusted-local"` 和
+`permissionMode: "provider-default" | "allow-all"`。ProviderAttempt 必须属于同一
+Activation 且仍在执行；绑定作为 receipt 的持久事实，不含任意配置。
+未提供该字段继续表示固定 probe。旧开发数据库必须在停止旧进程后重新创建，
+不迁移、不自动删除；不得恢复 diagnostic session 标识。
+
+Tool 观察只保存 `tool_started`、`tool_completed`、`tool_failed` 活动，payload
+只含本次 ProviderAttempt 内生成的 `toolCallId`、ACP 枚举 `kind` 和归一化 `status`。
+不得保存 Provider tool ID、title、命令、路径、参数、结果、MCP server 名、错误正文。
+最多跟踪 128 个 Tool、接收 512 次 Tool 更新；原始 ID 只在内存中使用且最多 256 字符。
+初始 pending/in_progress 只发布一次 started，终态最多一次；未知 ID、无效状态和
+终态后的状态改变必须失败。一次带终态的初始调用发布 started 和对应终态。
+Timeline 使用这些固定字段及已有 Run/Activation/ProviderAttempt 来源。
+
+Trusted-local 的原始 assistant chunks 只用于有界内存中的最终 action envelope，
+不直接作为公开 streaming activity 保存；Tool 和诊断正文也不转换为报告或 Reply。
+显式最终 public actions 仍通过现有 capability 通道处理。ACP Session ID 只用于内存路由，
+不恢复 diagnostic session 字段；所有失败继续采用 schema 17 的稳定代码和固定摘要。
+
+确定性测试必须证明真实固定 Provider 能在分配的 Worktree 写入并执行合成测试，
+以及 Shell/MCP Tool 状态、取消、过期、SQLite 争用、Host 重启、旧输出、
+未知停止/quarantine 和替代 Writer 准入。真实 Copilot smoke 必须显式 opt-in，
+仅使用可丢弃合成目录，结束时删除它，不在普通 CI 中运行。
+
+本地 Host 使用 `TORSOR_PROVIDER_POLICY`（默认 `restricted`），`trusted-local`
+必须设置 `TORSOR_PROVIDER_PERMISSION_MODE`，`restricted` 则拒绝该设置。
+Trusted-local 还必须设置 `TORSOR_REPOSITORY_PATH`、`TORSOR_WORKTREE_ROOT` 和完整
+commit 的 `TORSOR_BASE_REVISION`，并拒绝 `TORSOR_PROVIDER_CWD`。
+`TORSOR_PROVIDER_TIMEOUT_MS` 在 trusted-local 下默认为 120000，在 restricted
+下默认为 25000，接受 1000 到 295000；Attention、Outbox、Activation 和 Writer
+窗口均为 timeout 加 5000 毫秒。这是有界执行尝试，不是可续期 Session。
+
+Copilot 的显式 `allow-all` 使用公开支持的 `--allow-all`，并只选择 ACP permission
+请求中实际声明的 `allow_always` 或 `allow_once` option；`provider-default` 拒绝无人值守
+permission 请求。优先使用声明的 `configOptions`，否则使用 legacy `modes`，只选择
+已声明的 `agent` / `interactive` coding mode，不把 Autopilot 当作权限模式。
+关闭 stdin 是正常 ACP close；取消先发送 `session/cancel` 再停止原进程树。
+参见 [Copilot ACP](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server)
+及 [ACP config options](https://agentclientprotocol.com/protocol/session-config-options)。
+
+普通 CI 运行固定 native ACP smoke 与 opt-in gate 测试，不读取真实 Provider 配置。
+真实 smoke 必须显式传入 `--allow-real-provider`；缺少 opt-in 时，在读取环境、创建目录
+或启动 Git/Provider 前拒绝。正常停止后清除 Torsor 临时数据库与合成内容；无法确认停止
+时保留隔离目录并明确报错，不能删除仍可能有 Writer 的目录。Provider 自己的全局
+Session/日志以及外部 MCP/API 效果不在 Torsor 清理范围，不能声称消除了 Provider 侧留存。

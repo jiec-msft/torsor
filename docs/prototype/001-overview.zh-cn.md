@@ -1069,6 +1069,10 @@ Runtime Host 调度恢复 pass 时，连续执行的 pass 数量必须有界，�
 
 首个物理执行切片进一步限定：
 
+以下 `write-probe-v1` 限制描述基础切片；显式 native Provider 执行的 provisioning、
+环境和完整进程树要求由[trusted-local 策略规范](../specs/trusted-local-provider-policy.zh-cn.md)
+扩展。未选择该策略时不扩大原有受限行为。
+
 5. Kernel 持久化不可重绑定的 `PhysicalWorktree` 运行记录：repository identity、
    canonical repository path、完整 base commit、source Run、opaque worktree ID、
    canonical directory path 和 filesystem identity。路径只是本地 Runtime 的 handle，

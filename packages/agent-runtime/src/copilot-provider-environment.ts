@@ -31,10 +31,7 @@ export function buildCopilotProviderEnvironment(
 
   if (validated.environment === "restricted-allowlist") {
     for (const [name] of overrideEntries) {
-      const upper = name.toUpperCase();
-      if (!upper.startsWith("COPILOT_PROVIDER_") &&
-        upper !== "COPILOT_PROVIDERS_CONFIG" &&
-        upper !== "COPILOT_HOME") {
+      if (!isRestrictedCopilotEnvironmentOverride(name)) {
         throw new Error("Invalid restricted Copilot environment override.");
       }
     }
@@ -52,4 +49,10 @@ export function buildCopilotProviderEnvironment(
         upper !== "COPILOT_ASSISTED_APPROVAL";
     }),
   );
+}
+
+export function isRestrictedCopilotEnvironmentOverride(name: string): boolean {
+  const upper = name.toUpperCase();
+  return upper.startsWith("COPILOT_PROVIDER_") ||
+    upper === "COPILOT_PROVIDERS_CONFIG" || upper === "COPILOT_HOME";
 }

@@ -11,6 +11,7 @@ import { requireLiveAuthority } from "./worktree-writer-leases.js";
 import type {
   CommandResult, KernelCommand, PhysicalWorktreeView, WorktreeExecutionReceipt,
   PrincipalContext, WorktreeExecutionState, WorktreeMutationAuthority,
+  WorktreeProviderBinding,
 } from "./types.js";
 import { integer, optionalText, requireNonEmpty, text, type Row } from "./values.js";
 
@@ -51,16 +52,20 @@ export function physicalWorktreeCommand(
     assertPhysicalWorktreeIdle(kernel, command.worktreeId);
     const worktree = requireWorktree(kernel, command.worktreeId);
     requireSourceActivation(kernel, text(worktree.run_id), command.activationId);
+    if (command.provider) requireExecutingProvider(kernel, command.provider, command.activationId);
     assertActivationWriterAuthority(kernel, command.activationId);
     requireLiveAuthority(kernel, command, principal, db.now(kernel), correlationId);
     const id = kernel.idFactory("worktree_execution");
     const token = randomBytes(32).toString("base64url");
     db.run(kernel, `INSERT INTO worktree_executions
       (id, worktree_id, activation_id, runtime_principal_id, executor_id, execution_token,
-       generation, fencing_token, operation, state, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'write-probe-v1', 'Starting', ?)`,
+       generation, fencing_token, operation, provider_attempt_id, provider_policy, permission_mode, state, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Starting', ?)`,
     id, command.worktreeId, command.activationId, text(principal.id), command.executorId,
-    token, command.generation, command.fencingToken, db.now(kernel));
+    token, command.generation, command.fencingToken,
+    command.provider ? "native-provider-v1" : "write-probe-v1",
+    command.provider?.providerAttemptId ?? null, command.provider?.policy ?? null,
+    command.provider?.permissionMode ?? null, db.now(kernel));
     appendEvent(kernel, id, "Starting", "Durable intent before any file or process effect.");
     return { commandType: command.type, entityId: id, executionToken: token };
   }
@@ -189,6 +194,14 @@ export function assertActivationWriterAuthority(
     const worktree = requireWorktree(kernel, text(execution.worktree_id));
     const lease = db.getRow(kernel, "SELECT * FROM worktree_writer_leases WHERE worktree_id = ?", text(execution.worktree_id));
     try {
+      if (execution.provider_attempt_id !== null) {
+        const attempt = db.getRow(kernel, "SELECT activation_id, status FROM provider_attempts WHERE id = ?",
+          text(execution.provider_attempt_id));
+        if (!attempt || text(attempt.activation_id) !== activationId ||
+            !["Started", "Acknowledged", ...(allowCommittedDecision ? ["Completed"] : [])].includes(text(attempt.status))) {
+          throw new KernelError("WriterAuthorityLost", "Native ProviderAttempt authority was lost.");
+        }
+      }
       if (kernel.localWorktreeRevocations.has(activationId) ||
           execution.authority_revoked_at !== null || text(worktree.state) !== "Ready" ||
           !lease || !["Starting", "Running", "StopRequested", "StopConfirmed"].includes(text(execution.state)) ||
@@ -224,6 +237,7 @@ export function resolveCachedWorktreeExecution(
   kernel: db.KernelContext, command: Extract<KernelCommand, { type: "StartWorktreeExecution" }>,
   result: CommandResult, principal: Row,
 ): CommandResult {
+  if (command.provider) requireExecutingProvider(kernel, command.provider, command.activationId);
   assertWorktreeMutation(kernel, {
     ...command, executionId: result.entityId, executionToken: result.executionToken ?? "",
   }, principal);
@@ -246,6 +260,11 @@ export function getPhysicalWorktree(
       id: text(execution.id), activationId: text(execution.activation_id),
       executorId: text(execution.executor_id), runtimePrincipalId: text(execution.runtime_principal_id),
       generation: integer(execution.generation), fencingToken: integer(execution.fencing_token),
+      ...(execution.provider_attempt_id === null ? {} : { provider: {
+        providerAttemptId: text(execution.provider_attempt_id),
+        policy: "trusted-local" as const,
+        permissionMode: text(execution.permission_mode) as WorktreeProviderBinding["permissionMode"],
+      } }),
       state: text(execution.state) as WorktreeExecutionState,
       pid: execution.pid === null ? null : integer(execution.pid),
       authorityRevokedAt: optionalText(execution.authority_revoked_at),
@@ -257,6 +276,38 @@ export function getPhysicalWorktree(
       })),
     } : null,
   };
+}
+
+export function validateWorktreeProviderBinding(value: unknown): asserts value is WorktreeProviderBinding {
+  const invalid = () => new KernelError("InvalidCommand", "Worktree provider binding is invalid.");
+  if (!value || typeof value !== "object" ||
+      (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) throw invalid();
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== 3 || keys.some((key) =>
+    !["providerAttemptId", "policy", "permissionMode"].includes(String(key)))) throw invalid();
+  const read = (key: string): unknown => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) throw invalid();
+    return descriptor.value;
+  };
+  const id = read("providerAttemptId");
+  const policy = read("policy");
+  const mode = read("permissionMode");
+  if (typeof id !== "string" || !id.trim() || id.length > 256 || policy !== "trusted-local" ||
+      (mode !== "provider-default" && mode !== "allow-all")) throw invalid();
+}
+
+function requireExecutingProvider(
+  kernel: db.KernelContext, provider: WorktreeProviderBinding, activationId: string,
+): void {
+  const attempt = db.getRow(kernel, "SELECT activation_id, status FROM provider_attempts WHERE id = ?", provider.providerAttemptId);
+  if (!attempt) throw new KernelError("NotFound", "Worktree ProviderAttempt does not exist.");
+  if (text(attempt.activation_id) !== activationId) {
+    throw new KernelError("Forbidden", "Worktree ProviderAttempt belongs to a different Activation.");
+  }
+  if (!["Started", "Acknowledged"].includes(text(attempt.status))) {
+    throw new KernelError("Conflict", "Worktree ProviderAttempt is not executing.");
+  }
 }
 
 function requireRuntime(principal: Row): void {

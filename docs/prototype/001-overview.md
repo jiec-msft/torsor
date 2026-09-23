@@ -805,6 +805,11 @@ The Runtime Host must bound consecutive recovery passes, yield to the event loop
 
 The first physical execution slice further requires:
 
+The `write-probe-v1` restrictions below describe the foundation slice. Explicit
+native Provider provisioning, environment, and whole-process-tree requirements
+are extended by the [trusted-local policy specification](../specs/trusted-local-provider-policy.md).
+Unselected policy never widens the original restricted behavior.
+
 5. Kernel persists an immutable `PhysicalWorktree` runtime record: repository identity,
    canonical repository path, full base commit, source Run, opaque worktree ID,
    canonical directory path, and filesystem identity. Paths are local Runtime handles,

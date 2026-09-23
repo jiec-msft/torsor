@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 17;
+export const CURRENT_SCHEMA_VERSION = 18;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -547,14 +547,21 @@ CREATE TABLE IF NOT EXISTS worktree_executions (
   execution_token TEXT NOT NULL,
   generation INTEGER NOT NULL CHECK (generation > 0),
   fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
-  operation TEXT NOT NULL CHECK (operation = 'write-probe-v1'),
+  operation TEXT NOT NULL CHECK (operation IN ('write-probe-v1', 'native-provider-v1')),
+  provider_attempt_id TEXT REFERENCES provider_attempts(id),
+  provider_policy TEXT CHECK (provider_policy = 'trusted-local'),
+  permission_mode TEXT CHECK (permission_mode IN ('provider-default', 'allow-all')),
   state TEXT NOT NULL CHECK (state IN
     ('Starting', 'Running', 'StopRequested', 'StopConfirmed', 'ForceTerminated', 'Uncertain')),
   pid INTEGER CHECK (pid > 0),
   authority_revoked_at TEXT,
   authority_revocation_reason TEXT,
   created_at TEXT NOT NULL,
-  CHECK ((authority_revoked_at IS NULL) = (authority_revocation_reason IS NULL))
+  CHECK ((authority_revoked_at IS NULL) = (authority_revocation_reason IS NULL)),
+  CHECK (
+    (operation = 'write-probe-v1' AND provider_attempt_id IS NULL AND provider_policy IS NULL AND permission_mode IS NULL)
+    OR (operation = 'native-provider-v1' AND provider_attempt_id IS NOT NULL AND provider_policy IS NOT NULL AND permission_mode IS NOT NULL)
+  )
 ) STRICT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS worktree_unsettled_execution_idx

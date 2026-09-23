@@ -212,6 +212,7 @@ class Host implements LocalRuntimeHost {
   }
 
   #requestStop(): void {
+    this.#runtime.stop();
     if (!this.#stopController.signal.aborted) {
       this.#stopController.abort();
     }

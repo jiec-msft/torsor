@@ -5,10 +5,10 @@
 ## 1. Status and charter
 
 This specification implements the intent of [#24](https://github.com/jiec-msft/torsor/issues/24):
-a required MVP 0.1 slice after execution foundations land, not an already supported
-real-provider launch path. Phase 1 supplies testable policy intent and environment
-preparation only. It changes no existing adapter enforcement, starts no process,
-adds no Host configuration entry point, and grants no Writer Authority.
+the MVP 0.1 trusted-local execution slice. Phase 2 connects the Phase 1 policy
+intent and environment preparation to merged lease-backed execution. Schema 18
+preserves schema 17 public diagnostics and adds Provider receipts. Policy itself
+still grants no Writer Authority.
 
 The [design baseline](../prototype/001-overview.md), sections 5, 22, 34, 43, and
 44.4, permits Agents to use granted CLI, API, MCP, and provider-native tools
@@ -123,7 +123,7 @@ execution entry point outside the assigned Worktree, marketplace, general policy
 editor, credential store, or exactly-once external API/MCP effects. `restricted`
 must remain a deterministic CI mode without real model or network calls.
 
-## 6. Phase 1 acceptance
+## 6. Phase 1 acceptance (historical scope)
 
 Deterministic unit tests cover the restricted default, explicit trusted-local and
 Allow All, invalid selections/combinations, both environment strategies, internal
@@ -131,3 +131,94 @@ control removal, provider environment retention, input immutability, fixed bound
 configuration, and secret-free serialization. Tests start no provider, make no
 network calls, and create no durable state or real credential artifacts. Existing
 adapter launch enforcement remains unchanged; Phase 1 does not complete #24.
+
+## 7. Phase 2 launch and public observation contract
+
+A trusted Host explicitly selects policy. Attention decisions have no Run
+Worktree and must remain `restricted`; only Run execution may be `trusted-local`.
+Runtime binds ProviderAttempt and policy; Executor derives the unique physical
+directory from the Run, never provider cwd. First execution may create a detached
+Worktree at a pinned commit in the configured repository, without repository
+hooks. Unregistered leftover directories or ambiguous ownership fail rather than
+being adopted. Registered directories must be revalidated.
+
+Acquire Lease and durable execution receipt before starting the controlled
+process owner. Retain the original process tree, using a Windows Job Object or
+Linux process group with `/proc` membership observation. Other platforms explicitly
+reject native launch rather than falling back to single-PID kill. Windows creates
+the provider suspended, assigns the Job, then resumes; closing the Job kills its
+members. The Linux owner retains the original group identity until observing an
+empty group. Provider exit stops remaining members; lost/forced owners without
+whole-tree evidence remain uncertain. Configuration crosses a private stdin
+handshake, never supervisor command arguments or disk configuration files.
+Stop evidence must cover the entire owned tree, not merely
+the provider's exit or an old PID. Normal completion stops the tree before final
+actions and retains the Lease through publication/settlement. Every stop initiates
+OS operations before waiting on SQLite. Unknown termination quarantines the
+Worktree; recovery must never reacquire process authority from a PID.
+
+Every public Run capability locally rejects revoked/expired execution and
+revalidates Writer Authority inside the Kernel transaction. Trusted-local cannot
+publish without an execution binding. Success requires normal physical stop and
+a still-valid execution receipt. Concurrent recovery and nonblocking supervision
+remain intact.
+
+Schema 18 extends schema 17's diagnostic privacy contract with explicit native
+execution ProviderAttempt/policy binding. `StartWorktreeExecution.provider`
+accepts only `providerAttemptId`, `policy: "trusted-local"`, and
+`permissionMode: "provider-default" | "allow-all"`. The ProviderAttempt must belong
+to the same Activation and remain executing. Persist this binding as a receipt
+fact, never arbitrary configuration. Omission still means the fixed probe.
+Stop old processes and recreate old development databases explicitly; do not
+migrate, automatically delete data, or restore diagnostic-session identifiers.
+
+Tool observation persists only `tool_started`, `tool_completed`, and `tool_failed`
+activities with payload fields `toolCallId` generated within this ProviderAttempt,
+ACP enum `kind`, and normalized `status`. Never store provider tool IDs, titles,
+commands, paths, arguments, results, MCP server names, or error text. Track at most
+128 tools and accept at most 512 tool updates; raw IDs are memory-only and at most
+256 characters. Initial pending/in_progress publishes started once, terminal
+state at most once; unknown IDs, invalid statuses, or terminal-state changes fail.
+A terminal initial call publishes started followed by its terminal fact. Timeline
+uses these fixed fields and existing Run/Activation/ProviderAttempt provenance.
+
+Trusted-local raw assistant chunks feed only the bounded in-memory final action
+envelope, not public streaming activity. Tool and diagnostic text never becomes
+a report or reply automatically. Explicit final public actions still use the
+existing capability channel. ACP session IDs are memory-only routing data, never
+restored diagnostic-session fields; failures retain schema 17 stable codes and
+fixed summaries.
+
+Deterministic tests must demonstrate a real fixed provider writing and running a
+synthetic test in the assigned Worktree, plus Shell/MCP tool states, cancellation,
+expiry, SQLite contention, Host restart, stale output, unknown stop/quarantine,
+and replacement Writer admission. Real Copilot smoke requires explicit opt-in,
+uses only disposable synthetic directories, removes them afterward, and never
+runs in ordinary CI.
+
+The local Host uses `TORSOR_PROVIDER_POLICY` (default `restricted`) and requires
+`TORSOR_PROVIDER_PERMISSION_MODE` for `trusted-local`, rejecting that permission
+setting for `restricted`. Trusted-local also requires `TORSOR_REPOSITORY_PATH`,
+`TORSOR_WORKTREE_ROOT`, and full-commit `TORSOR_BASE_REVISION`, and rejects
+`TORSOR_PROVIDER_CWD`. `TORSOR_PROVIDER_TIMEOUT_MS` defaults to 120000 for
+trusted-local and 25000 for restricted, accepts 1000 through 295000, and derives
+Attention, Outbox, Activation, and Writer windows as timeout plus 5000 milliseconds.
+These are bounded attempts, not renewable sessions.
+
+Explicit Copilot `allow-all` uses the publicly supported `--allow-all` and selects
+only an advertised ACP `allow_always` or `allow_once` permission option;
+`provider-default` denies unattended permission requests. Prefer advertised
+`configOptions`, otherwise legacy `modes`, selecting only advertised `agent` /
+`interactive` coding modes, never treating Autopilot as a permission mode.
+Closing stdin is normal ACP close; cancellation sends `session/cancel` before
+stopping the original tree. See [Copilot ACP](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server)
+and [ACP config options](https://agentclientprotocol.com/protocol/session-config-options).
+
+Ordinary CI runs the fixed native ACP smoke and opt-in gate tests without reading
+real provider configuration. Real smoke requires `--allow-real-provider`; missing
+opt-in refuses before environment access, directory creation, Git or Provider
+launch. Confirmed stop removes Torsor's temporary database and synthetic content.
+Unconfirmed stop preserves the quarantined directory and fails explicitly rather
+than deleting a possibly live Writer's directory. Provider-owned global sessions/logs
+and external MCP/API effects are outside Torsor cleanup; no provider-side erasure
+guarantee is made.
