@@ -1,9 +1,8 @@
 {
-  "name": "@torsor/server",
+  "name": "@torsor/operational-logging",
   "version": "0.1.0",
-  "description": "Local production host for the Torsor kernel and agent runtime",
+  "description": "Privacy-safe structured operational logging foundation for Torsor",
   "license": "Apache-2.0",
-  "private": true,
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -13,17 +12,14 @@
       "import": "./dist/index.js"
     }
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
-    "start": "node dist/main.js",
+    "prepack": "npm run build",
     "test": "npm run build && vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
-    "prebuild": "npm run build --workspace @torsor/kernel && npm run build --workspace @torsor/operational-logging && npm run build --workspace @torsor/agent-runtime",
     "build": "tsc -p tsconfig.json"
-  },
-  "dependencies": {
-    "@torsor/agent-runtime": "0.1.0",
-    "@torsor/kernel": "0.1.0",
-    "@torsor/operational-logging": "0.1.0"
   },
   "devDependencies": {
     "@types/node": "^24.10.0",

@@ -2,6 +2,7 @@ import { fileURLToPath } from "node:url";
 
 import { CopilotAcpAdapter, LocalWorktreeExecutor, ProviderExecutionError } from "@torsor/agent-runtime";
 import { KernelError, TorsorKernel } from "@torsor/kernel";
+import { OperationalLogger } from "@torsor/operational-logging";
 import { describe, expect, it, vi } from "vitest";
 import { createLocalRuntimeHost } from "../src/local-runtime-host.js";
 import { bootstrap, syntheticRepository } from "../../../packages/agent-runtime/test/fixtures/worktree-fixture.js";
@@ -38,10 +39,15 @@ describe("trusted-local HTTP Host", () => {
     let childClosed: Promise<PromiseSettledResult<unknown>> | undefined;
     let ownerClosed = false;
     let kernel: TorsorKernel | undefined;
+    const operationalLines: string[] = [];
+    const operationalLogger = new OperationalLogger({
+      sink: { write: (line) => { operationalLines.push(line); } },
+    });
     const host = createLocalRuntimeHost({
       databasePath: repo.databasePath, bootstrap, port: 0,
       credentials: [{ token: "synthetic-human-token", principalContext: { principalId: "human" } }],
       runtimePrincipalId: "runtime", projectIds: ["project"], runtimePollIntervalMs: 1,
+      operationalLogger,
       providerTimeoutMs: 120_000, activationDurationMs: 125_000,
       attentionLeaseMs: 125_000, outboxLeaseMs: 125_000,
       // Before admission, exercise the authoritative rejection rather than the poll.
@@ -51,10 +57,11 @@ describe("trusted-local HTTP Host", () => {
         command: process.execPath, commandArgs: [fixture, "hang"],
         unsafeAllowCustomCommandArgs: true, userEnvironment: {},
       }),
-      worktreeExecutorFactory: (ownedKernel) => {
+      worktreeExecutorFactory: (ownedKernel, logger) => {
         kernel = ownedKernel;
         const executor = new LocalWorktreeExecutor({
           kernel: ownedKernel, runtimePrincipalId: "runtime", ...repo, leaseDurationMs: 125_000,
+          ...(logger ? { operationalLogger: logger } : {}),
           ...(phase === "forced-before-return" ? { stopGraceMs: 1 } : {}),
         });
         const start = executor.startProvider.bind(executor);
@@ -97,8 +104,9 @@ describe("trusted-local HTTP Host", () => {
           }
         });
         const execute = ownedKernel.execute.bind(ownedKernel);
-        vi.spyOn(ownedKernel, "execute").mockImplementation(async (command, context) => {
-          const result = await execute(command, context);
+        vi.spyOn(ownedKernel, "execute").mockImplementation(
+          async (command, context, operationContext) => {
+            const result = await execute(command, context, operationContext);
           if (phase === "running-receipt" && command.type === "RecordWorktreeExecution" && command.state === "Running") {
             entered.resolve(launchingRunId!);
             await release.promise;
@@ -108,8 +116,9 @@ describe("trusted-local HTTP Host", () => {
             acknowledgedEarly ||= phase !== "before-admission" && (!returned || !ownerClosed);
             acknowledged.resolve();
           }
-          return result;
-        });
+            return result;
+          },
+        );
         return executor;
       },
     });
@@ -120,13 +129,17 @@ describe("trusted-local HTTP Host", () => {
     void acknowledged.promise.catch(() => undefined);
     try {
       const origin = await host.start();
-      expect((await fetch(`${origin}/api/v1/commands/start-thread`, {
+      const startResponse = await fetch(`${origin}/api/v1/commands/start-thread`, {
         method: "POST", headers,
         body: JSON.stringify({
           idempotencyKey: "launch-window", projectId: "project", channelId: "channel",
           body: "Synthetic launch-window cancellation.", targetAgentIds: ["orbit"],
         }),
-      })).status).toBe(200);
+      });
+      expect(startResponse.status).toBe(200);
+      const startResult = (await startResponse.json()).result as {
+        correlationId: string;
+      };
       const runId = await entered.promise;
       if (cancel) {
         const projection = await kernel!.query({ type: "GetRunProjection", runId }, { principalId: "human" });
@@ -156,6 +169,31 @@ describe("trusted-local HTTP Host", () => {
         expect(projection.run.state).toBe("Cancelled");
         expect(projection.providerAttempts.at(-1)?.status).toBe("Unknown");
         expect(projection.activity.items).toEqual([]);
+        const operationalEvents = operationalLines.map((line) => JSON.parse(line));
+        expect(operationalEvents).toContainEqual(expect.objectContaining({
+          event: "runtime.activation",
+          outcome: "started",
+          correlationId: startResult.correlationId,
+        }));
+        const runActivation = operationalEvents.find((event) =>
+          event.event === "runtime.activation" &&
+          event.outcome === "started" &&
+          event.runId === runId
+        );
+        expect(runActivation).toMatchObject({
+          correlationId: startResult.correlationId,
+        });
+        expect(operationalEvents).toContainEqual(
+          expect.objectContaining({
+            event: "runtime.run_terminal",
+            outcome: "cancelled",
+            errorCode: "run_cancelled",
+            correlationId: startResult.correlationId,
+          }),
+        );
+        const serializedOperationalLog = operationalLines.join("");
+        expect(serializedOperationalLog).not.toContain(fixture);
+        expect(serializedOperationalLog).not.toContain("Synthetic launch-window cancellation.");
         expect((await fetch(`${origin}/api/v1/commands/start-thread`, {
           method: "POST", headers, signal: AbortSignal.timeout(2_000),
           body: JSON.stringify({
@@ -227,8 +265,8 @@ describe("trusted-local HTTP Host", () => {
       worktreeExecutorFactory: (ownedKernel) => {
         kernel = ownedKernel;
         const execute = ownedKernel.execute.bind(ownedKernel);
-        vi.spyOn(ownedKernel, "execute").mockImplementation(async (command, context) => {
-          const result = await execute(command, context);
+        vi.spyOn(ownedKernel, "execute").mockImplementation(async (command, context, operationContext) => {
+          const result = await execute(command, context, operationContext);
           if (command.type === "AcquireWorktreeWriterLease") {
             leaseAuthority = {
               worktreeId: command.worktreeId,
@@ -470,12 +508,12 @@ describe("trusted-local HTTP Host", () => {
       worktreeExecutorFactory: (ownedKernel) => {
         kernel = ownedKernel;
         const execute = ownedKernel.execute.bind(ownedKernel);
-        vi.spyOn(ownedKernel, "execute").mockImplementation(async (command, context) => {
+        vi.spyOn(ownedKernel, "execute").mockImplementation(async (command, context, operationContext) => {
           if (command.type === "RecordWorktreeExecution" && command.state === "StopConfirmed") {
             settling.resolve();
             await releaseSettlement.promise;
           }
-          const result = await execute(command, context);
+          const result = await execute(command, context, operationContext);
           if (command.type === "AcquireWorktreeWriterLease") {
             leaseAuthority = {
               worktreeId: command.worktreeId,
@@ -601,8 +639,8 @@ describe("trusted-local HTTP Host", () => {
       }),
       worktreeExecutorFactory: (kernel) => {
         const execute = kernel.execute.bind(kernel);
-        vi.spyOn(kernel, "execute").mockImplementation(async (command, context) => {
-          const result = await execute(command, context);
+        vi.spyOn(kernel, "execute").mockImplementation(async (command, context, operationContext) => {
+          const result = await execute(command, context, operationContext);
           if (command.type === "AppendRunActivity" && command.kind === "tool_started") {
             runId = command.runId;
             if (scenario !== "success") observed.resolve(runId);

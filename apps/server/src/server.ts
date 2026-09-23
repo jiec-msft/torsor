@@ -13,9 +13,14 @@ import {
   type KernelBootstrap,
   type ArtifactStorage,
   type KernelCommand,
+  type CommandResult,
   type PrincipalContext,
   type PublicEventEnvelope,
 } from "@torsor/kernel";
+import {
+  createOpaqueId,
+  type OperationalLogger,
+} from "@torsor/operational-logging";
 
 const apiPrefix = "/api/v1";
 const defaultBodyLimitBytes = 1_048_576;
@@ -58,6 +63,7 @@ interface TorsorHttpServiceBaseOptions {
   readonly eventPollIntervalMs?: number;
   readonly heartbeatIntervalMs?: number;
   readonly sessionDurationMs?: number;
+  readonly operationalLogger?: OperationalLogger;
 }
 
 interface OwnedKernelHttpServiceOptions {
@@ -84,6 +90,7 @@ export type TorsorHttpServiceOptions = TorsorHttpServiceBaseOptions &
 export interface TorsorHttpService {
   readonly origin: string | null;
   readonly activeEventStreamCount: number;
+  readonly failure: Promise<never>;
   listen(): Promise<string>;
   close(): Promise<void>;
 }
@@ -129,6 +136,10 @@ class Service implements TorsorHttpService {
   readonly #eventPollIntervalMs: number;
   readonly #heartbeatIntervalMs: number;
   readonly #sessionDurationMs: number;
+  readonly #operationalLogger: OperationalLogger | undefined;
+  readonly #failure: Promise<never>;
+  #rejectFailure!: (error: unknown) => void;
+  #failed = false;
   #origin: string | null = null;
   #state: "created" | "starting" | "listening" | "closing" | "closed" =
     "created";
@@ -137,6 +148,10 @@ class Service implements TorsorHttpService {
   #closePromise: Promise<void> | null = null;
 
   constructor(options: TorsorHttpServiceOptions) {
+    this.#failure = new Promise<never>((_resolve, reject) => {
+      this.#rejectFailure = reject;
+    });
+    void this.#failure.catch(() => undefined);
     if (options.credentials.length === 0) {
       throw new Error("At least one local credential is required.");
     }
@@ -173,6 +188,7 @@ class Service implements TorsorHttpService {
       options.sessionDurationMs ?? defaultSessionDurationMs,
       "sessionDurationMs",
     );
+    this.#operationalLogger = options.operationalLogger;
     if (options.kernel) {
       this.#kernel = options.kernel;
       this.#ownsKernel = false;
@@ -187,7 +203,9 @@ class Service implements TorsorHttpService {
       this.#ownsKernel = true;
     }
     this.#server = createServer((request, response) => {
-      void this.#handle(request, response);
+      void this.#handle(request, response).catch((error: unknown) => {
+        this.#fail(error);
+      });
     });
   }
 
@@ -197,6 +215,10 @@ class Service implements TorsorHttpService {
 
   get activeEventStreamCount(): number {
     return this.#eventStreams.size;
+  }
+
+  get failure(): Promise<never> {
+    return this.#failure;
   }
 
   async listen(): Promise<string> {
@@ -274,6 +296,11 @@ class Service implements TorsorHttpService {
     response: ServerResponse,
   ): Promise<void> {
     const requestId = randomUUID();
+    const startedAt = performance.now();
+    let correlationId: string | undefined;
+    let requestFailed = false;
+    let requestLogged = false;
+    let requestLoggingError: unknown;
     response.setHeader("X-Request-Id", requestId);
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
@@ -302,7 +329,26 @@ class Service implements TorsorHttpService {
       const authenticated = this.#authenticate(request);
 
       if (request.method === "POST" && segments[2] === "commands") {
-        await this.#handleCommand(segments[3], request, response, authenticated);
+        const commandResult = await this.#handleCommand(
+          segments[3],
+          request,
+          authenticated,
+        );
+        correlationId = commandResult.correlationId;
+        try {
+          await this.#emitHttpRequest({
+            requestId,
+            correlationId,
+            startedAt,
+            status: 200,
+            failed: false,
+          });
+          requestLogged = true;
+        } catch (error) {
+          requestLoggingError = error;
+          throw error;
+        }
+        sendJson(response, 200, { result: commandResult.result });
         return;
       }
 
@@ -326,12 +372,52 @@ class Service implements TorsorHttpService {
 
       await this.#handleQuery(segments, url, response, authenticated);
     } catch (error) {
+      requestFailed = true;
       if (!response.headersSent) {
         sendError(response, error, requestId);
       } else if (!response.writableEnded) {
         response.destroy();
       }
+      if (requestLoggingError !== undefined) {
+        throw error;
+      }
+    } finally {
+      if (!requestLogged && requestLoggingError === undefined) {
+        await this.#emitHttpRequest({
+          requestId,
+          ...(correlationId === undefined ? {} : { correlationId }),
+          startedAt,
+          status: response.statusCode,
+          failed: requestFailed || response.statusCode >= 400,
+        });
+      }
     }
+  }
+
+  async #emitHttpRequest(input: {
+    readonly requestId: string;
+    readonly correlationId?: string;
+    readonly startedAt: number;
+    readonly status: number;
+    readonly failed: boolean;
+  }): Promise<void> {
+    if (!this.#operationalLogger) {
+      return;
+    }
+    await this.#operationalLogger.emit({
+      event: "http.request",
+      outcome: input.failed ? "failed" : "succeeded",
+      durationMs: Math.min(
+        86_400_000,
+        Math.max(0, Math.round(performance.now() - input.startedAt)),
+      ),
+      httpStatus: input.status,
+      requestId: createOpaqueId(input.requestId),
+      ...(input.correlationId === undefined
+        ? {}
+        : { correlationId: createOpaqueId(input.correlationId) }),
+      ...(input.failed ? { errorCode: "http_request_failed" } : {}),
+    });
   }
 
   async #handleSession(
@@ -474,9 +560,11 @@ class Service implements TorsorHttpService {
   async #handleCommand(
     commandSlug: string | undefined,
     request: IncomingMessage,
-    response: ServerResponse,
     authenticated: AuthenticatedRequest,
-  ): Promise<void> {
+  ): Promise<{
+    readonly correlationId: string;
+    readonly result: CommandResult;
+  }> {
     if (!commandSlug || !(commandSlug in commandTypes)) {
       throw new HttpError(
         404,
@@ -523,11 +611,16 @@ class Service implements TorsorHttpService {
     const type = commandTypes[commandSlug as keyof typeof commandTypes];
     const command = { ...body, type } as unknown as KernelCommand;
     this.#requireCurrentAuthentication(authenticated);
+    const correlationId = `corr-${randomUUID()}`;
     const result = await this.#kernel.execute(
       command,
       authenticated.context,
+      { correlationId },
     );
-    sendJson(response, 200, { result });
+    return {
+      correlationId: result.correlationId ?? correlationId,
+      result,
+    };
   }
 
   async #handleQuery(
@@ -907,6 +1000,13 @@ class Service implements TorsorHttpService {
       1,
       Math.min(maximumMs, authenticated.sessionExpiresAt - Date.now()),
     );
+  }
+
+  #fail(error: unknown): void {
+    if (this.#failed) return;
+    this.#failed = true;
+    this.#rejectFailure(error);
+    void this.close().catch(() => undefined);
   }
 
 }

@@ -2,6 +2,10 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { TorsorKernel } from "@torsor/kernel";
+import {
+  OperationalLogSinkError,
+  OperationalLogger,
+} from "@torsor/operational-logging";
 import { describe, expect, it, vi } from "vitest";
 import { bootstrap, createRun, runtimeContext } from "../../kernel/test/helpers.js";
 import type { ControlledChild } from "../src/controlled-process.js";
@@ -12,7 +16,7 @@ import { deferred } from "./fixtures/deferred.js";
 
 const policy = resolveProviderPolicy({ kind: "trusted-local", permissionMode: "allow-all" });
 
-async function fixture() {
+async function fixture(operationalLogger?: OperationalLogger) {
   const repo = syntheticRepository();
   const kernel = TorsorKernel.open({ databasePath: repo.databasePath, bootstrap });
   const run = await createRun(kernel);
@@ -26,8 +30,16 @@ async function fixture() {
   const executor = new LocalWorktreeExecutor({
     kernel, runtimePrincipalId: runtimeContext.principalId, ...repo,
     stopGraceMs: 10, forceGraceMs: 10,
+    ...(operationalLogger ? { operationalLogger } : {}),
   });
-  return { repo, kernel, run, executor, providerAttemptId: attempt.entityId };
+  return {
+    repo,
+    kernel,
+    run,
+    executor,
+    providerAttemptId: attempt.entityId,
+    correlationId: attempt.correlationId!,
+  };
 }
 
 function child(unknownStop = false) {
@@ -48,8 +60,8 @@ describe("native provider Worktree ownership", () => {
     const order: string[] = [];
     let cwd = "";
     const execute = f.kernel.execute.bind(f.kernel);
-    vi.spyOn(f.kernel, "execute").mockImplementation(async (command, context) => {
-      const result = await execute(command, context);
+    vi.spyOn(f.kernel, "execute").mockImplementation(async (command, context, operationContext) => {
+      const result = await execute(command, context, operationContext);
       if (command.type === "AcquireWorktreeWriterLease" || command.type === "StartWorktreeExecution") {
         order.push(command.type);
       }
@@ -57,7 +69,8 @@ describe("native provider Worktree ownership", () => {
     });
     try {
       const handle = await f.executor.startProvider({
-        runId: f.run.runId, activationId: f.run.activationId, providerAttemptId: f.providerAttemptId, policy,
+        runId: f.run.runId, activationId: f.run.activationId, providerAttemptId: f.providerAttemptId,
+        correlationId: f.correlationId, policy,
         start: (directory) => {
           order.push("spawn");
           cwd = directory;
@@ -95,6 +108,7 @@ describe("native provider Worktree ownership", () => {
     try {
       const handle = await f.executor.startProvider({
         runId: f.run.runId, activationId: f.run.activationId, providerAttemptId: f.providerAttemptId,
+        correlationId: f.correlationId,
         policy, start: () => child().value,
       });
       expect(await handle.finish()).toBe("StopConfirmed");
@@ -113,11 +127,16 @@ describe("native provider Worktree ownership", () => {
   });
 
   it("quarantines unknown stop and rejects stale publication or replacement until original-handle confirmation", async () => {
-    const f = await fixture();
+    const lines: string[] = [];
+    const logger = new OperationalLogger({
+      sink: { write: (line) => { lines.push(line); } },
+    });
+    const f = await fixture(logger);
     const owned = child(true);
     try {
       const handle = await f.executor.startProvider({
         runId: f.run.runId, activationId: f.run.activationId, providerAttemptId: f.providerAttemptId,
+        correlationId: f.correlationId,
         policy, start: () => owned.value,
       });
       expect(await handle.stop("Synthetic cancellation.")).toBe("Uncertain");
@@ -127,6 +146,7 @@ describe("native provider Worktree ownership", () => {
       const reopened = TorsorKernel.open({ databasePath: f.repo.databasePath });
       const recovered = new LocalWorktreeExecutor({
         kernel: reopened, runtimePrincipalId: runtimeContext.principalId, ...f.repo,
+        operationalLogger: logger,
       });
       try {
         await recovered.recover();
@@ -140,6 +160,7 @@ describe("native provider Worktree ownership", () => {
         const replacement = vi.fn(() => child().value);
         await expect(recovered.startProvider({
           runId: f.run.runId, activationId: f.run.activationId, providerAttemptId: f.providerAttemptId,
+          correlationId: f.correlationId,
           policy, start: replacement,
         })).rejects.toThrow();
         expect(replacement).not.toHaveBeenCalled();
@@ -155,14 +176,202 @@ describe("native provider Worktree ownership", () => {
         type: "AcquireWorktreeWriterLease", idempotencyKey: "confirmed-replacement",
         worktreeId: tree.worktreeId, leaseDurationMs: 30_000,
       }, runtimeContext)).resolves.toMatchObject({ leaseGeneration: 2, fencingToken: 2 });
+      const serialized = lines.join("");
+      expect(lines.map((line) => JSON.parse(line))).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          event: "writer_authority.acquire",
+          outcome: "succeeded",
+          correlationId: f.correlationId,
+        }),
+        expect.objectContaining({
+          event: "provider_process.stop",
+          outcome: "unknown",
+          errorCode: "provider_cleanup_failed",
+          correlationId: f.correlationId,
+        }),
+        expect.objectContaining({
+          event: "writer_authority.quarantine",
+          outcome: "succeeded",
+          correlationId: f.correlationId,
+        }),
+        expect.objectContaining({
+          event: "recovery.pass",
+          outcome: "succeeded",
+          correlationId: f.correlationId,
+        }),
+      ]));
+      expect(serialized).not.toContain(f.repo.directory);
+      expect(serialized).not.toContain("leaseToken");
+      expect(serialized).not.toContain("fencingToken");
+      expect(serialized).not.toContain("executionToken");
     } finally { owned.confirm(); await f.executor.close(); f.kernel.close(); f.repo.dispose(); }
+  });
+
+  it("records independent Writer authority loss without logging lease authority", async () => {
+    const lines: string[] = [];
+    const logger = new OperationalLogger({
+      sink: { write: (line) => { lines.push(line); } },
+    });
+    const f = await fixture(logger);
+    const owned = child();
+    let leaseToken: string | undefined;
+    const execute = f.kernel.execute.bind(f.kernel);
+    vi.spyOn(f.kernel, "execute").mockImplementation(
+      async (command, context, operationContext) => {
+        const result = await execute(command, context, operationContext);
+        if (command.type === "AcquireWorktreeWriterLease") {
+          leaseToken = result.leaseToken;
+        }
+        return result;
+      },
+    );
+    try {
+      await f.executor.startProvider({
+        runId: f.run.runId,
+        activationId: f.run.activationId,
+        providerAttemptId: f.providerAttemptId,
+        correlationId: f.correlationId,
+        policy,
+        start: () => owned.value,
+      });
+      const tree = (await f.kernel.query({
+        type: "ListPhysicalWorktrees",
+        runId: f.run.runId,
+      }, runtimeContext)).items[0]!;
+      const lease = await f.kernel.query({
+        type: "GetWorktreeWriterLease",
+        worktreeId: tree.worktreeId,
+      }, runtimeContext);
+      await f.kernel.execute({
+        type: "QuarantineWorktreeWriterLease",
+        idempotencyKey: "synthetic-independent-authority-loss",
+        worktreeId: tree.worktreeId,
+        expectedGeneration: lease.generation,
+        expectedFencingToken: lease.fencingToken,
+        leaseToken: leaseToken!,
+        reason: "Synthetic independent authority loss.",
+      }, runtimeContext);
+      await vi.waitFor(() => {
+        expect(lines.map((line) => JSON.parse(line))).toContainEqual(
+          expect.objectContaining({
+            event: "writer_authority.loss",
+            outcome: "lost",
+            errorCode: "writer_authority_lost",
+            correlationId: f.correlationId,
+          }),
+        );
+      });
+      const serialized = lines.join("");
+      expect(serialized).not.toContain("generation");
+      expect(serialized).not.toContain("fencingToken");
+      expect(serialized).not.toContain("leaseToken");
+      expect(serialized).not.toContain("Synthetic independent authority loss.");
+      expect(serialized).not.toContain(f.repo.directory);
+    } finally {
+      owned.confirm();
+      await f.executor.close();
+      f.kernel.close();
+      f.repo.dispose();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("physically stops and settles after authority loss even when authority logging fails", async () => {
+    const logger = new OperationalLogger({
+      sink: {
+        write: (line) => {
+          const event = JSON.parse(line) as { event: string };
+          if (event.event === "writer_authority.loss") {
+            throw new Error("Synthetic private sink failure.");
+          }
+        },
+      },
+    });
+    const f = await fixture(logger);
+    const closed = deferred<{ code: number; signal: null; error: null }>();
+    let stopRequests = 0;
+    const controlled: ControlledChild = {
+      pid: 12345,
+      result: Promise.resolve(""),
+      closed: closed.promise,
+      requestStop: () => {
+        stopRequests += 1;
+        closed.resolve({ code: 0, signal: null, error: null });
+      },
+      forceStop: () => false,
+    };
+    let leaseToken: string | undefined;
+    const execute = f.kernel.execute.bind(f.kernel);
+    vi.spyOn(f.kernel, "execute").mockImplementation(
+      async (command, context, operationContext) => {
+        const result = await execute(command, context, operationContext);
+        if (command.type === "AcquireWorktreeWriterLease") {
+          leaseToken = result.leaseToken;
+        }
+        return result;
+      },
+    );
+    try {
+      const handle = await f.executor.startProvider({
+        runId: f.run.runId,
+        activationId: f.run.activationId,
+        providerAttemptId: f.providerAttemptId,
+        correlationId: f.correlationId,
+        policy,
+        start: () => controlled,
+      });
+      const tree = (await f.kernel.query({
+        type: "ListPhysicalWorktrees",
+        runId: f.run.runId,
+      }, runtimeContext)).items[0]!;
+      const lease = await f.kernel.query({
+        type: "GetWorktreeWriterLease",
+        worktreeId: tree.worktreeId,
+      }, runtimeContext);
+      await f.kernel.execute({
+        type: "QuarantineWorktreeWriterLease",
+        idempotencyKey: "synthetic-logging-failed-authority-loss",
+        worktreeId: tree.worktreeId,
+        expectedGeneration: lease.generation,
+        expectedFencingToken: lease.fencingToken,
+        leaseToken: leaseToken!,
+        reason: "Synthetic independent authority loss.",
+      }, runtimeContext);
+
+      await vi.waitFor(() => expect(stopRequests).toBe(1), { timeout: 200 });
+      await expect(handle.authorityClassificationError())
+        .rejects.toBeInstanceOf(OperationalLogSinkError);
+      expect(await f.kernel.query({
+        type: "GetPhysicalWorktree",
+        worktreeId: tree.worktreeId,
+      }, runtimeContext)).toMatchObject({
+        state: "Ready",
+        latestExecution: { state: "StopConfirmed" },
+      });
+      expect(await f.kernel.query({
+        type: "GetWorktreeWriterLease",
+        worktreeId: tree.worktreeId,
+      }, runtimeContext)).toMatchObject({ status: "Quarantined" });
+    } finally {
+      closed.resolve({ code: 0, signal: null, error: null });
+      await f.executor.close();
+      f.kernel.close();
+      f.repo.dispose();
+      vi.restoreAllMocks();
+    }
   });
 
   it("rejects restricted policy and pre-aborted requests without creating a process", async () => {
     const f = await fixture();
     const start = vi.fn(() => child().value);
     try {
-      const input = { runId: f.run.runId, activationId: f.run.activationId, providerAttemptId: f.providerAttemptId, start };
+      const input = {
+        runId: f.run.runId,
+        activationId: f.run.activationId,
+        providerAttemptId: f.providerAttemptId,
+        correlationId: f.correlationId,
+        start,
+      };
       await expect(f.executor.startProvider({ ...input, policy: resolveProviderPolicy() })).rejects.toThrow();
       await expect(f.executor.startProvider({ ...input, policy, signal: AbortSignal.abort() })).rejects.toThrow();
       expect(start).not.toHaveBeenCalled();
@@ -180,7 +389,8 @@ describe("native provider Worktree ownership", () => {
     try {
       const original = await f.executor.startProvider({
         runId: f.run.runId, activationId: f.run.activationId,
-        providerAttemptId: f.providerAttemptId, policy, start: () => owned.value,
+        providerAttemptId: f.providerAttemptId, correlationId: f.correlationId,
+        policy, start: () => owned.value,
       });
       await replacement.recover();
       const tree = (await reopened.query({ type: "ListPhysicalWorktrees" }, runtimeContext)).items[0]!;
@@ -199,7 +409,7 @@ describe("native provider Worktree ownership", () => {
       const spawn = vi.fn(() => child().value);
       const input = {
         runId: f.run.runId, activationId: activation.entityId, providerAttemptId: attempt.entityId,
-        policy, start: spawn,
+        correlationId: attempt.correlationId!, policy, start: spawn,
       };
       await expect(replacement.startProvider(input)).rejects.toThrow();
       expect(spawn).not.toHaveBeenCalled();

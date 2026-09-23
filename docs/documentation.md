@@ -35,6 +35,7 @@ At adoption, `docs/prototype/001-overview.zh-cn.md` was the only locale-suffixed
 | `apps/web/README.md` | Not required | Component implementation reference | English-only; build and client-state reference tied directly to implementation |
 | `packages/agent-runtime/README.md` | Not required | Package implementation reference | English-only; detailed runtime contract maintained with code rather than used as the human product baseline |
 | `docs/specs/acp-conformance.md` | `docs/specs/acp-conformance.zh-cn.md` | Independent ACP harness specification and public reuse research | Paired; normative |
+| `docs/specs/operational-logging.md` | `docs/specs/operational-logging.zh-cn.md` | Trusted-local operational logging specification | Paired; normative |
 | `packages/acp-conformance/README.md` | `packages/acp-conformance/README.zh-cn.md` | Independent tool onboarding | Paired; owner-facing and external provider-author entry point |
 | `docs/specs/system-scenarios.md` | `docs/specs/system-scenarios.zh-cn.md` | System-test contract | Paired; normative |
 | `packages/system-scenarios/README.md` | `packages/system-scenarios/README.zh-cn.md` | System-test onboarding | Paired; owner-facing |

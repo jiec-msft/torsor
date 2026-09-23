@@ -11,6 +11,7 @@ import {
   type KernelOpenOptions,
   type ArtifactStorage,
 } from "@torsor/kernel";
+import { type OperationalLogger } from "@torsor/operational-logging";
 
 import {
   createTorsorHttpService,
@@ -44,7 +45,11 @@ export interface LocalRuntimeHostOptions {
   readonly runtimeHooks?: AgentRuntimeHooks;
   readonly clock?: () => Date;
   readonly idFactory?: (prefix: string) => string;
-  readonly worktreeExecutorFactory?: (kernel: TorsorKernel) => WorktreeExecutor;
+  readonly operationalLogger?: OperationalLogger;
+  readonly worktreeExecutorFactory?: (
+    kernel: TorsorKernel,
+    operationalLogger?: OperationalLogger,
+  ) => WorktreeExecutor;
 }
 
 export interface LocalRuntimeHost {
@@ -60,6 +65,7 @@ class Host implements LocalRuntimeHost {
   readonly #runtime: AgentRuntime;
   readonly #runtimePollIntervalMs: number;
   readonly #worktreeExecutor: WorktreeExecutor | undefined;
+  readonly #operationalLogger: OperationalLogger | undefined;
   readonly #started = deferred<string>();
   readonly #finished = deferred<void>();
   readonly #stopController = new AbortController();
@@ -77,12 +83,14 @@ class Host implements LocalRuntimeHost {
     service: TorsorHttpService,
     runtime: AgentRuntime,
     runtimePollIntervalMs: number,
+    operationalLogger?: OperationalLogger,
     worktreeExecutor?: WorktreeExecutor,
   ) {
     this.#kernel = kernel;
     this.#service = service;
     this.#runtime = runtime;
     this.#worktreeExecutor = worktreeExecutor;
+    this.#operationalLogger = operationalLogger;
     this.#runtimePollIntervalMs = positiveInteger(
       runtimePollIntervalMs,
       "runtimePollIntervalMs",
@@ -135,26 +143,65 @@ class Host implements LocalRuntimeHost {
 
   async #runLifecycle(): Promise<void> {
     let failure: { readonly error: unknown } | null = null;
+    let listening = false;
     try {
-      if (this.#worktreeExecutor) await this.#worktreeExecutor.recover();
+      if (this.#worktreeExecutor) {
+        await this.#operationalLogger?.emit({
+          event: "recovery.pass",
+          outcome: "started",
+        });
+        await this.#worktreeExecutor.recover();
+        await this.#operationalLogger?.emit({
+          event: "recovery.pass",
+          outcome: "succeeded",
+        });
+      }
       if (this.#stopController.signal.aborted) {
         this.#started.reject(new Error("The local runtime host closed during recovery."));
       } else {
         const origin = await this.#service.listen();
+        listening = true;
         this.#state = "running";
+        await this.#operationalLogger?.emit({
+          event: "host.start",
+          outcome: "succeeded",
+        });
         this.#started.resolve(origin);
-        await this.#runRuntimeLoop();
+        await Promise.race([
+          this.#runRuntimeLoop(),
+          this.#service.failure,
+        ]);
       }
     } catch (error) {
       failure = { error };
       this.#started.reject(error);
+      if (!listening) {
+        await this.#operationalLogger?.emit({
+          event: "host.start",
+          outcome: "failed",
+          errorCode: "host_start_failed",
+        });
+      }
     } finally {
       this.#state = "closing";
       this.#requestStop();
       try {
         await this.#closeResources();
+        await this.#operationalLogger?.emit({
+          event: "host.stop",
+          outcome: "succeeded",
+        });
       } catch (error) {
         failure ??= { error };
+        try {
+          await this.#operationalLogger?.emit({
+            event: "host.stop",
+            outcome: "failed",
+            errorCode: "host_stop_failed",
+          });
+        } catch (loggingError) {
+          failure = { error: loggingError };
+        }
       }
     }
     if (failure) {
@@ -249,7 +296,10 @@ export function createLocalRuntimeHost(
   };
   const kernel = TorsorKernel.open(kernelOptions);
   try {
-    const worktreeExecutor = options.worktreeExecutorFactory?.(kernel);
+    const worktreeExecutor = options.worktreeExecutorFactory?.(
+      kernel,
+      options.operationalLogger,
+    );
     const service = createTorsorHttpService({
       kernel,
       credentials: options.credentials,
@@ -269,6 +319,9 @@ export function createLocalRuntimeHost(
         : {}),
       ...(options.sessionDurationMs
         ? { sessionDurationMs: options.sessionDurationMs }
+        : {}),
+      ...(options.operationalLogger
+        ? { operationalLogger: options.operationalLogger }
         : {}),
     });
     const runtime = new AgentRuntime({
@@ -300,12 +353,16 @@ export function createLocalRuntimeHost(
         : {}),
       ...(options.runtimeHooks ? { hooks: options.runtimeHooks } : {}),
       ...(options.clock ? { clock: options.clock } : {}),
+      ...(options.operationalLogger
+        ? { operationalLogger: options.operationalLogger }
+        : {}),
     });
     return new Host(
       kernel,
       service,
       runtime,
       runtimePollIntervalMs,
+      options.operationalLogger,
       worktreeExecutor,
     );
   } catch (error) {

@@ -3,7 +3,9 @@ import { dirname, resolve } from "node:path";
 
 import { CopilotAcpAdapter, LocalWorktreeExecutor } from "@torsor/agent-runtime";
 import { LocalArtifactStorage, type KernelBootstrap, type PrincipalContext } from "@torsor/kernel";
+import { OperationalLogger } from "@torsor/operational-logging";
 
+import { BoundedOperationalLogSink } from "./bounded-operational-log.js";
 import { createLocalRuntimeHost } from "./local-runtime-host.js";
 import { readProviderConfiguration } from "./provider-configuration.js";
 
@@ -26,6 +28,23 @@ async function main(): Promise<void> {
     ? await loadBootstrap(resolve(process.env.TORSOR_BOOTSTRAP_PATH))
     : undefined;
   await mkdir(dirname(databasePath), { recursive: true });
+  const operationalLogPath = resolve(
+    process.env.TORSOR_OPERATIONAL_LOG_PATH ??
+      resolve(dirname(databasePath), "operational.ndjson"),
+  );
+  await mkdir(dirname(operationalLogPath), { recursive: true });
+  const operationalLogger = new OperationalLogger({
+    sink: new BoundedOperationalLogSink({
+      path: operationalLogPath,
+      maximumBytes: boundedEnvironmentInteger(
+        process.env.TORSOR_OPERATIONAL_LOG_MAX_BYTES,
+        "TORSOR_OPERATIONAL_LOG_MAX_BYTES",
+        1_048_576,
+        65_536,
+        16_777_216,
+      ),
+    }),
+  });
   const artifactStorage = process.env.TORSOR_ARTIFACT_ROOT
     ? await LocalArtifactStorage.open(resolve(process.env.TORSOR_ARTIFACT_ROOT))
     : undefined;
@@ -40,6 +59,7 @@ async function main(): Promise<void> {
       },
     ],
     runtimePrincipalId,
+    operationalLogger,
     projectIds: requiredListEnvironment("TORSOR_PROJECT_IDS"),
     adapter: new CopilotAcpAdapter({
       policy: provider.policy,
@@ -51,8 +71,9 @@ async function main(): Promise<void> {
     outboxLeaseMs: leaseDurationMs,
     activationDurationMs: leaseDurationMs,
     ...(worktree ? {
-      worktreeExecutorFactory: (kernel) => new LocalWorktreeExecutor({
+      worktreeExecutorFactory: (kernel, logger) => new LocalWorktreeExecutor({
         kernel, runtimePrincipalId, leaseDurationMs,
+        ...(logger ? { operationalLogger: logger } : {}),
         repositoryPath: resolve(worktree.repositoryPath),
         rootPath: resolve(worktree.rootPath),
         baseRevision: worktree.baseRevision,
@@ -81,6 +102,23 @@ async function main(): Promise<void> {
   } finally {
     process.removeListener("SIGINT", close);
     process.removeListener("SIGTERM", close);
+  }
+
+  function boundedEnvironmentInteger(
+    value: string | undefined,
+    name: string,
+    fallback: number,
+    minimum: number,
+    maximum: number,
+  ): number {
+    if (value === undefined) return fallback;
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+      throw new Error(
+        `${name} must be an integer between ${minimum} and ${maximum}.`,
+      );
+    }
+    return parsed;
   }
 }
 
@@ -130,11 +168,7 @@ function optionalInteger(
   return parsed;
 }
 
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-void main().catch((error: unknown) => {
-  process.stderr.write(`${formatError(error)}\n`);
+void main().catch(() => {
+  process.stderr.write("Torsor local runtime host failed.\n");
   process.exitCode = 1;
 });
