@@ -269,6 +269,20 @@ test("bounded Web root probe aborts a hanging response and releases its port", a
   }
 });
 
+test("managed termination accepts only clean or SIGTERM exit forms", () => {
+  assert.equal(isExpectedManagedTermination({ code: 0, signal: null }), true);
+  assert.equal(
+    isExpectedManagedTermination({ code: null, signal: "SIGTERM" }),
+    true,
+  );
+  assert.equal(isExpectedManagedTermination({ code: 143, signal: null }), true);
+  assert.equal(isExpectedManagedTermination({ code: 1, signal: null }), false);
+  assert.equal(
+    isExpectedManagedTermination({ code: null, signal: "SIGKILL" }),
+    false,
+  );
+});
+
 test("documented ACP mock accepts the portable scenario path without credentials", async () => {
   const output = await runNodeCli(acpCli, ["mock", acpBasicScenario]);
   assert.equal(output.trim(), "");
@@ -524,8 +538,16 @@ async function terminateManagedProcess(process) {
     throw error;
   }
   assert.ok(
-    result.code === 0 || result.signal === "SIGTERM",
+    isExpectedManagedTermination(result),
     `Unexpected managed-process exit ${result.code ?? result.signal}:\n${process.output}`,
+  );
+}
+
+function isExpectedManagedTermination(result) {
+  return (
+    result.code === 0 ||
+    result.signal === "SIGTERM" ||
+    (result.code === 143 && result.signal === null)
   );
 }
 
