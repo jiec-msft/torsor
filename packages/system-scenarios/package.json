@@ -1,0 +1,32 @@
+{
+  "name": "@torsor/system-scenarios",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Deterministic public-behavior Torsor system scenarios",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "build": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@torsor/agent-runtime": "0.1.0",
+    "@torsor/kernel": "0.1.0",
+    "@torsor/server": "0.1.0",
+    "@torsor/web": "0.1.0",
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.1"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}

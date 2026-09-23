@@ -116,6 +116,7 @@ npm exec -- acp-conformance mock packages/acp-conformance/examples/basic.json
 - [产品定义](docs/product.zh-cn.md) ([English](docs/product.md))
 - [MVP 0.1 内核与交互原型](docs/prototype/001-overview.zh-cn.md) ([English](docs/prototype/001-overview.md))
 - [独立 ACP Provider 一致性 Harness](packages/acp-conformance/README.zh-cn.md) ([English](packages/acp-conformance/README.md))
+- [确定性 Torsor System Scenarios](packages/system-scenarios/README.zh-cn.md) ([English](packages/system-scenarios/README.md))
 - [文档语言与配对策略](docs/documentation.zh-cn.md) ([English](docs/documentation.md))
 - [公开内容策略](docs/public-content.zh-cn.md) ([English](docs/public-content.md))
 - [贡献指南](CONTRIBUTING.zh-cn.md) ([English](CONTRIBUTING.md))

@@ -54,6 +54,10 @@ export interface PrincipalContext {
   readonly activationId?: string;
 }
 
+export interface KernelOperationContext {
+  readonly correlationId: string;
+}
+
 export interface BootstrapPrincipal {
   readonly id: string;
   readonly kind: PrincipalKind;
@@ -568,6 +572,18 @@ export interface GetProviderAttemptQuery {
   readonly providerAttemptId: string;
 }
 
+export type OperationalCorrelationEntityType =
+  | "Attention"
+  | "Run"
+  | "RunInput"
+  | "ProviderAttempt";
+
+export interface GetOperationalCorrelationQuery {
+  readonly type: "GetOperationalCorrelation";
+  readonly entityType: OperationalCorrelationEntityType;
+  readonly entityId: string;
+}
+
 export interface RecoverableAttentionExecutionCursor {
   readonly startedAt: string;
   readonly activationId: string;
@@ -645,6 +661,7 @@ export type KernelQuery =
   | ListOpenAttentionsQuery
   | ListOutboxEventsQuery
   | GetProviderAttemptQuery
+  | GetOperationalCorrelationQuery
   | GetAttentionRecoverySnapshotQuery
   | ListRecoverableAttentionExecutionsQuery
   | ListThreadProjectionsQuery
@@ -978,6 +995,7 @@ export interface QueryResultMap {
   readonly ListOpenAttentions: AttentionPage;
   readonly ListOutboxEvents: OutboxPage;
   readonly GetProviderAttempt: ProviderAttemptView;
+  readonly GetOperationalCorrelation: { readonly correlationId: string };
   readonly GetAttentionRecoverySnapshot: AttentionRecoverySnapshot;
   readonly ListRecoverableAttentionExecutions: RecoverableAttentionExecutionPage;
   readonly ListThreadProjections: ThreadProjectionPage;
@@ -993,6 +1011,7 @@ export type QueryResult<Q extends KernelQuery> = QueryResultMap[Q["type"]];
 export interface CommandResult {
   readonly commandType: KernelCommand["type"];
   readonly entityId: string;
+  readonly correlationId?: string;
   readonly revision?: number;
   readonly threadCursor?: number;
   readonly relatedIds?: Readonly<Record<string, string>>;

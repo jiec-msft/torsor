@@ -1,4 +1,9 @@
 export {
+  BoundedOperationalLogSink,
+  OperationalLogFileError,
+  type BoundedOperationalLogSinkOptions,
+} from "./bounded-operational-log.js";
+export {
   createLocalRuntimeHost,
   type LocalRuntimeHost,
   type LocalRuntimeHostOptions,

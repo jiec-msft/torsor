@@ -118,6 +118,7 @@ import type {
   CommandResult,
   FinalizeReportInput,
   KernelCommand,
+  KernelOperationContext,
   KernelOpenOptions,
   KernelQuery,
   PrincipalContext,
@@ -209,6 +210,7 @@ export class TorsorKernel {
   async execute<C extends KernelCommand>(
     command: C,
     principalContext: PrincipalContext,
+    operationContext?: KernelOperationContext,
   ): Promise<CommandResult> {
     if (command.type === "PublishArtifact") {
       throw new KernelError("Forbidden", "Artifact descriptors require trusted byte finalization.");
@@ -216,7 +218,7 @@ export class TorsorKernel {
     const localBinding = command.type === "StartWorktreeExecution"
       ? { principalId: principalContext.principalId, activationId: command.activationId, executorId: command.executorId }
       : undefined;
-    const result = await this.#execute(command, principalContext);
+    const result = await this.#execute(command, principalContext, operationContext);
     if (localBinding && result.executionToken) {
       this.#localWorktreeExecutions.set(result.entityId, {
         ...localBinding, executionId: result.entityId, executionToken: result.executionToken,
@@ -274,6 +276,7 @@ export class TorsorKernel {
   async finalizeReport(
     input: FinalizeReportInput,
     context: PrincipalContext,
+    operationContext?: KernelOperationContext,
   ): Promise<CommandResult> {
     this.#assertOpen();
     validateReportInput(input);
@@ -301,6 +304,7 @@ export class TorsorKernel {
         byteLength: content.byteLength,
       },
       actor,
+      operationContext,
     );
   }
 
@@ -329,12 +333,27 @@ export class TorsorKernel {
   async #execute(
     command: KernelCommand,
     principalContext: PrincipalContext,
+    operationContext?: KernelOperationContext,
   ): Promise<CommandResult> {
-    return this.#withDatabaseAccess(() => this.#executeTransaction(command, principalContext));
+    return this.#withDatabaseAccess(() => this.#executeTransaction(
+      command,
+      principalContext,
+      operationContext,
+    ));
   }
 
-  #executeTransaction(command: KernelCommand, principalContext: PrincipalContext): CommandResult {
+  #executeTransaction(
+    command: KernelCommand,
+    principalContext: PrincipalContext,
+    operationContext?: KernelOperationContext,
+  ): CommandResult {
     this.#assertOpen();
+    if (
+      operationContext &&
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(operationContext.correlationId)
+    ) {
+      throw new KernelError("InvalidCommand", "Operational correlation identifier is invalid.");
+    }
     const principal = requirePrincipal(
       this.#context,
       principalContext.principalId,
@@ -525,13 +544,16 @@ export class TorsorKernel {
         return result;
       }
 
-      const correlationId = this.#context.idFactory("corr");
-      const result = this.#dispatchCommand(
-        command,
-        effectiveContext,
-        principal,
+      const correlationId = operationContext?.correlationId ?? this.#context.idFactory("corr");
+      const result = {
+        ...this.#dispatchCommand(
+          command,
+          effectiveContext,
+          principal,
+          correlationId,
+        ),
         correlationId,
-      );
+      };
       recordProjectionVersions(this.#context, correlationId);
       run(
         this.#context,
@@ -751,6 +773,38 @@ export class TorsorKernel {
             principalContext,
           );
           break;
+        case "GetOperationalCorrelation": {
+          requireKind(this.#context, principal, "runtime");
+          let row = getRow(
+            this.#context,
+            `SELECT correlation_id
+               FROM public_events
+              WHERE entity_type = ? AND entity_id = ?
+              ORDER BY sequence
+              LIMIT 1`,
+            query.entityType,
+            query.entityId,
+          );
+          if (!row && query.entityType === "RunInput") {
+            row = getRow(
+              this.#context,
+              `SELECT event.correlation_id
+                 FROM run_inputs AS input
+                 JOIN public_events AS event
+                   ON event.entity_type = 'Run'
+                  AND event.entity_id = input.run_id
+                WHERE input.id = ?
+                ORDER BY event.sequence
+                LIMIT 1`,
+              query.entityId,
+            );
+          }
+          if (!row) {
+            throw new KernelError("NotFound", "Operational correlation source was not found.");
+          }
+          result = { correlationId: text(row.correlation_id) };
+          break;
+        }
         case "GetAttentionRecoverySnapshot":
           requireKind(this.#context, principal, "runtime");
           result = getAttentionRecoverySnapshot(this.#context);

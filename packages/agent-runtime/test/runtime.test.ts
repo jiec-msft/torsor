@@ -10,6 +10,7 @@ import {
   type KernelBootstrap,
   type RecoverableAttentionExecutionPage,
 } from "@torsor/kernel";
+import { OperationalLogger } from "@torsor/operational-logging";
 import { describe, expect, it, vi } from "vitest";
 import { seedArtifactScopes } from "../../kernel/test/artifact-scope-fixture.js";
 
@@ -266,6 +267,48 @@ describe("AgentRuntime", () => {
       expect(projection.messages.at(-1)?.revisions[0]?.body).toBe(
         "The deterministic fake completed the requested work.",
       );
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("preserves the originating correlation through Attention activation and settlement", async () => {
+    const kernel = openKernel(":memory:");
+    const correlationId = "corr-http-command";
+    const lines: string[] = [];
+    const logger = new OperationalLogger({
+      sink: { write: (line) => { lines.push(line); } },
+    });
+    try {
+      const thread = await kernel.execute(
+        {
+          type: "StartThread",
+          idempotencyKey: "attention-correlation",
+          projectId: "project-sample",
+          channelId: "channel-general",
+          body: "Orbit, preserve this synthetic command correlation.",
+          targetAgentIds: ["agent-orbit"],
+        },
+        humanContext,
+        { correlationId },
+      );
+      await createRuntime(kernel, new DeterministicFakeAdapter(), {
+        operationalLogger: logger,
+      }).drainUntilIdle();
+
+      const events = (await kernel.readEvents(null, 500)).filter(
+        (event) => event.threadRootId === thread.entityId,
+      );
+      expect(events.find((event) => event.type === "ActivationStarted"))
+        .toMatchObject({ correlationId });
+      expect(events.every((event) => event.correlationId === correlationId))
+        .toBe(true);
+      const operationalEvents = lines
+        .map((line) => JSON.parse(line) as { event: string; correlationId?: string })
+        .filter((event) => event.event.startsWith("runtime."));
+      expect(operationalEvents.length).toBeGreaterThan(0);
+      expect(operationalEvents.every((event) => event.correlationId === correlationId))
+        .toBe(true);
     } finally {
       kernel.close();
     }
@@ -2305,8 +2348,13 @@ describe("AgentRuntime", () => {
         humanContext,
       );
       expect(run.inputs).toHaveLength(2);
+      const continuedAttention = projection.attentions.find(
+        (attention) =>
+          attention.resolutionOutcome === "ExistingRunContinued" &&
+          attention.resolvedRunId === selectedRunId,
+      );
       expect(run.inputs[1]?.sourceAttentionId).toBe(
-        projection.attentions[1]?.id,
+        continuedAttention?.id,
       );
     } finally {
       kernel.close();
@@ -2407,6 +2455,7 @@ describe("AgentRuntime", () => {
         agent: bootstrapView.agents[0]!,
         activationId: firstActivation.entityId,
         providerAttemptId: "provider-attempt-stale",
+        correlationId: "corr-stale-attention",
         causeType: "attention",
         attention,
         attentionRevision: firstClaim.revision!,
@@ -2511,6 +2560,7 @@ describe("AgentRuntime", () => {
         agent: bootstrapView.agents[0]!,
         activationId: activation.entityId,
         providerAttemptId: attempt.entityId,
+        correlationId: attempt.correlationId!,
         causeType: "attention",
         attention,
         attentionRevision: claim.revision!,

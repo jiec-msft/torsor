@@ -3,6 +3,7 @@ import type {
   AttentionView,
   BootstrapAgent,
   JsonValue,
+  KernelOperationContext,
   RunProjection,
   RunView,
   TorsorKernel,
@@ -19,6 +20,7 @@ interface BridgeBaseOptions {
   readonly agent: BootstrapAgent;
   readonly activationId: string;
   readonly providerAttemptId: string;
+  readonly correlationId: string;
   readonly assertPublication?: () => void;
 }
 
@@ -89,6 +91,7 @@ export class KernelActivationCapabilityBridge
         content: Buffer.from(input.text, "utf8"),
       },
       this.#agentContext(),
+      this.#operationContext(),
     );
     return result.entityId;
   }
@@ -107,6 +110,7 @@ export class KernelActivationCapabilityBridge
         handlerLeaseToken: this.options.handlerLeaseToken,
       },
       this.#agentContext(),
+      this.#operationContext(),
     );
     this.#attentionDecision = { type: "create", runId: result.entityId };
     return result.entityId;
@@ -132,6 +136,7 @@ export class KernelActivationCapabilityBridge
         expectedRunRevision: eligible.revision,
       },
       this.#agentContext(),
+      this.#operationContext(),
     );
     this.#attentionDecision = { type: "continue", runId };
     return result.relatedIds?.runInputId ?? result.entityId;
@@ -152,6 +157,7 @@ export class KernelActivationCapabilityBridge
         reason,
       },
       this.#agentContext(),
+      this.#operationContext(),
     );
     this.#attentionDecision = { type: "ignore", reason: reason.trim() };
   }
@@ -174,6 +180,7 @@ export class KernelActivationCapabilityBridge
         retentionClass,
       },
       this.#agentContext(),
+      this.#operationContext(),
     );
     return result.entityId;
   }
@@ -199,6 +206,7 @@ export class KernelActivationCapabilityBridge
           : { expectedThreadCursor: input.expectedThreadCursor }),
       },
       this.#agentContext(),
+      this.#operationContext(),
     );
     return result.entityId;
   }
@@ -230,6 +238,7 @@ export class KernelActivationCapabilityBridge
           ...(input.finalReply ? { finalReply: input.finalReply } : {}),
         },
         this.#agentContext(),
+        this.#operationContext(),
       );
       this.#runRevision = result.revision ?? this.#runRevision;
     } catch (error) {
@@ -252,6 +261,7 @@ export class KernelActivationCapabilityBridge
           reason,
         },
         this.#agentContext(),
+        this.#operationContext(),
       );
       this.#runRevision = result.revision ?? this.#runRevision;
     } catch (error) {
@@ -274,6 +284,7 @@ export class KernelActivationCapabilityBridge
           reason,
         },
         this.#agentContext(),
+        this.#operationContext(),
       );
       this.#runRevision = result.revision ?? this.#runRevision;
     } catch (error) {
@@ -321,6 +332,10 @@ export class KernelActivationCapabilityBridge
       principalId: this.options.agent.principalId,
       activationId: this.activationId,
     };
+  }
+
+  #operationContext(): KernelOperationContext {
+    return { correlationId: this.options.correlationId };
   }
 
   #key(operation: string): string {

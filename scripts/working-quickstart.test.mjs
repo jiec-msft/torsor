@@ -363,9 +363,22 @@ test("clean tracked source packs installable Kernel and agent-runtime tarballs",
     assert.ok(runtimePack.files.some(
       (file) => file.path === "dist/provider-process-windows-owner.js",
     ));
+    assert.ok(runtimePack.bundled?.includes("@torsor/operational-logging"));
+    assert.ok(runtimePack.files.some(
+      (file) =>
+        file.path ===
+        "node_modules/@torsor/operational-logging/dist/index.js",
+    ));
+    assert.ok(runtimePack.files.some(
+      (file) =>
+        file.path ===
+        "node_modules/@torsor/operational-logging/LICENSE",
+    ));
     assert.equal(runtimePack.files.some(
       (file) => file.path.startsWith("src/") ||
         file.path.startsWith("test/") ||
+        file.path.includes("/src/") ||
+        file.path.includes("/test/") ||
         file.path.endsWith(".node"),
     ), false);
     const kernelTarball = join(source, kernelPack.filename);
@@ -373,7 +386,13 @@ test("clean tracked source packs installable Kernel and agent-runtime tarballs",
     await mkdir(consumer, { recursive: true });
     await runNpm(["init", "-y"], consumer, 30_000);
     await runNpm(
-      ["install", "--no-audit", "--no-fund", kernelTarball, runtimeTarball],
+      [
+        "install",
+        "--no-audit",
+        "--no-fund",
+        kernelTarball,
+        runtimeTarball,
+      ],
       consumer,
       120_000,
     );

@@ -120,8 +120,8 @@ describe("orphaned physical Writer Host recovery (MVP 22.2)", () => {
         worktreeExecutorFactory(kernel) {
           originalKernel = kernel;
           const execute = kernel.execute.bind(kernel);
-          vi.spyOn(kernel, "execute").mockImplementation(async (command, context) => {
-            const result = await execute(command, context);
+          vi.spyOn(kernel, "execute").mockImplementation(async (command, context, operationContext) => {
+            const result = await execute(command, context, operationContext);
             if (source && command.type === "FinishProviderAttempt" && command.status === "Completed") {
               committed.resolve();
               await resumeOriginal.promise;
@@ -152,7 +152,7 @@ describe("orphaned physical Writer Host recovery (MVP 22.2)", () => {
           adapter: new DeterministicFakeAdapter(async () => { throw new Error("Committed work must not rerun."); }),
           worktreeExecutorFactory(kernel) {
             const execute = kernel.execute.bind(kernel);
-            vi.spyOn(kernel, "execute").mockImplementation(async (command, context) => {
+            vi.spyOn(kernel, "execute").mockImplementation(async (command, context, operationContext) => {
               if (command.type === "FinishActivation" && command.idempotencyKey === `${source}:reconciled-authority-lost`) {
                 fallback.resolve();
                 await resumeReplacement.promise;
@@ -161,7 +161,7 @@ describe("orphaned physical Writer Host recovery (MVP 22.2)", () => {
                     ? "The Activation is already finished." : "Synthetic unrelated conflict.");
                 }
               }
-              return execute(command, context);
+              return execute(command, context, operationContext);
             });
             return new LocalWorktreeExecutor({ kernel, runtimePrincipalId: "runtime", ...repo });
           },
