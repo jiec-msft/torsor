@@ -2435,6 +2435,17 @@ Also published in #torsor-core / current Thread
 9. Thread 与 Run 的投影读取各自拥有 replacement、loading 和错误归属，组合刷新不得以共享 freshness 条件丢弃仍有效的一半。某一半被单独刷新或另一组合刷新替代时，只交接该投影的归属；仍有效的一半必须完成或明确失败。替代失败必须传递给等待者；旧响应不得清除新选择、新 Session 或新 Project 的 loading、错误或事实。两半仍有效且成功时一起发布；两半仍有效但任一读取失败时保留原投影并结束 loading，允许重试读取。
 10. 已确认提交后的任一投影读取失败，必须在该 Run 的 Composer 内显示可感知的 `Committed; projections could not be refreshed`，包括窄屏 modal；不能只在 modal 外的 inert 主区域报告。Composer 内现有刷新操作只重试读取，不重新提交命令。保留已确认请求的幂等身份与回执，和未确认请求的恢复身份分开；刷新失败不把已提交状态变成未知或可重发命令。刷新状态按 Run 和刷新尝试隔离，跨 Pane 重新挂载保留；旧刷新结果不覆盖较新的刷新，异步状态不抢走 Human 焦点。
 
+### 44.2.1 Human Cancel 和 Withdraw 控件
+
+1. 生产 Human Web 的 Run detail 提供 `Cancel Run` 和逐条 `Withdraw Input`。仅 `Active` / `Waiting` Run 可取消；仅属于当前 Run、由当前 Human 分配且 disposition 为 `Pending` 的 RunInput 可撤回。未加载匹配投影、正在刷新、未认证、终态、其他分配者或已处置输入不提供可执行的新操作，并说明原因。服务端仍是权限和 eligibility 的权威。
+2. 控件复用 Run Composer 的请求、幂等重放、认证恢复、回执和投影刷新状态机，不另造 retry 协议。调用既有 `cancel-run` / `withdraw-run-input`，使用观察到的 Run revision；撤回还携带 disposition revision。使用当前 session/CSRF，固定公开原因 `Cancelled by Human from Run controls.` / `Withdrawn by Human from Run controls.`，不编辑或删除 Message。
+3. 每个操作在请求前冻结目标、revision、原因和 idempotency key；双击或重复键盘激活不能创建第二个请求。丢失响应、不可验证回执或不确定服务错误显示 `Outcome unknown`，仅允许显式 `Retry same action`。即使刷新后 Run 已终态或输入已处置，也允许原身份重放以确认原结果，不将投影猜测当作该请求的回执。
+4. 明确的 stale revision / conflict 拒绝保留原因并要求刷新、重新审阅，由 Human 显式开始新操作；不自动以新 revision 重发。首次明确权限拒绝不声称成功。认证或 CSRF 失败要求重新连接；此前未知的结果遇到权限或认证失败仍保持未知。只能由原 Human 恢复，不能把原请求借给其他身份。已由其他请求取消或处置的目标显示当前持久事实，不重复产生逻辑效果。
+5. 操作状态按 Run 和输入身份隔离，跨 Pane 关闭、Run 切换、重新认证保留。当前 Window 的 `sessionStorage` 仅保存这些控件的恢复元数据和已确认回执（目标 ID、principal ID、revision、key、固定原因），不保存正文、凭据、CSRF、Provider payload 或错误文本。浏览器重载将进行中请求视为未知；重新打开读取持久投影，不自动重发。存储不可用或恢复数据损坏时明确报告并禁用新控件命令，而不是丢弃未知身份后重新发送。此要求不扩大 Composer 草稿的重载保证。
+6. 成功或同身份恢复确认后刷新 Run、home Thread 和现有 Timeline 历史，不伪造事件或乐观 disposition。已确认提交后的读取失败在 Run 控件内显示 `Committed; projections could not be refreshed`，保留回执并提供只读刷新，不重发命令。旧 Run / Session 的迟到读取不替换当前选择或抢焦点。
+7. 始终区分逻辑 `Cancelled`、异步停止请求、物理 `StopConfirmed` 和 Worktree quarantine。提交成功只确认逻辑取消；不以 ProviderAttempt 结束、取消应答、Run 终态或 lease 撤销推断物理停止。当前公开 Run 投影不暴露物理执行 / quarantine 事实，必须明确说明无法在此确认；不声称 Worktree 已安全释放或实际处于 quarantine。已有 Provider stop-unconfirmed 提示继续显示。此切片不增加物理控制、quarantine 解除或 Trusted Local 执行。
+8. 使用原生具名按钮，支持 Tab、Enter 和 Space、可见焦点、disabled / busy 状态和可感知状态 / 错误区域；withdraw label 包含输入 sequence 和 ID。恢复与只读刷新在窄屏 modal 内可访问，异步结果不抢焦点。确定性 controller 和渲染测试覆盖成功、eligibility、重复激活、响应丢失、revision / conflict、权限 / CSRF / session expiry、reload / reopen，以及物理停止未确认或 Worktree 已隔离时的逻辑取消。
+
 ### 44.3 Tool Call 展开和失败
 
 默认时间线只显示：

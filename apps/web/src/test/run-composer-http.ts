@@ -234,25 +234,31 @@ export async function runComposerHttp({
   const browser = new ControlledBrowser();
   const sources: HttpEvents[] = [];
   const storage = new Map<string, string>();
-  const controller = new WebController({
-    apiBase: origin, fetch: browser.fetch,
-    sessionStorage: {
-      getItem: (key) => storage.get(key) ?? null,
-      setItem: (key, value) => { storage.set(key, value); },
-      removeItem: (key) => { storage.delete(key); },
-    },
-    eventSourceFactory: (url) => {
-      const source = new HttpEvents(url, browser);
-      source.paused = pauseEvents;
-      sources.push(source);
-      return source as unknown as EventSource;
-    },
-    broadcastChannelFactory: () => Object.assign(new EventTarget(), {
-      name: "synthetic", onmessage: null, onmessageerror: null,
-      postMessage() {}, close() {},
-    }),
-    reconnectProbeDelayMs: 60_000,
-  });
+  const controllers: WebController[] = [];
+  const createController = () => {
+    const client = new WebController({
+      apiBase: origin, fetch: browser.fetch,
+      sessionStorage: {
+        getItem: (key) => storage.get(key) ?? null,
+        setItem: (key, value) => { storage.set(key, value); },
+        removeItem: (key) => { storage.delete(key); },
+      },
+      eventSourceFactory: (url) => {
+        const source = new HttpEvents(url, browser);
+        source.paused = pauseEvents;
+        sources.push(source);
+        return source as unknown as EventSource;
+      },
+      broadcastChannelFactory: () => Object.assign(new EventTarget(), {
+        name: "synthetic", onmessage: null, onmessageerror: null,
+        postMessage() {}, close() {},
+      }),
+      reconnectProbeDelayMs: 60_000,
+    });
+    controllers.push(client);
+    return client;
+  };
+  const controller = createController();
   await controller.exchangeSession("synthetic-human", "project-sample");
   await sources[0]!.ready.promise;
   await controller.loadRun(first.id);
@@ -260,7 +266,7 @@ export async function runComposerHttp({
   let activityActivationId: string | null = null;
   let activitySequence = 0;
   return {
-    kernel, controller, browser, sources, first, second, origin,
+    kernel, controller, browser, sources, first, second, origin, createController,
     async appendActivity(count: number) {
       const runtime = { principalId: "principal-runtime" };
       for (let index = 0; !activityActivationId; index += 1) {
@@ -305,7 +311,7 @@ export async function runComposerHttp({
     },
     async close() {
       browser.releaseAll();
-      controller.dispose();
+      for (const client of controllers) client.dispose();
       await Promise.all(sources.map((source) => source.done));
       await service.close();
       kernel.close();
