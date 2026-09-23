@@ -10,8 +10,26 @@ permissions:
   contents: read
 
 jobs:
-  validate:
+  validation:
+    name: ${{ matrix.slice }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slice: docs-build
+            command: npm run check:docs && npm run test:docs && npm run build && npm exec --prefix prototype -- tsc --noEmit -p prototype/tsconfig.app.json && npm run test:prototype
+          - slice: kernel-runtime
+            command: npm run test:kernel && npm run test:operational-logging && npm run test:agent-runtime && npm run typecheck --workspace @torsor/kernel && npm run typecheck --workspace @torsor/operational-logging && npm run typecheck --workspace @torsor/agent-runtime
+          - slice: acp-smoke
+            command: npm run test:acp-conformance && npm run typecheck --workspace @torsor/acp-conformance && npm run test:trusted-local-smoke
+          - slice: server-web
+            command: npm run test:server && npm run test:web && npm run typecheck --workspace @torsor/server && npm run typecheck --workspace @torsor/web
+          - slice: quickstart
+            command: npm run test:quickstart
+          - slice: system-scenarios
+            command: npm run test:system-scenarios && npm run typecheck --workspace @torsor/system-scenarios
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,13 +43,23 @@ jobs:
             package-lock.json
             prototype/package-lock.json
       - name: Check documentation changes at PR head
-        if: github.event_name == 'pull_request'
+        if: matrix.slice == 'docs-build' && github.event_name == 'pull_request'
         env:
           DOCS_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: npm run check:docs -- --base "$DOCS_BASE_SHA"
       - name: Install workspace dependencies
         run: npm ci
       - name: Install prototype dependencies
+        if: matrix.slice == 'docs-build'
         run: npm --prefix prototype ci
-      - name: Validate workspace
-        run: npm run ci
+      - name: Validate ${{ matrix.slice }}
+        run: ${{ matrix.command }}
+  validate:
+    if: always()
+    needs: validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every validation slice
+        env:
+          VALIDATION_RESULT: ${{ needs.validation.result }}
+        run: test "$VALIDATION_RESULT" = success
