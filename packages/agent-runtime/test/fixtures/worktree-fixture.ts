@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -21,7 +21,7 @@ export const bootstrap: KernelBootstrap = {
 export const runtimeContext = { principalId: "runtime" };
 
 export function syntheticRepository() {
-  const directory = mkdtempSync(join(tmpdir(), "torsor-physical-"));
+  const directory = realpathSync.native(mkdtempSync(join(tmpdir(), "torsor-physical-")));
   const repositoryPath = join(directory, "repository");
   const rootPath = join(directory, "managed");
   mkdirSync(repositoryPath);

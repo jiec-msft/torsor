@@ -10,7 +10,9 @@ import type {
   RunView,
   ThreadProjection,
 } from "@torsor/kernel";
-import type { WorktreeExecutor } from "./worktree-executor.js";
+import type { ControlledWorktreeProcess, WorktreeExecutor } from "./worktree-executor.js";
+import type { ControlledChild } from "./controlled-process.js";
+import type { ProviderPolicy } from "./provider-policy.js";
 
 export interface ProviderCapabilityProfile {
   readonly acceptsInputWhileRunning: boolean;
@@ -87,6 +89,10 @@ export interface ProviderExecutionContext {
   readonly cause: ProviderCause;
   readonly capabilities: ActivationCapabilityBridge;
   readonly signal: AbortSignal;
+  readonly nativeExecution?: {
+    readonly policy: ProviderPolicy;
+    start(spawn: (cwd: string) => ControlledChild): Promise<ControlledWorktreeProcess>;
+  };
   readonly worktree?: {
     probe(worktreeId: string): ReturnType<WorktreeExecutor["probe"]>;
   };
@@ -98,6 +104,7 @@ export interface ProviderAdapter {
   readonly name: string;
   readonly version: string;
   readonly capabilities: ProviderCapabilityProfile;
+  readonly policy?: ProviderPolicy;
   execute(
     context: ProviderExecutionContext,
   ): Promise<ProviderExecutionResult>;

@@ -6,8 +6,8 @@ durable Server-Sent Events service, and runs `@torsor/agent-runtime` against
 that same Kernel.
 
 Startup binds the HTTP listener only after configuration and the database have
-opened successfully. Shutdown stops accepting HTTP work, waits for the current
-bounded Runtime pass, and then closes the Kernel. Startup, Runtime-loop, and
+opened successfully. Shutdown stops accepting HTTP work, aborts active Runtime
+executions immediately, waits for physical stop/settlement, then closes the Kernel. Startup, Runtime-loop, and
 shutdown failures reject the host lifecycle and make the executable exit
 unsuccessfully.
 
@@ -43,8 +43,15 @@ repository root instead.
 The production provider is the GitHub Copilot CLI ACP adapter. It launches the
 `copilot` command in the current directory by default. Set
 `TORSOR_COPILOT_COMMAND` to use another executable location and
-`TORSOR_PROVIDER_CWD` to set the provider working directory. The adapter keeps
-its deny-by-default tool and environment policy.
+`TORSOR_PROVIDER_CWD` to set the restricted provider working directory. The default
+`TORSOR_PROVIDER_POLICY=restricted` keeps deny-by-default tools and environment.
+For explicit `trusted-local`, set `TORSOR_PROVIDER_PERMISSION_MODE` to
+`provider-default` or `allow-all`, plus `TORSOR_REPOSITORY_PATH`,
+`TORSOR_WORKTREE_ROOT`, and full-commit `TORSOR_BASE_REVISION`. Trusted-local
+rejects `TORSOR_PROVIDER_CWD`; Runtime derives cwd from the Run's assigned physical
+Worktree. See [paired local usage documentation](../../docs/trusted-local.md).
+`TORSOR_PROVIDER_TIMEOUT_MS` defaults to 120000 for trusted-local and 25000 for
+restricted, bounded from 1000 through 295000; authority windows add 5000ms.
 
 `TORSOR_HOST` defaults to `127.0.0.1`, `TORSOR_PORT` defaults to `4317`, and
 `TORSOR_RUNTIME_POLL_INTERVAL_MS` defaults to `250`. `TORSOR_PROJECT_IDS` is a
@@ -54,7 +61,7 @@ dynamically.
 
 The bootstrap file uses `KernelBootstrap` JSON. It is applied with schema/config
 creation in one transaction only for an empty version-0 database, never reapplied
-on reopen. Existing schema 17 files undergo complete read-only schema-contract
+on reopen. Existing schema 18 files undergo complete read-only schema-contract
 validation before a writable connection is opened. Incompatible or partial
 development schemas fail unchanged; the host does not repair or migrate them.
 
@@ -65,10 +72,10 @@ HTTP-only embedding; when passed a shared Kernel, the caller retains Kernel
 shutdown ownership.
 
 An embedding Host may explicitly supply `worktreeExecutorFactory(kernel)` to
-enable the fixed controlled Worktree tracer. The Host recovers physical
+enable the controlled Worktree tracer or trusted-local provider execution. The Host recovers physical
 execution intents before listening and stops or quarantines admitted work before
-closing Kernel. No environment flag, HTTP route, or ACP native tool enables
-arbitrary Worktree execution. See the agent-runtime implementation reference and
+closing Kernel. Policy selection alone never grants Writer authority, and no
+HTTP route exposes arbitrary command execution. See the agent-runtime implementation reference and
 MVP §§22, 24, 38, and 43.1 for the private-root and process-handle limitations.
 
 Report Artifacts are opt-in. Set `TORSOR_ARTIFACT_ROOT` to a private local
@@ -78,9 +85,10 @@ or to the owned Kernel options of `createTorsorHttpService`; shared-Kernel
 embedding configures the adapter on that Kernel. The executable uses
 `LocalArtifactStorage`, whose storage/crash boundary is documented in the
 Kernel package and paired MVP sections 21/23. Never expose this directory as
-a static web root. Integrated schema 17 retains causal limits, trusted
+a static web root. Integrated schema 18 retains causal limits, trusted
 Artifact descriptors, physical Worktree execution/publication fences, and the
-allowlisted Provider diagnostic boundary. Schema 16 is rejected because it can
+allowlisted Provider diagnostic boundary, and adds native ProviderAttempt/policy
+execution receipts. Schema 17 lacks these native receipts. Schema 16 can
 contain pre-redaction public Provider diagnostics; all earlier development
 schemas are also rejected before DDL/bootstrap. Stop old processes and
 explicitly recreate the disposable

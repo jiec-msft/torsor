@@ -1,6 +1,6 @@
 # `@torsor/kernel`
 
-## Physical execution records (schema 17)
+## Physical execution records (schema 18)
 
 `RegisterPhysicalWorktree`, `StartWorktreeExecution`, `RecordWorktreeExecution`,
 `RevokeWorktreeExecutionAuthority`, and `RecoverWorktreeExecution` are trusted Runtime-only commands.
@@ -351,7 +351,9 @@ clock-derived expiry, and
 release, expiry, quarantine, and reconciliation ledger. These primitives do
 not perform filesystem mutation, process execution, or shell execution.
 
-The current direct schema version is 17. It combines the physical records and
+The current direct schema version is 18. It adds closed native ProviderAttempt,
+policy, and permission-mode execution bindings; schema 17 lacks these receipts.
+It combines the physical records and
 irreversible Writer publication fences above with trusted Artifact byte
 length and source Thread provenance (replacing caller-provided storage
 locations) with durable server-owned causal limits, immutable Run root/parent/depth,

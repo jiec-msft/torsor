@@ -10,6 +10,28 @@ const cli = fileURLToPath(new URL("./check-bilingual-docs.mjs", import.meta.url)
 const policies = ["docs/documentation.md", "docs/documentation.zh-cn.md"];
 const success = "Bilingual documentation check passed.\n";
 
+test("paired native-execution documents match the production schema and explicit reset contract", () => {
+  const schema = readFileSync(new URL("../packages/kernel/src/schema.ts", import.meta.url), "utf8");
+  const version = Number(schema.match(/export const CURRENT_SCHEMA_VERSION = (\d+);/)?.[1]);
+  assert.equal(version, 18);
+  for (const suffix of ["", ".zh-cn"]) {
+    for (const stem of ["prototype/001-overview", "specs/trusted-local-provider-policy", "trusted-local"]) {
+      const text = readFileSync(new URL(`../docs/${stem}${suffix}.md`, import.meta.url), "utf8").replace(/\s+/g, " ");
+      assert.match(text, new RegExp(`schema (?:\\*\\*)?${version}`, "i"), `${stem}${suffix}: current schema`);
+      assert.match(text, suffix ? /schema 17 被拒绝/ : /schema 17 is rejected/i, `${stem}${suffix}: predecessor rejection`);
+      assert.match(text, suffix ? /不迁移/ : /(?:no migration|without migration|do not migrate)/i);
+      assert.match(text, suffix ? /停止旧进程/ : /stop old processes/i);
+      assert.match(text, suffix ? /新的可丢弃数据库/ : /fresh disposable database/i);
+      assert.match(text, suffix ? /新的 managed root/ : /fresh managed root/i);
+      assert.doesNotMatch(text, /schema 17 (?:reopen|重开)/i);
+      if (stem === "prototype/001-overview") {
+        assert.match(text, new RegExp(`user_version = ${version}`));
+        assert.doesNotMatch(text, /user_version = 17|schema \*\*17\*\*/);
+      }
+    }
+  }
+});
+
 // Fixtures exercise docs/documentation.md's executable contract via the public CLI.
 function repository(t) {
   const root = mkdtempSync(join(tmpdir(), "torsor-docs-"));
