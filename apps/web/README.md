@@ -24,8 +24,10 @@ for a nonterminal Run; already running Activations remain pinned to their
 recorded revision.
 
 These commands use expected revisions and recover unknown outcomes by retrying
-the exact request with its original idempotency key. Definite conflicts and
-permission failures remain visible rather than being treated as success.
+the exact request with its original idempotency key. An authentication failure
+after an unknown outcome keeps that request in current-window controller memory
+through SessionGate and same-Principal reauthentication. Definite conflicts
+without prior uncertainty remain visible rather than becoming unknown.
 Agent configuration content is held only for the active request/retry and is
 not persisted in browser recovery metadata.
 

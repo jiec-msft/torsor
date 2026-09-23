@@ -40,6 +40,46 @@ export interface CollaborationCommandOutcome {
   readonly refreshed: boolean;
 }
 
+export interface EditMessageInput {
+  readonly messageId: string;
+  readonly threadRootId: string;
+  readonly expectedMessageRevision: number;
+  readonly body: string;
+  readonly targetAgentIds: readonly string[];
+}
+
+export interface DeleteMessageInput {
+  readonly messageId: string;
+  readonly threadRootId: string;
+  readonly expectedMessageRevision: number;
+}
+
+export interface UpdateAgentConfigInput {
+  readonly agentId: string;
+  readonly expectedAgentConfigRevision: number;
+  readonly config: JsonValue;
+}
+
+export interface AdoptRunConfigInput {
+  readonly runId: string;
+  readonly threadRootId: string;
+  readonly expectedRunRevision: number;
+  readonly expectedAgentConfigRevision: number;
+  readonly targetAgentConfigRevision: number;
+}
+
+type CollaborationCommandInput =
+  | EditMessageInput
+  | DeleteMessageInput
+  | UpdateAgentConfigInput
+  | AdoptRunConfigInput;
+
+type CollaborationCommandSlug =
+  | "edit-message"
+  | "delete-message"
+  | "update-agent-config"
+  | "adopt-run-config";
+
 export type SessionState =
   | "signed-out"
   | "exchanging"
@@ -137,6 +177,9 @@ interface PendingReply {
 }
 
 interface PendingCollaborationOperation {
+  readonly slug: CollaborationCommandSlug;
+  readonly principalId: string;
+  readonly input: CollaborationCommandInput;
   readonly request: Readonly<Record<string, unknown>>;
   uncertain: boolean;
   activeAttempts: number;
@@ -290,6 +333,73 @@ export class WebController {
 
   get principalId(): string | null {
     return this.#principalId;
+  }
+
+  get hasUnknownCollaborationOutcome(): boolean {
+    return [...this.#pendingCollaborationOperations.values()].some(
+      (pending) => pending.uncertain,
+    );
+  }
+
+  pendingMessageEdit(messageId: string): EditMessageInput | null {
+    for (const pending of this.#pendingCollaborationOperations.values()) {
+      if (
+        pending.slug === "edit-message" &&
+        pending.uncertain &&
+        "messageId" in pending.input &&
+        "body" in pending.input &&
+        pending.input.messageId === messageId &&
+        this.#canRecoverCollaborationOperation(pending)
+      ) {
+        return pending.input as EditMessageInput;
+      }
+    }
+    return null;
+  }
+
+  pendingMessageDelete(messageId: string): DeleteMessageInput | null {
+    for (const pending of this.#pendingCollaborationOperations.values()) {
+      if (
+        pending.slug === "delete-message" &&
+        pending.uncertain &&
+        "messageId" in pending.input &&
+        pending.input.messageId === messageId &&
+        this.#canRecoverCollaborationOperation(pending)
+      ) {
+        return pending.input as DeleteMessageInput;
+      }
+    }
+    return null;
+  }
+
+  pendingAgentConfigUpdate(agentId: string): UpdateAgentConfigInput | null {
+    for (const pending of this.#pendingCollaborationOperations.values()) {
+      if (
+        pending.slug === "update-agent-config" &&
+        pending.uncertain &&
+        "agentId" in pending.input &&
+        pending.input.agentId === agentId &&
+        this.#canRecoverCollaborationOperation(pending)
+      ) {
+        return pending.input as UpdateAgentConfigInput;
+      }
+    }
+    return null;
+  }
+
+  pendingRunConfigAdoption(runId: string): AdoptRunConfigInput | null {
+    for (const pending of this.#pendingCollaborationOperations.values()) {
+      if (
+        pending.slug === "adopt-run-config" &&
+        pending.uncertain &&
+        "runId" in pending.input &&
+        pending.input.runId === runId &&
+        this.#canRecoverCollaborationOperation(pending)
+      ) {
+        return pending.input as AdoptRunConfigInput;
+      }
+    }
+    return null;
   }
 
   subscribe = (listener: () => void): (() => void) => {
@@ -821,21 +931,16 @@ export class WebController {
     }
   }
 
-  editMessage(input: {
-    readonly messageId: string;
-    readonly threadRootId: string;
-    readonly expectedMessageRevision: number;
-    readonly body: string;
-    readonly targetAgentIds?: readonly string[];
-  }): Promise<CollaborationCommandOutcome> {
+  editMessage(input: EditMessageInput): Promise<CollaborationCommandOutcome> {
     return this.#collaborationCommand(
       "edit-message",
       {
         messageId: input.messageId,
         expectedMessageRevision: input.expectedMessageRevision,
         body: input.body,
-        targetAgentIds: [...(input.targetAgentIds ?? [])],
+        targetAgentIds: [...input.targetAgentIds],
       },
+      input,
       async () =>
         this.#threadId === input.threadRootId
           ? this.loadThread(input.threadRootId)
@@ -843,17 +948,16 @@ export class WebController {
     );
   }
 
-  deleteMessage(input: {
-    readonly messageId: string;
-    readonly threadRootId: string;
-    readonly expectedMessageRevision: number;
-  }): Promise<CollaborationCommandOutcome> {
+  deleteMessage(
+    input: DeleteMessageInput,
+  ): Promise<CollaborationCommandOutcome> {
     return this.#collaborationCommand(
       "delete-message",
       {
         messageId: input.messageId,
         expectedMessageRevision: input.expectedMessageRevision,
       },
+      input,
       async () =>
         this.#threadId === input.threadRootId
           ? this.loadThread(input.threadRootId)
@@ -861,11 +965,9 @@ export class WebController {
     );
   }
 
-  updateAgentConfig(input: {
-    readonly agentId: string;
-    readonly expectedAgentConfigRevision: number;
-    readonly config: JsonValue;
-  }): Promise<CollaborationCommandOutcome> {
+  updateAgentConfig(
+    input: UpdateAgentConfigInput,
+  ): Promise<CollaborationCommandOutcome> {
     return this.#collaborationCommand(
       "update-agent-config",
       {
@@ -873,6 +975,7 @@ export class WebController {
         expectedAgentConfigRevision: input.expectedAgentConfigRevision,
         config: input.config,
       },
+      input,
       async () => {
         const [bootstrap, agents] = await Promise.all([
           this.#refreshBootstrap(),
@@ -883,13 +986,9 @@ export class WebController {
     );
   }
 
-  adoptRunConfig(input: {
-    readonly runId: string;
-    readonly threadRootId: string;
-    readonly expectedRunRevision: number;
-    readonly expectedAgentConfigRevision: number;
-    readonly targetAgentConfigRevision: number;
-  }): Promise<CollaborationCommandOutcome> {
+  adoptRunConfig(
+    input: AdoptRunConfigInput,
+  ): Promise<CollaborationCommandOutcome> {
     return this.#collaborationCommand(
       "adopt-run-config",
       {
@@ -898,6 +997,7 @@ export class WebController {
         expectedAgentConfigRevision: input.expectedAgentConfigRevision,
         targetAgentConfigRevision: input.targetAgentConfigRevision,
       },
+      input,
       async () => {
         const [run, runs, thread] = await Promise.all([
           this.#runId === input.runId ? this.loadRun(input.runId) : true,
@@ -927,20 +1027,30 @@ export class WebController {
   }
 
   async #collaborationCommand(
-    slug: Extract<
-      HumanCommand,
-      | "edit-message"
-      | "delete-message"
-      | "update-agent-config"
-      | "adopt-run-config"
-    >,
+    slug: CollaborationCommandSlug,
     body: Readonly<Record<string, unknown>>,
+    input: CollaborationCommandInput,
     refresh: () => Promise<boolean>,
   ): Promise<CollaborationCommandOutcome> {
+    const principalId = this.#principalId;
+    if (!principalId) {
+      throw new Error(
+        "Connect an authenticated Human session before using collaboration controls.",
+      );
+    }
     const fingerprint = `${slug}:${JSON.stringify(body)}`;
+    const existing = this.#pendingCollaborationOperations.get(fingerprint);
+    if (existing && existing.principalId !== principalId) {
+      throw new Error(
+        "Only the original Principal can recover this collaboration operation.",
+      );
+    }
     const pending =
-      this.#pendingCollaborationOperations.get(fingerprint) ??
+      existing ??
       ({
+        slug,
+        principalId,
+        input,
         request: {
           idempotencyKey: crypto.randomUUID(),
           ...body,
@@ -978,6 +1088,15 @@ export class WebController {
         this.#pendingCollaborationOperations.delete(fingerprint);
       }
     }
+  }
+
+  #canRecoverCollaborationOperation(
+    pending: PendingCollaborationOperation,
+  ): boolean {
+    return (
+      this.#principalId === null ||
+      pending.principalId === this.#principalId
+    );
   }
 
   cancelRun(runId: string): Promise<boolean> {

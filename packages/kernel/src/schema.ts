@@ -1,4 +1,4 @@
-export const CURRENT_SCHEMA_VERSION = 18;
+export const CURRENT_SCHEMA_VERSION = 19;
 
 export const schemaSql = `
 PRAGMA foreign_keys = ON;
@@ -633,6 +633,7 @@ CREATE TABLE IF NOT EXISTS run_history (
   event_sequence INTEGER NOT NULL REFERENCES public_events(sequence),
   state TEXT NOT NULL CHECK (state IN ('Active', 'Waiting', 'Completed', 'Failed', 'Cancelled')),
   revision INTEGER NOT NULL CHECK (revision > 0),
+  agent_config_revision INTEGER NOT NULL CHECK (agent_config_revision > 0),
   activation_generation INTEGER NOT NULL CHECK (activation_generation >= 0),
   updated_at TEXT NOT NULL,
   terminal_reason TEXT,

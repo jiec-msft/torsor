@@ -13,6 +13,7 @@ import {
   runProjection,
   thread,
 } from "./test/fixtures";
+import { ApiError } from "./api";
 import styles from "./styles.css?raw";
 import timelineStyles from "./timeline.css?raw";
 
@@ -47,6 +48,11 @@ function stubController(state: WebState = readyState()) {
     runComposer: new RunComposerModel(),
     runControls: new RunControlsModel({ getItem: () => null, setItem: () => {} }),
     principalId: "principal-human",
+    hasUnknownCollaborationOutcome: false,
+    pendingMessageEdit: vi.fn(() => null),
+    pendingMessageDelete: vi.fn(() => null),
+    pendingAgentConfigUpdate: vi.fn(() => null),
+    pendingRunConfigAdoption: vi.fn(() => null),
     getSnapshot: () => state,
     subscribe: () => () => undefined,
     resume: vi.fn(async () => undefined),
@@ -84,6 +90,11 @@ function mutableController(initialState: WebState) {
     runComposer: new RunComposerModel(),
     runControls: new RunControlsModel({ getItem: () => null, setItem: () => {} }),
     principalId: "principal-human",
+    hasUnknownCollaborationOutcome: false,
+    pendingMessageEdit: vi.fn(() => null),
+    pendingMessageDelete: vi.fn(() => null),
+    pendingAgentConfigUpdate: vi.fn(() => null),
+    pendingRunConfigAdoption: vi.fn(() => null),
     getSnapshot: () => state,
     subscribe: (listener: () => void) => {
       listeners.add(listener);
@@ -171,6 +182,37 @@ describe("TorsorApp", () => {
       expectedMessageRevision: 1,
     });
     expect(screen.getAllByText(/Revision history/).length).toBeGreaterThan(0);
+  });
+
+  it("keeps an initial definite Message conflict out of unknown recovery", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(
+      {},
+      "",
+      "/?project=project-sample&channel=channel-general&thread=thread-1",
+    );
+    const controller = stubController();
+    vi.mocked(controller.editMessage).mockRejectedValue(
+      new ApiError(
+        409,
+        "stale_revision",
+        "The Message revision changed.",
+      ),
+    );
+    render(<TorsorApp controller={controller} />);
+
+    await user.click(screen.getByRole("button", { name: "Edit message" }));
+    await user.click(screen.getByRole("button", { name: "Save revision" }));
+
+    expect(
+      await screen.findByRole("alert"),
+    ).toHaveTextContent("The Message revision changed.");
+    expect(
+      screen.queryByText("Outcome unknown. Retry same edit."),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Retry same edit" }),
+    ).not.toBeInTheDocument();
   });
 
   it("renders tombstones without Human mutation controls", () => {

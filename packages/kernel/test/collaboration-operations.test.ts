@@ -197,6 +197,34 @@ describe("MVP collaboration operations", () => {
     const kernel = openMemoryKernel();
     try {
       const setup = await createRun(kernel, "-config-adoption");
+      const pinnedRuns = await kernel.query(
+        {
+          type: "ListRunProjections",
+          projectId: "project-sample",
+          limit: 1,
+        },
+        humanContext,
+      );
+      const pinnedThreads = await kernel.query(
+        {
+          type: "ListThreadProjections",
+          projectId: "project-sample",
+          snapshotEventId: pinnedRuns.snapshotEventId,
+          limit: 1,
+        },
+        humanContext,
+      );
+      expect(pinnedRuns.items[0]!.run).toMatchObject({
+        id: setup.runId,
+        revision: 1,
+        agentConfigRevision: 3,
+      });
+      expect(
+        pinnedThreads.items[0]!.runs.find((run) => run.id === setup.runId),
+      ).toMatchObject({
+        revision: 1,
+        agentConfigRevision: 3,
+      });
       const updateCommand = {
         type: "UpdateAgentConfig",
         idempotencyKey: "update-agent-config",
@@ -267,6 +295,45 @@ describe("MVP collaboration operations", () => {
       expect(afterAdoption.run).toMatchObject({
         agentConfigRevision: 4,
         revision: 2,
+      });
+      const historicalRuns = await kernel.query(
+        {
+          type: "ListRunProjections",
+          projectId: "project-sample",
+          snapshotEventId: pinnedRuns.snapshotEventId,
+          limit: 1,
+        },
+        humanContext,
+      );
+      const historicalThreads = await kernel.query(
+        {
+          type: "ListThreadProjections",
+          projectId: "project-sample",
+          snapshotEventId: pinnedRuns.snapshotEventId,
+          limit: 1,
+        },
+        humanContext,
+      );
+      expect(historicalRuns).toMatchObject({
+        snapshotEventId: pinnedRuns.snapshotEventId,
+        hasMore: false,
+      });
+      expect(historicalRuns.items[0]!.run).toMatchObject({
+        id: setup.runId,
+        revision: 1,
+        agentConfigRevision: 3,
+      });
+      expect(historicalThreads).toMatchObject({
+        snapshotEventId: pinnedRuns.snapshotEventId,
+        hasMore: false,
+      });
+      expect(
+        historicalThreads.items[0]!.runs.find(
+          (run) => run.id === setup.runId,
+        ),
+      ).toMatchObject({
+        revision: 1,
+        agentConfigRevision: 3,
       });
       expect(
         afterAdoption.activations.find(

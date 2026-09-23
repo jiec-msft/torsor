@@ -600,6 +600,9 @@ Provider 或 Agent 请求中的同名字段不能成为权威事实。
 5. 成功采用只更新 Run 固定的 config revision 并增加 Run revision；不撤销、不重启、
    不重写已存在 Activation。之后授权创建的 Activation 记录并使用新 revision。
    幂等重放返回原回执，即使 Run 或 Agent 随后已继续推进。
+6. Run 的历史版本必须与 `agent_config_revision` 一起持久化。带 snapshot event
+   边界的 Run/Thread 列表投影必须从同一历史版本读取 state、Run revision 与固定的
+   config revision，不能把历史 Run 状态和当前 config revision 混合成不存在的事实。
 
 ## 16. Message 和 Thread
 
@@ -1073,18 +1076,19 @@ Artifact 和原始 provenance，不重复发布事件。新 Activation 只有在
 阻止新 descriptor；已提交 descriptor 仍由当前获授权的 Human/Runtime 查询。
 首片不自动删除 orphan 或 staging 文件，避免与并发固化竞争；清理留给停机维护。
 
-持久因果限制、可信 Artifact、物理 Worktree 与 Provider 诊断边界的整合数据库使用 schema **18**，同时保留第 25 节的
+持久因果限制、可信 Artifact、物理 Worktree 与 Provider 诊断边界的整合数据库使用 schema **19**，同时保留第 25 节的
 Run root/parent/depth、不可变约束、准入索引及持久配置，以及第 23 节的可信报告
 descriptor、第 22 节的物理身份、执行记录及不可逆的 Writer publication fence，
-并增加 native execution 的 ProviderAttempt/策略 receipt 绑定。schema 17 被拒绝，
-因为它缺少这些 native receipt；不迁移。
+以及 schema 18 的 native execution ProviderAttempt/策略 receipt 绑定，并在 Run
+历史版本中加入固定的 Agent config revision。schema 18 被拒绝，因为它不能正确重建
+采用配置前的 Run/Thread snapshot；schema 17 还缺少 native receipt；均不迁移。
 schema 16 可能包含诊断边界修复前公开持久化的 Provider 原始诊断，因此必须拒绝并重建；
 更早的 causal-only、Artifact-only、Worktree-only schema 14 及整合 schema 15
 同样不兼容。不得因版本数字相同而接受另一套布局。打开任何旧版或未版本化的非空
 开发数据库必须在应用 DDL/Bootstrap 前明确拒绝，不迁移、不改写版本、不删除数据。
-停止旧进程后由操作者显式使用新的可丢弃数据库和新的 managed root。schema 18 重开仍校验持久 causal 配置及 Worktree storage identity。
+停止旧进程后由操作者显式使用新的可丢弃数据库和新的 managed root。schema 19 重开仍校验持久 causal 配置及 Worktree storage identity。
 
-`user_version = 18` 不是布局证明。已有数据库必须在任何 DDL、Bootstrap 或配置写入
+`user_version = 19` 不是布局证明。已有数据库必须在任何 DDL、Bootstrap 或配置写入
 之前，以只读方式对照由可信 DDL 在隔离内存库生成的完整 schema 指纹：对象集合、
 列/type/not-null/default/PK/FK、索引/唯一性/partial predicate、trigger、CHECK
 和 STRICT 等约束。比较 SQLite 解析后的 metadata 与保留 literal/operator 语义的
@@ -1092,7 +1096,7 @@ SQL token；只忽略空白、注释和未引用 keyword/identifier 大小写，
 缺失、额外不兼容、部分、损坏、前驱形状或未来布局必须拒绝，保持原文件字节及逻辑
 状态不变，不用 `CREATE IF NOT EXISTS` 修补。SQLite 自有统计对象不属于应用布局。
 只有没有持久对象的 version 0 数据库可在同一事务内执行 DDL、初始配置及 Bootstrap；
-失败完整回滚。有效 schema 18 重开不重新应用 Bootstrap，也不修改持久 causal 配置或 storage identity。
+失败完整回滚。有效 schema 19 重开不重新应用 Bootstrap，也不修改持久 causal 配置或 storage identity。
 
 Runtime Host 调度恢复 pass 时，连续执行的 pass 数量必须有界，并在继续前让出事件循环并重新检查关闭请求。积压处理不得饿死 HTTP、timer、signal 或关闭处理。空闲轮询等待必须可被关闭请求中断；无论等待还是关闭先完成，都必须移除对应 listener 并取消不再需要的 timer。
 
@@ -1621,7 +1625,7 @@ Writer Lease 提供平台认可的权限与协调保证，不是 hostile-code sa
 多租户隔离、防御恶意本机 owner 或已失陷主机、阻止主动 daemonize 并逃离受控进程树的
 程序，也不承诺外部 MCP/API 副作用 exactly-once。这些非目标不能用于弱化第 14 节的
 身份、来源和终态边界、第 22 节的 Lease/fencing/停止/quarantine、第 27 节的隐私与
-最小上下文，或既有 authorization、当前 schema 18 和失败显式化契约。
+最小上下文，或既有 authorization、当前 schema 19 和失败显式化契约。
 
 对其余 MVP 工作，release-blocking finding 必须落在可重复的受支持路径上，说明可信的
 用户或数据完整性影响，并给出最小验收测试。即使构造输入罕见，只要能够证明违反已承诺的
@@ -2528,6 +2532,9 @@ Also published in #torsor-core / current Thread
    idempotency key。Pending 时禁止重复激活；响应丢失或不可验证时显示
    `Outcome unknown`，只允许重试同一请求。明确 stale/permission/conflict 保留编辑
    草稿或删除意图，刷新后由 Human 重新审阅并创建新请求，不能自动换 revision。
+   若此前结果未知，重试收到 401/无效 CSRF 时必须跨 SessionGate 保留冻结请求与未知
+   状态；同一 Principal 重新认证后控件恢复原正文/revision/key 并只允许原身份重放。
+   此前没有未知结果的明确 4xx 仍是确定拒绝，不得伪装成未知结果。
 4. 成功或同身份重放确认后刷新 Thread，不乐观伪造 revision、tombstone、Mention 或
    Attention。已确认提交后的读取失败显示 `Committed; projections could not be
    refreshed`，只允许重试读取。旧 Thread/Session 的迟到结果不得覆盖当前选择或焦点。
@@ -2552,7 +2559,10 @@ Also published in #torsor-core / current Thread
 3. 两类操作均冻结目标、expected/target revision、请求正文（仅 update）和
    idempotency key，复用 `Outcome unknown`、`Retry same action`、同 Principal
    认证恢复、明确 conflict 后刷新审阅及已提交后只读刷新语义。不得自动采用刚观察到
-   的更高 revision，也不得在 stale 后静默改写 target。
+   的更高 revision，也不得在 stale 后静默改写 target。未知 update/adoption 重试收到
+   401/无效 CSRF 时，SessionGate 和重新认证后的控件必须继续显示未知结果，并从
+   Controller 的当前 Window 内存恢复完全相同的请求/key；没有先前未知结果的明确 4xx
+   仍释放该次请求身份。
 4. Config 正文不得进入公开事件、命令回执、错误文本或持久 Client 恢复元数据。
    当前 Window 可在内存中保留未知 update 请求以便同身份重放；浏览器重载后若无法
    保留完整原请求，必须显示无法恢复，不能以新 key 猜测重发。adoption 恢复元数据

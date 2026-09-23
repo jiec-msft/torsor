@@ -445,6 +445,11 @@ Request fields with the same names are not authoritative.
    existing Activation. Later authorized Activations record and use the adopted
    revision. Idempotent replay returns the original receipt even after later
    Run or Agent changes.
+6. Persist every Run history version together with its
+   `agent_config_revision`. Snapshot-bounded Run and Thread list projections
+   read state, Run revision, and pinned config revision from the same historical
+   version; they never combine historical Run facts with the current config
+   revision into a state that never existed.
 
 ## 16. Message and Thread
 
@@ -842,9 +847,9 @@ A report finalization request is identified by `(principal_id, run_id, idempoten
 
 This slice uses caller-driven retry, not background replay of Provider output. A crash during staging leaves only an invisible temporary file; content publication before database commit leaves only an invisible content-addressed blob; a lost response after commit is recoverable from durable idempotency results and Run/Thread projections. Retry verifies and reuses the blob and rechecks current authorization, Activation, and Run revision in the transaction. Revocation or a terminal Run blocks new descriptors; currently authorized Humans/Runtime may still query committed descriptors. No automatic orphan/staging deletion is included: cleanup is offline maintenance, avoiding races with concurrent finalization.
 
-The integrated durable-causal-limit, trusted-Artifact, physical-Worktree, and provider-diagnostic-boundary database uses schema **18**. It retains section 25's Run root/parent/depth, immutable constraints, admission index and durable configuration alongside section 23's trusted report descriptors and section 22's physical identities, executions and irreversible Writer publication fence, adding native execution ProviderAttempt/policy receipt bindings. Schema 17 is rejected because it lacks those native receipts; no migration is supported. Schema 16 is rejected and recreated because it may contain raw provider diagnostics publicly persisted before this boundary; the former causal-only, Artifact-only and Worktree-only schema 14 layouts and integrated schema 15 are also incompatible. Equal version numbers must not authorize different layouts. Opening any older or unversioned nonempty development database must fail explicitly before applying DDL/bootstrap, without migration, version rewriting, or data deletion. Operators stop old processes and explicitly use a fresh disposable database and fresh managed root. Schema 18 reopen still validates durable causal configuration and Worktree storage identity.
+The integrated durable-causal-limit, trusted-Artifact, physical-Worktree, and provider-diagnostic-boundary database uses schema **19**. It retains section 25's Run root/parent/depth, immutable constraints, admission index and durable configuration alongside section 23's trusted report descriptors, section 22's physical identities, executions and irreversible Writer publication fence, and schema 18's native execution ProviderAttempt/policy receipt bindings, while adding the pinned Agent config revision to every Run history version. Schema 18 is rejected because it cannot reconstruct pre-adoption Run/Thread snapshots correctly; schema 17 also lacks native receipts. No migration is supported. Schema 16 is rejected and recreated because it may contain raw provider diagnostics publicly persisted before this boundary; the former causal-only, Artifact-only and Worktree-only schema 14 layouts and integrated schema 15 are also incompatible. Equal version numbers must not authorize different layouts. Opening any older or unversioned nonempty development database must fail explicitly before applying DDL/bootstrap, without migration, version rewriting, or data deletion. Operators stop old processes and explicitly use a fresh disposable database and fresh managed root. Schema 19 reopen still validates durable causal configuration and Worktree storage identity.
 
-`user_version = 18` is not layout proof. Before any DDL, bootstrap or configuration write, existing databases undergo read-only comparison against a complete schema fingerprint generated from trusted DDL in an isolated memory database: object sets, columns/types/nullability/defaults/PKs/FKs, indexes/uniqueness/partial predicates, triggers, CHECK and STRICT constraints. Compare SQLite-parsed metadata and SQL tokens that preserve literal/operator semantics; ignore only whitespace, comments and unquoted keyword/identifier case, never whitespace inside strings. Reject missing, extra-incompatible, partial, corrupt, predecessor-shaped or future layouts without changing file bytes or logical state; never repair with `CREATE IF NOT EXISTS`. SQLite-owned statistics objects are outside the application layout. Only version 0 with no persistent objects may execute DDL, initial configuration and bootstrap in one transaction, with complete rollback on failure. Valid schema 18 reopen does not reapply bootstrap or modify durable causal configuration or storage identity.
+`user_version = 19` is not layout proof. Before any DDL, bootstrap or configuration write, existing databases undergo read-only comparison against a complete schema fingerprint generated from trusted DDL in an isolated memory database: object sets, columns/types/nullability/defaults/PKs/FKs, indexes/uniqueness/partial predicates, triggers, CHECK and STRICT constraints. Compare SQLite-parsed metadata and SQL tokens that preserve literal/operator semantics; ignore only whitespace, comments and unquoted keyword/identifier case, never whitespace inside strings. Reject missing, extra-incompatible, partial, corrupt, predecessor-shaped or future layouts without changing file bytes or logical state; never repair with `CREATE IF NOT EXISTS`. SQLite-owned statistics objects are outside the application layout. Only version 0 with no persistent objects may execute DDL, initial configuration and bootstrap in one transaction, with complete rollback on failure. Valid schema 19 reopen does not reapply bootstrap or modify durable causal configuration or storage identity.
 
 The Runtime Host must bound consecutive recovery passes, yield to the event loop before continuing, and recheck shutdown. Backlog processing must not starve HTTP, timers, signals, or shutdown handling. Idle polling waits must be interruptible by shutdown and must remove their listener and cancel any no-longer-needed timer regardless of which side completes first.
 
@@ -1326,7 +1331,7 @@ that deliberately daemonize and escape the owned process tree, or exactly-once
 external MCP/API effects. These non-goals do not weaken section 14 identity,
 provenance, and terminal boundaries; section 22 Lease, fencing, stop, and
 quarantine contracts; section 27 privacy and minimum-context rules; or existing
-authorization, current schema 18, and explicit-failure contracts.
+authorization, current schema 19, and explicit-failure contracts.
 
 For the remaining MVP work, a release-blocking finding must have a reproducible
 supported path, credible user or data-integrity impact, and a minimal acceptance
@@ -1989,7 +1994,12 @@ It uses atomic `send_to_run` from section 36 independently of Live Timeline impl
    Lost or unverifiable responses show `Outcome unknown` and only retry the
    same request. Definite stale/permission/conflict results preserve the edit
    draft or delete intent; after refresh the Human reviews and creates a new
-   request rather than automatic revision replacement.
+   request rather than automatic revision replacement. If an earlier outcome
+   is unknown, a retry receiving 401 or invalid CSRF retains the frozen request
+   and unknown state across the SessionGate. After the same Principal
+   reauthenticates, the control restores the original body/revision/key and
+   permits only same-identity replay. A definite 4xx without prior uncertainty
+   remains a definite rejection rather than becoming unknown.
 4. Success or same-identity replay confirmation refreshes the Thread without
    optimistic revision, tombstone, Mention, or Attention facts. A failed read
    after acknowledged commit shows `Committed; projections could not be
@@ -2025,6 +2035,11 @@ It uses atomic `send_to_run` from section 36 independently of Live Timeline impl
    action`, same-Principal authentication recovery, explicit refresh/review
    after conflict, and read-only refresh after acknowledged commit. Never
    auto-adopt a newly observed revision or silently rewrite a stale target.
+   If an unknown update/adoption retry receives 401 or invalid CSRF, the
+   SessionGate and reauthenticated control continue to show the unknown
+   outcome and restore the byte-identical request/key from current-window
+   Controller memory. A definite 4xx without prior uncertainty still releases
+   that request identity.
 4. Config bodies never enter public events, command receipts, error text, or
    persistent Client recovery metadata. The current Window may retain an
    unknown update request in memory for same-identity replay. After browser

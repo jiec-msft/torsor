@@ -308,6 +308,7 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
       <SessionGate
         state={state}
         projectId={route.projectId}
+        hasUnknownOutcome={controller.hasUnknownCollaborationOutcome}
         onExchange={async (token, projectId) => {
           const next = { ...route, projectId };
           updateRoute(setRoute, next, "replace");
@@ -516,10 +517,12 @@ export function TorsorApp({ controller }: { readonly controller: WebController }
 function SessionGate({
   state,
   projectId,
+  hasUnknownOutcome,
   onExchange,
 }: {
   readonly state: WebState;
   readonly projectId: string;
+  readonly hasUnknownOutcome: boolean;
   readonly onExchange: (token: string, projectId: string) => Promise<void>;
 }) {
   const tokenRef = useRef<HTMLInputElement>(null);
@@ -558,6 +561,9 @@ function SessionGate({
             Run drafts and submission identities are retained in this window.
             A lost response may have committed; reconnect to recover it.
             Run control recovery is retained across reconnect and reload in this window.
+            {hasUnknownOutcome
+              ? " Outcome unknown. Reconnect to retry the same collaboration request."
+              : null}
           </div>
         ) : null}
         {state.authError ? (
@@ -1032,14 +1038,26 @@ function MessageRevisionControls({
   readonly message: Message;
 }) {
   const latest = latestMessageRevision(message);
-  const [editing, setEditing] = useState(false);
-  const [confirmingDelete, setConfirmingDelete] = useState(false);
-  const [draft, setDraft] = useState(latest?.body ?? "");
+  const recoveredEdit = controller.pendingMessageEdit(message.id);
+  const recoveredDelete = controller.pendingMessageDelete(message.id);
+  const [editing, setEditing] = useState(recoveredEdit !== null);
+  const [confirmingDelete, setConfirmingDelete] = useState(
+    recoveredDelete !== null,
+  );
+  const [draft, setDraft] = useState(
+    recoveredEdit?.body ?? latest?.body ?? "",
+  );
   const [targets, setTargets] = useState<readonly string[]>(
-    latest?.targetAgentIds ?? [],
+    recoveredEdit?.targetAgentIds ?? latest?.targetAgentIds ?? [],
   );
   const [pending, setPending] = useState(false);
-  const [status, setStatus] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(
+    recoveredEdit
+      ? "Outcome unknown. Retry same edit."
+      : recoveredDelete
+        ? "Outcome unknown. Retry same delete."
+        : null,
+  );
   const [error, setError] = useState<string | null>(null);
   const [frozenEdit, setFrozenEdit] = useState<{
     readonly messageId: string;
@@ -1047,12 +1065,12 @@ function MessageRevisionControls({
     readonly expectedMessageRevision: number;
     readonly body: string;
     readonly targetAgentIds: readonly string[];
-  } | null>(null);
+  } | null>(recoveredEdit);
   const [frozenDelete, setFrozenDelete] = useState<{
     readonly messageId: string;
     readonly threadRootId: string;
     readonly expectedMessageRevision: number;
-  } | null>(null);
+  } | null>(recoveredDelete);
   const canMutate =
     state.session === "ready" &&
     controller.principalId === message.authorPrincipalId &&
@@ -1086,7 +1104,9 @@ function MessageRevisionControls({
       setFrozenEdit(null);
       setEditing(false);
     } catch (caught) {
-      if (isUncertainUiError(caught)) {
+      const retained = controller.pendingMessageEdit(message.id);
+      if (isUncertainUiError(caught) || retained) {
+        setFrozenEdit(retained ?? request);
         setStatus("Outcome unknown. Retry same edit.");
       } else {
         setError(
@@ -1120,7 +1140,9 @@ function MessageRevisionControls({
       setFrozenDelete(null);
       setConfirmingDelete(false);
     } catch (caught) {
-      if (isUncertainUiError(caught)) {
+      const retained = controller.pendingMessageDelete(message.id);
+      if (isUncertainUiError(caught) || retained) {
+        setFrozenDelete(retained ?? request);
         setStatus("Outcome unknown. Retry same delete.");
       } else {
         setError(
@@ -1535,17 +1557,20 @@ function AgentConfigControl({
   readonly state: WebState;
   readonly agent: AgentStatus;
 }) {
-  const [editing, setEditing] = useState(false);
+  const recovered = controller.pendingAgentConfigUpdate(agent.id);
+  const [editing, setEditing] = useState(recovered !== null);
   const [draft, setDraft] = useState(() =>
-    JSON.stringify(agent.config, null, 2),
+    JSON.stringify(recovered?.config ?? agent.config, null, 2),
   );
   const [frozen, setFrozen] = useState<{
     readonly agentId: string;
     readonly expectedAgentConfigRevision: number;
     readonly config: JsonValue;
-  } | null>(null);
+  } | null>(recovered);
   const [pending, setPending] = useState(false);
-  const [status, setStatus] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(
+    recovered ? "Outcome unknown. Retry same config update." : null,
+  );
   const [error, setError] = useState<string | null>(null);
 
   const submit = async () => {
@@ -1576,7 +1601,9 @@ function AgentConfigControl({
       setFrozen(null);
       setEditing(false);
     } catch (caught) {
-      if (isUncertainUiError(caught)) {
+      const retained = controller.pendingAgentConfigUpdate(agent.id);
+      if (isUncertainUiError(caught) || retained) {
+        setFrozen(retained ?? request);
         setStatus("Outcome unknown. Retry same config update.");
       } else {
         setError(
@@ -1651,15 +1678,18 @@ function RunConfigAdoption({
   const agent = state.agents.find(
     (candidate) => candidate.id === run?.ownerAgentId,
   );
+  const recovered = controller.pendingRunConfigAdoption(runId);
   const [frozen, setFrozen] = useState<{
     readonly runId: string;
     readonly threadRootId: string;
     readonly expectedRunRevision: number;
     readonly expectedAgentConfigRevision: number;
     readonly targetAgentConfigRevision: number;
-  } | null>(null);
+  } | null>(recovered);
   const [pending, setPending] = useState(false);
-  const [status, setStatus] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(
+    recovered ? "Outcome unknown. Retry same config adoption." : null,
+  );
   const [error, setError] = useState<string | null>(null);
   if (!run || !agent) {
     return null;
@@ -1693,7 +1723,9 @@ function RunConfigAdoption({
       );
       setFrozen(null);
     } catch (caught) {
-      if (isUncertainUiError(caught)) {
+      const retained = controller.pendingRunConfigAdoption(run.id);
+      if (isUncertainUiError(caught) || retained) {
+        setFrozen(retained ?? request);
         setStatus("Outcome unknown. Retry same config adoption.");
       } else {
         setError(

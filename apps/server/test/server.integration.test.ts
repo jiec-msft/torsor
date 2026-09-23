@@ -1252,7 +1252,7 @@ describe("Torsor HTTP and SSE service", () => {
     await reader.cancel().catch(() => undefined);
   });
 
-  it.each([14, 15, 16, 17, 99])("rejects incompatible development schema %i on service startup", async (version) => {
+  it.each([14, 15, 16, 17, 18, 99])("rejects incompatible development schema %i on service startup", async (version) => {
     const directory = await temporaryDirectory();
     const databasePath = join(directory, "torsor.sqlite");
     const database = new DatabaseSync(databasePath);
@@ -1266,16 +1266,16 @@ describe("Torsor HTTP and SSE service", () => {
         credentials,
         port: 0,
       }),
-    ).toThrow(`Incompatible development database schema version ${version}; expected 18.`);
+    ).toThrow(`Incompatible development database schema version ${version}; expected 19.`);
   });
 
-  it.each(["partial", "missing-index", "missing-trigger"])("refuses %s schema 18 unchanged before HTTP startup", async (layout) => {
+  it.each(["partial", "missing-index", "missing-trigger"])("refuses %s schema 19 unchanged before HTTP startup", async (layout) => {
     const directory = await temporaryDirectory();
     const databasePath = join(directory, "state.sqlite");
     if (layout !== "partial") TorsorKernel.open({ databasePath, bootstrap }).close();
     const database = new DatabaseSync(databasePath);
     database.exec(layout === "partial"
-      ? "CREATE TABLE causal_limits (singleton INTEGER PRIMARY KEY); PRAGMA user_version = 18;"
+      ? "CREATE TABLE causal_limits (singleton INTEGER PRIMARY KEY); PRAGMA user_version = 19;"
       : layout === "missing-index" ? "DROP INDEX runs_causal_nonterminal_idx;"
       : "DROP TRIGGER runs_causal_provenance_immutable;");
     database.close();
@@ -1284,7 +1284,7 @@ describe("Torsor HTTP and SSE service", () => {
       let service: TorsorHttpService | undefined;
       try {
         expect(() => { service = createTorsorHttpService({ databasePath, bootstrap, credentials, port: 0 }); })
-          .toThrow("Incompatible development database schema 18 contract.");
+          .toThrow("Incompatible development database schema 19 contract.");
       } finally {
         await service?.close();
       }

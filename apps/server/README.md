@@ -61,7 +61,7 @@ dynamically.
 
 The bootstrap file uses `KernelBootstrap` JSON. It is applied with schema/config
 creation in one transaction only for an empty version-0 database, never reapplied
-on reopen. Existing schema 18 files undergo complete read-only schema-contract
+on reopen. Existing schema 19 files undergo complete read-only schema-contract
 validation before a writable connection is opened. Incompatible or partial
 development schemas fail unchanged; the host does not repair or migrate them.
 
@@ -85,10 +85,11 @@ or to the owned Kernel options of `createTorsorHttpService`; shared-Kernel
 embedding configures the adapter on that Kernel. The executable uses
 `LocalArtifactStorage`, whose storage/crash boundary is documented in the
 Kernel package and paired MVP sections 21/23. Never expose this directory as
-a static web root. Integrated schema 18 retains causal limits, trusted
+a static web root. Integrated schema 19 retains causal limits, trusted
 Artifact descriptors, physical Worktree execution/publication fences, and the
 allowlisted Provider diagnostic boundary, and adds native ProviderAttempt/policy
-execution receipts. Schema 17 lacks these native receipts. Schema 16 can
+execution receipts plus snapshot-consistent Run config history. Schema 18 lacks
+that historical config field; schema 17 also lacks native receipts. Schema 16 can
 contain pre-redaction public Provider diagnostics; all earlier development
 schemas are also rejected before DDL/bootstrap. Stop old processes and
 explicitly recreate the disposable

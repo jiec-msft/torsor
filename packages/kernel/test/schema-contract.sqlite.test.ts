@@ -20,6 +20,7 @@ describe("integrated schema contract (MVP 21.5, 22, 23.1, 25.1-25.2)", () => {
     { name: "predecessor-shaped schema claiming current version", sql: predecessorSchema },
     { name: "partial schema containing only causal_limits", sql: "CREATE TABLE causal_limits (singleton INTEGER PRIMARY KEY, max_depth INTEGER, max_non_terminal_runs_per_root INTEGER);" },
     { name: "missing native ProviderAttempt binding", replace: ["provider_attempt_id TEXT REFERENCES provider_attempts(id)", "provider_attempt_id TEXT"] },
+    { name: "missing historical Agent config revision", replace: ["  agent_config_revision INTEGER NOT NULL CHECK (agent_config_revision > 0),\n  activation_generation", "  activation_generation"] },
     { name: "missing Worktree acquisition index", after: "DROP INDEX worktree_unsettled_execution_idx;" },
     { name: "missing Writer publication index", after: "DROP INDEX worktree_execution_activation_idx;" },
     { name: "missing Writer revocation trigger", after: "DROP TRIGGER worktree_publication_revocation_immutable;" },
@@ -53,7 +54,7 @@ describe("integrated schema contract (MVP 21.5, 22, 23.1, 25.1-25.2)", () => {
     { name: "future version", after: "PRAGMA user_version = 99;" },
   ];
 
-  it.each([14, 15, 17])("refuses predecessor version %i without modifying its bytes or logical state", async (version) => {
+  it.each([14, 15, 17, 18])("refuses predecessor version %i without modifying its bytes or logical state", async (version) => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-physical-predecessor-"));
     const databasePath = join(directory, "state.sqlite");
     try {

@@ -41,6 +41,16 @@ export class ControlledBrowser {
   stream = (url: string): Promise<Response> =>
     this.#fetch(url, { headers: { Cookie: this.#cookie } });
 
+  async revokeSession(origin: string): Promise<void> {
+    const response = await this.fetch(`${origin}/api/v1/session`, {
+      method: "DELETE",
+      credentials: "include",
+    });
+    if (response.status !== 204) {
+      throw new Error(`Session revocation failed: ${response.status}`);
+    }
+  }
+
   fetch: typeof fetch = async (input, init) => {
     const path = new URL(String(input)).pathname;
     this.requests.push({

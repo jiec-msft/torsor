@@ -62,7 +62,7 @@ uses `CreateProcessW(CREATE_SUSPENDED)`, assigns the Provider to a
 Cancellation, expiry, and shutdown stop physically before persisting evidence.
 Unknown stop quarantines the directory
 and blocks replacement. Restart does not clear quarantine after losing the original
-handle. Schema 18 is current; schema 17 is rejected. Stop old processes
+handle. Schema 19 is current; schema 18 and older layouts are rejected. Stop old processes
 and explicitly use a fresh disposable database and fresh managed root; no migration
 or automatic deletion.
 From a clean checkout, `npm pack --workspace @torsor/kernel` and
