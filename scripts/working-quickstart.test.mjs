@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, copyFile, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -327,6 +327,121 @@ test("public package tarballs contain the repository Apache license", async () =
     );
   }
 });
+
+test("clean tracked source packs installable Kernel and agent-runtime tarballs", async () => {
+  assert.ok(process.env.npm_execpath, "npm_execpath is required");
+  const temporary = await mkdtemp(join(tmpdir(), "torsor-clean-pack-"));
+  const source = join(temporary, "source");
+  const consumer = join(temporary, "consumer");
+  try {
+    await mkdir(source, { recursive: true });
+    const tracked = spawnSync("git", ["ls-files", "-z"], {
+      cwd: root,
+      encoding: "buffer",
+      windowsHide: true,
+    });
+    assert.equal(tracked.status, 0, String(tracked.stderr || tracked.stdout));
+    const files = tracked.stdout.toString("utf8").split("\0").filter(Boolean);
+    await Promise.all(files.map(async (file) => {
+      const destination = join(source, ...file.split("/"));
+      await mkdir(resolve(destination, ".."), { recursive: true });
+      await copyFile(join(root, ...file.split("/")), destination);
+    }));
+    await runNpm(["ci", "--ignore-scripts", "--no-audit", "--no-fund"], source, 180_000);
+    const kernelPack = JSON.parse(await runNpm(
+      ["pack", "--json", "--workspace", "@torsor/kernel"],
+      source,
+      120_000,
+    ))[0];
+    const runtimePack = JSON.parse(await runNpm(
+      ["pack", "--json", "--workspace", "@torsor/agent-runtime"],
+      source,
+      120_000,
+    ))[0];
+    assert.ok(kernelPack.files.some((file) => file.path === "dist/index.js"));
+    assert.ok(runtimePack.files.some((file) => file.path === "dist/index.js"));
+    assert.ok(runtimePack.files.some(
+      (file) => file.path === "dist/provider-process-windows-owner.js",
+    ));
+    assert.equal(runtimePack.files.some(
+      (file) => file.path.startsWith("src/") ||
+        file.path.startsWith("test/") ||
+        file.path.endsWith(".node"),
+    ), false);
+    const kernelTarball = join(source, kernelPack.filename);
+    const runtimeTarball = join(source, runtimePack.filename);
+    await mkdir(consumer, { recursive: true });
+    await runNpm(["init", "-y"], consumer, 30_000);
+    await runNpm(
+      ["install", "--no-audit", "--no-fund", kernelTarball, runtimeTarball],
+      consumer,
+      120_000,
+    );
+    const imported = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        "const runtime=await import('@torsor/agent-runtime');" +
+          "if(typeof runtime.AgentRuntime!=='function')process.exit(17);",
+      ],
+      {
+        cwd: consumer,
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: 30_000,
+      },
+    );
+    assert.equal(imported.status, 0, imported.stderr || imported.stdout);
+    const installedRuntime = join(
+      consumer, "node_modules", "@torsor", "agent-runtime",
+    );
+    const owner = join(installedRuntime, "dist", "provider-process-windows-owner.js");
+    await access(owner);
+    const runtimeManifest = JSON.parse(
+      await readFile(join(installedRuntime, "package.json"), "utf8"),
+    );
+    assert.equal(runtimeManifest.dependencies.koffi, "3.2.0");
+    const koffiManifest = JSON.parse(
+      await readFile(join(consumer, "node_modules", "koffi", "package.json"), "utf8"),
+    );
+    assert.equal(koffiManifest.license, "MIT");
+    if (process.platform === "win32") {
+      const loaded = spawnSync(process.execPath, [owner], {
+        cwd: consumer,
+        input: Buffer.from([0xff, 0xff, 0x7f, 0x00]),
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: 30_000,
+      });
+      assert.equal(loaded.status, 125, loaded.stderr || loaded.stdout);
+    }
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+async function runNpm(args, cwd, timeout) {
+  const result = await new Promise((resolvePromise) => {
+    const child = spawn(process.execPath, [process.env.npm_execpath, ...args], {
+      cwd,
+      env: { ...process.env },
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const timer = setTimeout(() => child.kill(), timeout);
+    child.once("close", (status, signal) => {
+      clearTimeout(timer);
+      resolvePromise({ status, signal, stdout, stderr });
+    });
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout || String(result.signal));
+  return result.stdout;
+}
 
 async function startHostCli(stateDirectory, host) {
   const port = await allocateTcpPort(host);

@@ -4,7 +4,12 @@ export {
   type LocalWorktreeExecutorOptions,
   type WorktreeExecutor,
   type WorktreeProbeInput,
+  type WorktreeProviderInput,
 } from "./worktree-executor.js";
+export {
+  resolveProviderPolicy, parseProviderPolicy, serializeProviderPolicy,
+  type ProviderPolicy, type ProviderPolicySelection, type ProviderEnvironmentStrategy,
+} from "./provider-policy.js";
 export type { WorktreeRegistration } from "./worktree-paths.js";
 export {
   CopilotAcpAdapter,

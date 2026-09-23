@@ -125,7 +125,7 @@ describe("physical Worktree SQLite fencing (§22.3)", () => {
       const prior = new DatabaseSync(priorPath);
       prior.exec("CREATE TABLE retained (id INTEGER); INSERT INTO retained VALUES (1); PRAGMA user_version = 13;");
       prior.close();
-      expect(() => TorsorKernel.open({ databasePath: priorPath })).toThrow(/schema version 13; expected 17/);
+      expect(() => TorsorKernel.open({ databasePath: priorPath })).toThrow(/schema version 13; expected 18/);
       const unchanged = new DatabaseSync(priorPath, { readOnly: true });
       try { expect(unchanged.prepare("SELECT id FROM retained").get()).toMatchObject({ id: 1 }); }
       finally { unchanged.close(); }

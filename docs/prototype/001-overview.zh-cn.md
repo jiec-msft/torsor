@@ -1040,16 +1040,18 @@ Artifact 和原始 provenance，不重复发布事件。新 Activation 只有在
 阻止新 descriptor；已提交 descriptor 仍由当前获授权的 Human/Runtime 查询。
 首片不自动删除 orphan 或 staging 文件，避免与并发固化竞争；清理留给停机维护。
 
-持久因果限制、可信 Artifact、物理 Worktree 与 Provider 诊断边界的整合数据库使用 schema **17**，同时保留第 25 节的
+持久因果限制、可信 Artifact、物理 Worktree 与 Provider 诊断边界的整合数据库使用 schema **18**，同时保留第 25 节的
 Run root/parent/depth、不可变约束、准入索引及持久配置，以及第 23 节的可信报告
-descriptor，并加入第 22 节的物理身份、执行记录及不可逆的 Writer publication fence。
+descriptor、第 22 节的物理身份、执行记录及不可逆的 Writer publication fence，
+并增加 native execution 的 ProviderAttempt/策略 receipt 绑定。schema 17 被拒绝，
+因为它缺少这些 native receipt；不迁移。
 schema 16 可能包含诊断边界修复前公开持久化的 Provider 原始诊断，因此必须拒绝并重建；
 更早的 causal-only、Artifact-only、Worktree-only schema 14 及整合 schema 15
 同样不兼容。不得因版本数字相同而接受另一套布局。打开任何旧版或未版本化的非空
 开发数据库必须在应用 DDL/Bootstrap 前明确拒绝，不迁移、不改写版本、不删除数据。
-停止旧进程后由操作者显式重建可丢弃数据库和新的 managed root。schema 17 重开仍校验持久 causal 配置及 Worktree storage identity。
+停止旧进程后由操作者显式使用新的可丢弃数据库和新的 managed root。schema 18 重开仍校验持久 causal 配置及 Worktree storage identity。
 
-`user_version = 17` 不是布局证明。已有数据库必须在任何 DDL、Bootstrap 或配置写入
+`user_version = 18` 不是布局证明。已有数据库必须在任何 DDL、Bootstrap 或配置写入
 之前，以只读方式对照由可信 DDL 在隔离内存库生成的完整 schema 指纹：对象集合、
 列/type/not-null/default/PK/FK、索引/唯一性/partial predicate、trigger、CHECK
 和 STRICT 等约束。比较 SQLite 解析后的 metadata 与保留 literal/operator 语义的
@@ -1057,7 +1059,7 @@ SQL token；只忽略空白、注释和未引用 keyword/identifier 大小写，
 缺失、额外不兼容、部分、损坏、前驱形状或未来布局必须拒绝，保持原文件字节及逻辑
 状态不变，不用 `CREATE IF NOT EXISTS` 修补。SQLite 自有统计对象不属于应用布局。
 只有没有持久对象的 version 0 数据库可在同一事务内执行 DDL、初始配置及 Bootstrap；
-失败完整回滚。有效 schema 17 重开不重新应用 Bootstrap，也不修改持久 causal 配置或 storage identity。
+失败完整回滚。有效 schema 18 重开不重新应用 Bootstrap，也不修改持久 causal 配置或 storage identity。
 
 Runtime Host 调度恢复 pass 时，连续执行的 pass 数量必须有界，并在继续前让出事件循环并重新检查关闭请求。积压处理不得饿死 HTTP、timer、signal 或关闭处理。空闲轮询等待必须可被关闭请求中断；无论等待还是关闭先完成，都必须移除对应 listener 并取消不再需要的 timer。
 
@@ -1071,6 +1073,10 @@ Runtime Host 调度恢复 pass 时，连续执行的 pass 数量必须有界，�
 4. Lease 带单调递增的 fencing token。
 
 首个物理执行切片进一步限定：
+
+以下 `write-probe-v1` 限制描述基础切片；显式 native Provider 执行的 provisioning、
+环境和完整进程树要求由[trusted-local 策略规范](../specs/trusted-local-provider-policy.zh-cn.md)
+扩展。未选择该策略时不扩大原有受限行为。
 
 5. Kernel 持久化不可重绑定的 `PhysicalWorktree` 运行记录：repository identity、
    canonical repository path、完整 base commit、source Run、opaque worktree ID、

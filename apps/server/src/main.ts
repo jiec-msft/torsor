@@ -1,12 +1,18 @@
 import { mkdir, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
-import { CopilotAcpAdapter } from "@torsor/agent-runtime";
+import { CopilotAcpAdapter, LocalWorktreeExecutor } from "@torsor/agent-runtime";
 import { LocalArtifactStorage, type KernelBootstrap, type PrincipalContext } from "@torsor/kernel";
 
 import { createLocalRuntimeHost } from "./local-runtime-host.js";
+import { readProviderConfiguration } from "./provider-configuration.js";
 
 async function main(): Promise<void> {
+  const provider = readProviderConfiguration(process.env);
+  const worktree = provider.worktree;
+  const runtimePrincipalId = requiredEnvironment("TORSOR_RUNTIME_PRINCIPAL_ID");
+  const leaseDurationMs = provider.providerTimeoutMs + 5_000;
+  if (provider.worktree) await mkdir(resolve(provider.worktree.rootPath), { recursive: true });
   const databasePath = resolve(
     process.env.TORSOR_DATABASE_PATH ?? ".torsor/torsor.sqlite",
   );
@@ -33,16 +39,25 @@ async function main(): Promise<void> {
         principalContext,
       },
     ],
-    runtimePrincipalId: requiredEnvironment("TORSOR_RUNTIME_PRINCIPAL_ID"),
+    runtimePrincipalId,
     projectIds: requiredListEnvironment("TORSOR_PROJECT_IDS"),
     adapter: new CopilotAcpAdapter({
-      ...(process.env.TORSOR_COPILOT_COMMAND
-        ? { command: process.env.TORSOR_COPILOT_COMMAND }
-        : {}),
-      ...(process.env.TORSOR_PROVIDER_CWD
-        ? { cwd: resolve(process.env.TORSOR_PROVIDER_CWD) }
-        : {}),
+      policy: provider.policy,
+      ...(provider.command ? { command: provider.command } : {}),
+      ...(provider.cwd ? { cwd: resolve(provider.cwd) } : {}),
     }),
+    providerTimeoutMs: provider.providerTimeoutMs,
+    attentionLeaseMs: leaseDurationMs,
+    outboxLeaseMs: leaseDurationMs,
+    activationDurationMs: leaseDurationMs,
+    ...(worktree ? {
+      worktreeExecutorFactory: (kernel) => new LocalWorktreeExecutor({
+        kernel, runtimePrincipalId, leaseDurationMs,
+        repositoryPath: resolve(worktree.repositoryPath),
+        rootPath: resolve(worktree.rootPath),
+        baseRevision: worktree.baseRevision,
+      }),
+    } : {}),
     ...(bootstrap ? { bootstrap } : {}),
     host: process.env.TORSOR_HOST ?? "127.0.0.1",
     port: optionalInteger(process.env.TORSOR_PORT, "TORSOR_PORT", 4317, 0),

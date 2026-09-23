@@ -356,6 +356,13 @@ export interface StartWorktreeExecutionCommand extends WorktreeWriterLeaseAuthor
   readonly type: "StartWorktreeExecution";
   readonly activationId: string;
   readonly executorId: string;
+  readonly provider?: WorktreeProviderBinding;
+}
+
+export interface WorktreeProviderBinding {
+  readonly providerAttemptId: string;
+  readonly policy: "trusted-local";
+  readonly permissionMode: "provider-default" | "allow-all";
 }
 
 export interface WorktreeExecutionReceipt {
@@ -396,6 +403,7 @@ export interface WorktreeExecutionView {
   readonly runtimePrincipalId: string;
   readonly generation: number;
   readonly fencingToken: number;
+  readonly provider?: WorktreeProviderBinding;
   readonly state: WorktreeExecutionState;
   readonly pid: number | null;
   readonly authorityRevokedAt: string | null;
@@ -596,7 +604,7 @@ export interface ListWorktreeWriterLeaseEventsQuery {
 
 export type KernelQuery =
   | { readonly type: "GetWorktreeStorageIdentity" }
-  | { readonly type: "ListPhysicalWorktrees"; readonly afterWorktreeId?: string; readonly limit?: number }
+  | { readonly type: "ListPhysicalWorktrees"; readonly runId?: string; readonly afterWorktreeId?: string; readonly limit?: number }
   | { readonly type: "GetPhysicalWorktree"; readonly worktreeId: string }
   | GetArtifactQuery
   | GetBootstrapQuery

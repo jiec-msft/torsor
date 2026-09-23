@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { TorsorKernel } from "../src/index.js";
-import { schemaSql } from "../src/schema.js";
+import { CURRENT_SCHEMA_VERSION, schemaSql } from "../src/schema.js";
 import { bootstrap } from "./helpers.js";
 
 describe("integrated schema contract (MVP 21.5, 22, 23.1, 25.1-25.2)", () => {
@@ -17,8 +17,9 @@ describe("integrated schema contract (MVP 21.5, 22, 23.1, 25.1-25.2)", () => {
     "",
   );
   const incompatibleLayouts = [
-    { name: "predecessor-shaped schema claiming version 17", sql: predecessorSchema },
-    { name: "partial v17 containing only causal_limits", sql: "CREATE TABLE causal_limits (singleton INTEGER PRIMARY KEY, max_depth INTEGER, max_non_terminal_runs_per_root INTEGER);" },
+    { name: "predecessor-shaped schema claiming current version", sql: predecessorSchema },
+    { name: "partial schema containing only causal_limits", sql: "CREATE TABLE causal_limits (singleton INTEGER PRIMARY KEY, max_depth INTEGER, max_non_terminal_runs_per_root INTEGER);" },
+    { name: "missing native ProviderAttempt binding", replace: ["provider_attempt_id TEXT REFERENCES provider_attempts(id)", "provider_attempt_id TEXT"] },
     { name: "missing Worktree acquisition index", after: "DROP INDEX worktree_unsettled_execution_idx;" },
     { name: "missing Writer publication index", after: "DROP INDEX worktree_execution_activation_idx;" },
     { name: "missing Writer revocation trigger", after: "DROP TRIGGER worktree_publication_revocation_immutable;" },
@@ -46,13 +47,13 @@ describe("integrated schema contract (MVP 21.5, 22, 23.1, 25.1-25.2)", () => {
     { name: "changed string literal case", replace: ["'human', 'agent', 'runtime'", "'Human', 'agent', 'runtime'"] },
     { name: "changed trigger literal whitespace", replace: ["Run causal provenance is immutable", "Run causal  provenance is immutable"] },
     { name: "non-STRICT table", replace: [") STRICT;", ");"] },
-    { name: "predecessor-shaped Artifact table claiming v17", after: "ALTER TABLE artifacts DROP COLUMN producer_thread_root_id; ALTER TABLE artifacts DROP COLUMN byte_length; ALTER TABLE artifacts ADD COLUMN storage_location TEXT;" },
+    { name: "predecessor-shaped Artifact table claiming current version", after: "ALTER TABLE artifacts DROP COLUMN producer_thread_root_id; ALTER TABLE artifacts DROP COLUMN byte_length; ALTER TABLE artifacts ADD COLUMN storage_location TEXT;" },
     { name: "missing durable causal configuration", after: "DELETE FROM causal_limits;" },
     { name: "missing durable runtime configuration", after: "DELETE FROM kernel_runtime_state;" },
     { name: "future version", after: "PRAGMA user_version = 99;" },
   ];
 
-  it.each([14, 15])("refuses predecessor version %i without modifying its bytes or logical state", async (version) => {
+  it.each([14, 15, 17])("refuses predecessor version %i without modifying its bytes or logical state", async (version) => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-physical-predecessor-"));
     const databasePath = join(directory, "state.sqlite");
     try {
@@ -68,7 +69,7 @@ describe("integrated schema contract (MVP 21.5, 22, 23.1, 25.1-25.2)", () => {
       const logical = logicalSnapshot(databasePath);
       for (let attempt = 0; attempt < 2; attempt++) {
         expect(() => TorsorKernel.open({ databasePath, bootstrap }))
-          .toThrow(`Incompatible development database schema version ${version}; expected 17.`);
+          .toThrow(`Incompatible development database schema version ${version}; expected ${CURRENT_SCHEMA_VERSION}.`);
         expect((await readFile(databasePath)).equals(before)).toBe(true);
         expect(logicalSnapshot(databasePath)).toEqual(logical);
       }
@@ -87,7 +88,7 @@ describe("integrated schema contract (MVP 21.5, 22, 23.1, 25.1-25.2)", () => {
         ddl = ddl.replace(from!, to!);
       }
       database.exec(ddl);
-      database.exec("INSERT INTO causal_limits VALUES (1, 4, 50); PRAGMA user_version = 17;");
+      database.exec(`INSERT INTO causal_limits VALUES (1, 4, 50); PRAGMA user_version = ${CURRENT_SCHEMA_VERSION};`);
       if (layout.after) database.exec(layout.after);
       database.close();
       const before = await readFile(databasePath);
@@ -111,7 +112,7 @@ describe("integrated schema contract (MVP 21.5, 22, 23.1, 25.1-25.2)", () => {
       const database = new DatabaseSync(databasePath);
       database.exec(schemaSql.replaceAll("CREATE TABLE", "create /* layout */ table")
         .replaceAll("CREATE INDEX", "create\nindex").replaceAll(" NOT NULL", " not null"));
-      database.exec("INSERT INTO causal_limits VALUES (1, 4, 50); PRAGMA user_version = 17; PRAGMA journal_mode = WAL;");
+      database.exec(`INSERT INTO causal_limits VALUES (1, 4, 50); PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}; PRAGMA journal_mode = WAL;`);
       database.close();
       const before = await readFile(databasePath);
       const logical = logicalSnapshot(databasePath);
@@ -165,7 +166,7 @@ describe("integrated schema contract (MVP 21.5, 22, 23.1, 25.1-25.2)", () => {
       expect(() =>
         TorsorKernel.open({ databasePath, bootstrap }),
       ).toThrow(
-        "Incompatible development database schema version 16; expected 17. Stop old Torsor processes and recreate the disposable local database.",
+        `Incompatible development database schema version 16; expected ${CURRENT_SCHEMA_VERSION}. Stop old Torsor processes and recreate the disposable local database.`,
       );
       expect((await readFile(databasePath)).equals(before)).toBe(true);
     } finally {
@@ -213,16 +214,17 @@ describe("integrated schema contract (MVP 21.5, 22, 23.1, 25.1-25.2)", () => {
     }
   });
 
-  it("initializes and reopens schema 17 with causal, Artifact and physical execution contracts", async () => {
+  it("initializes and reopens the native-provider schema with causal, Artifact and physical execution contracts", async () => {
     const directory = await mkdtemp(join(tmpdir(), "torsor-schema-contract-"));
     const databasePath = join(directory, "kernel.sqlite");
     try {
       TorsorKernel.open({ databasePath, bootstrap }).close();
       const database = new DatabaseSync(databasePath, { readOnly: true });
       try {
-        expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 17 });
+        expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: CURRENT_SCHEMA_VERSION });
         expect(database.prepare("PRAGMA table_info(worktree_executions)").all().map((row) => row.name))
-          .toEqual(expect.arrayContaining(["activation_id", "generation", "fencing_token", "authority_revoked_at"]));
+          .toEqual(expect.arrayContaining(["activation_id", "generation", "fencing_token", "authority_revoked_at",
+            "provider_attempt_id", "provider_policy", "permission_mode"]));
         expect(database.prepare("SELECT identity FROM worktree_storage_identity").get()?.identity)
           .toMatch(/^[a-f0-9]{64}$/);
         expect(database.prepare("SELECT * FROM causal_limits").all()).toEqual([{
@@ -289,7 +291,7 @@ describe("integrated schema contract (MVP 21.5, 22, 23.1, 25.1-25.2)", () => {
         const logical = logicalSnapshot(databasePath);
         for (let attempt = 0; attempt < 2; attempt += 1) {
           expect(() => TorsorKernel.open({ databasePath, bootstrap })).toThrow(
-            "Incompatible development database schema version 14; expected 17. Stop old Torsor processes and recreate the disposable local database.",
+            `Incompatible development database schema version 14; expected ${CURRENT_SCHEMA_VERSION}. Stop old Torsor processes and recreate the disposable local database.`,
           );
           expect((await readFile(databasePath)).equals(before)).toBe(true);
           expect(logicalSnapshot(databasePath)).toEqual(logical);
