@@ -15,6 +15,7 @@ export const defaultQuickstartStateDirectory = join(
 export const quickstartToken = "torsor-local-demo";
 
 export async function createQuickstartHost(options = {}) {
+  const hostName = requireLoopbackHost(options.host ?? "127.0.0.1");
   const stateDirectory = resolve(
     options.stateDirectory ?? defaultQuickstartStateDirectory,
   );
@@ -34,7 +35,7 @@ export async function createQuickstartHost(options = {}) {
     runtimePrincipalId: "principal-runtime",
     projectIds: ["project-sample"],
     adapter: new DeterministicFakeAdapter(),
-    host: options.host ?? "127.0.0.1",
+    host: hostName,
     port: options.port ?? 4317,
     runtimePollIntervalMs: 10,
   });
@@ -84,7 +85,7 @@ function parseArguments(arguments_) {
     if (argument === "--state-dir") {
       options.stateDirectory = resolve(value);
     } else if (argument === "--host") {
-      options.host = value;
+      options.host = requireLoopbackHost(value);
     } else if (argument === "--port") {
       const port = Number(value);
       if (!Number.isInteger(port) || port < 0 || port > 65_535) {
@@ -97,6 +98,13 @@ function parseArguments(arguments_) {
     index += 1;
   }
   return options;
+}
+
+export function requireLoopbackHost(host) {
+  if (host === "127.0.0.1" || host === "::1") {
+    return host;
+  }
+  throw new Error("--host must be the loopback literal 127.0.0.1 or ::1.");
 }
 
 function formatError(error) {

@@ -52,7 +52,8 @@ npm run quickstart:host
 它使用[完整合成 Bootstrap](examples/working-quickstart/bootstrap.json)、生产
 `createLocalRuntimeHost` 组合路径和固定 `DeterministicFakeAdapter`，不需要模型、
 模型凭据或网络，也不会改变生产 CLI 的 Provider 默认值。状态写入
-`.torsor/quickstart`。
+`.torsor/quickstart`。可选 `--host` 参数只接受显式 Loopback 字面量
+`127.0.0.1` 与 `::1`。
 
 第二个终端运行已检查的最小 HTTP Journey：
 
@@ -96,7 +97,7 @@ npm run preview:web
 
 ```powershell
 npm run build --workspace @torsor/acp-conformance
-npm exec -- acp-conformance mock packages\acp-conformance\examples\basic.json
+npm exec -- acp-conformance mock packages/acp-conformance/examples/basic.json
 ```
 
 更完整的场景和真实 Provider 显式启用规则见

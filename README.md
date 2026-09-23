@@ -55,7 +55,8 @@ at `http://127.0.0.1:4317`. It uses the
 the production `createLocalRuntimeHost` composition path, and the fixed
 `DeterministicFakeAdapter`. It needs no model, model credential, or network
 access and does not change the production CLI's provider defaults. State is
-stored under `.torsor/quickstart`.
+stored under `.torsor/quickstart`. The optional `--host` argument accepts only
+the explicit loopback literals `127.0.0.1` and `::1`.
 
 In a second terminal, run the checked minimum HTTP journey:
 
@@ -105,7 +106,7 @@ network access. Stop it with `Ctrl+C`:
 
 ```powershell
 npm run build --workspace @torsor/acp-conformance
-npm exec -- acp-conformance mock packages\acp-conformance\examples\basic.json
+npm exec -- acp-conformance mock packages/acp-conformance/examples/basic.json
 ```
 
 See the [ACP conformance quick start](packages/acp-conformance/README.md) for

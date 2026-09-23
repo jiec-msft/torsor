@@ -2317,8 +2317,9 @@ Prototype 和 evidence 至少覆盖：
 2. Quick start Bootstrap 是已提交、完整且机器无关的 JSON，至少包含 Human Principal、
    Runtime Principal、Agent Principal、对应 Agent 配置、Project 和 Channel，只使用合成数据。
 3. 无凭据 Host 是单独的 Example/Development 入口。它通过公开
-   `createLocalRuntimeHost` 与 `DeterministicFakeAdapter` 使用生产组合路径，固定绑定本机，
-   不通过环境变量切换生产 CLI，不启用任意 Adapter、命令、工具或宽松权限。
+   `createLocalRuntimeHost` 与 `DeterministicFakeAdapter` 使用生产组合路径，只允许显式
+   IPv4/IPv6 Loopback 字面量 `127.0.0.1` 或 `::1`，拒绝 Wildcard、非 Loopback 地址和
+   Hostname；不通过环境变量切换生产 CLI，不启用任意 Adapter、命令、工具或宽松权限。
 4. 最小 HTTP Journey 必须实际验证 `/health`、Bearer 到 HttpOnly Session Cookie 的交换、
    Session CSRF、Project Bootstrap、`start-thread`、生成的 Run、Run Activity 和终态完成。
    动态 ID 由受检脚本从响应中取得，不在文档中硬编码。
@@ -2332,4 +2333,6 @@ Prototype 和 evidence 至少覆盖：
    本机 Smoke 代理，但必须标记为本地预览，而不是不存在的生产反向代理或部署承诺。
 8. 所有可消费公共 Package 都必须在 `npm pack --dry-run` 的文件清单中包含与仓库根目录
    完全相同的 Apache-2.0 `LICENSE`。文档/Quick start 测试应覆盖示例文件、根命令、cwd
-   语义、端到端 Journey、重启持久性和 Package License 清单。
+   语义、CLI Loopback 拒绝/接受、通过真实 Host CLI 与 Vite dev/preview 进程完成的端到端
+   Journey、重启持久性和 Package License 清单。进程 Readiness 和关闭必须有界且受监督，
+   使用动态端口，并在成功或失败后清理。

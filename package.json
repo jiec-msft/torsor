@@ -17,7 +17,7 @@
     "quickstart:host": "npm run build --workspace @torsor/server && node examples/working-quickstart/host.mjs",
     "quickstart:http": "node examples/working-quickstart/http-journey.mjs",
     "test": "npm run test:docs && npm run test:kernel && npm run test:agent-runtime && npm run test:acp-conformance && npm run test:server && npm run test:quickstart && npm run test:web && npm run test:prototype",
-    "test:quickstart": "npm run build --workspace @torsor/server && node --test scripts/working-quickstart.test.mjs",
+    "test:quickstart": "npm run build --workspace @torsor/server && npm run build --workspace @torsor/web && npm run build --workspace @torsor/acp-conformance && node --test scripts/working-quickstart.test.mjs",
     "test:kernel": "npm run test --workspace @torsor/kernel",
     "test:agent-runtime": "npm run test --workspace @torsor/agent-runtime",
     "test:acp-conformance": "npm run test --workspace @torsor/acp-conformance",

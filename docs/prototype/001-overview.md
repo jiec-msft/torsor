@@ -1694,9 +1694,11 @@ working MVP without model credentials or network access.
    synthetic data only.
 3. The credential-free Host is a separate example/development entry point. It
    uses the production composition path through public
-   `createLocalRuntimeHost` and `DeterministicFakeAdapter`, binds locally, does
-   not switch the production CLI through an environment flag, and does not
-   enable arbitrary adapters, commands, tools, or relaxed permissions.
+   `createLocalRuntimeHost` and `DeterministicFakeAdapter`, accepts only the
+   explicit IPv4/IPv6 loopback literals `127.0.0.1` or `::1`, rejects wildcard,
+   non-loopback addresses, and hostnames, does not switch the production CLI
+   through an environment flag, and does not enable arbitrary adapters,
+   commands, tools, or relaxed permissions.
 4. The minimum HTTP journey actually verifies `/health`, bearer exchange for
    an HttpOnly session cookie, session CSRF, Project bootstrap, `start-thread`,
    the resulting Run, Run activity, and terminal completion. A checked script
@@ -1716,5 +1718,8 @@ working MVP without model credentials or network access.
    deployment promise.
 8. Every consumable public package includes a byte-identical copy of the
    repository Apache-2.0 `LICENSE` in `npm pack --dry-run`. Documentation and
-   quick-start tests cover example files, root commands, cwd semantics, the
-   end-to-end journey, restart durability, and package license contents.
+   quick-start tests cover example files, root commands, cwd semantics, CLI
+   loopback rejection/acceptance, the end-to-end journey through real Host CLI
+   and Vite dev/preview processes, restart durability, and package license
+   contents. Process readiness and shutdown are bounded and supervised, use
+   dynamic ports, and clean up after success or failure.
