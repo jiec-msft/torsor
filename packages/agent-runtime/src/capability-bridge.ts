@@ -19,6 +19,7 @@ interface BridgeBaseOptions {
   readonly agent: BootstrapAgent;
   readonly activationId: string;
   readonly providerAttemptId: string;
+  readonly assertPublication?: () => void;
 }
 
 interface AttentionBridgeOptions extends BridgeBaseOptions {
@@ -315,6 +316,7 @@ export class KernelActivationCapabilityBridge
     readonly principalId: string;
     readonly activationId: string;
   } {
+    this.options.assertPublication?.();
     return {
       principalId: this.options.agent.principalId,
       activationId: this.activationId,

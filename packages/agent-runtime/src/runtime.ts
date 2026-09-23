@@ -14,7 +14,12 @@ import {
 } from "@torsor/kernel";
 
 import { KernelActivationCapabilityBridge } from "./capability-bridge.js";
-import type { WorktreeExecutor } from "./worktree-executor.js";
+import {
+  NativeRunCancellationInterruption,
+  isNativeRunCancellationInterruption,
+} from "./native-run-cancellation.js";
+import type { ControlledWorktreeProcess, WorktreeExecutor } from "./worktree-executor.js";
+import { parseProviderPolicy, resolveProviderPolicy, type ProviderPolicy } from "./provider-policy.js";
 import {
   normalizeProviderExecutionError,
   providerPublicDiagnostic,
@@ -138,6 +143,8 @@ export class AgentRuntime {
     AttentionProjectDiscoveryContinuation
   >();
   #attentionProjectOffset = 0;
+  readonly #executions = new Set<AbortController>();
+  #stopped = false;
 
   constructor(options: AgentRuntimeOptions) {
     if (options.projectIds.length === 0) {
@@ -226,12 +233,22 @@ export class AgentRuntime {
     return result;
   }
 
+  stop(): void {
+    this.#stopped = true;
+    for (const controller of this.#executions) {
+      controller.abort(new ProviderExecutionError("provider_cancelled", "Unknown"));
+    }
+  }
+
   async #runPass(): Promise<RuntimePassExecution> {
+    if (this.#stopped) {
+      return { attentionsDispatched: 0, attentionsDeferred: 0, attentionRecoveries: 0, outboxEventsProcessed: 0 };
+    }
     await this.#refreshAgents();
     const attentionRecoveries =
       await this.#reconcileOrphanedAttentionExecutions();
     const attentionResult = await this.#dispatchOpenAttentions();
-    const outboxEventsProcessed = await this.#drainOutboxBatch();
+    const outboxEventsProcessed = this.#stopped ? 0 : await this.#drainOutboxBatch();
     return {
       attentionsDispatched: attentionResult.dispatched,
       attentionsDeferred: attentionResult.deferred,
@@ -867,7 +884,18 @@ export class AgentRuntime {
     readonly runInputIds: readonly string[];
     readonly requestIdempotencyKey: string;
   }): Promise<boolean> {
-    if (this.#providerExecutionBudget(input.authorityLeaseExpiresAt) <= 0) {
+    const policy = input.cause.type === "attention"
+      ? resolveProviderPolicy()
+      : parseProviderPolicy(this.#adapter.policy ?? resolveProviderPolicy());
+    let nativeHandle: ControlledWorktreeProcess | undefined;
+    let nativeLaunch: Promise<ControlledWorktreeProcess> | undefined;
+    let nativeStartRequested = false;
+    const assertPublication = () => {
+      if (policy.kind !== "trusted-local") return;
+      if (!nativeHandle) throw new ProviderExecutionError("provider_worktree_authority_lost", "Unknown");
+      nativeHandle.assertPublication();
+    };
+    if (this.#stopped || this.#providerExecutionBudget(input.authorityLeaseExpiresAt) <= 0) {
       await this.#finishActivationBeforeProvider(input.activationId);
       return false;
     }
@@ -883,7 +911,7 @@ export class AgentRuntime {
         : {}),
       adapter: this.#adapter.name,
       adapterVersion: this.#adapter.version,
-      capabilitySnapshot: providerCapabilitiesJson(this.#adapter),
+      capabilitySnapshot: providerCapabilitiesJson(this.#adapter, policy),
       runInputIds: input.runInputIds,
       requestIdempotencyKey: input.requestIdempotencyKey,
     } as const;
@@ -967,6 +995,7 @@ export class AgentRuntime {
             providerAttemptId: attempt.entityId,
             causeType: "run",
             projection: input.cause.run,
+            assertPublication,
           });
     const admission = await this.#kernel.execute(
       admissionCommand,
@@ -999,13 +1028,24 @@ export class AgentRuntime {
       return false;
     }
     const controller = new AbortController();
+    this.#executions.add(controller);
+    if (this.#stopped) controller.abort(new ProviderExecutionError("provider_cancelled", "Unknown"));
     let worktreeScopeOpen = true;
+    let worktreeStop: Promise<void> | undefined;
+    const nativeRunCancellation = policy.kind === "trusted-local" && input.cause.type === "run"
+      ? new NativeRunCancellationInterruption(
+          input.cause.run.run.id,
+          input.activationId,
+          input.cause.run.run.activationGeneration,
+        )
+      : undefined;
     const stopMonitor = this.#monitorExecution(
       input.cause,
       input.activationId,
       executionBudgetMs,
       controller,
       () => bridge.terminalAction !== null,
+      nativeRunCancellation,
     );
     try {
       await executeWithAbort(
@@ -1017,6 +1057,28 @@ export class AgentRuntime {
           cause: input.cause,
           capabilities: bridge,
           signal: controller.signal,
+          ...(policy.kind === "trusted-local" && input.cause.type === "run" ? {
+            nativeExecution: {
+              policy,
+              start: async (start: (cwd: string) => import("./controlled-process.js").ControlledChild) => {
+                if (!worktreeScopeOpen || nativeStartRequested || controller.signal.aborted ||
+                    !this.#worktreeExecutor?.startProvider || input.cause.type !== "run") {
+                  throw new ProviderExecutionError("provider_worktree_authority_lost", "Unknown");
+                }
+                nativeStartRequested = true;
+                nativeLaunch = this.#worktreeExecutor.startProvider({
+                  runId: input.cause.run.run.id, activationId: input.activationId,
+                  providerAttemptId: attempt.entityId, policy, start,
+                  ...(nativeRunCancellation
+                    ? { cancellationInterruption: nativeRunCancellation }
+                    : {}),
+                  signal: controller.signal,
+                });
+                nativeHandle = await nativeLaunch;
+                return nativeHandle;
+              },
+            },
+          } : {}),
           ...(input.cause.type === "run" && this.#worktreeExecutor ? {
             worktree: {
               probe: (worktreeId: string) => {
@@ -1060,13 +1122,36 @@ export class AgentRuntime {
       }
       return true;
     } catch (error) {
-      const providerError =
-        error instanceof KernelError && error.code === "WriterAuthorityLost"
-          ? new ProviderExecutionError(
-              "provider_worktree_authority_lost",
-              "Unknown",
-            )
-          : normalizeProviderExecutionError(error);
+      worktreeScopeOpen = false;
+      if (policy.kind === "trusted-local") {
+        controller.abort(error);
+        // The executor owns children even before launch returns or Running is
+        // persisted. Start every physical stop before awaiting launch or SQLite.
+        worktreeStop = this.#worktreeExecutor?.stopActivation(input.activationId);
+        // Observe rejection now, and propagate this same stop promise in finally.
+        void worktreeStop?.catch(() => undefined);
+      }
+      let providerError = normalizeWorktreeProviderError(error);
+      if (nativeLaunch) {
+        try {
+          // The abort race may finish before native admission returns. Observe
+          // that launch before settlement; late failures must not become success.
+          nativeHandle ??= await nativeLaunch;
+        } catch (launchError) {
+          const launchFailure = normalizeWorktreeProviderError(launchError);
+          if (!isNativeRunCancellation(launchFailure, nativeRunCancellation)) {
+            providerError = launchFailure;
+          }
+        }
+        const authorityClassificationError =
+          await nativeHandle?.authorityClassificationError();
+        if (authorityClassificationError !== undefined) {
+          providerError = normalizeWorktreeProviderError(
+            authorityClassificationError,
+          );
+        }
+      }
+      let cancelledNativeRun = false;
       if (input.cause.type === "run" && bridge.terminalAction === null) {
         const latest = await this.#kernel.query(
           { type: "GetRunProjection", runId: input.cause.run.run.id },
@@ -1075,6 +1160,46 @@ export class AgentRuntime {
         const activation = latest.activations.find(
           (candidate) => candidate.id === input.activationId,
         );
+        const authoritativeCancellation = policy.kind === "trusted-local" && !this.#stopped &&
+          latest.run.state === "Cancelled" && activation?.revocationReason === "run_cancelled" &&
+          activation.runActivationGeneration === latest.run.activationGeneration &&
+          activation.runActivationGeneration === input.cause.run.run.activationGeneration &&
+          isNativeRunCancellation(providerError, nativeRunCancellation);
+        if (authoritativeCancellation && nativeRunCancellation) {
+          const identity = nativeRunCancellation.executionIdentity();
+          if (!identity) {
+            cancelledNativeRun = true;
+          } else {
+            try {
+              await worktreeStop;
+              const [tree, lease] = await Promise.all([
+                this.#kernel.query(
+                  { type: "GetPhysicalWorktree", worktreeId: identity.worktreeId },
+                  this.#runtimeContext,
+                ),
+                this.#kernel.query(
+                  { type: "GetWorktreeWriterLease", worktreeId: identity.worktreeId },
+                  this.#runtimeContext,
+                ),
+              ]);
+              cancelledNativeRun =
+                nativeRunCancellation.ownsPhysicalStop(identity) &&
+                tree.latestExecution?.id === identity.executionId &&
+                tree.latestExecution.generation === identity.leaseGeneration &&
+                tree.latestExecution.fencingToken === identity.fencingToken &&
+                lease.status !== "Quarantined" &&
+                lease.generation === identity.leaseGeneration &&
+                lease.fencingToken === identity.fencingToken;
+              if (!cancelledNativeRun) {
+                providerError = nativeRunCancellation.providerExitPrecededStop(identity)
+                  ? new ProviderExecutionError("provider_process_exited", "Unknown")
+                  : new ProviderExecutionError("provider_worktree_authority_lost", "Unknown");
+              }
+            } catch (stopError) {
+              providerError = normalizeWorktreeProviderError(stopError);
+            }
+          }
+        }
         if (
           latest.run.state === "Active" &&
           activation?.finishedAt === null &&
@@ -1091,6 +1216,8 @@ export class AgentRuntime {
                   waitError.code === "Conflict" ||
                   waitError.code === "WriterAuthorityLost" ||
                   waitError.code === "TerminalRun")
+                || waitError instanceof ProviderExecutionError &&
+                  waitError.diagnosticCode === "provider_worktree_authority_lost"
               )
             ) {
               throw waitError;
@@ -1125,11 +1252,15 @@ export class AgentRuntime {
           this.#runtimeContext,
         );
       }
+      // A committed Human cancellation is handled work, not a successful
+      // Provider attempt and not a reason to tear down the observation Host.
+      if (cancelledNativeRun) return true;
       throw providerError;
     } finally {
       worktreeScopeOpen = false;
       stopMonitor();
-      await this.#worktreeExecutor?.stopActivation(input.activationId);
+      this.#executions.delete(controller);
+      await (worktreeStop ?? this.#worktreeExecutor?.stopActivation(input.activationId));
     }
   }
 
@@ -1139,6 +1270,7 @@ export class AgentRuntime {
     executionBudgetMs: number,
     controller: AbortController,
     hasProviderTerminalAction: () => boolean,
+    nativeRunCancellation?: NativeRunCancellationInterruption,
   ): () => void {
     const timeout = setTimeout(() => {
       controller.abort(
@@ -1165,6 +1297,17 @@ export class AgentRuntime {
         const activation = projection.activations.find(
           (candidate) => candidate.id === activationId,
         );
+        if (
+          nativeRunCancellation &&
+          projection.run.id === nativeRunCancellation.runId &&
+          projection.run.state === "Cancelled" &&
+          activation?.revocationReason === "run_cancelled" &&
+          activation.runActivationGeneration === projection.run.activationGeneration &&
+          activation.runActivationGeneration === nativeRunCancellation.runActivationGeneration
+        ) {
+          controller.abort(nativeRunCancellation);
+          return;
+        }
         if (
           !activation ||
           activation.finishedAt !== null ||
@@ -1936,8 +2079,9 @@ function isTerminalProviderStatus(
   return status === "Completed" || status === "Failed" || status === "Unknown";
 }
 
-function providerCapabilitiesJson(adapter: ProviderAdapter): JsonValue {
+function providerCapabilitiesJson(adapter: ProviderAdapter, policy: ProviderPolicy): JsonValue {
   return {
+    ...(adapter.policy ? { policy } : {}),
     accepts_input_while_running:
       adapter.capabilities.acceptsInputWhileRunning,
     supports_cancel: adapter.capabilities.supportsCancel,
@@ -1978,6 +2122,22 @@ function requireIntegerAtLeast(
   }
 }
 
+function normalizeWorktreeProviderError(error: unknown): ProviderExecutionError {
+  if (isNativeRunCancellationInterruption(error)) {
+    return error;
+  }
+  return error instanceof KernelError && error.code === "WriterAuthorityLost"
+    ? new ProviderExecutionError("provider_worktree_authority_lost", "Unknown")
+    : normalizeProviderExecutionError(error);
+}
+
+function isNativeRunCancellation(
+  error: ProviderExecutionError,
+  expected: NativeRunCancellationInterruption | undefined,
+): boolean {
+  return expected !== undefined && error === expected;
+}
+
 async function executeWithAbort<T>(
   execution: Promise<T>,
   signal: AbortSignal,
@@ -2006,6 +2166,9 @@ async function executeWithAbort<T>(
 function abortReason(signal: AbortSignal): Error {
   if (signal.reason === undefined) {
     return new ProviderExecutionError("provider_cancelled", "Unknown");
+  }
+  if (isNativeRunCancellationInterruption(signal.reason)) {
+    return signal.reason;
   }
   return normalizeProviderExecutionError(signal.reason, "Unknown");
 }

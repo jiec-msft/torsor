@@ -3954,7 +3954,7 @@ describe("AgentRuntime", () => {
       new CopilotAcpAdapter({
         environment: { COPILOT_ALLOW_ALL: "true" },
       }),
-    ).toThrow("not in the explicit provider allowlist");
+    ).toThrow("Invalid restricted Copilot environment override.");
     expect(() =>
       new CopilotAcpAdapter({
         commandArgs: ["--acp"],
@@ -3962,13 +3962,13 @@ describe("AgentRuntime", () => {
     ).toThrow("unsafeAllowCustomCommandArgs=true");
   });
 
-  it("cancels ACP permission requests without exposing a built-in tool", async () => {
+  it.each(["permission", "permission-string"])("cancels ACP permission requests without exposing a built-in tool: %s", async (scenario) => {
     const kernel = openKernel(":memory:");
     try {
       await prepareAcpRun(kernel, "permission-request");
       const runtime = createRuntime(
         kernel,
-        createFixtureAcpAdapter("permission"),
+        createFixtureAcpAdapter(scenario),
       );
 
       await runtime.runOnce();

@@ -39,6 +39,7 @@ export function readPlainFile(path: string): string {
 
 export function inspectWorktree(
   rootPath: string, repositoryPath: string, input: WorktreeRegistration,
+  allowDetachedCommit = false,
 ): PhysicalWorktreeBinding {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(input.directoryName)) {
     throw new Error("Worktree directoryName must be one safe path component.");
@@ -61,9 +62,10 @@ export function inspectWorktree(
     throw new Error("Git worktree belongs to another repository.");
   }
   const commonTarget = canonicalDirectory(resolve(admin.path, readPlainFile(join(admin.path, "commondir"))));
+  const head = readPlainFile(join(admin.path, "HEAD"));
   if (commonTarget.path !== common.path ||
       pathKey(resolve(admin.path, readPlainFile(join(admin.path, "gitdir")))) !== pathKey(gitFile) ||
-      readPlainFile(join(admin.path, "HEAD")) !== input.baseRevision) {
+      (allowDetachedCommit ? !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head) : head !== input.baseRevision)) {
     throw new Error("Git worktree identity or detached base revision changed.");
   }
   return {

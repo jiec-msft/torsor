@@ -1,20 +1,27 @@
 # `@torsor/agent-runtime`
 
-## Controlled physical Worktree tracer
+## Lease-backed physical Worktree execution
 
-The optional `LocalWorktreeExecutor` implements only `write-probe-v1`, governed by
+The optional `LocalWorktreeExecutor` retains `write-probe-v1`, governed by
 MVP §§22.1–22.4, 24.2–24.3, 38.1–38.4, and 43.1. It registers a trusted,
 pre-provisioned detached Git worktree under a private managed root, exclusively
 creates `torsor-probe.txt`, and runs a fixed Node child to digest the content.
-It does not provision Git worktrees, execute repository code, run arbitrary
-commands, or grant ACP native shell/write tools.
+The separate `startProvider` path implements the
+[trusted-local policy contract](../../docs/specs/trusted-local-provider-policy.md).
+It resolves the assigned Worktree from the Run, provisions a detached Worktree at
+the configured immutable base when needed, acquires its Writer Lease, and records
+the Activation/ProviderAttempt/policy receipt before starting the owned provider
+process tree. Provider input cannot select cwd, paths, ownership, or fencing.
 
 `register` binds immutable physical/repository/Run facts; `start` and `probe`
 require a live Run Activation. Every mediated mutation is checked under the
 Kernel write lock after a durable execution intent. `stopActivation`, `recover`,
 and `close` bound the lifecycle. Runtime gives explicitly enabled trusted
-adapters only `context.worktree.probe(worktreeId)`, never a path or executable.
-Attention contexts have no such capability.
+adapters `context.worktree.probe(worktreeId)`. Explicit trusted-local Run adapters
+also receive a single-use `nativeExecution` launch capability; Runtime binds its
+Run, Activation, ProviderAttempt, policy, signal, and publication checks.
+Attention contexts have neither native authority nor a writable Worktree and
+continue using restricted Copilot launch.
 
 Clean `probe` requires the fixed digest, normal child close and a current Writer
 fence; it retains the lease until Activation publication/settlement ends. Kernel
@@ -55,9 +62,13 @@ authority transactionally; observational snapshots grant no effect permission.
 The managed root is bound to one database storage identity by `.torsor-owner`.
 Use a fresh root after recreating the database. Do not concurrently run copied
 databases against it. The private root must exclude concurrent external path
-replacement; path checks are not a same-user OS sandbox. General process-tree
-containment, cross-restart stop proof, Pause/Resume, Terminal, Files UI, GC, and
-external integration remain out of scope.
+replacement; path checks are not a same-user OS sandbox. Native providers run
+under a retained Windows Job Object or Linux process group with `/proc` observation.
+Other platforms fail native launch explicitly. Normal completion
+requires whole-tree stop before final actions, not merely main-process exit.
+Host shutdown calls `AgentRuntime.stop()` to synchronously abort active scopes.
+Cross-restart stop proof, Pause/Resume, Terminal/Files UI, and GC remain out of scope;
+a lost original handle still quarantines the physical Worktree.
 
 `controlled-process.ts` is an isolated trusted process-driver seam. Synthetic
 fixtures exercise stop uncertainty and crashes without adding another Provider
@@ -140,7 +151,7 @@ through the same leased stream. `projectIds` supplies the Projects whose
 existing open Attentions are scanned at startup; Projects encountered in
 outbox events are loaded dynamically.
 
-The Copilot adapter starts with a deny-by-default provider policy. It filters
+The Copilot adapter defaults to the `restricted` deny-by-default policy. It filters
 the model-visible tool list to a nonexistent Runtime sentinel, explicitly
 denies shell, write, and URL permissions, disables built-in MCP servers and
 custom instructions, supplies no session MCP servers, and launches with a
@@ -148,6 +159,20 @@ minimal environment allowlist. Custom command arguments are rejected unless
 the caller explicitly enables the unsafe development option used by test
 fixtures. Child stdin write, end, EOF, and pipe failures are folded into the
 same provider failure and cleanup path.
+
+Explicit `trusted-local` enables normal provider-native tools, configured MCP,
+custom instructions, and user/provider environment. Permission selection is
+required: `provider-default` never grants an unattended permission request;
+`allow-all` is explicit. `TORSOR_*` and ambient Copilot approval variables are
+removed by the shared policy environment strategy. Only enum policy intent
+enters the capability snapshot; the environment is transient spawn input.
+See [local usage and real-provider opt-in](../../docs/trusted-local.md).
+
+Trusted-local Tool updates become bounded `tool_started`, `tool_completed`, and
+`tool_failed` activity with Runtime-generated IDs and enum kind/status only.
+Tool payloads, titles, provider IDs, arguments/results, and raw assistant chunks
+are not published. The final bounded action envelope still uses the existing
+capability bridge after normal physical stop and authority revalidation.
 
 The Runtime is the diagnostic boundary before Kernel persistence. Adapter
 failures carry a stable diagnostic code and outcome, but public Run,
@@ -178,7 +203,6 @@ sequence numbers. Extra descriptor/provenance fields fail before actions apply;
 `publish_artifact` remains forbidden. Without storage the capability fails closed
 and is not advertised. Report publication does not complete the Run.
 
-The Copilot process is also not an operating-system
-sandbox; this slice relies on the CLI tool-availability boundary and sanitized
-environment and does not provide Worktree, Git, terminal, or multi-host
-execution.
+Neither profile is an operating-system sandbox. Trusted-local has the user's
+native tool power, with lease-owned cwd/process lifetime and durable publication
+fences, not hostile-code or multi-host isolation.
