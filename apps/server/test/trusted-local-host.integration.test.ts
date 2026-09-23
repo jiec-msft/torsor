@@ -16,6 +16,7 @@ describe("trusted-local HTTP Host", () => {
   it.each([
     { phase: "before-admission", cancel: true, failure: "none" },
     { phase: "before-return", cancel: true, failure: "none" },
+    { phase: "forced-before-return", cancel: true, failure: "none" },
     { phase: "running-receipt", cancel: true, failure: "none" },
     { phase: "running-receipt", cancel: true, failure: "persistence" },
     { phase: "before-return", cancel: true, failure: "spawn" },
@@ -33,8 +34,8 @@ describe("trusted-local HTTP Host", () => {
     let returned = false;
     let acknowledgedEarly = false;
     let spawns = 0;
-    let childClosed: Promise<unknown> | undefined;
-    let physicallyClosed = false;
+    let childClosed: Promise<PromiseSettledResult<unknown>> | undefined;
+    let ownerClosed = false;
     let kernel: TorsorKernel | undefined;
     const host = createLocalRuntimeHost({
       databasePath: repo.databasePath, bootstrap, port: 0,
@@ -53,6 +54,7 @@ describe("trusted-local HTTP Host", () => {
         kernel = ownedKernel;
         const executor = new LocalWorktreeExecutor({
           kernel: ownedKernel, runtimePrincipalId: "runtime", ...repo, leaseDurationMs: 125_000,
+          ...(phase === "forced-before-return" ? { stopGraceMs: 1 } : {}),
         });
         const start = executor.startProvider.bind(executor);
         vi.spyOn(executor, "startProvider").mockImplementation(async (input) => {
@@ -68,12 +70,14 @@ describe("trusted-local HTTP Host", () => {
             start: (cwd) => {
               spawns += 1;
               const child = input.start(cwd);
-              childClosed = child.closed;
-              void child.closed.then(() => { physicallyClosed = true; });
+              childClosed = Promise.allSettled([child.closed]).then(([observation]) => {
+                ownerClosed = true;
+                return observation;
+              });
               return child;
             },
           });
-          if (phase === "before-return") {
+          if (phase === "before-return" || phase === "forced-before-return") {
             entered.resolve(input.runId);
             await release.promise;
           }
@@ -99,7 +103,7 @@ describe("trusted-local HTTP Host", () => {
             if (failure === "persistence") throw new Error("Synthetic Running receipt persistence failure.");
           }
           if (command.type === "AcknowledgeOutboxEvents" && runActivation) {
-            acknowledgedEarly ||= phase !== "before-admission" && (!returned || !physicallyClosed);
+            acknowledgedEarly ||= phase !== "before-admission" && (!returned || !ownerClosed);
             acknowledged.resolve();
           }
           return result;
@@ -133,7 +137,7 @@ describe("trusted-local HTTP Host", () => {
         })).status).toBe(200);
         if (phase !== "before-admission") {
           await aborted.promise;
-          await vi.waitFor(() => expect(physicallyClosed).toBe(true), { timeout: 3_000 });
+          await vi.waitFor(() => expect(ownerClosed).toBe(true), { timeout: 3_000 });
           await childClosed;
           await new Promise<void>((resolve) => setImmediate(resolve));
           expect(acknowledgedEarly).toBe(false);
@@ -170,7 +174,7 @@ describe("trusted-local HTTP Host", () => {
     } finally {
       release.resolve();
       const [closed] = await Promise.allSettled([host.close()]);
-      await childClosed;
+      const observation = await childClosed;
       vi.restoreAllMocks();
       const reopened = TorsorKernel.open({ databasePath: repo.databasePath });
       try {
@@ -178,12 +182,17 @@ describe("trusted-local HTTP Host", () => {
         for (const tree of trees.items) {
           expect(["StopConfirmed", "ForceTerminated", "Uncertain"]).toContain(tree.latestExecution?.state);
           if (tree.latestExecution?.state === "Uncertain") expect(tree.state).toBe("Quarantined");
+          if (observation?.status === "rejected") {
+            expect(observation.reason).toMatchObject({ outcome: "Unknown" });
+            expect(tree).toMatchObject({ state: "Quarantined", latestExecution: { state: "Uncertain" } });
+          }
           const run = await reopened.query({ type: "GetRunProjection", runId: tree.runId }, { principalId: "human" });
           expect(run.run.state).not.toBe("Completed");
           expect(run.providerAttempts.at(-1)?.status).not.toBe("Completed");
           expect(run.activity.items).toEqual([]);
         }
       } finally { reopened.close(); repo.dispose(); }
+      if (phase === "forced-before-return") expect(observation?.status).toBe("rejected");
       if (failure === "none") expect(closed.status).toBe("fulfilled");
     }
   }, 150_000);
