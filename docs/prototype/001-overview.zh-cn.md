@@ -2506,3 +2506,40 @@ Prototype 和 evidence 至少覆盖：
 13. Activity Center 聚合跨 Thread 工作，并返回来源 Thread/Run。
 14. 一个稳定 Agent 身份在多个 Thread 中并发拥有独立 Run。
 15. 多 Client 共享服务端事实，但各自保持独立 Panel、Tab、草稿和滚动状态。
+
+## 45. 公开可工作 Quick start
+
+公开仓库必须提供一条从干净 Checkout 可重复执行的最小纵向路径，使首次贡献者在受支持
+的 Node.js 上不需要模型凭据或网络即可验证工作中的 MVP。
+
+1. 根 README 提供受支持 Node.js 版本、`npm ci`、聚焦验证、完整 CI、Synthetic Host、
+   最小 HTTP Journey、Web 开发/静态预览和 ACP Mock 命令。命令从仓库根目录复制执行；
+   Windows PowerShell 是明确验证环境，路径在可行时保持跨平台。
+2. Quick start Bootstrap 是已提交、完整且机器无关的 JSON，至少包含 Human Principal、
+   Runtime Principal、Agent Principal、对应 Agent 配置、Project 和 Channel，只使用合成数据。
+3. 无凭据 Host 是单独的 Example/Development 入口。它通过公开
+   `createLocalRuntimeHost` 与 `DeterministicFakeAdapter` 使用生产组合路径，只允许显式
+   IPv4/IPv6 Loopback 字面量 `127.0.0.1` 或 `::1`，拒绝 Wildcard、非 Loopback 地址和
+   Hostname；不通过环境变量切换生产 CLI，不启用任意 Adapter、命令、工具或宽松权限。
+4. 最小 HTTP Journey 必须实际验证 `/health`、Bearer 到 HttpOnly Session Cookie 的交换、
+   Session CSRF、Project Bootstrap、`start-thread`、生成的 Run、Run Activity 和终态完成。
+   动态 ID 由受检脚本从响应中取得，不在文档中硬编码。
+5. Host 的正常关闭必须关闭 HTTP、Runtime 和 Kernel；使用同一个状态目录重启后，先前完成
+   的 Thread、Run 和 Activity 仍可读取。Example CLI 提供显式选择加入的
+   `--shutdown-stdin` 控制，只接受 `shutdown` 行并调用与信号处理相同的关闭路径；成功退出
+   前必须完成关闭并返回状态码 0。测试使用该协作式路径证明正常关闭，而不是把强制终止当作
+   正常关闭证据。测试使用独立临时目录和动态端口，不留下进程、端口、数据库或生成文件。
+6. Server Workspace 命令的当前工作目录是 `apps/server`。组件文档必须明确该语义，并对
+   Bootstrap、数据库和 Artifact 路径使用能从该 cwd 正确解析的路径；根级 Quick start
+   Example 则从仓库根目录解析自己的默认状态。
+7. 根级 `dev:web` 与 `preview:web` Wrapper 必须选择 `@torsor/web` Workspace，并把调用者
+   放在 `--` 后的 Vite 参数完整转发给 Workspace Script。Web 开发服务可以明确代理 `/api`
+   与 `/health` 到本机 Host。静态 Preview 可以提供同样的本机 Smoke 代理，但必须标记为
+   本地预览，而不是不存在的生产反向代理或部署承诺。
+8. 所有可消费公共 Package 都必须在 `npm pack --dry-run` 的文件清单中包含与仓库根目录
+   完全相同的 Apache-2.0 `LICENSE`。文档/Quick start 测试应覆盖示例文件、根命令、cwd
+   语义、CLI Loopback 拒绝/接受、通过真实 Host CLI 与根级 Web Wrapper 完成的 Vite
+   dev/preview 端到端 Journey、重启持久性和 Package License 清单。测试必须证明 Wrapper
+   选择正确 Workspace，并转发 `host`、正整数动态 `port` 与 `strictPort` 参数。进程
+   Readiness、HTTP Probe 和关闭必须有界且受监督；Vite 不使用会被解释为默认端口的 0，
+   并在成功或失败后清理。
