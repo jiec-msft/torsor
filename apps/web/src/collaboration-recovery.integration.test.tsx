@@ -16,7 +16,7 @@ afterEach(async () => {
 describe("rendered collaboration recovery over production HTTP", () => {
   it("recovers one committed Message edit and Attention after 401 reauthentication", async () => {
     const user = userEvent.setup();
-    const harness = await runComposerHttp();
+    const harness = await runComposerHttp({ pauseEvents: true });
     cleanup.push(() => harness.close());
     const editMessage = vi.spyOn(harness.controller, "editMessage");
     window.history.replaceState(
@@ -79,12 +79,14 @@ describe("rendered collaboration recovery over production HTTP", () => {
     await waitFor(() => {
       expect(harness.controller.getSnapshot().commandPending).toBe(false);
     });
-    expect(
-      harness.browser.requests.filter(
-        (request) => request.path === "/api/v1/commands/edit-message",
-      ),
-    ).toHaveLength(2);
-    expect(editMessage).toHaveBeenCalledTimes(2);
+    await waitFor(() => {
+      expect(editMessage).toHaveBeenCalledTimes(2);
+      expect(
+        harness.browser.requests.filter(
+          (request) => request.path === "/api/v1/commands/edit-message",
+        ),
+      ).toHaveLength(2);
+    });
     await user.type(
       screen.getByLabelText("Local bearer credential"),
       "synthetic-human",
@@ -131,7 +133,7 @@ describe("rendered collaboration recovery over production HTTP", () => {
 
   it("recovers one committed Agent config revision after 401 reauthentication", async () => {
     const user = userEvent.setup();
-    const harness = await runComposerHttp();
+    const harness = await runComposerHttp({ pauseEvents: true });
     cleanup.push(() => harness.close());
     window.history.replaceState(
       {},
