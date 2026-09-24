@@ -568,12 +568,17 @@ export class AgentRuntime {
       this.#runtimeContext,
       operationContext,
     );
+    const activationAgent = await this.#activationAgent(
+      activation.entityId,
+      attention.targetAgentId,
+      attention.projectId,
+    );
     const thread = await this.#kernel.query(
       {
         type: "GetThreadProjection",
         threadRootId: attention.threadRootId,
       },
-      { principalId: agent.principalId, activationId: activation.entityId },
+      { principalId: activationAgent.principalId, activationId: activation.entityId },
     );
     const triggeringMessage = thread.messages.find((message) =>
       message.revisions.some(
@@ -606,7 +611,7 @@ export class AgentRuntime {
     } as const;
     const providerStarted = await this.#executeProvider({
       activationId: activation.entityId,
-      agent,
+      agent: activationAgent,
       cause,
       attentionRevision: claim.revision,
       handlerLeaseToken,
@@ -839,15 +844,13 @@ export class AgentRuntime {
         `Outbox delivery ${event.id} has no current Activation.`,
       );
     }
-    let agent = this.#agents.get(currentProjection.run.ownerAgentId);
-    if (!agent) {
-      await this.#loadProject(currentProjection.run.projectId);
-      agent = this.#agents.get(currentProjection.run.ownerAgentId);
-    }
-    if (!agent) {
-      throw new Error(
-        `Run ${currentProjection.run.id} belongs to unknown Agent ${currentProjection.run.ownerAgentId}.`,
-      );
+    const agent = await this.#activationAgent(
+      activationView.id,
+      currentProjection.run.ownerAgentId,
+      currentProjection.run.projectId,
+    );
+    if (agent.configRevision !== activationView.configRevision) {
+      throw new Error(`Activation ${activationView.id} has an inconsistent configuration revision.`);
     }
     const thread = await this.#kernel.query(
       {
@@ -894,6 +897,21 @@ export class AgentRuntime {
       requestIdempotencyKey,
       correlationId,
     });
+  }
+
+  async #activationAgent(
+    activationId: string,
+    agentId: string,
+    projectId: string,
+  ): Promise<BootstrapAgent> {
+    const agent = await this.#kernel.query(
+      { type: "GetActivationAgentConfig", activationId },
+      this.#runtimeContext,
+    );
+    if (agent.id !== agentId || agent.projectId !== projectId) {
+      throw new Error(`Activation ${activationId} has an inconsistent Agent.`);
+    }
+    return agent;
   }
 
   async #executeProvider(input: {
