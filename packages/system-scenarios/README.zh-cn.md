@@ -87,7 +87,8 @@ executor 再开放 HTTP；原实例可仍持有旧 process handle。每个 compo
 Git Worktree 中写入 `native-result.txt`、执行固定 Node test，或创建用于
 cancel/fence 的实际 descendant；不读取真实 Copilot 凭据、用户环境或网络。
 
-三个 SS-3.10 场景分别验证正常完成、`Uncertain` 停止后的 quarantine/recovery，
+三个 SS-3.10 场景分别验证正常完成、Windows 原 owner 确认 `ForceTerminated` 或
+Linux 无完整证据时的 `Uncertain` quarantine/recovery，
 以及独立 fencing 后 Human cancel 的 `provider_worktree_authority_lost` 和
 delivery 不误确认。PID fixture 仅用于独立证明本场景拥有的 Provider/descendant
 已消失。停止未确认时清理保留明确临时目录并失败，不会删除可能仍在写入的 Worktree。
@@ -106,7 +107,7 @@ delivery 不误确认。PID fixture 仅用于独立证明本场景拥有的 Prov
 | SS-3.8.2 | 精确 expiry、所有旧 Writer publication 拒绝、未知停止隔离、晚到 close reconciliation |
 | SS-3.8.3 | 独立 composition 并发接管、独立目录、新 Run generation、晚到旧输出拒绝、重复恢复 |
 | SS-3.10.1 | 真实 Host/ACP/native owner 正常 edit/test、receipt、Tool activity、SSE/Web completion |
-| SS-3.10.2 | Human cancel、真实 stubborn process tree、`Uncertain`/quarantine、fresh-executor recovery |
+| SS-3.10.2 | Human cancel、真实 stubborn process tree、Windows 原 owner 确认 `ForceTerminated`；Linux 无完整证据则 `Uncertain` 并隔离；fresh-executor recovery |
 | SS-3.10.3 | 精确 live-authority fence、Human cancel、authority-lost、无 false delivery acknowledgement |
 | SS-2.4 | 无新事件时仍完成真实 SSE handshake；初始连接、重连与重开不重发命令 |
 | SS-2.2/SS-3.8.4 | 显式 Runtime 失败断言不掩盖独立 Provider assertion |

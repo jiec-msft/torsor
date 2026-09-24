@@ -227,13 +227,24 @@ describe("trusted-local HTTP Host", () => {
             expect(observation.reason).toMatchObject({ outcome: "Unknown" });
             expect(tree).toMatchObject({ state: "Quarantined", latestExecution: { state: "Uncertain" } });
           }
+          if (phase === "forced-before-return") {
+            if (process.platform === "win32") {
+              expect(observation).toMatchObject({
+                status: "fulfilled", value: { code: expect.any(Number), signal: null, error: null },
+              });
+              expect(tree.state).toBe("Ready");
+              expect(["StopConfirmed", "ForceTerminated"]).toContain(tree.latestExecution?.state);
+            } else {
+              expect(observation?.status).toBe("rejected");
+              expect(tree).toMatchObject({ state: "Quarantined", latestExecution: { state: "Uncertain" } });
+            }
+          }
           const run = await reopened.query({ type: "GetRunProjection", runId: tree.runId }, { principalId: "human" });
           expect(run.run.state).not.toBe("Completed");
           expect(run.providerAttempts.at(-1)?.status).not.toBe("Completed");
           expect(run.activity.items).toEqual([]);
         }
       } finally { reopened.close(); repo.dispose(); }
-      if (phase === "forced-before-return") expect(observation?.status).toBe("rejected");
       if (failure === "none") expect(closed.status).toBe("fulfilled");
     }
   }, 150_000);

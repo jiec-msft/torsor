@@ -183,6 +183,17 @@ contract, and group stop is not isolation proof for them.
 Provider exit stops remaining members; lost/forced owners without
 whole-tree evidence remain uncertain. Configuration crosses a private stdin
 handshake, never supervisor command arguments or disk configuration files.
+On Windows, when the grace period expires, the owner retaining the original
+Job handle must receive a force-stop request over a separate private control
+channel, terminate the Job, and observe all its members exit before reporting
+stop evidence. Killing the owner first and inferring confirmation from a
+missing PID is forbidden. Control failure, unexpected owner loss, or failed
+whole-tree observation remains `Uncertain` with the Worktree quarantined;
+never fabricate `StopConfirmed`.
+The default Windows observation window after a force-stop request is 2500ms,
+allowing the owner's bounded process and Job checks to finish. Missing
+whole-tree evidence after that window remains quarantined without extending
+Writer Authority.
 Stop evidence must cover the entire owned tree, not merely
 the provider's exit or an old PID. Normal completion stops the tree before final
 actions and retains the Lease through publication/settlement. Every stop initiates
@@ -270,6 +281,9 @@ expiry, SQLite contention, Host restart, stale output, unknown stop/quarantine,
 and replacement Writer admission. Real Copilot smoke requires explicit opt-in,
 uses only disposable synthetic directories, removes them afterward, and never
 runs in ordinary CI.
+Windows stop tests also cover a synthetic Provider that ignores stdin: forced
+stop must be confirmed by the original owner for both the Provider and its
+descendants; losing the owner directly cannot confirm stop.
 
 The local Host uses `TORSOR_PROVIDER_POLICY` (default `restricted`) and requires
 `TORSOR_PROVIDER_PERMISSION_MODE` for `trusted-local`, rejecting that permission

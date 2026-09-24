@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
 import { delimiter, isAbsolute, win32 } from "node:path";
@@ -67,8 +67,15 @@ export class OwnedProviderProcess implements ControlledChild {
     }
     const child = spawn(command, args, {
       cwd: launch.cwd, env: environment, shell: false, windowsHide: true,
-      detached: process.platform === "linux", stdio: ["pipe", "pipe", "pipe"],
+      detached: process.platform === "linux",
+      stdio: process.platform === "win32"
+        ? ["pipe", "pipe", "pipe", "ipc"]
+        : ["pipe", "pipe", "pipe"],
     });
+    if (!hasPipes(child)) {
+      child.kill("SIGKILL");
+      throw new ProviderExecutionError("provider_process_start_failed", "Unknown");
+    }
     this.processHandle = child;
     let inputFailed = false;
     child.stdin.on("error", () => {
@@ -122,8 +129,22 @@ export class OwnedProviderProcess implements ControlledChild {
       process.kill(-this.pid, "SIGKILL");
       return true;
     }
+    if (process.platform === "win32" && this.processHandle.connected) {
+      try {
+        this.processHandle.send({ type: "force-stop" }, (error) => {
+          if (error && !this.#exited) this.processHandle.kill("SIGKILL");
+        });
+        return true;
+      } catch {
+        return this.processHandle.kill("SIGKILL");
+      }
+    }
     return this.processHandle.kill("SIGKILL");
   }
+}
+
+function hasPipes(child: ChildProcess): child is ChildProcessWithoutNullStreams {
+  return child.stdin !== null && child.stdout !== null && child.stderr !== null;
 }
 
 function resolveWindowsApplication(

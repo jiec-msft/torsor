@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync } from "node:fs";
+import { once } from "node:events";
 import { join } from "node:path";
 
 import { TorsorKernel } from "@torsor/kernel";
@@ -10,13 +11,18 @@ import { describe, expect, it, vi } from "vitest";
 import { bootstrap, createRun, runtimeContext } from "../../kernel/test/helpers.js";
 import type { ControlledChild } from "../src/controlled-process.js";
 import { resolveProviderPolicy } from "../src/provider-policy.js";
+import { OwnedProviderProcess } from "../src/provider-process.js";
 import { LocalWorktreeExecutor } from "../src/worktree-executor.js";
 import { syntheticRepository } from "./fixtures/worktree-fixture.js";
 import { deferred } from "./fixtures/deferred.js";
 
 const policy = resolveProviderPolicy({ kind: "trusted-local", permissionMode: "allow-all" });
 
-async function fixture(operationalLogger?: OperationalLogger) {
+async function fixture(
+  operationalLogger?: OperationalLogger,
+  stopDurations: { stopGraceMs?: number; forceGraceMs?: number } =
+    { stopGraceMs: 10, forceGraceMs: 10 },
+) {
   const repo = syntheticRepository();
   const kernel = TorsorKernel.open({ databasePath: repo.databasePath, bootstrap });
   const run = await createRun(kernel);
@@ -29,7 +35,7 @@ async function fixture(operationalLogger?: OperationalLogger) {
   }, runtimeContext);
   const executor = new LocalWorktreeExecutor({
     kernel, runtimePrincipalId: runtimeContext.principalId, ...repo,
-    stopGraceMs: 10, forceGraceMs: 10,
+    ...stopDurations,
     ...(operationalLogger ? { operationalLogger } : {}),
   });
   return {
@@ -125,6 +131,86 @@ describe("native provider Worktree ownership", () => {
         .toMatchObject({ status: "Released" });
     } finally { await f.executor.close(); f.kernel.close(); f.repo.dispose(); }
   });
+
+  it.runIf(process.platform === "win32")(
+    "persists confirmed force termination instead of quarantining after the Provider ignores stdin",
+    async () => {
+      const f = await fixture(undefined, { stopGraceMs: 50, forceGraceMs: 2_000 });
+      let owner: OwnedProviderProcess | undefined;
+      let confirmed = false;
+      try {
+        const handle = await f.executor.startProvider({
+          runId: f.run.runId, activationId: f.run.activationId,
+          providerAttemptId: f.providerAttemptId, correlationId: f.correlationId,
+          policy,
+          start: (cwd) => owner = new OwnedProviderProcess({
+            command: process.execPath, cwd, environment: {},
+            args: ["-e", `
+              const child = require("node:child_process").spawn(process.execPath,
+                ["-e", "setInterval(()=>{},1000)"], {stdio:"ignore"});
+              process.stdout.write(child.pid+"\\n");
+              process.stdin.resume();
+              process.stdin.on("end",()=>setInterval(()=>{},1000));
+            `],
+          }),
+        });
+        const [pidChunk] = await once(owner!.processHandle.stdout, "data");
+        const pid = Number(String(pidChunk).trim());
+        expect(pid).toBeGreaterThan(0);
+        expect(await handle.stop("Synthetic Provider shutdown.")).toBe("ForceTerminated");
+        const tree = (await f.kernel.query({
+          type: "ListPhysicalWorktrees", runId: f.run.runId,
+        }, runtimeContext)).items[0]!;
+        expect(tree).toMatchObject({
+          state: "Ready",
+          latestExecution: { state: "ForceTerminated", authorityRevokedAt: expect.any(String) },
+        });
+        expect(() => handle.assertPublication()).toThrow();
+        expect(() => process.kill(pid, 0)).toThrow();
+        confirmed = true;
+      } finally {
+        await f.executor.close();
+        f.kernel.close();
+        if (confirmed) f.repo.dispose();
+      }
+    },
+    30_000,
+  );
+
+  it.runIf(process.platform === "win32")(
+    "allows the default Windows force-stop window to observe a late original-handle confirmation",
+    async () => {
+      const f = await fixture(undefined, { stopGraceMs: 1 });
+      const closed = deferred<{ code: number; signal: null; error: null }>();
+      let timer: NodeJS.Timeout | undefined;
+      const delayed: ControlledChild = {
+        pid: 12345, result: Promise.resolve(""), closed: closed.promise,
+        requestStop: () => {},
+        forceStop: () => {
+          timer = setTimeout(() => closed.resolve({ code: 137, signal: null, error: null }), 1_500);
+          return true;
+        },
+      };
+      try {
+        const handle = await f.executor.startProvider({
+          runId: f.run.runId, activationId: f.run.activationId,
+          providerAttemptId: f.providerAttemptId, correlationId: f.correlationId,
+          policy, start: () => delayed,
+        });
+        expect(await handle.stop("Synthetic delayed Job confirmation.")).toBe("ForceTerminated");
+        const tree = (await f.kernel.query({
+          type: "ListPhysicalWorktrees", runId: f.run.runId,
+        }, runtimeContext)).items[0]!;
+        expect(tree).toMatchObject({ state: "Ready", latestExecution: { state: "ForceTerminated" } });
+      } finally {
+        clearTimeout(timer);
+        closed.resolve({ code: 137, signal: null, error: null });
+        await f.executor.close();
+        f.kernel.close(); f.repo.dispose();
+      }
+    },
+    30_000,
+  );
 
   it("quarantines unknown stop and rejects stale publication or replacement until original-handle confirmation", async () => {
     const lines: string[] = [];

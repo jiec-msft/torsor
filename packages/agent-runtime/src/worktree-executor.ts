@@ -94,7 +94,7 @@ export class LocalWorktreeExecutor implements WorktreeExecutor {
     this.#operationalLogger = options.operationalLogger;
     this.#leaseMs = positive(options.leaseDurationMs ?? 30_000);
     this.#stopMs = positive(options.stopGraceMs ?? 1_000);
-    this.#forceMs = positive(options.forceGraceMs ?? 1_000);
+    this.#forceMs = positive(options.forceGraceMs ?? (process.platform === "win32" ? 2_500 : 1_000));
   }
 
   recover(): Promise<void> {

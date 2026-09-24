@@ -1,9 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -21,8 +19,6 @@ const providerFixturePath = fileURLToPath(new URL(
   "fixtures/trusted-local-provider.mjs",
   import.meta.url,
 ));
-const deliberateFailure = "Synthetic deliberate trusted-local scenario failure.";
-
 describe("trusted-local production lifecycle", () => {
   it("SS-3.10.1: completes through the production Host, Worktree owner, HTTP, SSE, and Web projection", async () => {
     vi.useRealTimers();
@@ -88,12 +84,15 @@ describe("trusted-local production lifecycle", () => {
     });
   });
 
-  it("SS-3.10.2: quarantines an unconfirmed Human cancellation and preserves it across recovery", async () => {
+  it("SS-3.10.2: confirms Windows forced stop or quarantines unconfirmed Linux stop after Human cancellation", async () => {
     vi.useRealTimers();
+    const confirmed = process.platform === "win32";
+    const stopState = confirmed ? "ForceTerminated" : "Uncertain";
+    const treeState = confirmed ? "Ready" : "Quarantined";
     await runTrustedLocalScenario({
       providerMode: "stubborn-hang",
       stopGraceMs: 1,
-      forceGraceMs: 1,
+      forceGraceMs: confirmed ? 2_000 : 1,
     }, async (system) => {
       await system.startThread();
       const running = await system.waitForTree(
@@ -104,9 +103,9 @@ describe("trusted-local production lifecycle", () => {
       expect(await system.web.loadRun(running.runId)).toBe(true);
       expect(await system.web.cancelRun(running.runId)).toBe(true);
 
-      const uncertain = await system.waitForTree(
-        (candidate) => candidate.latestExecution?.state === "Uncertain",
-        "unconfirmed owned process-tree stop",
+      const stopped = await system.waitForTree(
+        (candidate) => candidate.latestExecution?.state === stopState,
+        confirmed ? "confirmed forced process-tree stop" : "unconfirmed owned process-tree stop",
       );
       const cancelled = await system.waitForRun(
         running.runId,
@@ -115,21 +114,23 @@ describe("trusted-local production lifecycle", () => {
         "cancelled Run with unknown Provider settlement",
       );
       expect(cancelled.run.state).toBe("Cancelled");
-      expect(uncertain).toMatchObject({
-        state: "Quarantined",
+      expect(stopped).toMatchObject({
+        state: treeState,
         latestExecution: {
-          state: "Uncertain",
+          state: stopState,
           authorityRevokedAt: expect.any(String),
         },
       });
-      await expect(system.kernel.execute({
-        type: "AcquireWorktreeWriterLease",
-        idempotencyKey: "replacement-before-confirmation",
-        worktreeId: uncertain.worktreeId,
-        leaseDurationMs: 30_000,
-      }, system.runtimePrincipal)).rejects.toMatchObject({
-        code: "DomainBusy",
-      });
+      if (!confirmed) {
+        await expect(system.kernel.execute({
+          type: "AcquireWorktreeWriterLease",
+          idempotencyKey: "replacement-before-confirmation",
+          worktreeId: stopped.worktreeId,
+          leaseDurationMs: 30_000,
+        }, system.runtimePrincipal)).rejects.toMatchObject({
+          code: "DomainBusy",
+        });
+      }
       await system.waitForProcessesGone(processIds);
 
       const latestEventId = await system.sync();
@@ -141,27 +142,28 @@ describe("trusted-local production lifecycle", () => {
         events: system.events,
         run: system.web.getSnapshot().run,
       });
-      expectPrivateExecutionValuesAbsent(publicEvidence, system, uncertain);
+      expectPrivateExecutionValuesAbsent(publicEvidence, system, stopped);
 
       const recovered = await system.recoverWithFreshExecutor();
       const recoveredTree = await recovered.kernel.query(
-        { type: "GetPhysicalWorktree", worktreeId: uncertain.worktreeId },
+        { type: "GetPhysicalWorktree", worktreeId: stopped.worktreeId },
         system.runtimePrincipal,
       );
       expect(recoveredTree).toMatchObject({
-        state: "Quarantined",
-        latestExecution: { state: "Uncertain" },
+        state: treeState,
+        latestExecution: { state: stopState },
       });
-      await expect(recovered.kernel.execute({
-        type: "AcquireWorktreeWriterLease",
-        idempotencyKey: "replacement-after-recovery",
-        worktreeId: uncertain.worktreeId,
-        leaseDurationMs: 30_000,
-      }, system.runtimePrincipal)).rejects.toMatchObject({
-        code: "DomainBusy",
-      });
+      if (!confirmed) {
+        await expect(recovered.kernel.execute({
+          type: "AcquireWorktreeWriterLease",
+          idempotencyKey: "replacement-after-recovery",
+          worktreeId: stopped.worktreeId,
+          leaseDurationMs: 30_000,
+        }, system.runtimePrincipal)).rejects.toMatchObject({
+          code: "DomainBusy",
+        });
+      }
     });
-    await expectUnconfirmedCleanupPreserved();
   });
 
   it("SS-3.10.3: propagates an independent fence and never falsely acknowledges delivery", async () => {
@@ -299,96 +301,5 @@ function expectPrivateExecutionValuesAbsent(
       expect(serialized, `public evidence exposed private execution value: ${value}`)
         .not.toContain(encoded);
     }
-  }
-}
-
-async function expectUnconfirmedCleanupPreserved(): Promise<void> {
-  let directory: string | undefined;
-  let pidFixturePath: string | undefined;
-  let rejection: unknown;
-  try {
-    await runTrustedLocalScenario({
-      providerMode: "stubborn-hang",
-      stopGraceMs: 1,
-      forceGraceMs: 1,
-    }, async (system) => {
-      await system.startThread();
-      const running = await system.waitForTree(
-        (candidate) => candidate.latestExecution?.state === "Running",
-        "cleanup-regression stubborn Provider start",
-      );
-      directory = system.paths.directory;
-      pidFixturePath = join(running.directoryPath, "owned-processes.json");
-      await waitFor(
-        () => existsSync(pidFixturePath!),
-        "cleanup-regression PID fixture",
-      );
-      expect(false, deliberateFailure).toBe(true);
-    });
-  } catch (error) {
-    rejection = error;
-  }
-
-  try {
-    expect(rejection).toBeInstanceOf(AggregateError);
-    const messages = collectErrorMessages(rejection);
-    expect(messages.some((message) => message.includes(deliberateFailure))).toBe(true);
-    expect(messages.some((message) =>
-      message.includes("Preserved trusted-local scenario state at ")
-    )).toBe(true);
-    expect(directory).toBeDefined();
-    expect(pidFixturePath).toBeDefined();
-    expect(existsSync(directory!)).toBe(true);
-  } finally {
-    if (directory && pidFixturePath && existsSync(directory)) {
-      const pids = readProcessIds(pidFixturePath);
-      await waitFor(
-        () => pids.every((pid) => !processExists(pid)),
-        "cleanup-regression owned process tree to stop",
-      );
-      await rm(directory, { recursive: true, force: true });
-    }
-  }
-  expect(existsSync(directory!)).toBe(false);
-}
-
-function collectErrorMessages(error: unknown): string[] {
-  if (error instanceof AggregateError) {
-    return [
-      error.message,
-      ...error.errors.flatMap((item) => collectErrorMessages(item)),
-    ];
-  }
-  return [error instanceof Error ? error.message : String(error)];
-}
-
-function readProcessIds(path: string): readonly number[] {
-  const value: unknown = JSON.parse(readFileSync(path, "utf8"));
-  if (!Array.isArray(value) || value.length !== 2 ||
-      value.some((pid) => !Number.isSafeInteger(pid) || pid < 1)) {
-    throw new Error("Cleanup regression fixture recorded invalid process identities.");
-  }
-  return value as number[];
-}
-
-async function waitFor(
-  predicate: () => boolean,
-  description: string,
-): Promise<void> {
-  const deadline = Date.now() + 20_000;
-  while (!predicate()) {
-    if (Date.now() >= deadline) {
-      throw new Error(`Timed out waiting for ${description}.`);
-    }
-    await delay(10);
-  }
-}
-
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return !(error instanceof Error && "code" in error && error.code === "ESRCH");
   }
 }

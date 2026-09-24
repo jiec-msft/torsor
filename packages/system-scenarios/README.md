@@ -97,8 +97,9 @@ Provider only writes `native-result.txt` and runs a fixed Node test in a
 disposable Git Worktree, or creates an actual descendant for cancel/fence
 coverage. It reads no real Copilot credentials, user environment, or network.
 
-The three SS-3.10 scenarios cover normal completion, quarantine/recovery after
-an `Uncertain` stop, and `provider_worktree_authority_lost` plus no false
+The three SS-3.10 scenarios cover normal completion, original-owner-confirmed
+`ForceTerminated` on Windows or `Uncertain` quarantine/recovery without whole-tree
+evidence on Linux, and `provider_worktree_authority_lost` plus no false
 delivery acknowledgement after independent fencing and Human cancellation.
 The PID fixture independently proves that only the owned Provider/descendant
 disappeared. If stop is unconfirmed, cleanup preserves the explicit temporary
@@ -118,7 +119,7 @@ directory and fails rather than deleting a possibly active Worktree.
 | SS-3.8.2 | Exact expiry, denial of all stale Writer publication, unknown-stop quarantine, late-close reconciliation |
 | SS-3.8.3 | Concurrent independent composition, isolated directory, new Run generation, rejected late output, repeated recovery |
 | SS-3.10.1 | Real Host/ACP/native-owner edit/test, receipt, Tool activity, and SSE/Web completion |
-| SS-3.10.2 | Human cancellation, real stubborn process tree, `Uncertain`/quarantine, fresh-executor recovery |
+| SS-3.10.2 | Human cancellation, real stubborn process tree, original-owner-confirmed `ForceTerminated` on Windows or `Uncertain` quarantine without whole-tree evidence on Linux, fresh-executor recovery |
 | SS-3.10.3 | Exact live-authority fence, Human cancellation, authority loss, no false delivery acknowledgement |
 | SS-2.4 | Real SSE handshake without new events; initial connection, reconnect and reopen never resend commands |
 | SS-2.2/SS-3.8.4 | Explicit Runtime failure assertions cannot hide a distinct Provider assertion |
