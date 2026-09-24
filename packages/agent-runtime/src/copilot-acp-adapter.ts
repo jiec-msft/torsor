@@ -54,6 +54,8 @@ export interface CopilotAcpAdapterOptions {
 
 type RpcId = string | number;
 
+class ActionEnvelopeFormatError extends ProviderProtocolError {}
+
 interface RpcRequest {
   readonly jsonrpc: "2.0";
   readonly id?: RpcId;
@@ -231,6 +233,7 @@ export class CopilotAcpAdapter implements ProviderAdapter {
     );
     let sessionId: string | null = null;
     let acceptUpdates = true;
+    let restrictedPermissionRequested = false;
     let streamBytes = 0;
     let activityBytes = 0;
     let primaryError: unknown;
@@ -267,6 +270,7 @@ export class CopilotAcpAdapter implements ProviderAdapter {
 
     connection.onRequest = async (request) => {
       if (request.method === "session/request_permission") {
+        if (policy.kind === "restricted") restrictedPermissionRequested = true;
         if (policy.kind === "trusted-local" && policy.permissionMode === "allow-all" &&
             !context.signal.aborted && acceptUpdates) {
           const params = getRecord(request.params, "permission params");
@@ -437,7 +441,9 @@ export class CopilotAcpAdapter implements ProviderAdapter {
         try {
           parseActions(outputChunks.join(""), this.#limits);
         } catch (error) {
-          if (!(error instanceof ProviderProtocolError)) throw error;
+          if (!(error instanceof ActionEnvelopeFormatError) || restrictedPermissionRequested) {
+            throw error;
+          }
           outputChunks.length = 0;
           promptResult = getRecord(
             await connection.request("session/prompt", {
@@ -1012,14 +1018,20 @@ function parseActions(
   try {
     parsed = JSON.parse(normalized);
   } catch {
-    throw new ProviderProtocolError(
+    throw new ActionEnvelopeFormatError(
       "Copilot ACP did not return a valid JSON action envelope.",
     );
   }
   assertJsonDepth(parsed, limits.maxJsonDepth, "action envelope");
-  const record = getRecord(parsed, "action envelope");
+  let record: Record<string, unknown>;
+  try {
+    record = getRecord(parsed, "action envelope");
+  } catch (error) {
+    if (error instanceof ProviderProtocolError) throw new ActionEnvelopeFormatError();
+    throw error;
+  }
   if (!Array.isArray(record.actions) || record.actions.length === 0) {
-    throw new ProviderProtocolError(
+    throw new ActionEnvelopeFormatError(
       "Copilot ACP action envelope must contain at least one action.",
     );
   }
@@ -1035,7 +1047,16 @@ function parseAction(
   value: unknown,
   limits: CopilotAcpLimits,
 ): CopilotAction {
-  const action = getRecord(value, "action");
+  let action: Record<string, unknown>;
+  try {
+    action = getRecord(value, "action");
+  } catch (error) {
+    if (error instanceof ProviderProtocolError) throw new ActionEnvelopeFormatError();
+    throw error;
+  }
+  if (typeof action.type !== "string" || action.type.length === 0) {
+    throw new ActionEnvelopeFormatError();
+  }
   const type = requireBoundedString(
     action.type,
     "action.type",

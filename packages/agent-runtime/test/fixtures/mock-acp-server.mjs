@@ -53,14 +53,21 @@ lines.on("line", (line) => {
     handlePrompt();
     return;
   }
-  if (message.id === permissionId && (mode === "permission" || mode === "permission-string")) {
+  if (message.id === permissionId &&
+      (mode === "permission" || mode === "permission-string" || mode === "permission-then-malformed")) {
     if (
       message.result?.outcome?.outcome !== "cancelled"
     ) {
       process.stderr.write("permission was not cancelled");
       process.exit(2);
     }
-    sendActions(validRunActions());
+    if (mode === "permission-then-malformed") {
+      sendUpdate({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: '{"actions":[{"action":"create_run"}]}' },
+      });
+      send({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+    } else sendActions(validRunActions());
   }
 });
 
@@ -83,6 +90,25 @@ function handlePrompt() {
         },
       });
       send({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+      return;
+    case "forbidden-action-then-valid":
+      sendActions(promptCount === 1
+        ? [{ type: "publish_artifact", location: "file:///synthetic" }]
+        : [{ type: "create_run" }]);
+      return;
+    case "permission-then-malformed":
+      if (promptCount === 2) {
+        sendActions([{ type: "create_run" }]);
+        return;
+      }
+      send({
+        jsonrpc: "2.0", id: permissionId, method: "session/request_permission",
+        params: {
+          sessionId: "diagnostic-session",
+          options: [{ optionId: "allow_once", name: "Allow once", kind: "allow_once" }],
+          toolCall: { toolCallId: "forbidden", title: "Forbidden tool", kind: "execute" },
+        },
+      });
       return;
     case "invalid-plan":
       sendActions([

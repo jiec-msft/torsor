@@ -4152,6 +4152,28 @@ describe("AgentRuntime", () => {
     }
   });
 
+  it.each(["forbidden-action-then-valid", "permission-then-malformed"])(
+    "never corrects a restricted ACP turn with disqualifying behavior: %s",
+    async (mode) => {
+      const kernel = openKernel(":memory:");
+      try {
+        await mentionAgent(kernel, `disqualified-${mode}`);
+        const runtime = createRuntime(
+          kernel,
+          createFixtureAcpAdapter(mode),
+          { outboxBatchSize: 1 },
+        );
+        await expect(runtime.runOnce()).rejects.toMatchObject({
+          diagnosticCode: "provider_protocol_error",
+        });
+        const events = await kernel.readEvents(null, 500);
+        expect(events.some((event) => event.type === "RunCreated")).toBe(false);
+      } finally {
+        kernel.close();
+      }
+    },
+  );
+
   it("launches Copilot ACP with deny-by-default tools and a sanitized environment", () => {
     const adapter = new CopilotAcpAdapter({
       environment: {

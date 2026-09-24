@@ -197,9 +197,11 @@ Trusted-local 的原始 assistant chunks 只用于有界内存中的最终 actio
 不直接作为公开 streaming activity 保存；Tool 和诊断正文也不转换为报告或 Reply。
 显式最终 public actions 仍通过现有 capability 通道处理。ACP Session ID 只用于内存路由，
 不恢复 diagnostic session 字段；所有失败继续采用 schema 17 的稳定代码和固定摘要。
-受限 Attention 或 Run 的第一轮若无法解析 JSON action envelope 或其 action 字段，
+受限 Attention 或 Run 的第一轮若无法解析 JSON action envelope、`actions` 容器
+或必需的 `action.type` 字段，
 Runtime 可在同一 ACP Session 中追加至多一次不包含原始输出的格式纠正 Prompt。
-合法 envelope 中互相冲突或不允许的 action plan、权限及协议违规不得进入纠正轮。
+合法 envelope 中互相冲突或不允许的 action plan、被拒绝的权限请求及协议违规
+不得进入纠正轮。
 仅在纠正轮返回
 完整、严格验证的 action plan 后才执行任何 action；第二轮仍不合法时明确失败。
 每轮只使用该轮 `session/prompt` 的 assistant chunks，不从混合文本截取 JSON，也不将
