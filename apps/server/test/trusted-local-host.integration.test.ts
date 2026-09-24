@@ -228,10 +228,15 @@ describe("trusted-local HTTP Host", () => {
             expect(tree).toMatchObject({ state: "Quarantined", latestExecution: { state: "Uncertain" } });
           }
           if (phase === "forced-before-return") {
-            expect(observation).toMatchObject({
-              status: "fulfilled", value: { code: 137, signal: null, error: null },
-            });
-            expect(tree).toMatchObject({ state: "Ready", latestExecution: { state: "ForceTerminated" } });
+            if (process.platform === "win32") {
+              expect(observation).toMatchObject({
+                status: "fulfilled", value: { code: 137, signal: null, error: null },
+              });
+              expect(tree).toMatchObject({ state: "Ready", latestExecution: { state: "ForceTerminated" } });
+            } else {
+              expect(observation?.status).toBe("rejected");
+              expect(tree).toMatchObject({ state: "Quarantined", latestExecution: { state: "Uncertain" } });
+            }
           }
           const run = await reopened.query({ type: "GetRunProjection", runId: tree.runId }, { principalId: "human" });
           expect(run.run.state).not.toBe("Completed");

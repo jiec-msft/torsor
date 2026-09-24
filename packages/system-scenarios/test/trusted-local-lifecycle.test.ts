@@ -84,12 +84,15 @@ describe("trusted-local production lifecycle", () => {
     });
   });
 
-  it("SS-3.10.2: confirms forced stop of a stubborn Provider after Human cancellation", async () => {
+  it("SS-3.10.2: confirms Windows forced stop or quarantines unconfirmed Linux stop after Human cancellation", async () => {
     vi.useRealTimers();
+    const confirmed = process.platform === "win32";
+    const stopState = confirmed ? "ForceTerminated" : "Uncertain";
+    const treeState = confirmed ? "Ready" : "Quarantined";
     await runTrustedLocalScenario({
       providerMode: "stubborn-hang",
       stopGraceMs: 1,
-      forceGraceMs: 2_000,
+      forceGraceMs: confirmed ? 2_000 : 1,
     }, async (system) => {
       await system.startThread();
       const running = await system.waitForTree(
@@ -100,9 +103,9 @@ describe("trusted-local production lifecycle", () => {
       expect(await system.web.loadRun(running.runId)).toBe(true);
       expect(await system.web.cancelRun(running.runId)).toBe(true);
 
-      const terminated = await system.waitForTree(
-        (candidate) => candidate.latestExecution?.state === "ForceTerminated",
-        "confirmed forced process-tree stop",
+      const stopped = await system.waitForTree(
+        (candidate) => candidate.latestExecution?.state === stopState,
+        confirmed ? "confirmed forced process-tree stop" : "unconfirmed owned process-tree stop",
       );
       const cancelled = await system.waitForRun(
         running.runId,
@@ -111,13 +114,23 @@ describe("trusted-local production lifecycle", () => {
         "cancelled Run with unknown Provider settlement",
       );
       expect(cancelled.run.state).toBe("Cancelled");
-      expect(terminated).toMatchObject({
-        state: "Ready",
+      expect(stopped).toMatchObject({
+        state: treeState,
         latestExecution: {
-          state: "ForceTerminated",
+          state: stopState,
           authorityRevokedAt: expect.any(String),
         },
       });
+      if (!confirmed) {
+        await expect(system.kernel.execute({
+          type: "AcquireWorktreeWriterLease",
+          idempotencyKey: "replacement-before-confirmation",
+          worktreeId: stopped.worktreeId,
+          leaseDurationMs: 30_000,
+        }, system.runtimePrincipal)).rejects.toMatchObject({
+          code: "DomainBusy",
+        });
+      }
       await system.waitForProcessesGone(processIds);
 
       const latestEventId = await system.sync();
@@ -129,17 +142,27 @@ describe("trusted-local production lifecycle", () => {
         events: system.events,
         run: system.web.getSnapshot().run,
       });
-      expectPrivateExecutionValuesAbsent(publicEvidence, system, terminated);
+      expectPrivateExecutionValuesAbsent(publicEvidence, system, stopped);
 
       const recovered = await system.recoverWithFreshExecutor();
       const recoveredTree = await recovered.kernel.query(
-        { type: "GetPhysicalWorktree", worktreeId: terminated.worktreeId },
+        { type: "GetPhysicalWorktree", worktreeId: stopped.worktreeId },
         system.runtimePrincipal,
       );
       expect(recoveredTree).toMatchObject({
-        state: "Ready",
-        latestExecution: { state: "ForceTerminated" },
+        state: treeState,
+        latestExecution: { state: stopState },
       });
+      if (!confirmed) {
+        await expect(recovered.kernel.execute({
+          type: "AcquireWorktreeWriterLease",
+          idempotencyKey: "replacement-after-recovery",
+          worktreeId: stopped.worktreeId,
+          leaseDurationMs: 30_000,
+        }, system.runtimePrincipal)).rejects.toMatchObject({
+          code: "DomainBusy",
+        });
+      }
     });
   });
 
