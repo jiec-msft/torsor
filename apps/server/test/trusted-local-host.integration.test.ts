@@ -227,13 +227,18 @@ describe("trusted-local HTTP Host", () => {
             expect(observation.reason).toMatchObject({ outcome: "Unknown" });
             expect(tree).toMatchObject({ state: "Quarantined", latestExecution: { state: "Uncertain" } });
           }
+          if (phase === "forced-before-return") {
+            expect(observation).toMatchObject({
+              status: "fulfilled", value: { code: 137, signal: null, error: null },
+            });
+            expect(tree).toMatchObject({ state: "Ready", latestExecution: { state: "ForceTerminated" } });
+          }
           const run = await reopened.query({ type: "GetRunProjection", runId: tree.runId }, { principalId: "human" });
           expect(run.run.state).not.toBe("Completed");
           expect(run.providerAttempts.at(-1)?.status).not.toBe("Completed");
           expect(run.activity.items).toEqual([]);
         }
       } finally { reopened.close(); repo.dispose(); }
-      if (phase === "forced-before-return") expect(observation?.status).toBe("rejected");
       if (failure === "none") expect(closed.status).toBe("fulfilled");
     }
   }, 150_000);

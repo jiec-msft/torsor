@@ -148,6 +148,12 @@ Linux 受支持的工具必须把后代保留在原进程组内；主动脱离�
 程序不在此执行契约内，不能把组停止当作这类进程的隔离证明。
 Provider 退出后停止剩余成员；owner 丢失或强制停止而没有完整树证明时保持不确定。
 进程配置只经私有 stdin 握手传递，不放入 supervisor 命令行或磁盘配置文件。
+Windows 上宽限时间结束时，持有原始 Job handle 的 owner 必须通过独立的私有控制通道
+接收强制停止请求，终止 Job 并观察其中全部进程退出后才报告停止证据；不得先杀死
+owner 再把 PID 消失当作确认。控制通道失效、owner 意外退出或完整树观察失败时仍保持
+`Uncertain` 和 Worktree quarantine，不得伪造 `StopConfirmed`。
+Windows 强停后的默认观察窗口为 2500 毫秒，以容纳 owner 的有界进程和 Job 确认；
+窗口结束仍无完整证据时保持隔离，不延长 Writer Authority。
 停止证据必须覆盖整个所拥有的树，
 不能仅凭 Provider 主进程退出或旧 PID 判断。正常结束在最终 actions 发布前停止进程树，
 并保持 Lease 到 publication/settlement 完成。所有停止先发起 OS 操作，再等待 SQLite。
@@ -212,6 +218,8 @@ Runtime 可在同一 ACP Session 中追加至多一次不包含原始输出的�
 以及 Shell/MCP Tool 状态、取消、过期、SQLite 争用、Host 重启、旧输出、
 未知停止/quarantine 和替代 Writer 准入。真实 Copilot smoke 必须显式 opt-in，
 仅使用可丢弃合成目录，结束时删除它，不在普通 CI 中运行。
+Windows 停止测试还需覆盖忽略 stdin 的合成 Provider：强制停止必须由原 owner
+确认 Job 中的 Provider 和后代均已退出；直接丢失 owner 时不得据此确认停止。
 
 本地 Host 使用 `TORSOR_PROVIDER_POLICY`（默认 `restricted`），`trusted-local`
 必须设置 `TORSOR_PROVIDER_PERMISSION_MODE`，`restricted` 则拒绝该设置。

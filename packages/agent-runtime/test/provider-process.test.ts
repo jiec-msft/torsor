@@ -182,6 +182,36 @@ describe("retained native process-tree owner", () => {
     }
   }, 150_000);
 
+  it.runIf(process.platform === "win32")(
+    "confirms forced stop of an unresponsive Provider and descendant through the original owner",
+    async () => {
+      const owner = new OwnedProviderProcess({
+        command: process.execPath, cwd: process.cwd(), environment: {},
+        args: ["-e", `
+          const child = require("node:child_process").spawn(process.execPath,
+            ["-e", "setInterval(()=>{},1000)"], {stdio:"ignore"});
+          process.stdout.write(child.pid+"\\n");
+          process.stdin.resume();
+          process.stdin.on("end",()=>setInterval(()=>{},1000));
+        `],
+      });
+      const timeout = setTimeout(() => owner.processHandle.kill("SIGKILL"), 10_000);
+      try {
+        const pid = Number(String(await ready(owner)).trim());
+        expect(pid).toBeGreaterThan(0);
+        owner.requestStop();
+        expect(owner.forceStop()).toBe(true);
+        await expect(owner.closed).resolves.toEqual({ code: 137, signal: null, error: null });
+        expect(() => process.kill(pid, 0)).toThrow();
+      } finally {
+        clearTimeout(timeout);
+        owner.processHandle.kill("SIGKILL");
+        await Promise.allSettled([owner.closed]);
+      }
+    },
+    30_000,
+  );
+
   it("does not treat abrupt owner loss as whole-tree stop confirmation", async () => {
     const owner = new OwnedProviderProcess({
       command: process.execPath, cwd: process.cwd(), environment: {},
@@ -190,7 +220,8 @@ describe("retained native process-tree owner", () => {
     const timeout = setTimeout(() => owner.forceStop(), 120_000);
     try {
       await ready(owner);
-      owner.forceStop();
+      if (process.platform === "win32") owner.processHandle.kill("SIGKILL");
+      else owner.forceStop();
       await expect(owner.closed).rejects.toMatchObject({ outcome: "Unknown" });
     } finally {
       clearTimeout(timeout);

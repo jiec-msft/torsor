@@ -106,7 +106,7 @@ delivery 不误确认。PID fixture 仅用于独立证明本场景拥有的 Prov
 | SS-3.8.2 | 精确 expiry、所有旧 Writer publication 拒绝、未知停止隔离、晚到 close reconciliation |
 | SS-3.8.3 | 独立 composition 并发接管、独立目录、新 Run generation、晚到旧输出拒绝、重复恢复 |
 | SS-3.10.1 | 真实 Host/ACP/native owner 正常 edit/test、receipt、Tool activity、SSE/Web completion |
-| SS-3.10.2 | Human cancel、真实 stubborn process tree、`Uncertain`/quarantine、fresh-executor recovery |
+| SS-3.10.2 | Human cancel、真实 stubborn process tree、原 owner 确认 `ForceTerminated`、fresh-executor recovery |
 | SS-3.10.3 | 精确 live-authority fence、Human cancel、authority-lost、无 false delivery acknowledgement |
 | SS-2.4 | 无新事件时仍完成真实 SSE handshake；初始连接、重连与重开不重发命令 |
 | SS-2.2/SS-3.8.4 | 显式 Runtime 失败断言不掩盖独立 Provider assertion |

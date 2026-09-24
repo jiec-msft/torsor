@@ -118,7 +118,7 @@ directory and fails rather than deleting a possibly active Worktree.
 | SS-3.8.2 | Exact expiry, denial of all stale Writer publication, unknown-stop quarantine, late-close reconciliation |
 | SS-3.8.3 | Concurrent independent composition, isolated directory, new Run generation, rejected late output, repeated recovery |
 | SS-3.10.1 | Real Host/ACP/native-owner edit/test, receipt, Tool activity, and SSE/Web completion |
-| SS-3.10.2 | Human cancellation, real stubborn process tree, `Uncertain`/quarantine, fresh-executor recovery |
+| SS-3.10.2 | Human cancellation, real stubborn process tree, original-owner-confirmed `ForceTerminated`, fresh-executor recovery |
 | SS-3.10.3 | Exact live-authority fence, Human cancellation, authority loss, no false delivery acknowledgement |
 | SS-2.4 | Real SSE handshake without new events; initial connection, reconnect and reopen never resend commands |
 | SS-2.2/SS-3.8.4 | Explicit Runtime failure assertions cannot hide a distinct Provider assertion |

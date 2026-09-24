@@ -10,8 +10,8 @@ const HANDLE_FLAG_INHERIT = 0x00000001;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
 const JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9;
-const INFINITE = 0xffffffff;
 const WAIT_OBJECT_0 = 0;
+const WAIT_TIMEOUT = 0x102;
 
 interface NativeProcessInformation {
   readonly Process: unknown;
@@ -180,7 +180,7 @@ function activeProcessCount(value: unknown): number {
   return active;
 }
 
-function run(): number {
+async function run(): Promise<number> {
   const applicationName = terminatedUtf16(readField());
   const commandLine = terminatedUtf16(readField());
   const marker = readField().toString("utf16le");
@@ -250,11 +250,29 @@ function run(): number {
     if (!assignProcess(job, process.Process)) return 126;
     assigned = true;
     if (resumeThread(process.Thread) === 0xffffffff) return 127;
-    if (waitForSingleObject(process.Process, INFINITE) !== WAIT_OBJECT_0) return 125;
+    let forceStopRequested = false;
+    globalThis.process.on("message", (message: unknown) => {
+      if (message && typeof message === "object" && "type" in message &&
+          message.type === "force-stop") forceStopRequested = true;
+    });
+    let forced = false;
+    while (true) {
+      const wait = waitForSingleObject(process.Process, 25);
+      if (wait === WAIT_OBJECT_0) break;
+      if (wait !== WAIT_TIMEOUT) return 125;
+      if (forceStopRequested) {
+        if (!terminateJob(job, 137) ||
+            waitForSingleObject(process.Process, 1_000) !== WAIT_OBJECT_0) return 125;
+        forced = true;
+        break;
+      }
+      // Yield so the private IPC stop request can be handled while the Provider is running.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
     const exitCode: number[] = [0];
     if (!getExitCode(process.Process, exitCode)) return 125;
     writeSync(2, `${exitMarker}${Number(exitCode[0])}\n`);
-    if (!terminateJob(job, 137)) return 125;
+    if (!forced && !terminateJob(job, 137)) return 125;
     for (let attempt = 0; attempt < 200; attempt += 1) {
       const accounting: Record<string, unknown> = {};
       if (!queryJobInformation(
@@ -288,10 +306,7 @@ function run(): number {
   }
 }
 
-let exitCode = 125;
-try {
-  exitCode = run();
-} catch {
-  exitCode = 125;
-}
-process.exit(exitCode);
+void run().then(
+  (code) => { process.exit(code); },
+  () => { process.exit(125); },
+);
