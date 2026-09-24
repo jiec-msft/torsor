@@ -73,6 +73,7 @@ import {
 } from "./outbox.js";
 import {
   getBootstrap,
+  getActivationAgentConfig,
   getAttentionRecoverySnapshot,
   getProjectAgentStatus,
   getProviderAttempt,
@@ -644,6 +645,10 @@ export class TorsorKernel {
           );
           break;
         }
+        case "GetActivationAgentConfig":
+          requireKind(this.#context, principal, "runtime");
+          result = getActivationAgentConfig(this.#context, query.activationId);
+          break;
         case "GetThreadProjection": {
           const thread = requireThread(this.#context, query.threadRootId);
           assertProjectAccess(this.#context, principal, text(thread.project_id));

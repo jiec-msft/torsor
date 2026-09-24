@@ -528,6 +528,11 @@ export interface GetBootstrapQuery {
   readonly projectId: string;
 }
 
+export interface GetActivationAgentConfigQuery {
+  readonly type: "GetActivationAgentConfig";
+  readonly activationId: string;
+}
+
 export interface GetThreadProjectionQuery {
   readonly type: "GetThreadProjection";
   readonly threadRootId: string;
@@ -655,6 +660,7 @@ export type KernelQuery =
   | { readonly type: "GetPhysicalWorktree"; readonly worktreeId: string }
   | GetArtifactQuery
   | GetBootstrapQuery
+  | GetActivationAgentConfigQuery
   | GetThreadProjectionQuery
   | GetRunProjectionQuery
   | ListActivityQuery
@@ -989,6 +995,7 @@ export interface QueryResultMap {
   readonly GetPhysicalWorktree: PhysicalWorktreeView;
   readonly GetArtifact: ArtifactView;
   readonly GetBootstrap: BootstrapProjection;
+  readonly GetActivationAgentConfig: BootstrapAgent;
   readonly GetThreadProjection: ThreadProjection;
   readonly GetRunProjection: RunProjection;
   readonly ListActivity: ActivityPage;

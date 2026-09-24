@@ -26,6 +26,7 @@ import type {
   AttentionRecoverySnapshot,
   AuthorizedPublicEventPage,
   AttentionPage,
+  BootstrapAgent,
   BootstrapProjection,
   OutboxPage,
   PrincipalContext,
@@ -89,6 +90,20 @@ export function getBootstrap(kernel: db.KernelContext, projectId: string, attent
     openAttentions: listOpenAttentions(kernel, projectId, attentionTargetAgentId, 0, snapshot.sequence, snapshot.eventId, 100),
     latestEventId: snapshot.eventId,
   };
+}
+
+export function getActivationAgentConfig(kernel: db.KernelContext, activationId: string): BootstrapAgent {
+  const agent = db.getRow(kernel, `SELECT agent.id, agent.principal_id, agent.project_id, agent.name,
+           activation.config_revision AS current_config_revision, config.config_json
+      FROM activation_attempts AS activation
+      JOIN agents AS agent ON agent.id = activation.agent_id
+      JOIN agent_config_revisions AS config
+        ON config.agent_id = activation.agent_id AND config.revision = activation.config_revision
+     WHERE activation.id = ?`, activationId);
+  if (!agent) {
+    throw new KernelError("NotFound", `Activation ${activationId} has no configuration revision.`);
+  }
+  return mapAgent(agent);
 }
 
 export function getThreadProjection(

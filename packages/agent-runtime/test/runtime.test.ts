@@ -117,6 +117,154 @@ const runtimeContext = { principalId: "principal-runtime" } as const;
 let kernelInstance = 0;
 
 describe("AgentRuntime", () => {
+  it("delivers the Run-pinned configuration after its Agent advances", async () => {
+    const initialConfig = { provider: "deterministic-fake", instruction: "Initial" };
+    const nextConfig = { provider: "deterministic-fake", instruction: "Updated" };
+    const kernel = openKernel(":memory:", undefined, {
+      ...bootstrap,
+      agents: bootstrap.agents!.map((agent) =>
+        agent.id === "agent-orbit" ? { ...agent, config: initialConfig } : agent),
+    });
+    const delivered: Array<{ revision: number; config: unknown }> = [];
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+        return;
+      }
+      delivered.push({
+        revision: context.agent.configRevision,
+        config: context.agent.config,
+      });
+      await context.capabilities.complete();
+    });
+    try {
+      await mentionAgent(kernel, "pinned-config");
+      const runtime = createRuntime(kernel, adapter);
+      await runtime.runOnce();
+      const runId = (await kernel.readEvents(null, 100))
+        .find((event) => event.type === "RunCreated")?.entityId;
+      expect(runId).toBeTruthy();
+
+      await kernel.execute({
+        type: "UpdateAgentConfig",
+        idempotencyKey: "update-config-after-run",
+        agentId: "agent-orbit",
+        expectedAgentConfigRevision: 1,
+        config: nextConfig,
+      }, humanContext);
+      await runtime.drainUntilIdle();
+
+      expect(delivered).toEqual([{ revision: 1, config: initialConfig }]);
+      const run = await kernel.query(
+        { type: "GetRunProjection", runId: runId! }, humanContext,
+      );
+      expect(run.run.agentConfigRevision).toBe(1);
+      expect(run.activations[0]?.configRevision).toBe(1);
+      await expect(kernel.query({
+        type: "GetActivationAgentConfig",
+        activationId: run.activations[0]!.id,
+      }, humanContext)).rejects.toMatchObject({ code: "Forbidden" });
+      await expect(kernel.query({
+        type: "GetActivationAgentConfig",
+        activationId: "unknown-activation",
+      }, runtimeContext)).rejects.toMatchObject({ code: "NotFound" });
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("delivers an adopted configuration only to later Activations, even after another Agent update", async () => {
+    const initialConfig = { provider: "deterministic-fake", instruction: "Initial" };
+    const adoptedConfig = { provider: "deterministic-fake", instruction: "Adopted" };
+    const latestConfig = { provider: "deterministic-fake", instruction: "Latest" };
+    const kernel = openKernel(":memory:", undefined, {
+      ...bootstrap,
+      agents: bootstrap.agents!.map((agent) =>
+        agent.id === "agent-orbit" ? { ...agent, config: initialConfig } : agent),
+    });
+    const delivered: Array<{ revision: number; config: unknown }> = [];
+    const adapter = new DeterministicFakeAdapter(async (context) => {
+      if (context.cause.type === "attention") {
+        await context.capabilities.createRunFromAttention();
+        return;
+      }
+      delivered.push({
+        revision: context.agent.configRevision,
+        config: context.agent.config,
+      });
+      if (delivered.length === 1) {
+        await context.capabilities.wait("Await another input.");
+      } else {
+        await context.capabilities.complete();
+      }
+    });
+    try {
+      await mentionAgent(kernel, "adopted-config");
+      const runtime = createRuntime(kernel, adapter);
+      await runtime.drainUntilIdle();
+      const runId = (await kernel.readEvents(null, 100))
+        .find((event) => event.type === "RunCreated")?.entityId;
+      expect(runId).toBeTruthy();
+      let run = await kernel.query(
+        { type: "GetRunProjection", runId: runId! }, humanContext,
+      );
+      expect(run.run.state).toBe("Waiting");
+      expect(delivered).toEqual([{ revision: 1, config: initialConfig }]);
+
+      await kernel.execute({
+        type: "UpdateAgentConfig",
+        idempotencyKey: "update-config-to-adopt",
+        agentId: "agent-orbit",
+        expectedAgentConfigRevision: 1,
+        config: adoptedConfig,
+      }, humanContext);
+      await kernel.execute({
+        type: "AdoptRunConfig",
+        idempotencyKey: "adopt-config-for-run",
+        runId: runId!,
+        expectedRunRevision: run.run.revision,
+        expectedAgentConfigRevision: 2,
+        targetAgentConfigRevision: 2,
+      }, humanContext);
+      run = await kernel.query(
+        { type: "GetRunProjection", runId: runId! }, humanContext,
+      );
+      expect(run.activations.map((activation) => activation.configRevision))
+        .toEqual([1]);
+      expect(run.run.agentConfigRevision).toBe(2);
+
+      await kernel.execute({
+        type: "UpdateAgentConfig",
+        idempotencyKey: "update-config-again",
+        agentId: "agent-orbit",
+        expectedAgentConfigRevision: 2,
+        config: latestConfig,
+      }, humanContext);
+      await kernel.execute({
+        type: "SendToRun",
+        idempotencyKey: "resume-adopted-run",
+        runId: runId!,
+        expectedRunRevision: run.run.revision,
+        body: "Resume with the adopted configuration.",
+      }, humanContext);
+      await runtime.drainUntilIdle();
+
+      expect(delivered).toEqual([
+        { revision: 1, config: initialConfig },
+        { revision: 2, config: adoptedConfig },
+      ]);
+      run = await kernel.query(
+        { type: "GetRunProjection", runId: runId! }, humanContext,
+      );
+      expect(run.run.agentConfigRevision).toBe(2);
+      expect(run.activations.map((activation) => activation.configRevision))
+        .toEqual([1, 2]);
+      expect(run.run.state).toBe("Completed");
+    } finally {
+      kernel.close();
+    }
+  });
+
   it("delivers only owning-Run Artifacts to Providers and none to Attention contexts", async () => {
     const directory = mkdtempSync(join(tmpdir(), "torsor-provider-artifact-scope-"));
     const clock = () => new Date("2026-09-21T08:00:00.000Z");
