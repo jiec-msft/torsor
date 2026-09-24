@@ -425,13 +425,30 @@ export class CopilotAcpAdapter implements ProviderAdapter {
         const selection = selectCodingMode(session);
         if (selection) await connection.request(selection.method, { sessionId, ...selection.params });
       }
-      const promptResult = getRecord(
+      let promptResult = getRecord(
         await connection.request("session/prompt", {
           sessionId,
           prompt: [{ type: "text", text: buildPrompt(context) }],
         }),
         "session/prompt result",
       );
+      if (policy.kind === "restricted") {
+        assertPromptEnded(promptResult);
+        try {
+          parseActions(outputChunks.join(""), this.#limits);
+        } catch (error) {
+          if (!(error instanceof ProviderProtocolError)) throw error;
+          outputChunks.length = 0;
+          promptResult = getRecord(
+            await connection.request("session/prompt", {
+              sessionId,
+              prompt: [{ type: "text", text: buildCorrectionPrompt(context.cause.type) }],
+            }),
+            "session/prompt correction result",
+          );
+          assertPromptEnded(promptResult);
+        }
+      }
       connection.allowProcessExit();
       if (worktree) await worktree.finish();
       else await stopProcess(processHandle, this.#shutdownGraceMs, () => connection.endInput());
@@ -439,19 +456,7 @@ export class CopilotAcpAdapter implements ProviderAdapter {
       await persistence.drain();
       connection.seal();
       if (policy.kind === "trusted-local") tools.assertComplete();
-      const stopReason = requireBoundedString(
-        promptResult.stopReason,
-        "stopReason",
-        64,
-      );
-      if (stopReason !== "end_turn") {
-        throw new ProviderExecutionError(
-          stopReason === "cancelled"
-            ? "provider_cancelled"
-            : "provider_execution_failed",
-          stopReason === "cancelled" ? "Unknown" : "Failed",
-        );
-      }
+      assertPromptEnded(promptResult);
       const actions = parseActions(outputChunks.join(""), this.#limits);
       validateActionPlan(actions, context.cause.type);
       if (actions.some((action) => action.type === "publish_report") && !context.capabilities.reportArtifactsEnabled) {
@@ -919,6 +924,30 @@ class NdjsonRpcConnection {
 function requireRpcId(value: unknown): RpcId {
   if (typeof value === "string" || typeof value === "number" && Number.isSafeInteger(value)) return value;
   throw new ProviderProtocolError("ACP request ID must be a string or safe integer.");
+}
+
+function assertPromptEnded(result: Record<string, unknown>): void {
+  const stopReason = requireBoundedString(result.stopReason, "stopReason", 64);
+  if (stopReason !== "end_turn") {
+    throw new ProviderExecutionError(
+      stopReason === "cancelled" ? "provider_cancelled" : "provider_execution_failed",
+      stopReason === "cancelled" ? "Unknown" : "Failed",
+    );
+  }
+}
+
+function buildCorrectionPrompt(cause: "attention" | "run"): string {
+  const types = cause === "attention"
+    ? "create_run, continue_run (requires runId), ignore_attention (requires reason)"
+    : "append_activity, publish_reply, report_status, complete, fail, wait";
+  return [
+    "Your previous response was not a valid JSON action envelope. No action was applied.",
+    "Use the authoritative state from the preceding prompt to decide again.",
+    'Return only one JSON object with an "actions" array and no other text or Markdown.',
+    'Every action must have a "type" string field.',
+    `Allowed type values: ${types}. Include all required fields for your chosen action.`,
+    "Do not use tools, repeat earlier output, or provide a progress message.",
+  ].join("\n");
 }
 
 function buildPrompt(context: ProviderExecutionContext): string {

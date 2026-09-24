@@ -6,6 +6,7 @@ const permissionId = mode === "permission-string" ? "synthetic-permission" : 900
 const parameter = Number(process.argv[3] ?? "0");
 const lines = createInterface({ input: process.stdin });
 let promptId;
+let promptCount = 0;
 
 lines.on("line", (line) => {
   const message = JSON.parse(line);
@@ -35,6 +36,20 @@ lines.on("line", (line) => {
   }
   if (message.method === "session/prompt") {
     promptId = message.id;
+    promptCount += 1;
+    if (mode === "recover-action-envelope" || mode === "unrecoverable-action-envelope") {
+      const text = message.params?.prompt?.[0]?.text;
+      if (promptCount === 2 &&
+          (typeof text !== "string" || !text.includes('"type"') ||
+           text.includes("SYNTHETIC_PRIVATE_OUTPUT"))) {
+        process.stderr.write("Correction prompt leaked output or omitted the required action type.");
+        process.exit(2);
+      }
+      if (promptCount > 2) {
+        process.stderr.write("Unexpected third prompt.");
+        process.exit(2);
+      }
+    }
     handlePrompt();
     return;
   }
@@ -53,6 +68,21 @@ function handlePrompt() {
   switch (mode) {
     case "valid":
       sendActions(validRunActions());
+      return;
+    case "recover-action-envelope":
+    case "unrecoverable-action-envelope":
+      if (promptCount === 2 && mode === "recover-action-envelope") {
+        sendActions([{ type: "create_run" }]);
+        return;
+      }
+      sendUpdate({
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "text",
+          text: 'SYNTHETIC_PRIVATE_OUTPUT {"actions":[{"action":"create_run"}]}',
+        },
+      });
+      send({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
       return;
     case "invalid-plan":
       sendActions([

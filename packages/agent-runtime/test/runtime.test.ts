@@ -4123,6 +4123,35 @@ describe("AgentRuntime", () => {
     }
   });
 
+  it.each([
+    { mode: "recover-action-envelope", succeeds: true },
+    { mode: "unrecoverable-action-envelope", succeeds: false },
+  ])("requests one bounded restricted ACP correction without replaying output: $mode", async ({ mode, succeeds }) => {
+    const kernel = openKernel(":memory:");
+    try {
+      await mentionAgent(kernel, `restricted-${mode}`);
+      const runtime = createRuntime(
+        kernel,
+        createFixtureAcpAdapter(mode),
+        { outboxBatchSize: 1 },
+      );
+      if (succeeds) {
+        await runtime.runOnce();
+      } else {
+        await expect(runtime.runOnce()).rejects.toMatchObject({
+          diagnosticCode: "provider_protocol_error",
+        });
+      }
+      const events = await kernel.readEvents(null, 500);
+      expect(events.filter((event) => event.type === "RunCreated")).toHaveLength(
+        succeeds ? 1 : 0,
+      );
+      expect(JSON.stringify(events)).not.toContain("SYNTHETIC_PRIVATE_OUTPUT");
+    } finally {
+      kernel.close();
+    }
+  });
+
   it("launches Copilot ACP with deny-by-default tools and a sanitized environment", () => {
     const adapter = new CopilotAcpAdapter({
       environment: {

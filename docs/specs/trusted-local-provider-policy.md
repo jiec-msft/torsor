@@ -250,6 +250,18 @@ a report or reply automatically. Explicit final public actions still use the
 existing capability channel. ACP session IDs are memory-only routing data, never
 restored diagnostic-session fields; failures retain schema 17 stable codes and
 fixed summaries.
+If the first turn of a restricted Attention or Run has an unparseable JSON
+action envelope or action fields, Runtime may request at most one format
+correction in the same ACP session without including the original output in
+that prompt. Conflicting or forbidden plans in a valid envelope, permission
+requests, and protocol violations must not trigger this correction. No action is
+applied until the correction returns a complete, strictly validated action plan;
+another invalid turn fails explicitly. Use only the assistant chunks from each
+respective `session/prompt` turn; do not extract JSON from mixed text or treat
+`usage_update` as a message boundary. The correction shares the original
+ProviderAttempt deadline and cumulative output limits. A trusted-local Run that
+may have executed native tools must not automatically request a correction or
+replay the work.
 
 Deterministic tests must demonstrate a real fixed provider writing and running a
 synthetic test in the assigned Worktree, plus Shell/MCP tool states, cancellation,
