@@ -6,6 +6,7 @@ const permissionId = mode === "permission-string" ? "synthetic-permission" : 900
 const parameter = Number(process.argv[3] ?? "0");
 const lines = createInterface({ input: process.stdin });
 let promptId;
+let promptCount = 0;
 
 lines.on("line", (line) => {
   const message = JSON.parse(line);
@@ -35,17 +36,38 @@ lines.on("line", (line) => {
   }
   if (message.method === "session/prompt") {
     promptId = message.id;
+    promptCount += 1;
+    if (mode === "recover-action-envelope" || mode === "unrecoverable-action-envelope") {
+      const text = message.params?.prompt?.[0]?.text;
+      if (promptCount === 2 &&
+          (typeof text !== "string" || !text.includes('"type"') ||
+           text.includes("SYNTHETIC_PRIVATE_OUTPUT"))) {
+        process.stderr.write("Correction prompt leaked output or omitted the required action type.");
+        process.exit(2);
+      }
+      if (promptCount > 2) {
+        process.stderr.write("Unexpected third prompt.");
+        process.exit(2);
+      }
+    }
     handlePrompt();
     return;
   }
-  if (message.id === permissionId && (mode === "permission" || mode === "permission-string")) {
+  if (message.id === permissionId &&
+      (mode === "permission" || mode === "permission-string" || mode === "permission-then-malformed")) {
     if (
       message.result?.outcome?.outcome !== "cancelled"
     ) {
       process.stderr.write("permission was not cancelled");
       process.exit(2);
     }
-    sendActions(validRunActions());
+    if (mode === "permission-then-malformed") {
+      sendUpdate({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: '{"actions":[{"action":"create_run"}]}' },
+      });
+      send({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+    } else sendActions(validRunActions());
   }
 });
 
@@ -53,6 +75,40 @@ function handlePrompt() {
   switch (mode) {
     case "valid":
       sendActions(validRunActions());
+      return;
+    case "recover-action-envelope":
+    case "unrecoverable-action-envelope":
+      if (promptCount === 2 && mode === "recover-action-envelope") {
+        sendActions([{ type: "create_run" }]);
+        return;
+      }
+      sendUpdate({
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "text",
+          text: 'SYNTHETIC_PRIVATE_OUTPUT {"actions":[{"action":"create_run"}]}',
+        },
+      });
+      send({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+      return;
+    case "forbidden-action-then-valid":
+      sendActions(promptCount === 1
+        ? [{ type: "publish_artifact", location: "file:///synthetic" }]
+        : [{ type: "create_run" }]);
+      return;
+    case "permission-then-malformed":
+      if (promptCount === 2) {
+        sendActions([{ type: "create_run" }]);
+        return;
+      }
+      send({
+        jsonrpc: "2.0", id: permissionId, method: "session/request_permission",
+        params: {
+          sessionId: "diagnostic-session",
+          options: [{ optionId: "allow_once", name: "Allow once", kind: "allow_once" }],
+          toolCall: { toolCallId: "forbidden", title: "Forbidden tool", kind: "execute" },
+        },
+      });
       return;
     case "invalid-plan":
       sendActions([
